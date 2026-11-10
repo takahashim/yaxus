@@ -236,8 +236,7 @@ pub const QK_ROPE: &str = r#"
 struct P { hq: u32, hkv: u32, eps: f32, _a: u32 }
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> qo: array<f32>;
-@group(0) @binding(1) var<storage, read_write> kc: array<f32>;
-@group(0) @binding(2) var<storage, read_write> vc: array<f32>;
+{KV_STORE_DECL}
 @group(0) @binding(3) var<storage, read> qkv: array<f32>;
 @group(0) @binding(4) var<storage, read> qn: array<f32>;
 @group(0) @binding(5) var<storage, read> kn: array<f32>;
@@ -276,15 +275,65 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let s = cs[ntab + pos * 64u + j];
     var o = 0.0;
     if (li < 64u) { o = v[li] * c - v[li + 64u] * s; } else { o = v[li] * c + v[li - 64u] * s; }
+    var kval = 0.0;
+    var vval = 0.0;
     if (is_q) {
         qo[t * qd + h * 128u + li] = o;
     } else {
-        let kh = h - p.hq;
-        let at = m.y * kvd + kh * 128u + li;
-        kc[at] = o;
-        vc[at] = qkv[row + qd + kvd + kh * 128u + li];
+        kval = o;
+        vval = qkv[row + qd + kvd + (h - p.hq) * 128u + li];
     }
+    // Element `li` of KV head `h - hq` in slot `m.y` (only for K/V heads).
+    let at = m.y * kvd + (h - p.hq) * 128u;
+{KV_STORE}
 }
+"#;
+
+/// KV storage in f32: one value per element.
+pub const KV_STORE_F32_DECL: &str = r#"
+@group(0) @binding(1) var<storage, read_write> kc: array<f32>;
+@group(0) @binding(2) var<storage, read_write> vc: array<f32>;
+"#;
+pub const KV_STORE_F32: &str = r#"
+    if (!is_q) {
+        kc[at + li] = kval;
+        vc[at + li] = vval;
+    }
+"#;
+
+/// KV storage in f16: two values per u32 (lanes pair up through workgroup memory).
+pub const KV_STORE_F16_DECL: &str = r#"
+@group(0) @binding(1) var<storage, read_write> kc: array<u32>;
+@group(0) @binding(2) var<storage, read_write> vc: array<u32>;
+var<workgroup> kb: array<f32, 128>;
+var<workgroup> vb: array<f32, 128>;
+"#;
+pub const KV_STORE_F16: &str = r#"
+    kb[li] = kval;
+    vb[li] = vval;
+    workgroupBarrier();
+    if (!is_q && li < 64u) {
+        kc[at / 2u + li] = pack2x16float(vec2<f32>(kb[2u * li], kb[2u * li + 1u]));
+        vc[at / 2u + li] = pack2x16float(vec2<f32>(vb[2u * li], vb[2u * li + 1u]));
+    }
+"#;
+
+/// KV reads for the attention kernels: `k4(i)` is the i-th group of 4 key elements,
+/// `v1(i)` the i-th value element. `{KB}`/`{VB}` are the binding numbers.
+pub const KV_LOAD_F32: &str = r#"
+@group(0) @binding({KB}) var<storage, read> kc: array<vec4<f32>>;
+@group(0) @binding({VB}) var<storage, read> vc: array<f32>;
+fn k4(i: u32) -> vec4<f32> { return kc[i]; }
+fn v1(i: u32) -> f32 { return vc[i]; }
+"#;
+pub const KV_LOAD_F16: &str = r#"
+@group(0) @binding({KB}) var<storage, read> kc: array<vec2<u32>>;
+@group(0) @binding({VB}) var<storage, read> vc: array<u32>;
+fn k4(i: u32) -> vec4<f32> {
+    let w = kc[i];
+    return vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y));
+}
+fn v1(i: u32) -> f32 { return unpack2x16float(vc[i >> 1u])[i & 1u]; }
 "#;
 
 /// Causal (optionally sliding-window) attention with online softmax over each row's own
@@ -295,8 +344,7 @@ struct P { hq: u32, hkv: u32, window: u32, scale: f32 }
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> o: array<f32>;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
-@group(0) @binding(2) var<storage, read> kc: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> vc: array<f32>;
+{KV_LOAD}
 @group(0) @binding(4) var<storage, read> rmeta: array<vec4<u32>>;
 @group(0) @binding(5) var<storage, read> pages: array<u32>;
 var<workgroup> qs: array<vec4<f32>, 32>;
@@ -336,7 +384,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             kslot[li] = ks;
             let off = (ks * kvd + kh * 128u) / 4u;
             var d = 0.0;
-            for (var i = 0u; i < 32u; i++) { d += dot(qs[i], kc[off + i]); }
+            for (var i = 0u; i < 32u; i++) { d += dot(qs[i], k4(off + i)); }
             s = d * p.scale;
         }
         red[li] = s;
@@ -357,7 +405,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         for (var j = 0u; j < cnt; j++) {
             let w = sc[j];
             l += w;
-            acc += w * vc[kslot[j] * kvd + kh * 128u + li];
+            acc += w * v1(kslot[j] * kvd + kh * 128u + li);
         }
         m = nm;
         workgroupBarrier();
@@ -830,8 +878,7 @@ var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> part: array<f32>;  // [row][hkv][nch][G][128]
 @group(0) @binding(1) var<storage, read_write> ml: array<vec2<f32>>; // [row][hkv][nch][G]
 @group(0) @binding(2) var<storage, read> q: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> kc: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read> vc: array<f32>;
+{KV_LOAD}
 @group(0) @binding(5) var<storage, read> rmeta: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> pages: array<u32>;
 var<workgroup> qs: array<vec4<f32>, 512>;  // [G][32]
@@ -875,7 +922,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         ks = pages[pt + key / 128u] * 128u + key % 128u;
         let off = (ks * kvd + kh * 128u) / 4u + half * 16u;
         for (var i = 0u; i < 16u; i++) {
-            let kv = kc[off + i];
+            let kv = k4(off + i);
             for (var h = 0u; h < G; h++) { d[h] += dot(qs[h * 32u + half * 16u + i], kv); }
         }
     }
@@ -904,7 +951,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var acc: array<f32, G>;
     for (var h = 0u; h < G; h++) { acc[h] = 0.0; }
     for (var k = 0u; k < n; k++) {
-        let v = vc[kslot[k] * kvd + kh * 128u + li];
+        let v = v1(kslot[k] * kvd + kh * 128u + li);
         for (var h = 0u; h < G; h++) { acc[h] += sc[h * 64u + k] * v; }
     }
     for (var h = 0u; h < G; h++) { part[(base + h) * 128u + li] = acc[h]; }

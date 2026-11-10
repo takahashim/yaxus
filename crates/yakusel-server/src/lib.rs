@@ -79,6 +79,10 @@ pub struct LoadOptions {
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
     pub kv_tokens: usize,
+    /// Store the target's KV cache in f16 (GPU only).
+    pub kv_f16: bool,
+    /// Store the draft model's KV cache in f16 (GPU only; never changes the output).
+    pub draft_kv_f16: bool,
     /// Scheduling (`draft_k` is taken from `draft`).
     pub engine: yakusel_model::EngineConfig,
 }
@@ -92,6 +96,8 @@ impl Default for LoadOptions {
             prefill_f32: false,
             prefix_cache: true,
             kv_tokens: yakusel_model::DEFAULT_KV_TOKENS,
+            kv_f16: false,
+            draft_kv_f16: true,
             engine: yakusel_model::EngineConfig::default(),
         }
     }
@@ -142,9 +148,14 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
         gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
     }
     let draft_gpu = gpu.share();
+    // The KV format is taken when each model creates its cache (in `prepare`).
+    gpu.set_kv_f16(o.kv_f16);
     let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
     let draft = match draft {
-        Some(d) => Some(prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?),
+        Some(d) => {
+            draft_gpu.set_kv_f16(o.draft_kv_f16);
+            Some(prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?)
+        }
         None => None,
     };
     Ok(Box::new(Engine::new(target, draft, cfg)?))
