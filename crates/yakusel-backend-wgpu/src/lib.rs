@@ -25,6 +25,10 @@ const GEMVM_MAX_T: usize = 16;
 /// 32 GFLOP is roughly 40 ms on a Radeon 780M; a 2B decode step is ~5 GFLOP.
 const SUBMIT_FLOPS: f64 = 32e9;
 
+/// Dispatches of a small pass recorded before it is first submitted (about one layer):
+/// the GPU then runs while the host records the rest. 2B GGUF decode 44.0 -> 44.8 tok/s.
+const EARLY_SUBMIT_DISPATCHES: usize = 12;
+
 type Pool = Arc<Mutex<HashMap<u64, Vec<wgpu::Buffer>>>>;
 
 /// A `[rows, cols]` f32 tensor on the GPU. Its buffer returns to the pool on drop.
@@ -109,6 +113,8 @@ pub struct Gpu {
     bind_groups: HashMap<(String, Vec<wgpu::Buffer>), wgpu::BindGroup>,
     /// Matmul FLOPs recorded since the last submission.
     pending_flops: f64,
+    /// Dispatches recorded since the pass began (early submission of small passes).
+    pass_dispatches: usize,
     /// Subgroup shuffles available (multi-row GEMV kernels).
     subgroups: bool,
     /// Cooperative matrices (16x16x16, f16 x f16 -> f32) available.
@@ -420,6 +426,7 @@ impl Gpu {
             readback,
             argmax_out,
             pending_flops: 0.0,
+            pass_dispatches: 0,
             subgroups,
             coop,
             gemm: GemmKind::from_env(coop),
@@ -642,6 +649,15 @@ impl Gpu {
         pass.set_bind_group(0, &bg, &[]);
         pass.set_immediates(0, bytemuck::cast_slice(&imm));
         pass.dispatch_workgroups(groups.0, groups.1, 1);
+        // Small passes (decode, verification) are recorded while the GPU already runs their
+        // first layer: one early submission. More submissions cost more than they hide.
+        self.pass_dispatches += 1;
+        if self.pass_dispatches == EARLY_SUBMIT_DISPATCHES
+            && self.pass_rows <= SPLIT_ATTN_MAX_ROWS
+            && self.kernels_profile.is_none()
+        {
+            self.submit();
+        }
     }
 
     fn submit(&mut self) {
@@ -894,6 +910,7 @@ impl Gpu {
         self.upload_ordered(MetaBuf::Tiles, bytemuck::cast_slice(&tiles));
         self.pass_tiles = tiles.len();
         self.pass_rows = rows;
+        self.pass_dispatches = 0;
         self.pass_max_pos = pass.pos.iter().copied().max().unwrap_or(0) as usize;
     }
 
