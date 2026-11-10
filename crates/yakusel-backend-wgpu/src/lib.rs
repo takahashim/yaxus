@@ -59,13 +59,11 @@ pub enum Weight {
     Embedding { table: wgpu::Buffer, h: usize },
 }
 
-/// Paged KV storage of one model: slot `s` of a layer holds `kv_dim` values at
-/// `s * kv_dim`, in f32 or f16.
+/// Paged KV storage of one model: slot `s` of a layer holds `kv_dim` floats at `s * kv_dim`.
 pub struct Kv {
     k: Vec<wgpu::Buffer>,
     v: Vec<wgpu::Buffer>,
     kv_dim: usize,
-    f16: bool,
     /// One page of scratch: WebGPU forbids copies within a buffer, so pages move through it.
     scratch: wgpu::Buffer,
     /// cos/sin tables `[2][max_pos][head_dim/2]` for sliding and full-attention layers.
@@ -110,8 +108,6 @@ pub struct Gpu {
     coop: bool,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
-    /// New KV caches store f16 (see `WgpuBackend::set_kv_f16`).
-    pub kv_f16: bool,
     kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
@@ -384,7 +380,6 @@ impl Gpu {
             subgroups,
             coop,
             gemm: GemmKind::from_env(coop),
-            kv_f16: false,
             profile: std::env::var_os("YAKUSEL_PROFILE").map(|_| Profile::default()),
         };
         b.build_kernels();
@@ -463,23 +458,13 @@ impl Gpu {
         self.add_kernel("glu_bf16", &format!("{MM_PARAMS}{W_BF16_16}{GEMV_GLU}"), &bf);
         self.add_kernel("argmax1", ARGMAX1, &[false, true]);
         self.add_kernel("argmax2", ARGMAX2, &[false, true]);
-        // KV-cache kernels in two storage formats: f32 and f16 (names ending in `_h`).
-        for (sfx, decl, store, load) in
-            [("", KV_STORE_F32_DECL, KV_STORE_F32, KV_LOAD_F32), ("_h", KV_STORE_F16_DECL, KV_STORE_F16, KV_LOAD_F16)]
-        {
-            let name = |n: &str| -> &'static str { Box::leak(format!("{n}{sfx}").into_boxed_str()) };
-            let rope = QK_ROPE.replace("{KV_STORE_DECL}", decl).replace("{KV_STORE}", store);
-            self.add_kernel(name("qk_rope"), &rope, &[false, false, false, true, true, true, true, true]);
-            let attn = ATTENTION.replace("{KV_LOAD}", &load.replace("{KB}", "2").replace("{VB}", "3"));
-            self.add_kernel(name("attention"), &attn, &[false, true, true, true, true, true]);
-            for g in [1usize, 2, 4, 6, 8, 12, 16] {
-                let src = ATTN_SPLIT
-                    .replace("{G}", &g.to_string())
-                    .replace("{KV_LOAD}", &load.replace("{KB}", "3").replace("{VB}", "4"));
-                self.add_kernel(name(&format!("attn_split{g}")), &src, &[false, false, true, true, true, true, true]);
-            }
-        }
+        self.add_kernel("qk_rope", QK_ROPE, &[false, false, false, true, true, true, true, true]);
+        self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
         self.add_kernel("embed", EMBED, &[false, true, true]);
+        for g in [1usize, 2, 4, 6, 8, 12, 16] {
+            let name: &'static str = Box::leak(format!("attn_split{g}").into_boxed_str());
+            self.add_kernel(name, &ATTN_SPLIT.replace("{G}", &g.to_string()), &[false, false, true, true, true, true, true]);
+        }
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
@@ -720,9 +705,7 @@ impl Gpu {
     fn new_kv(&mut self, cfg: &Config, metas: &[LayerMeta], pages: usize, max_pos: usize) -> Result<Kv> {
         anyhow::ensure!(cfg.head_dim == 128, "the WGSL kernels assume head_dim = 128");
         let kv_dim = cfg.kv_dim();
-        let f16 = self.kv_f16;
-        let elem = if f16 { 2 } else { 4 };
-        let size = (pages * PAGE * kv_dim * elem) as u64;
+        let size = (pages * PAGE * kv_dim * 4) as u64;
         anyhow::ensure!(size <= self.device.limits().max_storage_buffer_binding_size, "KV arena too large per layer");
         let mk = |label| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -738,7 +721,7 @@ impl Gpu {
         let full = metas.iter().find(|m| m.full_attn).unwrap_or(sliding);
         let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv-page-scratch"),
-            size: (PAGE * kv_dim * elem) as u64,
+            size: (PAGE * kv_dim * 4) as u64,
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -746,7 +729,6 @@ impl Gpu {
             k,
             v,
             kv_dim,
-            f16,
             scratch,
             rope_sliding: self.rope_table(sliding, max_pos, cfg.head_dim),
             rope_full: self.rope_table(full, max_pos, cfg.head_dim),
@@ -754,7 +736,7 @@ impl Gpu {
     }
 
     fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
-        let bytes = (PAGE * kv.kv_dim * if kv.f16 { 2 } else { 4 }) as u64;
+        let bytes = (PAGE * kv.kv_dim * 4) as u64;
         let enc = self.encoder();
         for b in kv.k.iter().chain(&kv.v) {
             enc.copy_buffer_to_buffer(b, src as u64 * bytes, &kv.scratch, 0, bytes);
@@ -913,9 +895,8 @@ impl Gpu {
         assert!((self.pass_max_pos as u64 + 1) * 64 * 4 * 2 <= rope.size(), "position beyond the rope table");
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
         let q = self.tensor(t, hq * 128);
-        let sfx = if kv.f16 { "_h" } else { "" };
         self.dispatch(
-            &format!("qk_rope{sfx}"),
+            "qk_rope",
             &[q.buf(), &kc, &vc, qkv.buf(), qn, kn, &rope, &rows],
             &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits()],
             ((hq + hkv) as u32, t as u32),
@@ -935,12 +916,12 @@ impl Gpu {
         let split = t <= SPLIT_ATTN_MAX_ROWS
             && self.subgroups
             && 2 * nch * hkv >= hq
-            && self.kernels.contains_key(format!("attn_split{g}{sfx}").as_str());
+            && self.kernels.contains_key(format!("attn_split{g}").as_str());
         if split {
             let part = self.tensor(t * hkv * nch * g, 128);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
-                &format!("attn_split{g}{sfx}"),
+                &format!("attn_split{g}"),
                 &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
                 &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
                 ((hkv * nch) as u32, t as u32),
@@ -953,7 +934,7 @@ impl Gpu {
             );
         } else {
             self.dispatch(
-                &format!("attention{sfx}"),
+                "attention",
                 &[o.buf(), q.buf(), &kc, &vc, &rows, &pages],
                 &[hq as u32, hkv as u32, window, scale.to_bits()],
                 (hq as u32, t as u32),
@@ -1149,12 +1130,6 @@ impl WgpuBackend {
     /// Selects the prefill GEMM.
     pub fn set_gemm(&self, kind: GemmKind) {
         self.g().gemm = kind;
-    }
-
-    /// Store KV caches created from now on in f16 instead of f32 (half the memory and
-    /// attention reads; values are rounded to f16).
-    pub fn set_kv_f16(&self, on: bool) {
-        self.g().kv_f16 = on;
     }
 
     /// Whether the prefill GEMM rounds its operands to f16.

@@ -46,15 +46,6 @@ pub struct ModelArgs {
     /// KV arena size in tokens, per model.
     #[arg(long, default_value_t = yakusel_model::DEFAULT_KV_TOKENS)]
     kv_tokens: usize,
-    /// Storage format of the model's KV cache on the GPU. f16 halves its memory and
-    /// speeds up long prompts (2048 tokens: 1.5x) but rounds the cached keys and values,
-    /// so logits move by up to ~5e-2 instead of ~1e-4 (decode included).
-    #[arg(long, default_value = "f32", value_parser = ["f16", "f32"])]
-    kv_precision: String,
-    /// Storage format of the draft model's KV cache on the GPU (speed and memory only,
-    /// never the output).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "f32"])]
-    draft_kv_precision: String,
     /// Requests processed at once (more wait in the queue).
     #[arg(long, default_value_t = 16)]
     max_streams: usize,
@@ -98,8 +89,6 @@ impl ModelArgs {
             prefill_f32: self.prefill_precision == "f32",
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
-            kv_f16: self.kv_precision == "f16",
-            draft_kv_f16: self.draft_kv_precision == "f16",
             engine: yakusel_model::EngineConfig {
                 max_streams: self.max_streams,
                 decode_rows: self.decode_rows,
