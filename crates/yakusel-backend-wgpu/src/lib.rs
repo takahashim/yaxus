@@ -288,13 +288,6 @@ impl Gpu {
     }
 }
 
-/// Rows per workgroup of the Q4 block GEMV: 16 (16 lanes per row) unless that leaves
-/// fewer than 128 workgroups, then 8. Measured on the 0.8B draft (o_proj 1536x2048:
-/// 53 -> 42 us, down 1536x6144: 105 -> 98 us, lm_head: 1219 -> 1169 us).
-fn q4_rows_per_wg(n: usize) -> u32 {
-    if n / 16 >= 128 { 16 } else { 8 }
-}
-
 /// Weight rows per 32-lane group in the multi-row GEMV for `t` activation rows.
 fn gemvm_rows(_t: usize) -> usize {
     std::env::var("YAKUSEL_GEMVM_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
@@ -480,15 +473,20 @@ impl Gpu {
 
     fn build_kernels(&mut self) {
         use shaders::*;
+        let sg = self.subgroups;
+        // Decode GEMV: the subgroup kernel where available.
+        let gemv1 = move |w16: &str| -> String {
+            if sg {
+                format!("{MM_PARAMS}{w16}{GEMV_T1}")
+            } else {
+                format!("{MM_PARAMS}{w16}{}", GEMV.replace("{MAXT}", "1").replace("{RED}", "256"))
+            }
+        };
         let gemv = |t: usize| GEMV.replace("{MAXT}", &t.to_string()).replace("{RED}", &(t * 256).to_string());
         let q8 = [false, true, true, true];
         let bf = [false, true, true];
-        self.add_kernel("gemv1_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(1)), &q8);
-        for rpw in [8u32, 16] {
-            let src = format!("{MM_PARAMS}{W_Q4_32}{}", GEMV1_32.replace("{RPW}", &rpw.to_string()));
-            self.add_kernel(Box::leak(format!("gemv1b{rpw}_q4").into_boxed_str()), &src, &q8);
-        }
-        self.add_kernel("gemv1_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(1)), &q8);
+        self.add_kernel("gemv1_q8", &gemv1(W_Q8_16), &q8);
+        self.add_kernel("gemv1_q4", &gemv1(W_Q4_16), &q8);
         self.add_kernel("gemv8_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(GEMV_MAX_T)), &q8);
         self.add_kernel("glu_q4", &format!("{MM_PARAMS}{W_Q4_16}{GEMV_GLU}"), &q8);
         self.add_kernel("gemv8_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(GEMV_MAX_T)), &q8);
@@ -519,7 +517,7 @@ impl Gpu {
         // GGUF Q4_K and Q6_K at their own bit widths.
         for (w, w4, w16) in [("q4k", W_Q4K, W_Q4K_16), ("q6", W_Q6, W_Q6_16)] {
             let name = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-            self.add_kernel(name(format!("gemv1_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(1)), &q8);
+            self.add_kernel(name(format!("gemv1_{w}")), &gemv1(w16), &q8);
             self.add_kernel(name(format!("gemv8_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), &q8);
             self.add_kernel(name(format!("glu_{w}")), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), &q8);
             if self.subgroups {
@@ -539,7 +537,7 @@ impl Gpu {
             }
             self.add_kernel(name(format!("gemm2f32_{w}")), &format!("{MM_PARAMS}{w4}{GEMM2}"), &q8);
         }
-        self.add_kernel("gemv1_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(1)), &bf);
+        self.add_kernel("gemv1_bf16", &gemv1(W_BF16_16), &bf);
         self.add_kernel("gemv8_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(GEMV_MAX_T)), &bf);
         self.add_kernel("rmsnorm", RMSNORM, &[false, true, true]);
         self.add_kernel("add_norm", ADD_NORM, &[false, false, true, true, true]);
@@ -975,10 +973,7 @@ impl Gpu {
             return y;
         }
         let params = [n as u32, k as u32, t as u32, 0];
-        let (name, groups) = if t == 1 && suffix == "q4" {
-            let rpw = q4_rows_per_wg(n);
-            (format!("gemv1b{rpw}_{suffix}"), grid(n.div_ceil(rpw as usize) as u32))
-        } else if t == 1 {
+        let (name, groups) = if t == 1 {
             (format!("gemv1_{suffix}"), grid(n.div_ceil(8) as u32))
         } else if t <= GEMV_MAX_T && self.subgroups && k % 512 == 0 {
             (format!("gemvm{t}_{suffix}"), grid(n.div_ceil(8 * gemvm_rows(t)) as u32))

@@ -108,6 +108,36 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
 }
 "#;
 
+/// Decode GEMV (one activation row) with subgroups: 8 output rows per workgroup, 32
+/// lanes per row reduced with shuffles (no workgroup memory or barriers), the
+/// activation loads issued before the weight loads. Faster than `GEMV` for every
+/// weight type (2B GGUF o_proj 76 -> 60 us; 0.8B Q4 draft 142 -> 148 tok/s).
+pub const GEMV_T1: &str = r#"
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let group = wg.y * nw.x + wg.x;
+    let row = group * 8u + li / 32u;
+    let lane = li % 32u;
+    let k16 = p.k / 16u;
+    // Rows past the end compute a copy of the last row (uniform control flow for the
+    // shuffles) and do not store it.
+    let r = min(row, p.n - 1u);
+    var acc = 0.0;
+    for (var j = lane; j < k16; j += 32u) {
+        let xb = 4u * j;
+        let x0 = x[xb];
+        let x1 = x[xb + 1u];
+        let x2 = x[xb + 2u];
+        let x3 = x[xb + 3u];
+        let w = load16(r, j);
+        acc += dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
+    }
+    for (var s = 16u; s > 0u; s >>= 1u) { acc += subgroupShuffleXor(acc, s); }
+    if (lane == 0u && row < p.n) { y[row] = acc; }
+}
+"#;
+
 /// Matrix-vector product for up to MAXT activation rows (substituted: 1 for decode,
 /// 8 otherwise). 8 output rows per workgroup, 32 lanes per row, each lane loading 16
 /// weights at a time, so every weight is read exactly once with wide loads.
@@ -945,36 +975,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-/// Q4 access by whole blocks: `load32(row, b)` returns the 32 weights of block `b` (one
-/// 16-byte load and one scale), for the T=1 kernels below.
-pub const W_Q4_32: &str = r#"
-@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
-@group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
-// `pad_scales` on the host).
-fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
-fn nib4(u: u32, s: f32) -> array<vec4<f32>, 2> {
-    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
-    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
-    return array<vec4<f32>, 2>((lo - 8.0) * s, (hi - 8.0) * s);
-}
-fn load32(row: u32, b: u32) -> array<vec4<f32>, 8> {
-    let i = row * sstride(p.k / 32u) + b;
-    let u = wq[row * (p.k / 32u) + b];
-    let s2 = unpack2x16float(wsc[i / 2u]);
-    let s = select(s2.x, s2.y, (i & 1u) == 1u);
-    let a = nib4(u.x, s);
-    let c = nib4(u.y, s);
-    let d = nib4(u.z, s);
-    let e = nib4(u.w, s);
-    return array<vec4<f32>, 8>(a[0], a[1], c[0], c[1], d[0], d[1], e[0], e[1]);
-}
-fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
-    var s = 0.0;
-    for (var m = 0u; m < 8u; m++) { s += dot(w[m], x[xb + m]); }
-    return s;
-}
-"#;
 
 /// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): nibbles as in Q4,
 /// per-256 headers in `wsc`.
@@ -1089,34 +1089,6 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
 }
 "#;
 
-/// T=1 GEMV over whole Q4 blocks: `{RPW}` rows per workgroup of 256, `256 / {RPW}` lanes
-/// per row (a power of two <= 32), each lane taking one 32-weight block per step.
-/// (A gate/up+SwiGLU variant of this was slower than `GEMV_GLU` and is not used.)
-pub const GEMV1_32: &str = r#"
-const RPW: u32 = {RPW}u;
-const LANES: u32 = 256u / RPW;
-var<workgroup> red: array<f32, 256>;
-
-@compute @workgroup_size(256)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
-        @builtin(local_invocation_index) li: u32) {
-    let group = wg.y * nw.x + wg.x;
-    let row = group * RPW + li / LANES;
-    let lane = li % LANES;
-    let k32 = p.k / 32u;
-    var acc = 0.0;
-    if (row < p.n) {
-        for (var b = lane; b < k32; b += LANES) { acc += dot32(load32(row, b), 8u * b); }
-    }
-    red[li] = acc;
-    workgroupBarrier();
-    for (var s = LANES / 2u; s > 0u; s >>= 1u) {
-        if (lane < s) { red[li] += red[li + s]; }
-        workgroupBarrier();
-    }
-    if (lane == 0u && row < p.n) { y[row] = red[li]; }
-}
-"#;
 
 /// Split-key attention for passes with few rows (decode, verification), part 1 of 2.
 /// One workgroup of 128 per (row, KV head, chunk of 64 keys): it handles all
