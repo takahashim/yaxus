@@ -62,8 +62,6 @@ pub struct DraftOptions {
     pub dir: PathBuf,
     /// Maximum tokens drafted per verification pass.
     pub k: usize,
-    /// Stop drafting when the draft model's probability for its token is below this.
-    pub min_prob: f32,
     /// Weight format of the draft model (it only affects speed, never the output).
     pub quant: Quant,
 }
@@ -77,25 +75,18 @@ pub fn load_generator(
     draft: Option<&DraftOptions>,
     prefill_f32: bool,
 ) -> Result<Box<dyn Generator>> {
-    let gpu = || -> Result<WgpuBackend> {
-        let mut b = WgpuBackend::new()?;
-        if prefill_f32 {
-            b.gemm = yakusel_backend_wgpu::GemmKind::F32;
-        }
-        Ok(b)
-    };
-    let use_gpu = match kind {
-        BackendKind::Cpu => false,
-        BackendKind::Vulkan => true,
+    let gpu = match kind {
+        BackendKind::Cpu => None,
+        BackendKind::Vulkan => Some(WgpuBackend::new()?),
         BackendKind::Auto => match WgpuBackend::new() {
-            Ok(_) => true,
+            Ok(g) => Some(g),
             Err(e) => {
                 tracing::warn!("Vulkan unavailable, using the CPU: {e:#}");
-                false
+                None
             }
         },
     };
-    let draft = if !use_gpu && draft.is_some() {
+    let draft = if gpu.is_none() && draft.is_some() {
         // The CPU matmul gains nothing from verifying several rows at once, so drafting
         // only adds work (measured 18.5 -> 14.6 tok/s on the 2B).
         tracing::info!("speculative decoding is disabled on the CPU backend (it is slower there)");
@@ -103,24 +94,27 @@ pub fn load_generator(
     } else {
         draft
     };
-    if !use_gpu {
+    let Some(gpu) = gpu else {
         yakusel_backend_cpu::init_threads();
+        return Ok(match draft {
+            None => Box::new(Model::load(dir, CpuBackend::new(), quant)?),
+            Some(d) => Box::new(Speculative::new(
+                Model::load(dir, CpuBackend::new(), quant)?,
+                Model::load(&d.dir, CpuBackend::new(), d.quant)?,
+                d.k,
+            )?),
+        });
+    };
+    // One device for the target and the draft model.
+    if prefill_f32 {
+        gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
     }
-    Ok(match (use_gpu, draft) {
-        (true, None) => Box::new(Model::load(dir, gpu()?, quant)?),
-        (false, None) => Box::new(Model::load(dir, CpuBackend::new(), quant)?),
-        (true, Some(d)) => Box::new(Speculative::new(
-            Model::load(dir, gpu()?, quant)?,
-            Model::load(&d.dir, gpu()?, d.quant)?,
-            d.k,
-        )?
-        .with_min_prob(d.min_prob)),
-        (false, Some(d)) => Box::new(Speculative::new(
-            Model::load(dir, CpuBackend::new(), quant)?,
-            Model::load(&d.dir, CpuBackend::new(), d.quant)?,
-            d.k,
-        )?
-        .with_min_prob(d.min_prob)),
+    Ok(match draft {
+        None => Box::new(Model::load(dir, gpu, quant)?),
+        Some(d) => {
+            let draft_gpu = gpu.share();
+            Box::new(Speculative::new(Model::load(dir, gpu, quant)?, Model::load(&d.dir, draft_gpu, d.quant)?, d.k)?)
+        }
     })
 }
 

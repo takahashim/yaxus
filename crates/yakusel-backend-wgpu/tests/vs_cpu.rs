@@ -38,12 +38,14 @@ fn compare(quant: Quant) {
     for c in &cases() {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let mut sc = cpu.new_session(ids.len() + 1).unwrap();
-        let lc = cpu.forward(&mut sc, &ids).unwrap();
+        let sc = cpu.new_seq().unwrap();
+        let lc = cpu.prefill(sc, &ids).unwrap();
         let lc = cpu.backend.to_host(&lc);
-        let mut sg = gpu.new_session(ids.len() + 1).unwrap();
-        let lg = gpu.forward(&mut sg, &ids).unwrap();
+        cpu.free_seq(sc);
+        let sg = gpu.new_seq().unwrap();
+        let lg = gpu.prefill(sg, &ids).unwrap();
         let lg = gpu.backend.to_host(&lg);
+        gpu.free_seq(sg);
         assert_eq!(lc.len(), lg.len());
         let max_err = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let argmax = |v: &[f32]| (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b]).then(b.cmp(&a))).unwrap();
@@ -69,12 +71,12 @@ fn gpu_matches_cpu_long_prompt() {
     let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
     let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), Quant::Q8).unwrap();
     let ids: Vec<u32> = (0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect();
-    let mut sc = cpu.new_session(ids.len() + 1).unwrap();
-    let lc = cpu.forward(&mut sc, &ids).unwrap();
+    let sc = cpu.new_seq().unwrap();
+    let lc = cpu.prefill(sc, &ids).unwrap();
     let lc = cpu.backend.to_host(&lc);
-    let mut sg = gpu.new_session(ids.len() + 1).unwrap();
-    let lt = gpu.forward(&mut sg, &ids).unwrap();
-    let (idx, prob) = gpu.backend.argmax_prob(&lt);
+    let sg = gpu.new_seq().unwrap();
+    let lt = gpu.prefill(sg, &ids).unwrap();
+    let idx = gpu.backend.argmax(&lt);
     let lg = gpu.backend.to_host(&lt);
     let max_err = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     eprintln!("600-token prompt: max |cpu - gpu| = {max_err:.2e}");
@@ -83,9 +85,8 @@ fn gpu_matches_cpu_long_prompt() {
     let m = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let z: f64 = lg.iter().map(|&v| ((v - m) as f64).exp()).sum();
     let want = (1.0 / z) as f32;
-    eprintln!("argmax {idx} p={prob:.5} (host {want:.5})");
+    eprintln!("argmax {idx} (host p={want:.5})");
     assert_eq!(lg[idx as usize], m);
-    assert!((prob - want).abs() < 1e-4);
 }
 
 #[test]
@@ -116,10 +117,11 @@ fn speculative_matches_plain() {
             }
         }
     };
-    let mut plain = Model::load(&dir, WgpuBackend::new().unwrap(), Quant::Q8).unwrap();
+    let gpu = WgpuBackend::new().unwrap();
+    let mut plain = Model::load(&dir, gpu.share(), Quant::Q8).unwrap();
     let mut spec = Speculative::new(
-        Model::load(&dir, WgpuBackend::new().unwrap(), Quant::Q8).unwrap(),
-        Model::load(&draft_dir, WgpuBackend::new().unwrap(), Quant::Q8).unwrap(),
+        Model::load(&dir, gpu.share(), Quant::Q8).unwrap(),
+        Model::load(&draft_dir, gpu.share(), Quant::Q4).unwrap(),
         5,
     )
     .unwrap();

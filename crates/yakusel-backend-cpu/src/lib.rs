@@ -5,7 +5,7 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use half::f16;
-use yakusel_model::{Backend, Config, LayerMeta, Quant, TensorRef, bf16_to_f32};
+use yakusel_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef, bf16_to_f32};
 
 use yakusel_model::quant::Q8_BLOCK;
 
@@ -78,21 +78,22 @@ impl Weight {
     }
 }
 
-struct LayerCache {
+struct LayerKv {
     k: Vec<f32>,
     v: Vec<f32>,
-    /// Ring capacity in tokens.
-    cap: usize,
 }
 
-pub struct Cache {
-    layers: Vec<LayerCache>,
+/// Paged KV storage: slot `s` of layer `l` holds `kv_dim` floats at `s * kv_dim`.
+pub struct Kv {
+    layers: Vec<LayerKv>,
+    kv_dim: usize,
 }
 
 #[derive(Default)]
 pub struct CpuBackend {
     /// Total bytes of loaded weights.
     pub weight_bytes: usize,
+    pass: PassMeta,
 }
 
 impl CpuBackend {
@@ -210,7 +211,7 @@ fn rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
 impl Backend for CpuBackend {
     type Tensor = Tensor;
     type Weight = Weight;
-    type Cache = Cache;
+    type Kv = Kv;
 
     fn weight_bytes(&self) -> usize {
         self.weight_bytes
@@ -232,23 +233,29 @@ impl Backend for CpuBackend {
         Ok(w)
     }
 
-    fn new_cache(&mut self, cfg: &Config, metas: &[LayerMeta], max_len: usize, chunk: usize) -> Result<Cache> {
-        let kv = cfg.kv_dim();
-        let layers = metas
-            .iter()
-            .map(|m| {
-                // A sliding layer needs the window plus one chunk of in-flight queries.
-                let cap = match m.window {
-                    Some(w) => max_len.min(w + chunk),
-                    None => max_len,
-                };
-                LayerCache { k: vec![0.0; cap * kv], v: vec![0.0; cap * kv], cap }
-            })
-            .collect();
-        Ok(Cache { layers })
+    fn new_kv(&mut self, cfg: &Config, metas: &[LayerMeta], pages: usize, _max_pos: usize) -> Result<Kv> {
+        let kv_dim = cfg.kv_dim();
+        let n = pages * PAGE * kv_dim;
+        // Zeroed allocations are lazily backed by the OS, so a large arena is cheap.
+        let layers = metas.iter().map(|_| LayerKv { k: vec![0.0; n], v: vec![0.0; n] }).collect();
+        Ok(Kv { layers, kv_dim })
     }
 
-    fn embed(&mut self, table: &Weight, ids: &[u32]) -> Tensor {
+    fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
+        let n = PAGE * kv.kv_dim;
+        let (s, d) = (src as usize * n, dst as usize * n);
+        for l in &mut kv.layers {
+            l.k.copy_within(s..s + n, d);
+            l.v.copy_within(s..s + n, d);
+        }
+    }
+
+    fn begin_pass(&mut self, pass: &PassMeta) {
+        self.pass = pass.clone();
+    }
+
+    fn embed(&mut self, table: &Weight) -> Tensor {
+        let ids = &self.pass.ids;
         let h = table.shape()[1];
         let w = table.bf16();
         let mut out = Tensor::zeros(ids.len(), h);
@@ -334,11 +341,11 @@ impl Backend for CpuBackend {
         qkv: &Tensor,
         q_norm: &Weight,
         k_norm: &Weight,
-        cache: &mut Cache,
+        kv: &mut Kv,
         cfg: &Config,
         layer: &LayerMeta,
-        pos0: usize,
     ) -> Tensor {
+        let pass = &self.pass;
         let (hq, hkv, d) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let (qd, kvd) = (hq * d, hkv * d);
         let group = hq / hkv;
@@ -346,22 +353,22 @@ impl Backend for CpuBackend {
         let qn = q_norm.to_f32();
         let kn = k_norm.to_f32();
         let eps = cfg.rms_norm_eps;
-        let lc = &mut cache.layers[layer.index];
-        assert!(t <= lc.cap, "chunk larger than cache capacity");
+        let lc = &mut kv.layers[layer.index];
+        assert_eq!(t, pass.pos.len(), "attention rows differ from the pass");
 
         let mut cos = vec![0f32; d / 2];
         let mut sin = vec![0f32; d / 2];
         let mut q = vec![0f32; t * qd];
         for i in 0..t {
             let row = qkv.row(i);
-            let pos = pos0 + i;
+            let pos = pass.pos[i] as usize;
             layer.rope.cos_sin(pos, &mut cos, &mut sin);
             for h in 0..hq {
                 let dst = &mut q[i * qd + h * d..i * qd + (h + 1) * d];
                 rmsnorm_row(&row[h * d..(h + 1) * d], &qn, 1.0, eps, dst);
                 rope_inplace(dst, &cos, &sin);
             }
-            let slot = pos % lc.cap;
+            let slot = pass.kv_slot[i] as usize;
             for h in 0..hkv {
                 let src = &row[qd + h * d..qd + (h + 1) * d];
                 let dst = &mut lc.k[slot * kvd + h * d..slot * kvd + (h + 1) * d];
@@ -373,12 +380,14 @@ impl Backend for CpuBackend {
         }
 
         let scale = 1.0 / (d as f32).sqrt();
-        let (kc, vc, cap) = (&lc.k, &lc.v, lc.cap);
+        let (kc, vc) = (&lc.k, &lc.v);
         let mut out = Tensor::zeros(t, qd);
         out.data.par_chunks_mut(d).enumerate().for_each(|(idx, o)| {
             let (i, h) = (idx / hq, idx % hq);
             let kh = h / group;
-            let p = pos0 + i;
+            let p = pass.pos[i] as usize;
+            let pages = &pass.pages[pass.pt_off[i] as usize..];
+            let slot = |s: usize| pages[s / PAGE] as usize * PAGE + s % PAGE;
             let lo = match layer.window {
                 Some(w) => (p + 1).saturating_sub(w),
                 None => 0,
@@ -386,7 +395,7 @@ impl Backend for CpuBackend {
             let qv = &q[i * qd + h * d..i * qd + (h + 1) * d];
             let scores: Vec<f32> = (lo..=p)
                 .map(|s| {
-                    let off = (s % cap) * kvd + kh * d;
+                    let off = slot(s) * kvd + kh * d;
                     dot(qv, &kc[off..off + d]) * scale
                 })
                 .collect();
@@ -395,7 +404,7 @@ impl Backend for CpuBackend {
             for (s, &sc) in (lo..=p).zip(&scores) {
                 let e = (sc - m).exp();
                 denom += e;
-                let off = (s % cap) * kvd + kh * d;
+                let off = slot(s) * kvd + kh * d;
                 for (ov, &vv) in o.iter_mut().zip(&vc[off..off + d]) {
                     *ov += e * vv;
                 }
@@ -427,19 +436,9 @@ impl Backend for CpuBackend {
         a.data.iter_mut().zip(&b.data).for_each(|(x, y)| *x += y);
     }
 
-    fn last_row(&mut self, x: &Tensor) -> Tensor {
-        Tensor { data: x.row(x.rows - 1).to_vec(), rows: 1, cols: x.cols }
-    }
-
-    fn argmax(&mut self, logits: &Tensor) -> u32 {
-        let r = logits.row(logits.rows - 1);
-        let mut best = 0;
-        for (i, &v) in r.iter().enumerate() {
-            if v > r[best] {
-                best = i;
-            }
-        }
-        best as u32
+    fn select_rows(&mut self, x: &Tensor, rows: &[usize]) -> Tensor {
+        let data = rows.iter().flat_map(|&r| x.row(r).iter().copied()).collect();
+        Tensor { data, rows: rows.len(), cols: x.cols }
     }
 
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {

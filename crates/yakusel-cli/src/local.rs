@@ -37,9 +37,6 @@ pub struct ModelArgs {
     /// Maximum tokens the draft model proposes per step.
     #[arg(long, default_value_t = 5)]
     draft_k: usize,
-    /// Stop drafting early once the draft model's probability for its token drops below this.
-    #[arg(long, default_value_t = 0.0)]
-    draft_min_prob: f32,
     /// Weight format of the draft model: q4 or q8. Affects speed only, never the output.
     #[arg(long, default_value = "q4")]
     draft_quant: Quant,
@@ -61,7 +58,7 @@ impl ModelArgs {
         if same(&dir, &target) {
             return Ok(None); // the target is the draft model itself
         }
-        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, min_prob: self.draft_min_prob, quant: self.draft_quant }))
+        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, quant: self.draft_quant }))
     }
 
     /// Returns (directory, display name).

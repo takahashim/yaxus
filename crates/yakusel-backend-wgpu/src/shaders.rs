@@ -230,9 +230,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 /// Per-head RMSNorm (offset 1) + half-split RoPE for q and k heads; writes q to `qo`
-/// and k/v into the ring-buffer cache. One workgroup per (head, token), 128 lanes = head_dim.
+/// and k/v to each row's KV slot. One workgroup per (head, row), 128 lanes = head_dim.
+/// `meta[row] = (position, kv slot, page-table offset, 0)`.
 pub const QK_ROPE: &str = r#"
-struct P { hq: u32, hkv: u32, pos0: u32, cap: u32, eps: f32, _a: u32, _b: u32, _c: u32 }
+struct P { hq: u32, hkv: u32, eps: f32, _a: u32 }
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> qo: array<f32>;
 @group(0) @binding(1) var<storage, read_write> kc: array<f32>;
@@ -241,6 +242,7 @@ var<immediate> p: P;
 @group(0) @binding(4) var<storage, read> qn: array<f32>;
 @group(0) @binding(5) var<storage, read> kn: array<f32>;
 @group(0) @binding(6) var<storage, read> cs: array<f32>; // [pos][64] cos, then [pos][64] sin
+@group(0) @binding(7) var<storage, read> rmeta: array<vec4<u32>>;
 var<workgroup> red: array<f32, 128>;
 var<workgroup> v: array<f32, 128>;
 
@@ -266,7 +268,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     if (is_q) { g = qn[li]; } else { g = kn[li]; }
     v[li] = (1.0 + g) * (val * r);
     workgroupBarrier();
-    let pos = p.pos0 + t;
+    let m = rmeta[t];
+    let pos = m.x;
     let ntab = arrayLength(&cs) / 2u;
     let j = li % 64u;
     let c = cs[pos * 64u + j];
@@ -277,25 +280,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         qo[t * qd + h * 128u + li] = o;
     } else {
         let kh = h - p.hq;
-        let slot = (pos % p.cap) * kvd + kh * 128u + li;
-        kc[slot] = o;
-        vc[slot] = qkv[row + qd + kvd + kh * 128u + li];
+        let at = m.y * kvd + kh * 128u + li;
+        kc[at] = o;
+        vc[at] = qkv[row + qd + kvd + kh * 128u + li];
     }
 }
 "#;
 
-/// Causal (optionally sliding-window) attention with online softmax.
-/// One workgroup per (query head, token); 128 lanes = head_dim, 128 keys per step.
+/// Causal (optionally sliding-window) attention with online softmax over each row's own
+/// sequence: key `j` of a row lives in slot `pages[pt + j / 128] * 128 + j % 128`.
+/// One workgroup per (query head, row); 128 lanes = head_dim, 128 keys per step.
 pub const ATTENTION: &str = r#"
-struct P { hq: u32, hkv: u32, pos0: u32, cap: u32, window: u32, scale: f32, _a: u32, _b: u32 }
+struct P { hq: u32, hkv: u32, window: u32, scale: f32 }
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> o: array<f32>;
 @group(0) @binding(1) var<storage, read> q: array<f32>;
 @group(0) @binding(2) var<storage, read> kc: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read> vc: array<f32>;
+@group(0) @binding(4) var<storage, read> rmeta: array<vec4<u32>>;
+@group(0) @binding(5) var<storage, read> pages: array<u32>;
 var<workgroup> qs: array<vec4<f32>, 32>;
 var<workgroup> sc: array<f32, 128>;
 var<workgroup> red: array<f32, 128>;
+var<workgroup> kslot: array<u32, 128>; // KV slot of each key in the current step
+
+fn slot(pt: u32, key: u32) -> u32 {
+    return pages[pt + key / 128u] * 128u + key % 128u;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -304,7 +315,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let qd = p.hq * 128u;
     let kvd = p.hkv * 128u;
     let kh = h / (p.hq / p.hkv);
-    let pos = p.pos0 + t;
+    let m4 = rmeta[t];
+    let pos = m4.x;
+    let pt = m4.z;
     var lo = 0u;
     if (p.window > 0u && pos + 1u > p.window) { lo = pos + 1u - p.window; }
     if (li < 32u) {
@@ -319,7 +332,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         let key = base + li;
         var s = -1e30;
         if (key <= pos) {
-            let off = ((key % p.cap) * kvd + kh * 128u) / 4u;
+            let ks = slot(pt, key);
+            kslot[li] = ks;
+            let off = (ks * kvd + kh * 128u) / 4u;
             var d = 0.0;
             for (var i = 0u; i < 32u; i++) { d += dot(qs[i], kc[off + i]); }
             s = d * p.scale;
@@ -342,7 +357,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         for (var j = 0u; j < cnt; j++) {
             let w = sc[j];
             l += w;
-            acc += w * vc[((base + j) % p.cap) * kvd + kh * 128u + li];
+            acc += w * vc[kslot[j] * kvd + kh * 128u + li];
         }
         m = nm;
         workgroupBarrier();
@@ -721,6 +736,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         coopStoreT(e1, &y[q1], ldy);
         coopStoreT(e2, &y[q2], ldy);
         coopStoreT(e3, &y[q3], ldy);
+    }
+}
+"#;
+
+/// Embedding gather from the bf16 table (two values per u32): one workgroup per row.
+pub const EMBED: &str = r#"
+struct P { h: u32, _a: u32, _b: u32, _c: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> table: array<u32>;
+@group(0) @binding(2) var<storage, read> ids: array<u32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h2 = p.h / 2u;
+    let src = ids[wg.x] * h2;
+    let dst = wg.x * p.h;
+    for (var i = li; i < h2; i += 256u) {
+        let u = table[src + i];
+        y[dst + 2u * i] = bitcast<f32>(u << 16u);
+        y[dst + 2u * i + 1u] = bitcast<f32>(u & 0xffff0000u);
     }
 }
 "#;

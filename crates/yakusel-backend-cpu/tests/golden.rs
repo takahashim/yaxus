@@ -39,9 +39,10 @@ fn q8_quality() {
     for c in &cases() {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let mut s = model.new_session(ids.len() + 1).unwrap();
-        let logits = model.forward(&mut s, &ids).unwrap();
+        let s = model.new_seq().unwrap();
+        let logits = model.prefill(s, &ids).unwrap();
         let logits = model.backend.to_host(&logits);
+        model.free_seq(s);
         let top_ids = u32s(&c["top_ids"]);
         let top_vals: Vec<f64> = c["top_logits"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
         let max_err = top_ids
@@ -71,9 +72,10 @@ fn golden_logits_and_greedy() {
     for c in &cases {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let mut s = model.new_session(ids.len() + 1).unwrap();
-        let logits = model.forward(&mut s, &ids).unwrap();
+        let s = model.new_seq().unwrap();
+        let logits = model.prefill(s, &ids).unwrap();
         let logits = model.backend.to_host(&logits);
+        model.free_seq(s);
 
         let top_ids = u32s(&c["top_ids"]);
         let top_vals: Vec<f64> = c["top_logits"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
