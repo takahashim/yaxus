@@ -87,9 +87,11 @@ pub struct Gpu {
     /// The compute pass being recorded into `encoder`, if any.
     pass: Option<wgpu::ComputePass<'static>>,
     /// Row metadata of the current forward pass (see [`MetaBuf`]).
-    meta_bufs: [Option<wgpu::Buffer>; 3],
+    meta_bufs: [Option<wgpu::Buffer>; 4],
     pass_rows: usize,
     pass_max_pos: usize,
+    /// Attention tiles of the pass (see `ATTN_TILE`).
+    pass_tiles: usize,
     pool: Pool,
     /// Total bytes of uploaded weights.
     pub weight_bytes: usize,
@@ -108,6 +110,9 @@ pub struct Gpu {
     coop: bool,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
+    /// Tiled attention for passes of more than 8 rows: keys are split into chunks until
+    /// about this many workgroups run (0: the per-row kernel instead).
+    tile_wgs: usize,
     kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
@@ -209,7 +214,12 @@ enum MetaBuf {
     Rows = 1,
     /// Concatenated page tables.
     Pages = 2,
+    /// `(first row, rows, 0, 0)` per attention tile.
+    Tiles = 3,
 }
+
+/// Rows per attention tile (`ATTN_TILE`'s `BM`).
+const ATTN_TILE_ROWS: usize = 32;
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 const ARGMAX_SLICES: usize = 64;
@@ -369,7 +379,8 @@ impl Gpu {
             kernels: HashMap::new(),
             encoder: None,
             pass: None,
-            meta_bufs: [None, None, None],
+            meta_bufs: [None, None, None, None],
+            pass_tiles: 0,
             pass_rows: 0,
             pass_max_pos: 0,
             pool: Arc::new(Mutex::new(HashMap::new())),
@@ -380,6 +391,7 @@ impl Gpu {
             subgroups,
             coop,
             gemm: GemmKind::from_env(coop),
+            tile_wgs: 384,
             profile: std::env::var_os("YAKUSEL_PROFILE").map(|_| Profile::default()),
         };
         b.build_kernels();
@@ -466,6 +478,9 @@ impl Gpu {
             self.add_kernel(name, &ATTN_SPLIT.replace("{G}", &g.to_string()), &[false, false, true, true, true, true, true]);
         }
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
+        if self.subgroups {
+            self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+        }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
     }
@@ -781,6 +796,20 @@ impl Gpu {
         self.upload_ordered(MetaBuf::Ids, bytemuck::cast_slice(&pass.ids));
         self.upload_ordered(MetaBuf::Rows, bytemuck::cast_slice(&meta));
         self.upload_ordered(MetaBuf::Pages, bytemuck::cast_slice(&pass.pages));
+        // Tiles: runs of consecutive positions of one sequence, at most 32 rows each.
+        let mut tiles: Vec<[u32; 4]> = Vec::new();
+        for i in 0..rows {
+            let joins = tiles.last().is_some_and(|t: &[u32; 4]| {
+                let (r0, n) = (t[0] as usize, t[1] as usize);
+                n < ATTN_TILE_ROWS && pass.pt_off[r0] == pass.pt_off[i] && pass.pos[r0] + n as u32 == pass.pos[i]
+            });
+            match tiles.last_mut() {
+                Some(t) if joins => t[1] += 1,
+                _ => tiles.push([i as u32, 1, 0, 0]),
+            }
+        }
+        self.upload_ordered(MetaBuf::Tiles, bytemuck::cast_slice(&tiles));
+        self.pass_tiles = tiles.len();
         self.pass_rows = rows;
         self.pass_max_pos = pass.pos.iter().copied().max().unwrap_or(0) as usize;
     }
@@ -932,6 +961,39 @@ impl Gpu {
                 &[hq as u32, hkv as u32, nch as u32],
                 (hq as u32, t as u32),
             );
+        } else if t > SPLIT_ATTN_MAX_ROWS && self.subgroups && self.tile_wgs > 0 {
+            let tiles = self.meta_buf(MetaBuf::Tiles);
+            // Split the keys into chunks while there are few workgroups (short passes
+            // over long contexts), merging the chunks with `attn_combine`.
+            let wgs = self.pass_tiles * hq;
+            let target: usize = std::env::var("YAKUSEL_TILE_WGS").ok().and_then(|v| v.parse().ok()).unwrap_or(384);
+            // Keys a tile can span: its first row's window up to its last row.
+            let span = match layer.window {
+                Some(w) => (self.pass_max_pos + 1).min(w + ATTN_TILE_ROWS - 1),
+                None => self.pass_max_pos + 1,
+            };
+            let nch = target.div_ceil(wgs).clamp(1, span.div_ceil(128));
+            let ch = span.div_ceil(nch).next_multiple_of(32);
+            let nch = span.div_ceil(ch);
+            let (part, ml) = if nch > 1 {
+                (self.tensor(t * hkv * nch * g, 128), self.tensor(t * hkv * nch * g, 2))
+            } else {
+                (self.tensor(1, 128), self.tensor(1, 2))
+            };
+            self.dispatch(
+                "attn_tile",
+                &[o.buf(), part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages, &tiles],
+                &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32, ch as u32],
+                ((self.pass_tiles * nch) as u32, hq as u32),
+            );
+            if nch > 1 {
+                self.dispatch(
+                    "attn_combine",
+                    &[o.buf(), part.buf(), ml.buf()],
+                    &[hq as u32, hkv as u32, nch as u32],
+                    (hq as u32, t as u32),
+                );
+            }
         } else {
             self.dispatch(
                 "attention",
@@ -1130,6 +1192,13 @@ impl WgpuBackend {
     /// Selects the prefill GEMM.
     pub fn set_gemm(&self, kind: GemmKind) {
         self.g().gemm = kind;
+    }
+
+    /// For tests: the attention of passes with more than 8 rows uses the tiled kernel,
+    /// splitting keys until about `target_wgs` workgroups run (default 384), or the
+    /// per-row kernel when `target_wgs` is 0.
+    pub fn set_tiled_attention(&self, target_wgs: usize) {
+        self.g().tile_wgs = target_wgs;
     }
 
     /// Whether the prefill GEMM rounds its operands to f16.

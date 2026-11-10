@@ -366,6 +366,178 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// Tiled attention for passes with many rows (prefill): one workgroup of 128 per (tile,
+/// key chunk, query head), where a tile is up to 32 consecutive rows of one sequence
+/// (built by `begin_pass`). Keys go through workgroup memory in blocks of 32 and serve
+/// all rows of the tile, so each key/value is read once per tile instead of once per
+/// row. Online softmax per row (4 lanes per row, joined with subgroup shuffles); f32
+/// throughout. With one chunk the output is written directly; with `nch > 1` each chunk
+/// of `ch` keys writes `ATTN_COMBINE`'s partial results. LDS rows are padded to 33 vec4.
+pub const ATTN_TILE: &str = r#"
+struct P { hq: u32, hkv: u32, window: u32, scale: f32, nch: u32, ch: u32, _a: u32, _b: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> o: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> part: array<vec4<f32>>; // [row][hkv][nch][G][32]
+@group(0) @binding(2) var<storage, read_write> ml: array<vec2<f32>>;   // [row][hkv][nch][G]
+@group(0) @binding(3) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> kc: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> vc: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> rmeta: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> pages: array<u32>;
+@group(0) @binding(8) var<storage, read> tiles: array<vec4<u32>>;
+
+const BM: u32 = 32u;
+const BN: u32 = 32u;
+const LD: u32 = 33u;
+var<workgroup> qs: array<vec4<f32>, 1056>;  // [BM][LD] queries, pre-scaled
+var<workgroup> kv: array<vec4<f32>, 1056>;  // [BN][LD] keys, then values
+var<workgroup> ss: array<f32, 1056>;        // [BM][33] scores, then probabilities
+var<workgroup> rm: array<f32, 32>;          // running max per row
+var<workgroup> rl: array<f32, 32>;          // running sum per row
+var<workgroup> rc: array<f32, 32>;          // rescale of the accumulator for this block
+var<workgroup> kslot: array<u32, 32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let tile = tiles[wg.x / p.nch];
+    let c = wg.x % p.nch;
+    let r0 = tile.x;
+    let nr = tile.y;
+    let h = wg.y;
+    let g = p.hq / p.hkv;
+    let kh = h / g;
+    let qd4 = p.hq * 32u;
+    let kvd = p.hkv * 128u;
+    let first = rmeta[r0];
+    let pt = first.z;
+    let pos0 = first.x;
+    let last = pos0 + nr - 1u;
+    var lo = 0u;
+    if (p.window > 0u && pos0 + 1u > p.window) { lo = pos0 + 1u - p.window; }
+    let kbeg = lo + c * p.ch;
+    let kend = min(last, kbeg + p.ch - 1u);
+    // Partial results of row r of the tile (nch > 1).
+    let pbase = ((r0 * p.hkv + kh) * p.nch + c) * g + h % g;
+    let pstride = p.hkv * p.nch * g;
+    if (kbeg > last) {
+        // A chunk past the tile's keys (uniform per workgroup).
+        if (li < nr) { ml[pbase + li * pstride] = vec2<f32>(-1e30, 0.0); }
+        return;
+    }
+    for (var i = li; i < BM * 32u; i += 128u) {
+        let r = i / 32u;
+        let cc = i % 32u;
+        var v = vec4<f32>(0.0);
+        if (r < nr) { v = q[(r0 + r) * qd4 + h * 32u + cc] * p.scale; }
+        qs[r * LD + cc] = v;
+    }
+    if (li < BM) {
+        rm[li] = -1e30;
+        rl[li] = 0.0;
+    }
+    // Scores: rows 2*tr, 2*tr+1 and keys tc + 8*j. Softmax: row li/4, keys 8*(li%4)...
+    // Output: rows 8*tp .. 8*tp+7, dims 4*td.
+    let tc = li % 8u;
+    let tr = li / 8u;
+    let td = li % 32u;
+    let tp = li / 32u;
+    let sr = li / 4u;
+    let sq = li % 4u;
+    var acc: array<vec4<f32>, 8>;
+    for (var k = 0u; k < 8u; k++) { acc[k] = vec4<f32>(0.0); }
+    for (var base = kbeg; base <= kend; base += BN) {
+        workgroupBarrier();
+        if (li < BN) {
+            let key = base + li;
+            var sl = 0u;
+            if (key <= kend) { sl = pages[pt + key / 128u] * 128u + key % 128u; }
+            kslot[li] = sl;
+        }
+        workgroupBarrier();
+        for (var i = li; i < BN * 32u; i += 128u) {
+            let j = i / 32u;
+            let cc = i % 32u;
+            var v = vec4<f32>(0.0);
+            if (base + j <= kend) { v = kc[(kslot[j] * kvd + kh * 128u) / 4u + cc]; }
+            kv[j * LD + cc] = v;
+        }
+        workgroupBarrier();
+        var sc: array<f32, 8>;
+        for (var k = 0u; k < 8u; k++) { sc[k] = 0.0; }
+        for (var cc = 0u; cc < 32u; cc++) {
+            let q0 = qs[(2u * tr) * LD + cc];
+            let q1 = qs[(2u * tr + 1u) * LD + cc];
+            for (var j = 0u; j < 4u; j++) {
+                let kk = kv[(tc + 8u * j) * LD + cc];
+                sc[j] += dot(q0, kk);
+                sc[4u + j] += dot(q1, kk);
+            }
+        }
+        for (var a = 0u; a < 2u; a++) {
+            let r = 2u * tr + a;
+            let pr = pos0 + r;
+            var lr = 0u;
+            if (p.window > 0u && pr + 1u > p.window) { lr = pr + 1u - p.window; }
+            for (var j = 0u; j < 4u; j++) {
+                let key = base + tc + 8u * j;
+                let ok = r < nr && key <= pr && key >= lr && key <= kend;
+                ss[r * 33u + tc + 8u * j] = select(-1e30, sc[4u * a + j], ok);
+            }
+        }
+        workgroupBarrier();
+        var mx = -1e30;
+        for (var j = 0u; j < 8u; j++) { mx = max(mx, ss[sr * 33u + 8u * sq + j]); }
+        mx = max(mx, subgroupShuffleXor(mx, 1u));
+        mx = max(mx, subgroupShuffleXor(mx, 2u));
+        let mo = rm[sr];
+        let mn = max(mo, mx);
+        var l = 0.0;
+        for (var j = 0u; j < 8u; j++) {
+            let at = sr * 33u + 8u * sq + j;
+            let sv = ss[at];
+            let e = select(0.0, exp(sv - mn), sv > -1e29);
+            ss[at] = e;
+            l += e;
+        }
+        l += subgroupShuffleXor(l, 1u);
+        l += subgroupShuffleXor(l, 2u);
+        // All lanes of the row have read rm[sr] before it changes.
+        workgroupBarrier();
+        if (sq == 0u) {
+            let corr = exp(mo - mn);
+            rm[sr] = mn;
+            rl[sr] = rl[sr] * corr + l;
+            rc[sr] = corr;
+        }
+        for (var i = li; i < BN * 32u; i += 128u) {
+            let j = i / 32u;
+            let cc = i % 32u;
+            var v = vec4<f32>(0.0);
+            if (base + j <= kend) { v = vc[(kslot[j] * kvd + kh * 128u) / 4u + cc]; }
+            kv[j * LD + cc] = v;
+        }
+        workgroupBarrier();
+        for (var k = 0u; k < 8u; k++) { acc[k] *= rc[8u * tp + k]; }
+        for (var j = 0u; j < BN; j++) {
+            let v = kv[j * LD + td];
+            for (var k = 0u; k < 8u; k++) { acc[k] += ss[(8u * tp + k) * 33u + j] * v; }
+        }
+    }
+    for (var k = 0u; k < 8u; k++) {
+        let r = 8u * tp + k;
+        if (r < nr) {
+            if (p.nch == 1u) {
+                o[(r0 + r) * qd4 + h * 32u + td] = acc[k] / rl[r];
+            } else {
+                let pi = pbase + r * pstride;
+                part[pi * 32u + td] = acc[k];
+                if (td == 0u) { ml[pi] = vec2<f32>(rm[r], rl[r]); }
+            }
+        }
+    }
+}
+"#;
+
 pub const SWIGLU: &str = r#"
 struct P { inter: u32, total: u32, _a: u32, _b: u32 }
 var<immediate> p: P;

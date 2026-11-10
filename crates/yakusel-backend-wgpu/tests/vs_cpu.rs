@@ -79,7 +79,9 @@ fn gpu_matches_cpu_long_prompt() {
     let lg = gpu.backend.to_host(&lt);
     let max_err = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     eprintln!("600-token prompt: max |cpu - gpu| = {max_err:.2e}");
-    assert!(max_err < 2e-2);
+    // With the f16 prefill GEMM the error is noise of 1e-2..5e-2 that depends on the
+    // summation order (attention kernel); with f32 it is ~1e-4.
+    assert!(max_err < if gpu.backend.gemm_uses_f16() { 5e-2 } else { 2e-2 });
     // The GPU's softmax probability of its argmax against a host-side computation.
     let m = lg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let z: f64 = lg.iter().map(|&v| ((v - m) as f64).exp()).sum();
@@ -93,8 +95,9 @@ fn gpu_matches_cpu_long_prompt() {
     let lg = gpu.backend.to_host(&lt);
     let max_err = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     eprintln!("decode at 601 tokens: max |cpu - gpu| = {max_err:.2e}");
-    // An f16 prefill leaves a slightly different KV cache, which the decode step inherits.
-    let tol = if gpu.backend.gemm_uses_f16() { 1e-1 } else { 2e-2 };
+    // An f16 prefill leaves a slightly different KV cache, which the decode step inherits
+    // (noise of up to ~1e-1 whose draw depends on the summation order of the kernels).
+    let tol = if gpu.backend.gemm_uses_f16() { 2e-1 } else { 2e-2 };
     assert!(max_err < tol);
 }
 
@@ -265,3 +268,37 @@ fn hints_and_response_cache_keep_output() {
         assert_eq!(eng.spec.rounds, rounds);
     }
 }
+
+/// The tiled prefill attention (`attn_tile`, with and without key chunks) against the
+/// CPU and the per-row kernel: 40 rows after a 2600-token prompt, past the 2048-token
+/// sliding window. f32 GEMM so only the attention kernels differ.
+#[test]
+#[ignore]
+fn tiled_attention_matches_cpu() {
+    let dir = model_dir();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
+    let gpu = WgpuBackend::new().unwrap();
+    gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
+    let mut gpu = Model::load(&dir, gpu, Quant::Q8).unwrap();
+    gpu.prefix_cache = false;
+    cpu.prefix_cache = false;
+    let ids: Vec<u32> = (0..2640u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let (a, b) = ids.split_at(2600);
+    let sc = cpu.new_seq().unwrap();
+    cpu.prefill(sc, a).unwrap();
+    let l = cpu.forward(&[(sc, b)], true).unwrap();
+    let lc = cpu.backend.to_host(&l);
+    for (name, wgs) in [("per-row", 0), ("tiled", 384), ("tiled, split keys", 100_000)] {
+        gpu.backend.set_tiled_attention(wgs);
+        let sg = gpu.new_seq().unwrap();
+        gpu.prefill(sg, a).unwrap();
+        let l = gpu.forward(&[(sg, b)], true).unwrap();
+        let lg = gpu.backend.to_host(&l);
+        gpu.free_seq(sg);
+        let e = lc.iter().zip(&lg).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        eprintln!("{name}: 40 rows after 2600: max |cpu - gpu| = {e:.2e}");
+        assert!(e < 2e-3, "{name}: {e}");
+    }
+}
+
+
