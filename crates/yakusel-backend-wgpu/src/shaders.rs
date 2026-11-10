@@ -41,7 +41,7 @@ fn load4(row: u32, i: u32) -> vec4<f32> {
 "#;
 
 pub const MM_PARAMS: &str = r#"
-struct P { n: u32, k: u32, t: u32, _pad: u32 }
+struct P { n: u32, k: u32, t: u32, r0: u32 } // r0: first row (multi-row GEMV only)
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> y: array<f32>;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
@@ -167,7 +167,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
         for (var i = li; i < T * 128u; i += 256u) {
             let t = i / 128u;
             let o = i % 128u; // vec4 index within the chunk: unit o/4, part o%4
-            xs[t * 128u + (o % 4u) * 32u + o / 4u] = x[t * k4 + c * 4u + o];
+            xs[t * 128u + (o % 4u) * 32u + o / 4u] = x[(p.r0 + t) * k4 + c * 4u + o];
         }
         workgroupBarrier();
         var w: array<array<vec4<f32>, 4>, R>;
@@ -197,7 +197,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
     if (lane == 0u) {
         for (var r = 0u; r < R; r++) {
             if (row0 + r < p.n) {
-                for (var t = 0u; t < T; t++) { y[t * p.n + row0 + r] = acc[r * T + t]; }
+                for (var t = 0u; t < T; t++) { y[(p.r0 + t) * p.n + row0 + r] = acc[r * T + t]; }
             }
         }
     }

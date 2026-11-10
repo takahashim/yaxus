@@ -27,8 +27,7 @@ use yakusel_api::{
 };
 use yakusel_backend_cpu::CpuBackend;
 use yakusel_backend_wgpu::WgpuBackend;
-use yakusel_model::speculative::Speculative;
-use yakusel_model::{Generator, Model, Quant};
+use yakusel_model::{Engine, Generator, Model, Quant};
 use yakusel_tokenizer::{GlossaryEntry, Tokenizer, TranslationPair, TranslationRequest};
 
 pub use tls::default_sans;
@@ -78,6 +77,8 @@ pub struct LoadOptions {
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
     pub kv_tokens: usize,
+    /// Scheduling (`draft_k` is taken from `draft`).
+    pub engine: yakusel_model::EngineConfig,
 }
 
 impl Default for LoadOptions {
@@ -89,6 +90,7 @@ impl Default for LoadOptions {
             prefill_f32: false,
             prefix_cache: true,
             kv_tokens: yakusel_model::DEFAULT_KV_TOKENS,
+            engine: yakusel_model::EngineConfig::default(),
         }
     }
 }
@@ -120,31 +122,30 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
     } else {
         o.draft.as_ref()
     };
+    let mut cfg = o.engine.clone();
+    if let Some(d) = draft {
+        cfg.draft_k = d.k;
+    }
     let Some(gpu) = gpu else {
         yakusel_backend_cpu::init_threads();
         let target = prepare(Model::load(dir, CpuBackend::new(), o.quant)?, o)?;
-        return Ok(match draft {
-            None => Box::new(target),
-            Some(d) => Box::new(Speculative::new(
-                target,
-                prepare(Model::load(&d.dir, CpuBackend::new(), d.quant)?, o)?,
-                d.k,
-            )?),
-        });
+        let draft = match draft {
+            Some(d) => Some(prepare(Model::load(&d.dir, CpuBackend::new(), d.quant)?, o)?),
+            None => None,
+        };
+        return Ok(Box::new(Engine::new(target, draft, cfg)?));
     };
     // One device for the target and the draft model.
     if o.prefill_f32 {
         gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
     }
-    Ok(match draft {
-        None => Box::new(prepare(Model::load(dir, gpu, o.quant)?, o)?),
-        Some(d) => {
-            let draft_gpu = gpu.share();
-            let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
-            let draft = prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?;
-            Box::new(Speculative::new(target, draft, d.k)?)
-        }
-    })
+    let draft_gpu = gpu.share();
+    let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
+    let draft = match draft {
+        Some(d) => Some(prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?),
+        None => None,
+    };
+    Ok(Box::new(Engine::new(target, draft, cfg)?))
 }
 
 pub struct ServeOptions {
@@ -392,12 +393,13 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     };
 
     let (jobs, rx) = mpsc::channel(opts.queue_limit.max(1));
+    let queue_limit = opts.queue_limit.max(1);
     let queued = Arc::new(AtomicUsize::new(0));
     {
         let (tok, queued) = (tok.clone(), queued.clone());
         std::thread::Builder::new()
             .name("inference".into())
-            .spawn(move || worker::run(model, tok, rx, queued))?;
+            .spawn(move || worker::run(model, tok, rx, queued, queue_limit))?;
     }
 
     let st = Arc::new(AppState { tok, jobs, queued, token: token.clone(), health, max_context: opts.max_context });

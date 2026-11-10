@@ -43,6 +43,12 @@ pub struct ModelArgs {
     /// KV arena size in tokens, per model.
     #[arg(long, default_value_t = yakusel_model::DEFAULT_KV_TOKENS)]
     kv_tokens: usize,
+    /// Requests processed at once (more wait in the queue).
+    #[arg(long, default_value_t = 16)]
+    max_streams: usize,
+    /// Most requests advanced by one decode pass.
+    #[arg(long, default_value_t = 8)]
+    decode_rows: usize,
     /// Weight format of the draft model: q4 or q8. Affects speed only, never the output.
     #[arg(long, default_value = "q4")]
     draft_quant: Quant,
@@ -80,6 +86,11 @@ impl ModelArgs {
             prefill_f32: self.prefill_precision == "f32",
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
+            engine: yakusel_model::EngineConfig {
+                max_streams: self.max_streams,
+                decode_rows: self.decode_rows,
+                ..Default::default()
+            },
         })
     }
 
@@ -335,6 +346,22 @@ enum BenchKind {
         #[arg(long)]
         compare: Option<PathBuf>,
     },
+    /// Concurrent requests: the first N items of a sentence set submitted at once.
+    Streams {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8,16")]
+        n: Vec<usize>,
+        #[arg(long, default_value = "tests/bench/sentences.tsv")]
+        file: PathBuf,
+        /// Compare each output with this file (written by `bench set --save`).
+        #[arg(long)]
+        compare: Option<PathBuf>,
+        /// Make every request generate exactly this many tokens (stop tokens ignored), to
+        /// measure steady-state throughput.
+        #[arg(long = "gen")]
+        fixed_gen: Option<usize>,
+    },
     /// Document scenario: paragraphs translated in order, each with the previous ones as history.
     Doc {
         #[command(flatten)]
@@ -375,13 +402,16 @@ pub fn bench(a: BenchArgs) -> Result<()> {
             bench_decode(model, prompt_tokens, gen_tokens, runs)
         }
         BenchKind::Set { model, file, save, compare } => bench_set(model, file, save, compare),
+        BenchKind::Streams { model, n, file, compare, fixed_gen } => bench_streams(model, n, file, compare, fixed_gen),
         BenchKind::Doc { model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose } => {
             bench_doc(model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose)
         }
     }
 }
 
-fn bench_rows(m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
+fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
+    // Each prompt is a prefix of the next one: the prefix cache would hide the work.
+    m.no_kv_cache = true;
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let mut model = m.load(&dir)?;
@@ -402,7 +432,8 @@ fn bench_rows(m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
     Ok(())
 }
 
-fn bench_decode(m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
+fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
+    m.no_kv_cache = true;
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let mut model = m.load(&dir)?;
@@ -482,6 +513,87 @@ fn bench_set(m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option
         for (i, (a, b)) in outs.iter().zip(&r).enumerate().filter(|(_, (a, b))| a != b) {
             println!("  [{}] ref: {b}\n  [{}] now: {a}", i + 1, i + 1);
         }
+    }
+    Ok(())
+}
+
+fn bench_streams(m: ModelArgs, ns: Vec<usize>, file: PathBuf, compare: Option<PathBuf>, fixed_gen: Option<usize>) -> Result<()> {
+    let (dir, name) = m.resolve()?;
+    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let mut model = m.load(&dir)?;
+    header(&name, &m, model.as_ref());
+    let set = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let mut prompts = Vec::new();
+    for line in set.lines().filter(|l| !l.trim().is_empty()) {
+        let (lang, text) = line.split_once('\t').context("set lines are `lang<TAB>text`")?;
+        let req = yakusel_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
+        prompts.push(tok.encode(&to_prompt_request(&req).to_prompt()?, false));
+    }
+    let reference: Option<Vec<String>> = match &compare {
+        Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),
+        None => None,
+    };
+    // Warm-up.
+    model.generate(&prompts[0], 4, &[EOS_ID, TAG_ID], &mut |_| true)?;
+    println!("{:>4} {:>8} {:>12} {:>14} {:>12}", "n", "tokens", "wall s", "total tok/s", "identical");
+    for &n in &ns {
+        let picked: Vec<usize> = (0..n).map(|i| i % prompts.len()).collect();
+        for (r, &i) in picked.iter().enumerate() {
+            model.submit(yakusel_model::Request {
+                id: r as u64,
+                prompt: prompts[i].clone(),
+                max_new_tokens: fixed_gen.unwrap_or(yakusel_api::DEFAULT_MAX_NEW_TOKENS),
+                stop: if fixed_gen.is_some() { vec![] } else { vec![EOS_ID, TAG_ID] },
+            });
+        }
+        let mut first_all: Option<Instant> = None;
+        let mut outs: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut done = 0;
+        let mut err = None;
+        let t0 = Instant::now();
+        while done < n {
+            model.step(&mut |ev| {
+                match ev {
+                    yakusel_model::Event::Token { id, token } => {
+                        outs[id as usize].push(token);
+                        // All prompts processed: from here on only decoding.
+                        if first_all.is_none() && outs.iter().all(|o| !o.is_empty()) {
+                            first_all = Some(Instant::now());
+                        }
+                    }
+                    yakusel_model::Event::Done { .. } => done += 1,
+                    yakusel_model::Event::Error { message, .. } => {
+                        err = Some(message);
+                        done += 1;
+                    }
+                }
+                true
+            })?;
+        }
+        let wall = t0.elapsed().as_secs_f64();
+        if let Some(e) = err {
+            anyhow::bail!("request failed: {e}");
+        }
+        let total: usize = outs.iter().map(|o| o.len()).sum();
+        if let (Some(_), Some(f)) = (fixed_gen, first_all) {
+            let dec = f.elapsed().as_secs_f64();
+            println!("      decode phase: {:.1} tok/s (after all prompts: {} tokens in {dec:.2} s)", (total - n) as f64 / dec, total - n);
+        }
+        let same = match &reference {
+            Some(r) if fixed_gen.is_none() => {
+                let ok = outs
+                    .iter()
+                    .zip(&picked)
+                    .filter(|(o, i)| r.get(**i).is_some_and(|l| *l == escape_line(&tok.decode(o))))
+                    .count();
+                format!("{ok}/{n}")
+            }
+            _ => "-".into(),
+        };
+        println!("{n:>4} {total:>8} {wall:>12.2} {:>14.1} {same:>12}", total as f64 / wall);
+    }
+    if let Some(s) = model.stats() {
+        println!("speculative: {s}");
     }
     Ok(())
 }

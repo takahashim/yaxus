@@ -8,8 +8,7 @@ use std::time::Instant;
 use serde_json::Value;
 use yakusel_backend_cpu::CpuBackend;
 use yakusel_backend_wgpu::WgpuBackend;
-use yakusel_model::speculative::Speculative;
-use yakusel_model::{Backend, Model, Quant};
+use yakusel_model::{Backend, Engine, EngineConfig, Event, Generator, Model, Quant, Request};
 
 fn model_dir() -> PathBuf {
     if let Ok(d) = std::env::var("YAKUSEL_MODEL_DIR") {
@@ -111,42 +110,91 @@ fn gpu_matches_cpu_bf16() {
     compare(Quant::Bf16);
 }
 
+fn draft_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap();
+    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b/snapshots");
+    std::fs::read_dir(snaps).ok()?.next()?.ok().map(|e| e.path())
+}
+
 /// Speculative decoding must reproduce the target model's plain greedy output exactly.
 #[test]
 #[ignore]
 fn speculative_matches_plain() {
     let dir = model_dir();
-    let draft_dir = {
-        let home = std::env::var("HOME").unwrap();
-        let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b/snapshots");
-        match std::fs::read_dir(snaps) {
-            Ok(mut d) => d.next().unwrap().unwrap().path(),
-            Err(_) => {
-                eprintln!("0.8B model not found; skipping");
-                return;
-            }
-        }
+    let Some(draft_dir) = draft_dir() else {
+        eprintln!("0.8B model not found; skipping");
+        return;
     };
     let gpu = WgpuBackend::new().unwrap();
-    let mut plain = Model::load(&dir, gpu.share(), Quant::Q8).unwrap();
-    let mut spec = Speculative::new(
+    let mut plain = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), None, EngineConfig::default()).unwrap();
+    let mut spec = Engine::new(
         Model::load(&dir, gpu.share(), Quant::Q8).unwrap(),
-        Model::load(&draft_dir, gpu.share(), Quant::Q4).unwrap(),
-        5,
+        Some(Model::load(&draft_dir, gpu.share(), Quant::Q4).unwrap()),
+        EngineConfig::default(),
     )
     .unwrap();
     for c in &cases() {
         let ids = u32s(&c["ids"]);
         for k in [1, 3, 5, 7] {
-            spec.k = k;
-            let a = plain.generate(&ids, 40, &[1, 16], |_| true).unwrap();
-            let b = spec.generate(&ids, 40, &[1, 16], |_| true).unwrap();
+            spec.cfg.draft_k = k;
+            let a = plain.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
+            let b = spec.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
             assert_eq!(a, b, "{} k={k}", c["name"]);
             // A budget that ends inside a round.
-            let a = plain.generate(&ids, 7, &[], |_| true).unwrap();
-            let b = spec.generate(&ids, 7, &[], |_| true).unwrap();
+            let a = plain.generate(&ids, 7, &[], &mut |_| true).unwrap();
+            let b = spec.generate(&ids, 7, &[], &mut |_| true).unwrap();
             assert_eq!(a, b, "{} k={k} max_new=7", c["name"]);
         }
     }
-    eprintln!("speculative: {:?}", spec.stats);
+    eprintln!("speculative: {:?}", spec.spec);
+}
+
+/// Requests run together (batched decode passes, interleaved prefill) must produce what
+/// each produces alone, with and without a draft model.
+#[test]
+#[ignore]
+fn concurrent_matches_solo() {
+    let dir = model_dir();
+    let gpu = WgpuBackend::new().unwrap();
+    // f32 prefill: the f16 prefill of a prompt run together with others could take a
+    // different kernel than alone (64-row tiles vs. multi-row GEMV).
+    gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
+    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap());
+    let cfg = EngineConfig { decode_rows: 4, busy_prefill_rows: 16, ..EngineConfig::default() };
+    let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
+    eng.target.prefix_cache = false;
+    if let Some(d) = eng.draft.as_mut() {
+        d.prefix_cache = false;
+    }
+    // The golden prompts plus truncated variants: 9 requests with different lengths.
+    let mut prompts: Vec<Vec<u32>> = Vec::new();
+    for c in &cases() {
+        let ids = u32s(&c["ids"]);
+        prompts.push(ids.clone());
+        prompts.push(ids[..ids.len() - 3].to_vec());
+        prompts.push(ids[..ids.len() / 2].to_vec());
+    }
+    let solo: Vec<Vec<u32>> = prompts.iter().map(|p| eng.generate(p, 24, &[1, 16], &mut |_| true).unwrap()).collect();
+    for (i, p) in prompts.iter().enumerate() {
+        eng.submit(Request { id: i as u64, prompt: p.clone(), max_new_tokens: 24, stop: vec![1, 16] });
+    }
+    let mut outs: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    let mut done = 0;
+    let mut steps = 0;
+    while done < prompts.len() {
+        eng.step(&mut |ev| {
+            match ev {
+                Event::Token { id, token } => outs[id as usize].push(token),
+                Event::Done { .. } => done += 1,
+                Event::Error { message, .. } => panic!("{message}"),
+            }
+            true
+        })
+        .unwrap();
+        steps += 1;
+    }
+    for i in 0..prompts.len() {
+        assert_eq!(outs[i], solo[i], "request {i} differs when run together");
+    }
+    eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec);
 }

@@ -76,7 +76,7 @@ fn matmul_kernels_match_host() {
         let w: Vec<u16> = values(n * k, 7).iter().map(|&v| f32_to_bf16(v * 0.05)).collect();
         for quant in [Quant::Bf16, Quant::Q8, Quant::Q4] {
             let wd = dequant(&w, k, quant);
-            for t in [1, 2, 3, 5, 8, 20, 70] {
+            for t in [1, 2, 3, 5, 8, 12, 16, 20, 24, 70] {
                 for glu in [false, true] {
                     if glu && t > 1 {
                         continue; // glu is fused only for decode; other T use matmul + swiglu

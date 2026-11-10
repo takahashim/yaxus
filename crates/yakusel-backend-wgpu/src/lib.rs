@@ -15,6 +15,9 @@ use yakusel_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef
 
 /// Activation rows up to which the GEMV kernel (weights read once) is used.
 const GEMV_MAX_T: usize = 8;
+/// Rows up to which the multi-row GEMV (activations staged in workgroup memory) is
+/// compiled; passes of up to twice this many rows run it twice on halves of the rows.
+const GEMVM_MAX_T: usize = 16;
 
 /// Matmul work after which recorded commands are submitted. On APUs compute jobs run on
 /// the graphics ring, where the kernel resets the GPU if one job runs for ~2 s (observed
@@ -213,6 +216,15 @@ const ARGMAX_SLICES: usize = 64;
 
 /// Passes with at most this many rows use the split-key attention.
 const SPLIT_ATTN_MAX_ROWS: usize = 8;
+
+impl Gpu {
+    /// Whether a pass of `t` (17..=32) rows should run as two multi-row GEMVs rather than
+    /// the 64-row-tile GEMM: measured on the 2B, two GEMVs win up to about 20 rows
+    /// (17 rows: 101 vs 140 ms; 24 rows: 149 vs 142 ms).
+    fn multi_split(&self, t: usize) -> bool {
+        t <= 20
+    }
+}
 
 /// Rows per workgroup of the Q4 block GEMV: 16 (16 lanes per row) unless that leaves
 /// fewer than 128 workgroups, then 8. Measured on the 0.8B draft (o_proj 1536x2048:
@@ -415,7 +427,7 @@ impl Gpu {
         self.add_kernel("glu_q4", &format!("{MM_PARAMS}{W_Q4_16}{GEMV_GLU}"), &q8);
         self.add_kernel("gemv8_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(GEMV_MAX_T)), &q8);
         if self.subgroups {
-            for t in 2..=GEMV_MAX_T {
+            for t in 2..=GEMVM_MAX_T {
                 let r = gemvm_rows(t);
                 let body = GEMV_MULTI
                     .replace("{T}", &t.to_string())
@@ -804,13 +816,36 @@ impl Gpu {
         let t = x.rows;
         // The matrix-core GEMM stores whole 64-token tiles.
         let y = if t > GEMV_MAX_T && self.gemm == GemmKind::Coop {
+            // (more than needed when a multi-row GEMV takes it; harmless)
             self.tensor_padded(t, n, t.div_ceil(64) * 64)
         } else {
             self.tensor(t, n)
         };
         let mut all = vec![y.buf(), x.buf()];
         all.extend(bufs);
-        let params = [n as u32, k as u32, t as u32];
+        let multi = self.subgroups && k % 512 == 0;
+        if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || self.multi_split(t)) {
+            // Up to 16 rows in one dispatch, up to 32 in two (each reads the weights once).
+            let all: Vec<wgpu::Buffer> = all.into_iter().cloned().collect();
+            let refs: Vec<&wgpu::Buffer> = all.iter().collect();
+            let first = t.div_ceil(2).min(GEMVM_MAX_T).max(if t <= GEMVM_MAX_T { t } else { 0 });
+            for (r0, rows) in [(0, first), (first, t - first)] {
+                if rows == 0 {
+                    continue;
+                }
+                if self.kernels_profile.is_some() {
+                    self.prof_detail = Some(format!("{n}x{k}"));
+                }
+                let groups = grid(n.div_ceil(8 * gemvm_rows(rows)) as u32);
+                self.dispatch(&format!("gemvm{rows}_{suffix}"), &refs, &[n as u32, k as u32, rows as u32, r0 as u32], groups);
+            }
+            self.pending_flops += 2.0 * (t * n * k) as f64;
+            if self.pending_flops >= SUBMIT_FLOPS {
+                self.submit();
+            }
+            return y;
+        }
+        let params = [n as u32, k as u32, t as u32, 0];
         let (name, groups) = if t == 1 && suffix == "q4" {
             let rpw = q4_rows_per_wg(n);
             (format!("gemv1b{rpw}_q4"), grid(n.div_ceil(rpw as usize) as u32))

@@ -1,8 +1,8 @@
 //! PLaMo 3 model: configuration, weight loading, and a backend-agnostic forward pass.
 
 pub mod config;
+pub mod engine;
 pub mod quant;
-pub mod speculative;
 pub mod weights;
 
 use std::collections::HashMap;
@@ -11,6 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub use config::{Config, LayerMeta, Rope};
+pub use engine::{Engine, EngineConfig, Event, Finish, Generator, ReqId, Request};
 pub use weights::{TensorRef, Weights, bf16_to_f32};
 
 /// Offsets of PLaMo 3's "sandwich" RMSNorms: `(offset + weight) * normalize(x)`.
@@ -370,10 +371,11 @@ impl<B: Backend> Model<B> {
         }
     }
 
-    /// Starts a sequence for `prompt` and returns it with the logits after the last prompt
-    /// token. With the prefix cache, the KV of the longest common prefix with a cached
-    /// sequence is shared instead of recomputed (at least the last token is computed).
-    pub fn start(&mut self, prompt: &[u32]) -> Result<(SeqId, B::Tensor)> {
+    /// Creates a sequence for `prompt` without processing it: with the prefix cache, the
+    /// sequence shares the KV of the longest common prefix with a cached sequence (always
+    /// leaving at least the last prompt token to compute). Returns the sequence and the
+    /// number of prompt tokens already in it.
+    pub fn begin(&mut self, prompt: &[u32]) -> Result<(SeqId, usize)> {
         anyhow::ensure!(!prompt.is_empty(), "empty prompt");
         self.kv()?;
         let mut best: Option<(SeqId, usize)> = None;
@@ -387,7 +389,7 @@ impl<B: Backend> Model<B> {
                 }
             }
         }
-        let (id, reused) = match best {
+        let r = match best {
             Some((src, lcp)) if lcp.min(prompt.len() - 1) >= MIN_REUSE => {
                 let keep = lcp.min(prompt.len() - 1);
                 let kv = self.kv.as_mut().unwrap();
@@ -401,7 +403,14 @@ impl<B: Backend> Model<B> {
             }
             _ => (self.new_seq()?, 0),
         };
-        self.last_start = StartInfo { reused, computed: prompt.len() - reused };
+        self.last_start = StartInfo { reused: r.1, computed: prompt.len() - r.1 };
+        Ok(r)
+    }
+
+    /// [`Model::begin`] followed by processing the rest of the prompt: returns the
+    /// sequence and the logits after the last prompt token.
+    pub fn start(&mut self, prompt: &[u32]) -> Result<(SeqId, B::Tensor)> {
+        let (id, reused) = self.begin(prompt)?;
         match self.prefill(id, &prompt[reused..]) {
             Ok(l) => Ok((id, l)),
             Err(e) => {
@@ -409,6 +418,11 @@ impl<B: Backend> Model<B> {
                 Err(e)
             }
         }
+    }
+
+    /// The tokens a sequence has consumed.
+    pub fn seq_tokens(&self, id: SeqId) -> &[u32] {
+        self.kv.as_ref().and_then(|k| k.seqs.get(&id)).map_or(&[], |s| &s.tokens)
     }
 
     /// Ends a sequence: keeps it for prefix reuse (LRU, at most `MAX_CACHED`) or frees it.
@@ -614,50 +628,5 @@ impl<B: Backend> Model<B> {
             Err(_) => self.free_seq(id),
         }
         r
-    }
-}
-
-/// Object-safe view of a loaded model, so callers can pick the backend at run time.
-pub trait Generator: Send {
-    /// Greedy generation; `on_token` returns `false` to stop early.
-    fn generate(
-        &mut self,
-        prompt: &[u32],
-        max_new_tokens: usize,
-        stop: &[u32],
-        on_token: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<Vec<u32>>;
-    fn backend_name(&self) -> String;
-    fn weight_bytes(&self) -> usize;
-    /// Speculative decoding statistics, if applicable.
-    fn stats(&self) -> Option<String> {
-        None
-    }
-    /// Prefix reuse of the last request (of the target model).
-    fn last_start(&self) -> StartInfo;
-}
-
-impl<B: Backend + Send> Generator for Model<B>
-where
-    B::Weight: Send,
-    B::Kv: Send,
-{
-    fn generate(
-        &mut self,
-        prompt: &[u32],
-        max_new_tokens: usize,
-        stop: &[u32],
-        on_token: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<Vec<u32>> {
-        Model::generate(self, prompt, max_new_tokens, stop, on_token)
-    }
-    fn backend_name(&self) -> String {
-        self.backend.name()
-    }
-    fn weight_bytes(&self) -> usize {
-        self.backend.weight_bytes()
-    }
-    fn last_start(&self) -> StartInfo {
-        self.last_start
     }
 }
