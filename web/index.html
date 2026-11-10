@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yakusel</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085; --border: #d9dde5;
+  --accent: #2f6fde; --accent-text: #ffffff; --danger: #c43c3c; --focus: #2f6fde55;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171d; --panel: #1c2028; --text: #e4e7ee; --muted: #9098aa; --border: #313745;
+    --accent: #5b8ff0; --accent-text: #0d1220; --danger: #e06464; --focus: #5b8ff055;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+#status { color: var(--muted); font-size: 13px; }
+#status.err { color: var(--danger); }
+header .spacer { flex: 1; }
+main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+select, input, textarea, button {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+select, input { padding: 6px 8px; }
+select:focus, input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+button { padding: 7px 14px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+.icon { padding: 6px 10px; }
+.panes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 760px) { .panes { grid-template-columns: 1fr; } }
+textarea {
+  width: 100%; min-height: 320px; padding: 12px; resize: vertical; line-height: 1.7;
+}
+#output { background: var(--panel); white-space: pre-wrap; }
+.pane-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; color: var(--muted); font-size: 13px; min-height: 30px; }
+details { margin-bottom: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; }
+details summary { cursor: pointer; color: var(--muted); }
+details textarea { min-height: 70px; margin-top: 6px; }
+label.field { display: block; margin-top: 8px; font-size: 13px; color: var(--muted); }
+.hint { font-size: 12px; color: var(--muted); }
+#token { width: 220px; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>yakusel</h1>
+  <span id="status">接続確認中…</span>
+  <span class="spacer"></span>
+  <label class="hint" for="token">トークン</label>
+  <input id="token" type="password" autocomplete="off" placeholder="Bearer トークン">
+</header>
+<main>
+  <div class="bar">
+    <select id="from" aria-label="原文の言語"><option value="">自動判定</option></select>
+    <button id="swap" class="icon" title="言語を入れ替え" aria-label="言語を入れ替え">⇄</button>
+    <select id="to" aria-label="訳文の言語"></select>
+    <select id="form" aria-label="文体" class="hidden">
+      <option value="">文体: 指定なし</option>
+      <option value="polite">です・ます調</option>
+      <option value="plain">だ・である調</option>
+    </select>
+    <span class="spacer" style="flex:1"></span>
+    <button id="go" class="primary" title="Ctrl+Enter">翻訳</button>
+    <button id="stop" class="hidden">停止</button>
+  </div>
+  <details id="opts">
+    <summary>詳細オプション (参考情報・用語集)</summary>
+    <label class="field" for="context">参考情報 (文脈、場面など)</label>
+    <textarea id="context" placeholder="例: 社内向けの連絡メール"></textarea>
+    <label class="field" for="glossary">用語集 (1 行に 1 語、「原語 = 訳語」)</label>
+    <textarea id="glossary" placeholder="owner = オーナー&#10;dashboard = 管理画面"></textarea>
+  </details>
+  <div class="panes">
+    <div>
+      <textarea id="input" placeholder="翻訳するテキスト。空行で区切った段落ごとに翻訳します。" autofocus></textarea>
+      <div class="pane-foot"><span id="count"></span><button id="clear" class="icon">クリア</button></div>
+    </div>
+    <div>
+      <textarea id="output" readonly placeholder="訳文"></textarea>
+      <div class="pane-foot"><span id="stats"></span><button id="copy" class="icon">コピー</button></div>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { return localStorage.getItem("yakusel." + k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("yakusel." + k, v); } catch {} },
+};
+const HISTORY_PAIRS = 2;
+let controller = null;
+
+function setStatus(text, isErr) {
+  $("status").textContent = text;
+  $("status").classList.toggle("err", !!isErr);
+}
+
+async function init() {
+  $("token").value = store.get("token", "");
+  $("context").value = store.get("context", "");
+  $("glossary").value = store.get("glossary", "");
+  try {
+    const [h, langs] = await Promise.all([
+      fetch("healthz").then((r) => r.json()),
+      fetch("v1/languages").then((r) => r.json()),
+    ]);
+    setStatus(`${h.model} · ${h.quant} · ${h.backend}`);
+    for (const l of langs) {
+      const label = `${l.name} (${l.code})`;
+      $("from").add(new Option(label, l.code));
+      $("to").add(new Option(label, l.code));
+    }
+  } catch (e) {
+    setStatus("サーバに接続できません", true);
+  }
+  $("from").value = store.get("from", "");
+  $("to").value = store.get("to", "en");
+  $("form").value = store.get("form", "");
+  updateForm();
+  updateCount();
+}
+
+function updateForm() {
+  $("form").classList.toggle("hidden", $("to").value !== "ja");
+}
+function updateCount() {
+  const n = paragraphs($("input").value).length;
+  $("count").textContent = $("input").value ? `${$("input").value.length} 文字 · ${n} 段落` : "";
+}
+
+function paragraphs(text) {
+  return text.split(/\r?\n[ \t　]*\r?\n\s*/).map((p) => p.replace(/\s+$/, "")).filter((p) => p.trim());
+}
+
+function glossary() {
+  return $("glossary").value.split("\n").map((l) => {
+    const m = l.split(/\s*(?:=|\t)\s*/);
+    return m.length >= 2 && m[0].trim() && m[1].trim() ? { source: m[0].trim(), target: m.slice(1).join("=").trim() } : null;
+  }).filter(Boolean);
+}
+
+async function translateOne(body, onDelta, signal) {
+  const res = await fetch("v1/translate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + $("token").value.trim() },
+    body: JSON.stringify({ ...body, stream: true }),
+    signal,
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { msg = (await res.json()).error || msg; } catch {}
+    if (res.status === 401) msg = "トークンが正しくありません";
+    if (res.status === 429) msg = "サーバが混雑しています。しばらくしてから再試行してください";
+    throw new Error(msg);
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", usage = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const chunk = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const ev = JSON.parse(line.slice(5));
+        if (ev.delta !== undefined) onDelta(ev.delta);
+        else if (ev.error) throw new Error(ev.error);
+        else if (ev.done) usage = ev.usage;
+      }
+    }
+  }
+  return usage;
+}
+
+async function run() {
+  const paras = paragraphs($("input").value);
+  if (!paras.length) return;
+  if (!$("token").value.trim()) { setStatus("トークンを入力してください", true); $("token").focus(); return; }
+  store.set("token", $("token").value.trim());
+  const base = {
+    target_lang: $("to").value,
+    source_lang: $("from").value || undefined,
+    form: $("to").value === "ja" && $("form").value ? $("form").value : undefined,
+    context: $("context").value.trim() || undefined,
+    glossary: glossary(),
+  };
+  controller = new AbortController();
+  $("go").disabled = true;
+  $("stop").classList.remove("hidden");
+  const out = $("output");
+  out.value = "";
+  const done = [];
+  let tokens = 0, decodeTokens = 0, decodeMs = 0;
+  const t0 = performance.now();
+  try {
+    for (const [k, p] of paras.entries()) {
+      let cur = "";
+      const prefix = done.map((d) => d.target).join("\n\n") + (done.length ? "\n\n" : "");
+      $("stats").textContent = `${k + 1} / ${paras.length} 段落を翻訳中…`;
+      const usage = await translateOne(
+        { ...base, text: p, history: done.slice(-HISTORY_PAIRS) },
+        (d) => { cur += d; out.value = prefix + cur; },
+        controller.signal,
+      );
+      done.push({ source: p, target: cur });
+      if (usage) {
+        tokens += usage.completion_tokens;
+        // The first token comes out of prompt processing; the rest measure decoding.
+        decodeTokens += Math.max(0, usage.completion_tokens - 1);
+        decodeMs += usage.elapsed_ms - usage.prefill_ms;
+      }
+    }
+    const secs = (performance.now() - t0) / 1000;
+    $("stats").textContent = `${tokens} トークン · ${secs.toFixed(1)} 秒` +
+      (decodeMs > 0 ? ` · 生成 ${(decodeTokens / (decodeMs / 1000)).toFixed(1)} tok/s` : "");
+  } catch (e) {
+    $("stats").textContent = e.name === "AbortError" ? "停止しました" : "エラー: " + e.message;
+  } finally {
+    controller = null;
+    $("go").disabled = false;
+    $("stop").classList.add("hidden");
+  }
+}
+
+$("go").onclick = run;
+$("stop").onclick = () => controller && controller.abort();
+$("input").addEventListener("input", updateCount);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !controller) { e.preventDefault(); run(); }
+});
+$("to").onchange = () => { store.set("to", $("to").value); updateForm(); };
+$("from").onchange = () => store.set("from", $("from").value);
+$("form").onchange = () => store.set("form", $("form").value);
+$("context").onchange = () => store.set("context", $("context").value);
+$("glossary").onchange = () => store.set("glossary", $("glossary").value);
+$("token").onchange = () => store.set("token", $("token").value.trim());
+$("swap").onclick = () => {
+  const f = $("from").value, t = $("to").value;
+  $("to").value = f || (t === "ja" ? "en" : "ja");
+  $("from").value = t;
+  if ($("output").value) { $("input").value = $("output").value; $("output").value = ""; }
+  store.set("from", $("from").value); store.set("to", $("to").value);
+  updateForm(); updateCount();
+};
+$("clear").onclick = () => { $("input").value = ""; $("output").value = ""; $("stats").textContent = ""; updateCount(); $("input").focus(); };
+$("copy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("output").value); $("copy").textContent = "コピーしました"; }
+  catch { $("output").select(); document.execCommand("copy"); }
+  setTimeout(() => ($("copy").textContent = "コピー"), 1500);
+};
+init();
+</script>
+</body>
+</html>

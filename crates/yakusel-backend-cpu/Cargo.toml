@@ -1,0 +1,16 @@
+[package]
+name = "yakusel-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference f32 CPU backend for yakusel"
+
+[dependencies]
+anyhow.workspace = true
+rayon = "1"
+half = "2"
+yakusel-model = { path = "../yakusel-model" }
+
+[dev-dependencies]
+yakusel-tokenizer = { path = "../yakusel-tokenizer" }
+serde_json.workspace = true

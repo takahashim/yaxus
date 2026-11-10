@@ -1,0 +1,726 @@
+//! WGSL kernels. Per-dispatch scalars come through `var<immediate>` (Vulkan push constants).
+//! Binding 0 is always the output buffer.
+
+/// Weight access for `[N, K]` Q8 matrices: `load4(row, i)` returns weights `4i..4i+4`.
+pub const W_Q8: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let q = bitcast<i32>(wq[row * (p.k / 4u) + i]);
+    let b = row * (p.k / 32u) + i / 8u;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    return vec4<f32>(
+        f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
+        f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u))) * s;
+}
+"#;
+
+/// Weight access for `[N, K]` Q4 matrices (8 nibbles per u32, `q + 8`).
+pub const W_Q4: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let u = wq[row * (p.k / 8u) + i / 2u] >> (16u * (i & 1u));
+    let b = row * (p.k / 32u) + i / 8u;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    return (vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u)) - 8.0) * s;
+}
+"#;
+
+/// Weight access for `[N, K]` bf16 matrices (two bf16 per u32, little endian).
+pub const W_BF16: &str = r#"
+@group(0) @binding(2) var<storage, read> wb: array<vec2<u32>>;
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let u = wb[row * (p.k / 4u) + i];
+    return vec4<f32>(
+        bitcast<f32>(u.x << 16u), bitcast<f32>(u.x & 0xffff0000u),
+        bitcast<f32>(u.y << 16u), bitcast<f32>(u.y & 0xffff0000u));
+}
+"#;
+
+pub const MM_PARAMS: &str = r#"
+struct P { n: u32, k: u32, t: u32, _pad: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
+"#;
+
+/// GEMV weight access, 16 weights per call (one 16-byte load for Q8, two for bf16).
+pub const W_Q8_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+fn unpack_q8(u: u32) -> vec4<f32> {
+    let q = bitcast<i32>(u);
+    return vec4<f32>(f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
+                     f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u)));
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let u = wq[row * (p.k / 16u) + j];
+    let b = row * (p.k / 32u) + j / 2u;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    return array<vec4<f32>, 4>(unpack_q8(u.x) * s, unpack_q8(u.y) * s, unpack_q8(u.z) * s, unpack_q8(u.w) * s);
+}
+"#;
+
+pub const W_Q4_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+fn unpack_q4(u: u32, s: f32) -> array<vec4<f32>, 2> {
+    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
+    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
+    return array<vec4<f32>, 2>((lo - 8.0) * s, (hi - 8.0) * s);
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let u = wq[row * (p.k / 16u) + j];
+    let b = row * (p.k / 32u) + j / 2u;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    let a = unpack_q4(u.x, s);
+    let c = unpack_q4(u.y, s);
+    return array<vec4<f32>, 4>(a[0], a[1], c[0], c[1]);
+}
+"#;
+
+pub const W_BF16_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wb: array<vec4<u32>>;
+fn bf2(u: u32) -> vec2<f32> { return vec2<f32>(bitcast<f32>(u << 16u), bitcast<f32>(u & 0xffff0000u)); }
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let i = row * (p.k / 8u) + 2u * j;
+    let a = wb[i];
+    let b = wb[i + 1u];
+    return array<vec4<f32>, 4>(vec4<f32>(bf2(a.x), bf2(a.y)), vec4<f32>(bf2(a.z), bf2(a.w)),
+                               vec4<f32>(bf2(b.x), bf2(b.y)), vec4<f32>(bf2(b.z), bf2(b.w)));
+}
+"#;
+
+/// Matrix-vector product for up to MAXT activation rows (substituted: 1 for decode,
+/// 8 otherwise). 8 output rows per workgroup, 32 lanes per row, each lane loading 16
+/// weights at a time, so every weight is read exactly once with wide loads.
+pub const GEMV: &str = r#"
+const MAXT: u32 = {MAXT}u;
+var<workgroup> red: array<f32, {RED}>; // [MAXT][256]
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let group = wg.y * nw.x + wg.x;
+    let row = group * 8u + li / 32u;
+    let lane = li % 32u;
+    let k4 = p.k / 4u;
+    let k16 = p.k / 16u;
+    var acc: array<f32, MAXT>;
+    for (var t = 0u; t < MAXT; t++) { acc[t] = 0.0; }
+    if (row < p.n) {
+        for (var j = lane; j < k16; j += 32u) {
+            let w = load16(row, j);
+            for (var t = 0u; t < MAXT; t++) {
+                if (t < p.t) {
+                    let xb = t * k4 + 4u * j;
+                    acc[t] += dot(w[0], x[xb]) + dot(w[1], x[xb + 1u]) + dot(w[2], x[xb + 2u]) + dot(w[3], x[xb + 3u]);
+                }
+            }
+        }
+    }
+    for (var t = 0u; t < MAXT; t++) { red[t * 256u + li] = acc[t]; }
+    workgroupBarrier();
+    for (var s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            for (var t = 0u; t < MAXT; t++) {
+                red[t * 256u + li] += red[t * 256u + li + s];
+            }
+        }
+        workgroupBarrier();
+    }
+    if (lane == 0u && row < p.n) {
+        for (var t = 0u; t < MAXT; t++) {
+            if (t < p.t) { y[t * p.n + row] = red[t * 256u + li]; }
+        }
+    }
+}
+"#;
+
+/// Matrix product for a few activation rows (speculative verification, tiny prompts).
+/// Exactly `{T}` rows. K is walked in chunks of 512: the workgroup stages that slice of all
+/// T activation rows in workgroup memory once, and its 8 lane groups x `{R}` weight rows
+/// all read it from there, so activations cost neither L2 traffic nor registers. Lanes of
+/// a 32-wide group are summed with subgroup shuffles. Needs K % 512 == 0 and SUBGROUP.
+pub const GEMV_MULTI: &str = r#"
+const T: u32 = {T}u;
+const R: u32 = {R}u;
+var<workgroup> xs: array<vec4<f32>, {T128}>; // [T][4 m][32 lanes]
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let group = wg.y * nw.x + wg.x;
+    let grp = li / 32u;
+    let lane = li % 32u;
+    let row0 = (group * 8u + grp) * R;
+    let k4 = p.k / 4u;
+    let k16 = p.k / 16u;
+    var acc: array<f32, {RT}>;
+    for (var i = 0u; i < R * T; i++) { acc[i] = 0.0; }
+    for (var c = 0u; c < k16; c += 32u) {
+        for (var i = li; i < T * 128u; i += 256u) {
+            let t = i / 128u;
+            let o = i % 128u; // vec4 index within the chunk: unit o/4, part o%4
+            xs[t * 128u + (o % 4u) * 32u + o / 4u] = x[t * k4 + c * 4u + o];
+        }
+        workgroupBarrier();
+        var w: array<array<vec4<f32>, 4>, R>;
+        for (var r = 0u; r < R; r++) {
+            if (row0 + r < p.n) { w[r] = load16(row0 + r, c + lane); }
+        }
+        for (var t = 0u; t < T; t++) {
+            let x0 = xs[t * 128u + lane];
+            let x1 = xs[t * 128u + 32u + lane];
+            let x2 = xs[t * 128u + 64u + lane];
+            let x3 = xs[t * 128u + 96u + lane];
+            for (var r = 0u; r < R; r++) {
+                acc[r * T + t] += dot(w[r][0], x0) + dot(w[r][1], x1) + dot(w[r][2], x2) + dot(w[r][3], x3);
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var i = 0u; i < R * T; i++) {
+        var v = acc[i];
+        v += subgroupShuffleXor(v, 16u);
+        v += subgroupShuffleXor(v, 8u);
+        v += subgroupShuffleXor(v, 4u);
+        v += subgroupShuffleXor(v, 2u);
+        v += subgroupShuffleXor(v, 1u);
+        acc[i] = v;
+    }
+    if (lane == 0u) {
+        for (var r = 0u; r < R; r++) {
+            if (row0 + r < p.n) {
+                for (var t = 0u; t < T; t++) { y[t * p.n + row0 + r] = acc[r * T + t]; }
+            }
+        }
+    }
+}
+"#;
+
+/// `(offset + w) * x / rms(x)`, one row per workgroup.
+pub const RMSNORM: &str = r#"
+struct P { cols: u32, offset: f32, eps: f32, _pad: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> w: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let base = wg.x * p.cols;
+    var s = 0.0;
+    for (var i = li; i < p.cols; i += 256u) { let v = x[base + i]; s += v * v; }
+    red[li] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st >>= 1u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let r = 1.0 / sqrt(red[0] / f32(p.cols) + p.eps);
+    for (var i = li; i < p.cols; i += 256u) { y[base + i] = (p.offset + w[i]) * (x[base + i] * r); }
+}
+"#;
+
+/// Per-head RMSNorm (offset 1) + half-split RoPE for q and k heads; writes q to `qo`
+/// and k/v into the ring-buffer cache. One workgroup per (head, token), 128 lanes = head_dim.
+pub const QK_ROPE: &str = r#"
+struct P { hq: u32, hkv: u32, pos0: u32, cap: u32, eps: f32, _a: u32, _b: u32, _c: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> qo: array<f32>;
+@group(0) @binding(1) var<storage, read_write> kc: array<f32>;
+@group(0) @binding(2) var<storage, read_write> vc: array<f32>;
+@group(0) @binding(3) var<storage, read> qkv: array<f32>;
+@group(0) @binding(4) var<storage, read> qn: array<f32>;
+@group(0) @binding(5) var<storage, read> kn: array<f32>;
+@group(0) @binding(6) var<storage, read> cs: array<f32>; // [pos][64] cos, then [pos][64] sin
+var<workgroup> red: array<f32, 128>;
+var<workgroup> v: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let t = wg.y;
+    let qd = p.hq * 128u;
+    let kvd = p.hkv * 128u;
+    let row = t * (qd + 2u * kvd);
+    let is_q = h < p.hq;
+    var src = row + qd + (h - p.hq) * 128u;
+    if (is_q) { src = row + h * 128u; }
+    let val = qkv[src + li];
+    red[li] = val * val;
+    workgroupBarrier();
+    for (var st = 64u; st > 0u; st >>= 1u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let r = 1.0 / sqrt(red[0] / 128.0 + p.eps);
+    var g = 0.0;
+    if (is_q) { g = qn[li]; } else { g = kn[li]; }
+    v[li] = (1.0 + g) * (val * r);
+    workgroupBarrier();
+    let pos = p.pos0 + t;
+    let ntab = arrayLength(&cs) / 2u;
+    let j = li % 64u;
+    let c = cs[pos * 64u + j];
+    let s = cs[ntab + pos * 64u + j];
+    var o = 0.0;
+    if (li < 64u) { o = v[li] * c - v[li + 64u] * s; } else { o = v[li] * c + v[li - 64u] * s; }
+    if (is_q) {
+        qo[t * qd + h * 128u + li] = o;
+    } else {
+        let kh = h - p.hq;
+        let slot = (pos % p.cap) * kvd + kh * 128u + li;
+        kc[slot] = o;
+        vc[slot] = qkv[row + qd + kvd + kh * 128u + li];
+    }
+}
+"#;
+
+/// Causal (optionally sliding-window) attention with online softmax.
+/// One workgroup per (query head, token); 128 lanes = head_dim, 128 keys per step.
+pub const ATTENTION: &str = r#"
+struct P { hq: u32, hkv: u32, pos0: u32, cap: u32, window: u32, scale: f32, _a: u32, _b: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> o: array<f32>;
+@group(0) @binding(1) var<storage, read> q: array<f32>;
+@group(0) @binding(2) var<storage, read> kc: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> vc: array<f32>;
+var<workgroup> qs: array<vec4<f32>, 32>;
+var<workgroup> sc: array<f32, 128>;
+var<workgroup> red: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let t = wg.y;
+    let qd = p.hq * 128u;
+    let kvd = p.hkv * 128u;
+    let kh = h / (p.hq / p.hkv);
+    let pos = p.pos0 + t;
+    var lo = 0u;
+    if (p.window > 0u && pos + 1u > p.window) { lo = pos + 1u - p.window; }
+    if (li < 32u) {
+        let qb = t * qd + h * 128u + li * 4u;
+        qs[li] = vec4<f32>(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
+    }
+    workgroupBarrier();
+    var m = -1e30;
+    var l = 0.0;
+    var acc = 0.0;
+    for (var base = lo; base <= pos; base += 128u) {
+        let key = base + li;
+        var s = -1e30;
+        if (key <= pos) {
+            let off = ((key % p.cap) * kvd + kh * 128u) / 4u;
+            var d = 0.0;
+            for (var i = 0u; i < 32u; i++) { d += dot(qs[i], kc[off + i]); }
+            s = d * p.scale;
+        }
+        red[li] = s;
+        workgroupBarrier();
+        for (var st = 64u; st > 0u; st >>= 1u) {
+            if (li < st) { red[li] = max(red[li], red[li + st]); }
+            workgroupBarrier();
+        }
+        let nm = max(m, red[0]);
+        var e = 0.0;
+        if (key <= pos) { e = exp(s - nm); }
+        sc[li] = e;
+        workgroupBarrier();
+        let corr = exp(m - nm);
+        l *= corr;
+        acc *= corr;
+        let cnt = min(128u, pos + 1u - base);
+        for (var j = 0u; j < cnt; j++) {
+            let w = sc[j];
+            l += w;
+            acc += w * vc[((base + j) % p.cap) * kvd + kh * 128u + li];
+        }
+        m = nm;
+        workgroupBarrier();
+    }
+    o[t * qd + h * 128u + li] = acc / l;
+}
+"#;
+
+pub const SWIGLU: &str = r#"
+struct P { inter: u32, total: u32, _a: u32, _b: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let idx = gid.y * nw.x * 256u + gid.x;
+    if (idx >= p.total) { return; }
+    let t = idx / p.inter;
+    let j = idx % p.inter;
+    let g = x[t * 2u * p.inter + j];
+    y[idx] = g / (1.0 + exp(-g)) * x[t * 2u * p.inter + p.inter + j];
+}
+"#;
+
+pub const ADD: &str = r#"
+struct P { total: u32, _a: u32, _b: u32, _c: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {
+    let idx = gid.y * nw.x * 256u + gid.x;
+    if (idx < p.total) { a[idx] += b[idx]; }
+}
+"#;
+
+/// Fused residual step: `x += (o1 + w1) * norm(d)`, then `h = (o2 + w2) * norm(x)`.
+/// One row per workgroup; each thread only re-reads the elements it wrote itself.
+pub const ADD_NORM: &str = r#"
+struct P { cols: u32, o1: f32, o2: f32, eps: f32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> h: array<f32>;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read> d: array<f32>;
+@group(0) @binding(3) var<storage, read> w1: array<f32>;
+@group(0) @binding(4) var<storage, read> w2: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn sum256(li: u32, v: f32) -> f32 {
+    red[li] = v;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st >>= 1u) {
+        if (li < st) { red[li] += red[li + st]; }
+        workgroupBarrier();
+    }
+    let r = red[0];
+    workgroupBarrier();
+    return r;
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let base = wg.x * p.cols;
+    var s = 0.0;
+    for (var i = li; i < p.cols; i += 256u) { let v = d[base + i]; s += v * v; }
+    let r1 = 1.0 / sqrt(sum256(li, s) / f32(p.cols) + p.eps);
+    var s2 = 0.0;
+    for (var i = li; i < p.cols; i += 256u) {
+        let v = x[base + i] + (p.o1 + w1[i]) * (d[base + i] * r1);
+        x[base + i] = v;
+        s2 += v * v;
+    }
+    let r2 = 1.0 / sqrt(sum256(li, s2) / f32(p.cols) + p.eps);
+    for (var i = li; i < p.cols; i += 256u) { h[base + i] = (p.o2 + w2[i]) * (x[base + i] * r2); }
+}
+"#;
+
+/// Decode-time (T=1) gate/up projection fused with SwiGLU. A workgroup computes 4 outputs:
+/// lane groups 0-3 the gate rows `u`, groups 4-7 the matching up rows `n + u`
+/// (`p.n` is the intermediate size), then `y[u] = silu(gate) * up`.
+pub const GEMV_GLU: &str = r#"
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let group = wg.y * nw.x + wg.x;
+    let g = li / 32u;
+    let lane = li % 32u;
+    let u = group * 4u + (g % 4u);
+    let row = select(u, p.n + u, g >= 4u);
+    let k4 = p.k / 4u;
+    let k16 = p.k / 16u;
+    var acc = 0.0;
+    if (u < p.n) {
+        for (var j = lane; j < k16; j += 32u) {
+            let w = load16(row, j);
+            let xb = 4u * j;
+            acc += dot(w[0], x[xb]) + dot(w[1], x[xb + 1u]) + dot(w[2], x[xb + 2u]) + dot(w[3], x[xb + 3u]);
+        }
+    }
+    red[li] = acc;
+    workgroupBarrier();
+    for (var s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[li] += red[li + s]; }
+        workgroupBarrier();
+    }
+    if (li < 4u && group * 4u + li < p.n) {
+        let gt = red[li * 32u];
+        let up = red[(li + 4u) * 32u];
+        y[group * 4u + li] = gt / (1.0 + exp(-gt)) * up;
+    }
+}
+"#;
+
+/// Argmax, stage 1: each workgroup scans one slice of one row and writes
+/// (max bits, index of the max, sum of exp(v - max) bits, 0).
+pub const ARGMAX1: &str = r#"
+struct P { n: u32, slice: u32, _a: u32, _b: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> part: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+var<workgroup> bv: array<f32, 256>;
+var<workgroup> bi: array<u32, 256>;
+var<workgroup> bs: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let row = wg.y;
+    let lo = wg.x * p.slice;
+    let hi = min(lo + p.slice, p.n);
+    var best = -3.0e38;
+    var idx = 0xffffffffu;
+    var sum = 0.0;
+    for (var i = lo + li; i < hi; i += 256u) {
+        let v = x[row * p.n + i];
+        if (v > best) { sum = sum * exp(best - v) + 1.0; best = v; idx = i; } else { sum += exp(v - best); }
+    }
+    bv[li] = best;
+    bi[li] = idx;
+    bs[li] = sum;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st >>= 1u) {
+        if (li < st) {
+            let ov = bv[li + st];
+            let oi = bi[li + st];
+            let os = bs[li + st];
+            let mv = max(bv[li], ov);
+            bs[li] = bs[li] * exp(bv[li] - mv) + os * exp(ov - mv);
+            if (ov > bv[li] || (ov == bv[li] && oi < bi[li])) { bv[li] = ov; bi[li] = oi; }
+        }
+        workgroupBarrier();
+    }
+    if (li == 0u) { part[row * nw.x + wg.x] = vec4<u32>(bitcast<u32>(bv[0]), bi[0], bitcast<u32>(bs[0]), 0u); }
+}
+"#;
+
+/// Argmax, stage 2: one workgroup per row reduces the per-slice results and writes
+/// (index, bits of the softmax probability of that index).
+pub const ARGMAX2: &str = r#"
+struct P { slices: u32, _a: u32, _b: u32, _c: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(0) @binding(1) var<storage, read> part: array<vec4<u32>>;
+var<workgroup> bv: array<f32, 64>;
+var<workgroup> bi: array<u32, 64>;
+var<workgroup> bs: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    var best = -3.0e38;
+    var idx = 0xffffffffu;
+    var sum = 0.0;
+    if (li < p.slices) {
+        let e = part[wg.x * p.slices + li];
+        best = bitcast<f32>(e.x);
+        idx = e.y;
+        sum = bitcast<f32>(e.z);
+    }
+    bv[li] = best;
+    bi[li] = idx;
+    bs[li] = sum;
+    workgroupBarrier();
+    for (var st = 32u; st > 0u; st >>= 1u) {
+        if (li < st) {
+            let ov = bv[li + st];
+            let oi = bi[li + st];
+            let os = bs[li + st];
+            let mv = max(bv[li], ov);
+            bs[li] = bs[li] * exp(bv[li] - mv) + os * exp(ov - mv);
+            if (ov > bv[li] || (ov == bv[li] && oi < bi[li])) { bv[li] = ov; bi[li] = oi; }
+        }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        out[2u * wg.x] = bi[0];
+        out[2u * wg.x + 1u] = bitcast<u32>(1.0 / bs[0]);
+    }
+}
+"#;
+
+/// Prefill GEMM with a 64 (tokens) x 128 (outputs) tile and 4 x 8 outputs per thread,
+/// K in steps of 16. Per k a thread reads 3 vec4 from workgroup memory for 32 FMAs
+/// (the 64x64 kernel read 2 for 16, and was bound by workgroup-memory bandwidth).
+/// f32 throughout; the fallback when cooperative matrices are unavailable (an f16 variant
+/// of this kernel, and a dot-product layout, were slower on RADV and are gone).
+pub const GEMM2: &str = r#"
+var<workgroup> xs: array<vec4<f32>, 256>; // [16 k][16 groups of 4 tokens]
+var<workgroup> ws: array<vec4<f32>, 512>; // [16 k][32 groups of 4 outputs]
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let n0 = wg.x * 128u;
+    let t0 = wg.y * 64u;
+    let tx = li % 16u;
+    let ty = li / 16u;
+    let k4 = p.k / 4u;
+    var acc: array<vec4<f32>, 8>; // [4 tokens][2 halves]
+    for (var i = 0u; i < 8u; i++) { acc[i] = vec4<f32>(0.0); }
+    for (var kb = 0u; kb < p.k; kb += 16u) {
+        {
+            let t = li / 4u;
+            let c = li % 4u;
+            var v = vec4<f32>(0.0);
+            if (t0 + t < p.t) { v = x[(t0 + t) * k4 + kb / 4u + c]; }
+            for (var e = 0u; e < 4u; e++) { xs[(c * 4u + e) * 16u + t / 4u][t % 4u] = v[e]; }
+        }
+        for (var r = 0u; r < 2u; r++) {
+            let idx = li + 256u * r;
+            let n = idx / 4u;
+            let c = idx % 4u;
+            var w = vec4<f32>(0.0);
+            if (n0 + n < p.n) { w = load4(n0 + n, kb / 4u + c); }
+            for (var e = 0u; e < 4u; e++) { ws[(c * 4u + e) * 32u + n / 4u][n % 4u] = w[e]; }
+        }
+        workgroupBarrier();
+        // Accumulating each 16-step slice separately and then adding it is measurably
+        // faster on RADV than updating `acc` in place (285 vs 188 tok/s at 512 tokens).
+        var part: array<vec4<f32>, 8>;
+        for (var i = 0u; i < 8u; i++) { part[i] = vec4<f32>(0.0); }
+        for (var kk = 0u; kk < 16u; kk++) {
+            let a = xs[kk * 16u + ty];
+            let b0 = ws[kk * 32u + tx];
+            let b1 = ws[kk * 32u + 16u + tx];
+            for (var i = 0u; i < 4u; i++) {
+                part[i * 2u] = fma(vec4<f32>(a[i]), b0, part[i * 2u]);
+                part[i * 2u + 1u] = fma(vec4<f32>(a[i]), b1, part[i * 2u + 1u]);
+            }
+        }
+        for (var i = 0u; i < 8u; i++) { acc[i] += part[i]; }
+        workgroupBarrier();
+    }
+    for (var i = 0u; i < 4u; i++) {
+        let t = t0 + ty * 4u + i;
+        if (t < p.t) {
+            for (var h = 0u; h < 2u; h++) {
+                for (var j = 0u; j < 4u; j++) {
+                    let n = n0 + h * 64u + tx * 4u + j;
+                    if (n < p.n) { y[t * p.n + n] = acc[i * 2u + h][j]; }
+                }
+            }
+        }
+    }
+}
+"#;
+
+/// Prefill GEMM on the matrix cores (`VK_KHR_cooperative_matrix`, WMMA on RDNA3):
+/// f16 operands, f32 accumulation. A workgroup of 128 invocations computes 64 tokens x 64
+/// outputs: it stages the 64x32 activation slice and the 64x32 weight slice (dequantized)
+/// as f16, and each subgroup multiplies 16-wide output stripes with four 16x16
+/// accumulators (64 tokens). With 4 subgroups (wave32) each takes one stripe, with 2
+/// (wave64) two. Cooperative ops need uniform control flow, so the subgroup count is
+/// broadcast through workgroup memory. Needs N % 64 == 0; `y` needs room for the token
+/// count rounded up to 64 rows.
+pub const GEMM_COOP: &str = r#"
+var<workgroup> xs: array<f16, 2048>;  // [64 tokens][32 k], row-major
+var<workgroup> wsm: array<f16, 2048>; // [64 outputs][32 k]
+var<workgroup> nsub: u32;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32,
+        @builtin(subgroup_id) sg: u32, @builtin(num_subgroups) ns: u32) {
+    if (li == 0u) { nsub = ns; }
+    let two = workgroupUniformLoad(&nsub) == 2u;
+    let n0 = wg.x * 64u;
+    let t0 = wg.y * 64u;
+    let k4 = p.k / 4u;
+    let s0 = sg;       // first stripe of this subgroup within the tile
+    let s1 = sg + 2u;  // second stripe (only with two subgroups)
+    var c0 = coop_mat16x16<f32, C>();
+    var c1 = coop_mat16x16<f32, C>();
+    var c2 = coop_mat16x16<f32, C>();
+    var c3 = coop_mat16x16<f32, C>();
+    var d0 = coop_mat16x16<f32, C>();
+    var d1 = coop_mat16x16<f32, C>();
+    var d2 = coop_mat16x16<f32, C>();
+    var d3 = coop_mat16x16<f32, C>();
+    for (var kb = 0u; kb < p.k; kb += 32u) {
+        for (var r = 0u; r < 4u; r++) {
+            let idx = li + 128u * r; // vec4 index in a 64 x 8 slice
+            let row = idx / 8u;
+            let c = idx % 8u;
+            var v = vec4<f32>(0.0);
+            if (t0 + row < p.t) { v = x[(t0 + row) * k4 + kb / 4u + c]; }
+            let w = load4(n0 + row, kb / 4u + c);
+            let o = row * 32u + c * 4u;
+            xs[o] = f16(v.x);
+            xs[o + 1u] = f16(v.y);
+            xs[o + 2u] = f16(v.z);
+            xs[o + 3u] = f16(v.w);
+            wsm[o] = f16(w.x);
+            wsm[o + 1u] = f16(w.y);
+            wsm[o + 2u] = f16(w.z);
+            wsm[o + 3u] = f16(w.w);
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk += 16u) {
+            // Indices are bound to `let`s: naga 30 does not emit index expressions written
+            // inline in cooperative load/store pointers.
+            let i0 = kk;
+            let i1 = 512u + kk;
+            let i2 = 1024u + kk;
+            let i3 = 1536u + kk;
+            let ib = s0 * 512u + kk;
+            let ib2 = s1 * 512u + kk;
+            let a0 = coopLoadT<coop_mat16x16<f16, A>>(&xs[i0], 32u);
+            let a1 = coopLoadT<coop_mat16x16<f16, A>>(&xs[i1], 32u);
+            let a2 = coopLoadT<coop_mat16x16<f16, A>>(&xs[i2], 32u);
+            let a3 = coopLoadT<coop_mat16x16<f16, A>>(&xs[i3], 32u);
+            // B[k][n] = W[n][k]: column-major with stride 32.
+            let b = coopLoad<coop_mat16x16<f16, B>>(&wsm[ib], 32u);
+            c0 = coopMultiplyAdd(a0, b, c0);
+            c1 = coopMultiplyAdd(a1, b, c1);
+            c2 = coopMultiplyAdd(a2, b, c2);
+            c3 = coopMultiplyAdd(a3, b, c3);
+            if (two) {
+                let b2 = coopLoad<coop_mat16x16<f16, B>>(&wsm[ib2], 32u);
+                d0 = coopMultiplyAdd(a0, b2, d0);
+                d1 = coopMultiplyAdd(a1, b2, d1);
+                d2 = coopMultiplyAdd(a2, b2, d2);
+                d3 = coopMultiplyAdd(a3, b2, d3);
+            }
+        }
+        workgroupBarrier();
+    }
+    // naga 30 does not emit the loads of a `var` or of `p.n` used directly as
+    // coopStore arguments ("Expression is not cached"), so bind them to `let`s first.
+    let ldy = p.n;
+    let col0 = n0 + s0 * 16u;
+    let col1 = n0 + s1 * 16u;
+    let o0 = t0 * ldy + col0;
+    let o1 = (t0 + 16u) * ldy + col0;
+    let o2 = (t0 + 32u) * ldy + col0;
+    let o3 = (t0 + 48u) * ldy + col0;
+    let q0 = t0 * ldy + col1;
+    let q1 = (t0 + 16u) * ldy + col1;
+    let q2 = (t0 + 32u) * ldy + col1;
+    let q3 = (t0 + 48u) * ldy + col1;
+    let r0 = c0;
+    let r1 = c1;
+    let r2 = c2;
+    let r3 = c3;
+    let e0 = d0;
+    let e1 = d1;
+    let e2 = d2;
+    let e3 = d3;
+    coopStoreT(r0, &y[o0], ldy);
+    coopStoreT(r1, &y[o1], ldy);
+    coopStoreT(r2, &y[o2], ldy);
+    coopStoreT(r3, &y[o3], ldy);
+    if (two) {
+        coopStoreT(e0, &y[q0], ldy);
+        coopStoreT(e1, &y[q1], ldy);
+        coopStoreT(e2, &y[q2], ldy);
+        coopStoreT(e3, &y[q3], ldy);
+    }
+}
+"#;

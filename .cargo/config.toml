@@ -1,0 +1,4 @@
+# Built for the machine that runs the server (AVX-512 / F16C on the Ryzen 8745H).
+# For a portable client binary, build with RUSTFLAGS="" or --config to override.
+[build]
+rustflags = ["-C", "target-cpu=native"]
