@@ -66,16 +66,42 @@ pub struct DraftOptions {
     pub quant: Quant,
 }
 
+/// How to load and run the model.
+#[derive(Debug, Clone)]
+pub struct LoadOptions {
+    pub backend: BackendKind,
+    pub quant: Quant,
+    pub draft: Option<DraftOptions>,
+    /// Keep the GPU prefill GEMM in f32 instead of using the matrix cores.
+    pub prefill_f32: bool,
+    /// Reuse the KV of finished requests for prompts sharing a prefix.
+    pub prefix_cache: bool,
+    /// KV arena size in tokens (per model).
+    pub kv_tokens: usize,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        LoadOptions {
+            backend: BackendKind::Auto,
+            quant: Quant::Q8,
+            draft: None,
+            prefill_f32: false,
+            prefix_cache: true,
+            kv_tokens: yakusel_model::DEFAULT_KV_TOKENS,
+        }
+    }
+}
+
+fn prepare<B: yakusel_model::Backend>(mut m: Model<B>, o: &LoadOptions) -> Result<Model<B>> {
+    m.prefix_cache = o.prefix_cache;
+    m.init_kv(o.kv_tokens, yakusel_model::DEFAULT_MAX_POS)?;
+    Ok(m)
+}
+
 /// Loads the model (and optional draft model) on the requested backend.
-/// `prefill_f32` keeps the GPU prefill GEMM in f32 instead of using the matrix cores.
-pub fn load_generator(
-    dir: &Path,
-    kind: BackendKind,
-    quant: Quant,
-    draft: Option<&DraftOptions>,
-    prefill_f32: bool,
-) -> Result<Box<dyn Generator>> {
-    let gpu = match kind {
+pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>> {
+    let gpu = match o.backend {
         BackendKind::Cpu => None,
         BackendKind::Vulkan => Some(WgpuBackend::new()?),
         BackendKind::Auto => match WgpuBackend::new() {
@@ -86,45 +112,45 @@ pub fn load_generator(
             }
         },
     };
-    let draft = if gpu.is_none() && draft.is_some() {
+    let draft = if gpu.is_none() && o.draft.is_some() {
         // The CPU matmul gains nothing from verifying several rows at once, so drafting
         // only adds work (measured 18.5 -> 14.6 tok/s on the 2B).
         tracing::info!("speculative decoding is disabled on the CPU backend (it is slower there)");
         None
     } else {
-        draft
+        o.draft.as_ref()
     };
     let Some(gpu) = gpu else {
         yakusel_backend_cpu::init_threads();
+        let target = prepare(Model::load(dir, CpuBackend::new(), o.quant)?, o)?;
         return Ok(match draft {
-            None => Box::new(Model::load(dir, CpuBackend::new(), quant)?),
+            None => Box::new(target),
             Some(d) => Box::new(Speculative::new(
-                Model::load(dir, CpuBackend::new(), quant)?,
-                Model::load(&d.dir, CpuBackend::new(), d.quant)?,
+                target,
+                prepare(Model::load(&d.dir, CpuBackend::new(), d.quant)?, o)?,
                 d.k,
             )?),
         });
     };
     // One device for the target and the draft model.
-    if prefill_f32 {
+    if o.prefill_f32 {
         gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
     }
     Ok(match draft {
-        None => Box::new(Model::load(dir, gpu, quant)?),
+        None => Box::new(prepare(Model::load(dir, gpu, o.quant)?, o)?),
         Some(d) => {
             let draft_gpu = gpu.share();
-            Box::new(Speculative::new(Model::load(dir, gpu, quant)?, Model::load(&d.dir, draft_gpu, d.quant)?, d.k)?)
+            let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
+            let draft = prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?;
+            Box::new(Speculative::new(target, draft, d.k)?)
         }
     })
 }
 
 pub struct ServeOptions {
     pub model_dir: PathBuf,
-    pub prefill_f32: bool,
-    pub draft: Option<DraftOptions>,
-    pub backend: BackendKind,
+    pub load: LoadOptions,
     pub model_name: String,
-    pub quant: Quant,
     pub listen: SocketAddr,
     /// Bearer token; generated and stored in `config_dir/token` when `None`.
     pub token: Option<String>,
@@ -347,12 +373,12 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
 
     let tok = Arc::new(Tokenizer::from_file(opts.model_dir.join("tokenizer.jsonl"))?);
     let t0 = Instant::now();
-    let model = load_generator(&opts.model_dir, opts.backend, opts.quant, opts.draft.as_ref(), opts.prefill_f32)
+    let model = load_generator(&opts.model_dir, &opts.load)
         .with_context(|| format!("loading model from {}", opts.model_dir.display()))?;
     tracing::info!(
         "loaded {} ({:?}, {:.2} GB) on {} in {:.2?}",
         opts.model_name,
-        opts.quant,
+        opts.load.quant,
         model.weight_bytes() as f64 / 1e9,
         model.backend_name(),
         t0.elapsed()
@@ -361,7 +387,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         status: "ok".into(),
         model: opts.model_name.clone(),
         backend: model.backend_name(),
-        quant: format!("{:?}", opts.quant).to_lowercase(),
+        quant: format!("{:?}", opts.load.quant).to_lowercase(),
         queue: 0,
     };
 

@@ -106,7 +106,23 @@ const store = {
   get(k, d) { try { return localStorage.getItem("yakusel." + k) ?? d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem("yakusel." + k, v); } catch {} },
 };
-const HISTORY_PAIRS = 2;
+// History sent with each paragraph: the kept part starts at a fixed paragraph and is cut
+// (to the newest quarter of the budget) only when it exceeds the budget, so consecutive
+// prompts share a prefix the server can reuse. Same policy as yakusel_api::HistoryWindow.
+const HISTORY_CHARS = 4000;
+function historyWindow(budget) {
+  let start = 0;
+  const size = (p) => [...p.source].length + [...p.target].length;
+  return (all) => {
+    start = Math.min(start, all.length);
+    if (all.slice(start).reduce((n, p) => n + size(p), 0) > budget) {
+      let s = all.length - 1, kept = size(all[s]);
+      while (s > start && kept + size(all[s - 1]) <= budget / 4) { s--; kept += size(all[s]); }
+      start = s;
+    }
+    return all.slice(start);
+  };
+}
 let controller = null;
 
 function setStatus(text, isErr) {
@@ -213,6 +229,7 @@ async function run() {
   const out = $("output");
   out.value = "";
   const done = [];
+  const selectHistory = historyWindow(HISTORY_CHARS);
   let tokens = 0, decodeTokens = 0, decodeMs = 0;
   const t0 = performance.now();
   try {
@@ -221,7 +238,7 @@ async function run() {
       const prefix = done.map((d) => d.target).join("\n\n") + (done.length ? "\n\n" : "");
       $("stats").textContent = `${k + 1} / ${paras.length} 段落を翻訳中…`;
       const usage = await translateOne(
-        { ...base, text: p, history: done.slice(-HISTORY_PAIRS) },
+        { ...base, text: p, history: selectHistory(done) },
         (d) => { cur += d; out.value = prefix + cur; },
         controller.signal,
       );

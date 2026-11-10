@@ -37,6 +37,12 @@ pub struct ModelArgs {
     /// Maximum tokens the draft model proposes per step.
     #[arg(long, default_value_t = 5)]
     draft_k: usize,
+    /// Do not reuse the KV of earlier requests (prefix cache).
+    #[arg(long)]
+    no_kv_cache: bool,
+    /// KV arena size in tokens, per model.
+    #[arg(long, default_value_t = yakusel_model::DEFAULT_KV_TOKENS)]
+    kv_tokens: usize,
     /// Weight format of the draft model: q4 or q8. Affects speed only, never the output.
     #[arg(long, default_value = "q4")]
     draft_quant: Quant,
@@ -66,14 +72,19 @@ impl ModelArgs {
         resolve_model(&self.model)
     }
 
+    fn load_options(&self) -> Result<yakusel_server::LoadOptions> {
+        Ok(yakusel_server::LoadOptions {
+            backend: self.backend,
+            quant: self.quant,
+            draft: self.draft_options()?,
+            prefill_f32: self.prefill_precision == "f32",
+            prefix_cache: !self.no_kv_cache,
+            kv_tokens: self.kv_tokens,
+        })
+    }
+
     fn load(&self, dir: &Path) -> Result<Box<dyn yakusel_model::Generator>> {
-        yakusel_server::load_generator(
-            dir,
-            self.backend,
-            self.quant,
-            self.draft_options()?.as_ref(),
-            self.prefill_precision == "f32",
-        )
+        yakusel_server::load_generator(dir, &self.load_options()?)
     }
 }
 
@@ -163,12 +174,9 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         .init();
     let (model_dir, model_name) = a.model.resolve()?;
     yakusel_server::serve(yakusel_server::ServeOptions {
-        draft: a.model.draft_options()?,
-        prefill_f32: a.model.prefill_precision == "f32",
+        load: a.model.load_options()?,
         model_dir,
-        backend: a.model.backend,
         model_name,
-        quant: a.model.quant,
         listen: a.listen,
         token: a.token,
         cert: a.cert,
@@ -337,14 +345,20 @@ enum BenchKind {
         file: Option<PathBuf>,
         #[arg(long, default_value = "en")]
         to: String,
-        /// Previous paragraphs passed as history.
-        #[arg(long, default_value_t = crate::HISTORY_PAIRS)]
-        history: usize,
+        /// History budget in characters (see `translate --history-chars`).
+        #[arg(long, default_value_t = yakusel_api::DEFAULT_HISTORY_CHARS)]
+        history_chars: usize,
+        /// Instead: a sliding window of the last N paragraphs (the pre-v2 behaviour).
+        #[arg(long)]
+        history_pairs: Option<usize>,
         #[arg(long, default_value_t = 14)]
         max_paragraphs: usize,
         /// Write the translations here, one paragraph per line.
         #[arg(long)]
         save: Option<PathBuf>,
+        /// Print a line per paragraph.
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -361,8 +375,8 @@ pub fn bench(a: BenchArgs) -> Result<()> {
             bench_decode(model, prompt_tokens, gen_tokens, runs)
         }
         BenchKind::Set { model, file, save, compare } => bench_set(model, file, save, compare),
-        BenchKind::Doc { model, file, to, history, max_paragraphs, save } => {
-            bench_doc(model, file, to, history, max_paragraphs, save)
+        BenchKind::Doc { model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose } => {
+            bench_doc(model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose)
         }
     }
 }
@@ -505,9 +519,11 @@ fn bench_doc(
     m: ModelArgs,
     file: Option<PathBuf>,
     to: String,
-    history: usize,
+    history_chars: usize,
+    history_pairs: Option<usize>,
     max_paragraphs: usize,
     save: Option<PathBuf>,
+    verbose: bool,
 ) -> Result<()> {
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
@@ -520,20 +536,45 @@ fn bench_doc(
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
-    println!("{} paragraphs, {chars} characters, to {to}, history {history}", paras.len());
+    let policy = match history_pairs {
+        Some(n) => format!("last {n} pairs"),
+        None => format!("{history_chars} chars"),
+    };
+    println!("{} paragraphs, {chars} characters, to {to}, history {policy}", paras.len());
     let mut done: Vec<yakusel_api::Pair> = Vec::new();
+    let mut window = yakusel_api::HistoryWindow::new(history_chars);
     let mut stats = Vec::new();
+    let mut computed = Vec::new();
     let t0 = Instant::now();
     for p in &paras {
         let req = yakusel_api::TranslateRequest {
             text: p.clone(),
             target_lang: to.clone(),
-            history: done[done.len().saturating_sub(history)..].to_vec(),
+            history: match history_pairs {
+                Some(n) => done[done.len().saturating_sub(n)..].to_vec(),
+                None => window.select(&done).to_vec(),
+            },
             ..Default::default()
         };
         let (out, st) = run_request(model.as_mut(), &tok, &req, &mut |_| {})?;
         done.push(yakusel_api::Pair { source: p.clone(), target: out });
         stats.push(st);
+        computed.push(model.last_start().computed);
+        if verbose {
+            let src = tok.encode(p, false).len();
+            let out_ids = tok.encode(&done.last().unwrap().target, false).len();
+            println!(
+                "  #{:<2} history {:>2} pairs, prompt {:>4}, computed {:>4} (source {:>3}), generated {:>3} (re-encoded {:>3}), first token {:>4.0} ms",
+                done.len(),
+                req.history.len(),
+                st.prompt_tokens,
+                model.last_start().computed,
+                src,
+                st.generated,
+                out_ids,
+                st.prefill.as_secs_f64() * 1e3
+            );
+        }
     }
     let wall = t0.elapsed().as_secs_f64();
     let sum = |f: &dyn Fn(&RunStats) -> f64| stats.iter().map(f).sum::<f64>();
@@ -554,6 +595,12 @@ fn bench_doc(
         "time to first token: mean {:.0} ms (paragraphs 2+: {:.0} ms)",
         1e3 * pf / n,
         1e3 * later.iter().sum::<f64>() / later.len().max(1) as f64
+    );
+    let comp: usize = computed.iter().sum();
+    println!(
+        "prompt tokens computed {comp} of {prompt:.0} ({:.0}% reused), {:.0} per paragraph",
+        100.0 * (1.0 - comp as f64 / prompt),
+        comp as f64 / n
     );
     if let Some(s) = model.stats() {
         println!("speculative: {s}");

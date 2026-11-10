@@ -141,6 +141,51 @@ pub const LANGUAGES: &[(&str, &str)] = &[
     ("vi", "Vietnamese"),
 ];
 
+/// Default history budget in characters (sources and translations of the kept pairs).
+pub const DEFAULT_HISTORY_CHARS: usize = 4000;
+
+/// Chooses the history sent with each segment of a document.
+///
+/// The kept history starts at a fixed pair and only moves forward when it exceeds the
+/// budget; it then keeps just the newest pairs fitting in a quarter of the budget.
+/// Consecutive prompts therefore share a long prefix, which the server reuses instead of
+/// recomputing (a sliding window of the last N pairs would change the prefix on every
+/// segment). Each move costs one recomputation of the kept quarter, so moving rarely and
+/// keeping little is cheapest: about a third of a pair per segment on average.
+#[derive(Debug, Clone)]
+pub struct HistoryWindow {
+    start: usize,
+    /// Budget in characters; 0 disables the history.
+    pub budget_chars: usize,
+}
+
+impl HistoryWindow {
+    pub fn new(budget_chars: usize) -> Self {
+        HistoryWindow { start: 0, budget_chars }
+    }
+
+    /// The pairs of `all` (every earlier segment, oldest first) to send now.
+    pub fn select<'a>(&mut self, all: &'a [Pair]) -> &'a [Pair] {
+        if self.budget_chars == 0 {
+            return &all[all.len()..];
+        }
+        let chars = |p: &Pair| p.source.chars().count() + p.target.chars().count();
+        self.start = self.start.min(all.len());
+        let total: usize = all[self.start..].iter().map(chars).sum();
+        if total > self.budget_chars {
+            // Keep the newest pairs within a quarter of the budget (at least one).
+            let mut start = all.len() - 1;
+            let mut kept = chars(&all[start]);
+            while start > self.start && kept + chars(&all[start - 1]) <= self.budget_chars / 4 {
+                start -= 1;
+                kept += chars(&all[start]);
+            }
+            self.start = start;
+        }
+        &all[self.start..]
+    }
+}
+
 /// Splits text into paragraphs (separated by blank lines) for segment-wise translation.
 /// Lines inside a paragraph keep their line breaks; translations are joined with `\n\n`.
 pub fn split_paragraphs(text: &str) -> Vec<String> {
@@ -170,6 +215,19 @@ mod tests {
     fn languages_match_model_card() {
         // 53 languages + the ja-easy variant.
         assert_eq!(LANGUAGES.len(), 54);
+    }
+
+    #[test]
+    fn history_window_moves_in_halves() {
+        let pair = |n: usize| Pair { source: "x".repeat(n), target: String::new() };
+        let all: Vec<Pair> = (0..10).map(|_| pair(100)).collect();
+        let mut w = HistoryWindow::new(800);
+        assert_eq!(w.select(&all[..8]).len(), 8);
+        // 9 pairs (900 chars) exceed the budget: keep the newest within 200 chars.
+        assert_eq!(w.select(&all[..9]).len(), 2);
+        // The start stays put while the window fits.
+        assert_eq!(w.select(&all[..10]).len(), 3);
+        assert_eq!(HistoryWindow::new(0).select(&all).len(), 0);
     }
 
     #[test]

@@ -175,6 +175,8 @@ pub struct SeqId(u64);
 struct Seq {
     pages: Vec<u32>,
     len: usize,
+    /// The tokens consumed so far (`tokens.len() == len`), for prefix matching.
+    tokens: Vec<u32>,
 }
 
 /// Page allocation with reference counts (shared prefixes).
@@ -210,6 +212,23 @@ struct KvState<B: Backend> {
     seqs: HashMap<SeqId, Seq>,
     next_id: u64,
     max_pos: usize,
+    /// Finished sequences kept for prefix reuse, with their last use (LRU).
+    cached: Vec<(SeqId, u64)>,
+    clock: u64,
+}
+
+/// Shortest common prefix worth reusing (shorter ones are recomputed).
+pub const MIN_REUSE: usize = 16;
+/// Finished sequences kept for reuse at most.
+pub const MAX_CACHED: usize = 32;
+
+/// How a prompt was started (for statistics and tests).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartInfo {
+    /// Prompt tokens whose KV came from a cached sequence.
+    pub reused: usize,
+    /// Prompt tokens processed now.
+    pub computed: usize,
 }
 
 /// Default KV arena size in tokens and maximum position.
@@ -226,6 +245,10 @@ pub struct Model<B: Backend> {
     /// Maximum rows per forward pass (prefill chunk).
     pub chunk: usize,
     kv: Option<KvState<B>>,
+    /// Keep finished sequences and reuse their KV for prompts sharing a prefix.
+    pub prefix_cache: bool,
+    /// Statistics of the last `start`.
+    pub last_start: StartInfo,
 }
 
 impl<B: Backend> Model<B> {
@@ -265,7 +288,18 @@ impl<B: Backend> Model<B> {
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
         let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;
-        Ok(Model { cfg, backend, embed, layers, norm, lm_head, chunk, kv: None })
+        Ok(Model {
+            cfg,
+            backend,
+            embed,
+            layers,
+            norm,
+            lm_head,
+            chunk,
+            kv: None,
+            prefix_cache: true,
+            last_start: StartInfo::default(),
+        })
     }
 
     /// Allocates the KV arena (`tokens` rounded up to pages). Called implicitly with the
@@ -274,7 +308,15 @@ impl<B: Backend> Model<B> {
         let pages = tokens.div_ceil(PAGE);
         let metas: Vec<LayerMeta> = self.layers.iter().map(|l| l.meta.clone()).collect();
         let kv = self.backend.new_kv(&self.cfg, &metas, pages, max_pos)?;
-        self.kv = Some(KvState { kv, pool: PagePool::new(pages), seqs: HashMap::new(), next_id: 0, max_pos });
+        self.kv = Some(KvState {
+            kv,
+            pool: PagePool::new(pages),
+            seqs: HashMap::new(),
+            next_id: 0,
+            max_pos,
+            cached: Vec::new(),
+            clock: 0,
+        });
         Ok(())
     }
 
@@ -295,12 +337,98 @@ impl<B: Backend> Model<B> {
     }
 
     pub fn free_seq(&mut self, id: SeqId) {
-        if let Some(kv) = self.kv.as_mut()
-            && let Some(s) = kv.seqs.remove(&id)
-        {
-            for p in s.pages {
-                kv.pool.release(p);
+        if let Some(kv) = self.kv.as_mut() {
+            kv.cached.retain(|(c, _)| *c != id);
+            if let Some(s) = kv.seqs.remove(&id) {
+                for p in s.pages {
+                    kv.pool.release(p);
+                }
             }
+        }
+    }
+
+    /// Evicts least recently used cached sequences until `n` pages are free (or the
+    /// cache is empty). Pages shared with live sequences are freed only when their last
+    /// owner goes.
+    fn ensure_free(&mut self, n: usize) {
+        loop {
+            let kv = self.kv.as_mut().unwrap();
+            if kv.pool.free.len() >= n || kv.cached.is_empty() {
+                return;
+            }
+            let (i, _) = kv.cached.iter().enumerate().min_by_key(|(_, (_, t))| *t).unwrap();
+            let (id, _) = kv.cached.remove(i);
+            self.free_seq(id);
+        }
+    }
+
+    /// Drops every cached sequence.
+    pub fn clear_prefix_cache(&mut self) {
+        let ids: Vec<SeqId> = self.kv.as_ref().map_or(vec![], |k| k.cached.iter().map(|c| c.0).collect());
+        for id in ids {
+            self.free_seq(id);
+        }
+    }
+
+    /// Starts a sequence for `prompt` and returns it with the logits after the last prompt
+    /// token. With the prefix cache, the KV of the longest common prefix with a cached
+    /// sequence is shared instead of recomputed (at least the last token is computed).
+    pub fn start(&mut self, prompt: &[u32]) -> Result<(SeqId, B::Tensor)> {
+        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+        self.kv()?;
+        let mut best: Option<(SeqId, usize)> = None;
+        if self.prefix_cache {
+            let kv = self.kv.as_ref().unwrap();
+            for (id, _) in &kv.cached {
+                let t = &kv.seqs[id].tokens;
+                let lcp = t.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+                if best.is_none_or(|(_, b)| lcp > b) {
+                    best = Some((*id, lcp));
+                }
+            }
+        }
+        let (id, reused) = match best {
+            Some((src, lcp)) if lcp.min(prompt.len() - 1) >= MIN_REUSE => {
+                let keep = lcp.min(prompt.len() - 1);
+                let kv = self.kv.as_mut().unwrap();
+                kv.clock += 1;
+                let now = kv.clock;
+                if let Some(e) = kv.cached.iter_mut().find(|(c, _)| *c == src) {
+                    e.1 = now;
+                }
+                self.ensure_free(1);
+                (self.fork(src, keep)?, keep)
+            }
+            _ => (self.new_seq()?, 0),
+        };
+        self.last_start = StartInfo { reused, computed: prompt.len() - reused };
+        match self.prefill(id, &prompt[reused..]) {
+            Ok(l) => Ok((id, l)),
+            Err(e) => {
+                self.free_seq(id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Ends a sequence: keeps it for prefix reuse (LRU, at most `MAX_CACHED`) or frees it.
+    pub fn finish(&mut self, id: SeqId) {
+        if !self.prefix_cache || self.seq_len(id) < MIN_REUSE {
+            self.free_seq(id);
+            return;
+        }
+        let kv = self.kv.as_mut().unwrap();
+        kv.clock += 1;
+        let now = kv.clock;
+        kv.cached.push((id, now));
+        loop {
+            let kv = self.kv.as_mut().unwrap();
+            if kv.cached.len() <= MAX_CACHED {
+                break;
+            }
+            let (i, _) = kv.cached.iter().enumerate().min_by_key(|(_, (_, t))| *t).unwrap();
+            let (old, _) = kv.cached.remove(i);
+            self.free_seq(old);
         }
     }
 
@@ -314,6 +442,7 @@ impl<B: Backend> Model<B> {
         let Some(s) = kv.seqs.get_mut(&id) else { return };
         assert!(len <= s.len, "truncate beyond the end");
         s.len = len;
+        s.tokens.truncate(len);
         let keep = len.div_ceil(PAGE);
         for p in s.pages.drain(keep..) {
             kv.pool.release(p);
@@ -333,11 +462,20 @@ impl<B: Backend> Model<B> {
             kv.pool.retain(p);
         }
         if len % PAGE != 0 {
-            let p = kv.pool.alloc().context("KV cache is full")?;
+            let p = match kv.pool.alloc() {
+                Some(p) => p,
+                None => {
+                    for &p in &pages {
+                        kv.pool.release(p);
+                    }
+                    kv.seqs.remove(&new);
+                    anyhow::bail!("KV cache is full");
+                }
+            };
             self.backend.copy_page(&mut kv.kv, src.pages[full], p);
             pages.push(p);
         }
-        kv.seqs.insert(new, Seq { pages, len });
+        kv.seqs.insert(new, Seq { pages, len, tokens: src.tokens[..len].to_vec() });
         Ok(new)
     }
 
@@ -349,6 +487,16 @@ impl<B: Backend> Model<B> {
     /// Makes positions `[len, len + n)` of `id` writable: allocates missing pages and
     /// copies shared ones (copy on write).
     fn reserve(&mut self, id: SeqId, n: usize) -> Result<()> {
+        // Pages that will be allocated: new ones plus shared ones to copy.
+        let need = {
+            let kv = self.kv.as_ref().unwrap();
+            let s = kv.seqs.get(&id).context("unknown sequence")?;
+            let (first, last) = (s.len / PAGE, (s.len + n).div_ceil(PAGE));
+            (first..last)
+                .filter(|&pi| pi >= s.pages.len() || kv.pool.refs[s.pages[pi] as usize] > 1)
+                .count()
+        };
+        self.ensure_free(need);
         let kv = self.kv.as_mut().unwrap();
         let s = kv.seqs.get_mut(&id).context("unknown sequence")?;
         let end = s.len + n;
@@ -397,6 +545,7 @@ impl<B: Backend> Model<B> {
                 meta.pt_off.push(off);
             }
             s.len += toks.len();
+            s.tokens.extend_from_slice(toks);
             last.push(meta.ids.len() - 1);
         }
         let b = &mut self.backend;
@@ -443,9 +592,9 @@ impl<B: Backend> Model<B> {
         stop: &[u32],
         mut on_token: impl FnMut(u32) -> bool,
     ) -> Result<Vec<u32>> {
-        let id = self.new_seq()?;
+        let (id, first) = self.start(prompt)?;
         let r = (|| {
-            let mut logits = self.prefill(id, prompt)?;
+            let mut logits = first;
             let mut out = Vec::new();
             while out.len() < max_new_tokens {
                 let next = self.backend.argmax(&logits);
@@ -460,7 +609,10 @@ impl<B: Backend> Model<B> {
             }
             Ok(out)
         })();
-        self.free_seq(id);
+        match r {
+            Ok(_) => self.finish(id),
+            Err(_) => self.free_seq(id),
+        }
         r
     }
 }
@@ -481,6 +633,8 @@ pub trait Generator: Send {
     fn stats(&self) -> Option<String> {
         None
     }
+    /// Prefix reuse of the last request (of the target model).
+    fn last_start(&self) -> StartInfo;
 }
 
 impl<B: Backend + Send> Generator for Model<B>
@@ -502,5 +656,8 @@ where
     }
     fn weight_bytes(&self) -> usize {
         self.backend.weight_bytes()
+    }
+    fn last_start(&self) -> StartInfo {
+        self.last_start
     }
 }

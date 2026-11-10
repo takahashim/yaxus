@@ -61,6 +61,8 @@ pub struct Kv {
     k: Vec<wgpu::Buffer>,
     v: Vec<wgpu::Buffer>,
     kv_dim: usize,
+    /// One page of scratch: WebGPU forbids copies within a buffer, so pages move through it.
+    scratch: wgpu::Buffer,
     /// cos/sin tables `[2][max_pos][head_dim/2]` for sliding and full-attention layers.
     rope_sliding: wgpu::Buffer,
     rope_full: wgpu::Buffer,
@@ -685,10 +687,17 @@ impl Gpu {
         let v = metas.iter().map(|_| mk("v")).collect();
         let sliding = metas.iter().find(|m| !m.full_attn).context("no sliding layer")?;
         let full = metas.iter().find(|m| m.full_attn).unwrap_or(sliding);
+        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kv-page-scratch"),
+            size: (PAGE * kv_dim * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Kv {
             k,
             v,
             kv_dim,
+            scratch,
             rope_sliding: self.rope_table(sliding, max_pos, cfg.head_dim),
             rope_full: self.rope_table(full, max_pos, cfg.head_dim),
         })
@@ -698,7 +707,8 @@ impl Gpu {
         let bytes = (PAGE * kv.kv_dim * 4) as u64;
         let enc = self.encoder();
         for b in kv.k.iter().chain(&kv.v) {
-            enc.copy_buffer_to_buffer(b, src as u64 * bytes, b, dst as u64 * bytes, bytes);
+            enc.copy_buffer_to_buffer(b, src as u64 * bytes, &kv.scratch, 0, bytes);
+            enc.copy_buffer_to_buffer(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
         }
     }
 

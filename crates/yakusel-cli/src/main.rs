@@ -35,8 +35,12 @@ struct LangArgs {
     glossary: Vec<String>,
     #[arg(long, default_value_t = DEFAULT_MAX_NEW_TOKENS)]
     max_new_tokens: usize,
+    /// History budget in characters: earlier paragraphs and their translations are sent
+    /// with each paragraph until this is exceeded (then the older half is dropped). 0 = none.
+    #[arg(long, default_value_t = yakusel_api::DEFAULT_HISTORY_CHARS)]
+    history_chars: usize,
     /// Text to translate (reads stdin if omitted). Paragraphs separated by blank lines
-    /// are translated one by one, each with the previous two as history.
+    /// are translated one by one, with earlier ones as history (see --history-chars).
     text: Option<String>,
 }
 
@@ -132,9 +136,6 @@ impl LangArgs {
     }
 }
 
-/// Number of previous paragraph translations passed as history.
-pub const HISTORY_PAIRS: usize = 2;
-
 /// Translates paragraph by paragraph, printing as it goes. `one` translates a single
 /// request, calling the callback with streamed pieces, and returns the full translation.
 fn translate_paragraphs(
@@ -148,6 +149,7 @@ fn translate_paragraphs(
     }
     let base = lang.base_request()?;
     let mut history: Vec<Pair> = Vec::new();
+    let mut window = yakusel_api::HistoryWindow::new(lang.history_chars);
     let mut stdout = std::io::stdout().lock();
     for (i, p) in paras.iter().enumerate() {
         if i > 0 {
@@ -155,7 +157,7 @@ fn translate_paragraphs(
         }
         let mut req = base.clone();
         req.text = p.clone();
-        req.history = history[history.len().saturating_sub(HISTORY_PAIRS)..].to_vec();
+        req.history = window.select(&history).to_vec();
         let out = one(&req, &mut |s| {
             let _ = stdout.write_all(s.as_bytes());
             let _ = stdout.flush();

@@ -47,37 +47,39 @@ impl<A: Backend, D: Backend> Speculative<A, D> {
         if max_new_tokens == 0 {
             return Ok(Vec::new());
         }
-        let ts = self.target.new_seq()?;
-        let ds = match self.draft.new_seq() {
-            Ok(d) => d,
-            Err(e) => {
-                self.target.free_seq(ts);
-                return Err(e);
+        let (ts, logits) = self.target.start(prompt)?;
+        let next = self.target.backend.argmax(&logits);
+        drop(logits);
+        let mut ds = None;
+        let r = self.run(ts, &mut ds, prompt, next, max_new_tokens, stop, &mut on_token);
+        let ok = r.is_ok();
+        for (m, id) in [(true, Some(ts)), (false, ds)] {
+            let Some(id) = id else { continue };
+            match (m, ok) {
+                (true, true) => self.target.finish(id),
+                (true, false) => self.target.free_seq(id),
+                (false, true) => self.draft.finish(id),
+                (false, false) => self.draft.free_seq(id),
             }
-        };
-        let r = self.run(ts, ds, prompt, max_new_tokens, stop, &mut on_token);
-        self.target.free_seq(ts);
-        self.draft.free_seq(ds);
+        }
         r
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
         ts: SeqId,
-        ds: SeqId,
+        ds_out: &mut Option<SeqId>,
         prompt: &[u32],
+        mut next: u32,
         max_new_tokens: usize,
         stop: &[u32],
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<Vec<u32>> {
         let mut out = Vec::new();
-        let logits = self.target.prefill(ts, prompt)?;
-        let mut next = self.target.backend.argmax(&logits);
-        drop(logits);
-        // The draft only needs the prompt in its cache.
-        drop(self.draft.prefill(ds, prompt)?);
         // Committed tokens the draft has not consumed yet.
         let mut pending: Vec<u32> = Vec::new();
+        let mut ds: Option<SeqId> = None;
 
         loop {
             // `next` is the target's greedy token; the target has not consumed it yet.
@@ -88,6 +90,17 @@ impl<A: Backend, D: Backend> Speculative<A, D> {
             if !on_token(next) || out.len() >= max_new_tokens {
                 return Ok(out);
             }
+            // The draft starts only after the first token is out, so it does not delay it.
+            let ds = match ds {
+                Some(d) => d,
+                None => {
+                    let (d, l) = self.draft.start(prompt)?;
+                    drop(l);
+                    *ds_out = Some(d);
+                    ds = Some(d);
+                    d
+                }
+            };
             pending.push(next);
             let base = self.target.seq_len(ts);
             debug_assert_eq!(self.draft.seq_len(ds) + pending.len(), base + 1);
@@ -162,6 +175,9 @@ where
     }
     fn weight_bytes(&self) -> usize {
         self.target.backend.weight_bytes() + self.draft.backend.weight_bytes()
+    }
+    fn last_start(&self) -> crate::StartInfo {
+        self.target.last_start
     }
     fn stats(&self) -> Option<String> {
         let s = &self.stats;
