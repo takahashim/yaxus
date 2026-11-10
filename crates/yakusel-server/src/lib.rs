@@ -106,12 +106,12 @@ fn prepare<B: yakusel_model::Backend>(mut m: Model<B>, o: &LoadOptions) -> Resul
 /// How the weights of `model` are stored, for display: the quantization, or for a GGUF
 /// file loaded with `auto` its main tensor type (`gguf Q4_K`).
 pub fn quant_label(model: &Path, quant: Quant) -> String {
-    if quant == Quant::Auto {
+    if matches!(quant, Quant::Auto | Quant::Auto4) {
         if yakusel_model::gguf::is_gguf(model) {
             let main = yakusel_model::gguf::Gguf::open(model).ok().and_then(|g| g.main_type());
             return format!("gguf {}", main.map_or("?", |t| t.name()));
         }
-        return "q8".into();
+        return if quant == Quant::Auto { "q8" } else { "q4" }.into();
     }
     format!("{quant:?}").to_lowercase()
 }

@@ -1114,6 +1114,112 @@ fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec
 }
 "#;
 
+/// Weight access for `[N, K]` Q3 matrices (GGUF Q3_K): 3 u32 per 32 values (2 of low
+/// 2-bit fields, 1 of high bits), scales as for Q6.
+pub const W_Q3: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn q3scale(row: u32, blk: u32) -> f32 {
+    let b = row * sstride(p.k / 16u) + blk;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    return select(s2.x, s2.y, (b & 1u) == 1u);
+}
+fn q3x4(lo: u32, hi: u32) -> vec4<f32> {
+    let q = (vec4<u32>(lo, lo >> 2u, lo >> 4u, lo >> 6u) & vec4<u32>(3u))
+          | ((vec4<u32>(hi, hi >> 1u, hi >> 2u, hi >> 3u) & vec4<u32>(1u)) << vec4<u32>(2u));
+    return vec4<f32>(q) - 4.0;
+}
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let g = row * (3u * p.k / 32u) + (i / 8u) * 3u;
+    let lo = wq[g + (i % 8u) / 4u] >> (8u * (i & 3u));
+    let hi = wq[g + 2u] >> (4u * (i % 8u));
+    return q3x4(lo, hi) * q3scale(row, i / 4u);
+}
+"#;
+
+pub const W_Q3_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per row: K / 256 f16 `d`, then K / 16 int8 scales (`q6_meta_stride` on the host).
+fn q3scale(row: u32, blk: u32) -> f32 {
+    let hb = p.k / 256u;
+    var rs = (18u * hb + 3u) / 4u;
+    rs += select(0u, 4u, (rs * 4u) % 512u == 0u);
+    let base = row * rs;
+    let d = unpack2x16float(wsc[base + blk / 32u])[(blk / 16u) & 1u];
+    let off = 2u * hb + blk;
+    let sc = extractBits(bitcast<i32>(wsc[base + off / 4u]), 8u * (off % 4u), 8u);
+    return d * f32(sc);
+}
+fn q3x4(lo: u32, hi: u32) -> vec4<f32> {
+    let q = (vec4<u32>(lo, lo >> 2u, lo >> 4u, lo >> 6u) & vec4<u32>(3u))
+          | ((vec4<u32>(hi, hi >> 1u, hi >> 2u, hi >> 3u) & vec4<u32>(1u)) << vec4<u32>(2u));
+    return vec4<f32>(q) - 4.0;
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let g = row * (3u * p.k / 32u) + (j / 2u) * 3u;
+    let lo = wq[g + (j & 1u)];
+    let h = wq[g + 2u] >> (16u * (j & 1u));
+    let s = q3scale(row, j);
+    return array<vec4<f32>, 4>(q3x4(lo, h) * s, q3x4(lo >> 8u, h >> 4u) * s, q3x4(lo >> 16u, h >> 8u) * s, q3x4(lo >> 24u, h >> 12u) * s);
+}
+// One scale per 16 values: it multiplies the sum, not every weight.
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let g = row * (3u * p.k / 32u) + (j / 2u) * 3u;
+    let lo = wq[g + (j & 1u)];
+    let h = wq[g + 2u] >> (16u * (j & 1u));
+    let d = dot(q3x4(lo, h), x0) + dot(q3x4(lo >> 8u, h >> 4u), x1)
+          + dot(q3x4(lo >> 16u, h >> 8u), x2) + dot(q3x4(lo >> 24u, h >> 12u), x3);
+    return d * q3scale(row, j);
+}
+"#;
+
+/// Weight access for `[N, K]` Q2 matrices (GGUF Q2_K): 16 values per u32, weight =
+/// `q * scale - min`. The decode kernels (`W_Q2_16`) read both as in Q2_K (two f16 per 256,
+/// two nibbles per 16); the prefill ones (`W_Q2`) a pair of f16 per 16.
+pub const W_Q2: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row pairs, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let u = wq[row * (p.k / 16u) + i / 4u] >> (8u * (i & 3u));
+    let sm = unpack2x16float(wsc[row * sstride(p.k / 16u) + i / 4u]);
+    return vec4<f32>(vec4<u32>(u, u >> 2u, u >> 4u, u >> 6u) & vec4<u32>(3u)) * sm.x - sm.y;
+}
+"#;
+
+pub const W_Q2_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per row: K / 256 pairs of f16 (`d`, `dmin`), then K / 16 bytes of scale | min << 4.
+fn q2sm(row: u32, blk: u32) -> vec2<f32> {
+    let hb = p.k / 256u;
+    let base = row * 5u * hb;
+    let dd = unpack2x16float(wsc[base + blk / 16u]);
+    let b = wsc[base + hb + blk / 4u] >> (8u * (blk % 4u));
+    return dd * vec2<f32>(f32(b & 15u), f32((b >> 4u) & 15u));
+}
+fn q2x4(u: u32) -> vec4<f32> {
+    return vec4<f32>(vec4<u32>(u, u >> 2u, u >> 4u, u >> 6u) & vec4<u32>(3u));
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let u = wq[row * (p.k / 16u) + j];
+    let sm = q2sm(row, j);
+    return array<vec4<f32>, 4>(q2x4(u) * sm.x - sm.y, q2x4(u >> 8u) * sm.x - sm.y,
+                               q2x4(u >> 16u) * sm.x - sm.y, q2x4(u >> 24u) * sm.x - sm.y);
+}
+// sum((q * s - m) * x) = s * sum(q * x) - m * sum(x).
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let u = wq[row * (p.k / 16u) + j];
+    let sm = q2sm(row, j);
+    let d = dot(q2x4(u), x0) + dot(q2x4(u >> 8u), x1) + dot(q2x4(u >> 16u), x2) + dot(q2x4(u >> 24u), x3);
+    return sm.x * d - sm.y * dot(x0 + x1 + x2 + x3, vec4<f32>(1.0));
+}
+"#;
+
 
 /// Split-key attention for passes with few rows (decode, verification), part 1 of 2.
 /// One workgroup of 128 per (row, KV head, chunk of 64 keys): it handles all

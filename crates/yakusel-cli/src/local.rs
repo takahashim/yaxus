@@ -34,7 +34,8 @@ pub struct ModelArgs {
     #[arg(long, default_value = "f16", value_parser = ["f16", "f32"])]
     prefill_precision: String,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
-    /// `auto` (use pfnet/plamo-3-translate-0.8b when it is in the local cache) or `none`.
+    /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
+    /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
     /// The output is identical with or without it; only the speed differs.
     #[arg(long, default_value = "auto")]
     draft: String,
@@ -57,8 +58,9 @@ pub struct ModelArgs {
     /// Most requests advanced by one decode pass.
     #[arg(long, default_value_t = 8)]
     decode_rows: usize,
-    /// Weight format of the draft model: q4 or q8. Affects speed only, never the output.
-    #[arg(long, default_value = "q4")]
+    /// Weight format of the draft model: auto4 (GGUF tensors of up to 4 bits as in the file,
+    /// everything else q4), q4 or q8. Affects speed only, never the output.
+    #[arg(long, default_value = "auto4")]
     draft_quant: Quant,
 }
 
@@ -67,7 +69,12 @@ impl ModelArgs {
         const AUTO_DRAFT: &str = "pfnet/plamo-3-translate-0.8b";
         let dir = match self.draft.as_str() {
             "none" => return Ok(None),
-            "auto" => match resolve_model(AUTO_DRAFT).or_else(|_| resolve_model("0.8b:Q4_K_M")) {
+            // The 2-bit GGUF first: its steps are 1.27x faster than the checkpoint's at 4 bits
+            // and about as many of its tokens are accepted (DESIGN.md 11.32).
+            "auto" => match resolve_model("0.8b:Q2_K")
+                .or_else(|_| resolve_model(AUTO_DRAFT))
+                .or_else(|_| resolve_model("0.8b:Q4_K_M"))
+            {
                 Ok((d, _)) => d,
                 Err(_) => return Ok(None),
             },
@@ -78,13 +85,7 @@ impl ModelArgs {
         if same(&dir, &target) {
             return Ok(None); // the target is the draft model itself
         }
-        // A GGUF draft in Q4_K etc. is already 4-bit: keep it rather than quantizing twice.
-        let quant = if yakusel_model::gguf::is_gguf(&dir) && self.draft_quant == Quant::Q4 {
-            Quant::Auto
-        } else {
-            self.draft_quant
-        };
-        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, quant }))
+        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, quant: self.draft_quant }))
     }
 
     /// Returns (directory, display name).

@@ -224,8 +224,10 @@ impl Backend for CpuBackend {
     fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
         let w = match (quant, t.as_bf16()) {
             (Quant::Q4, _) => anyhow::bail!("q4 weights are only supported on the Vulkan backend"),
-            (Quant::Q8 | Quant::Auto, Some(b)) => Weight::Q8(Q8Matrix::quantize(b, &t.shape)),
-            (Quant::Q8 | Quant::Auto, None) => Weight::Q8(Q8Matrix::quantize(&t.to_bf16_vec(), &t.shape)),
+            (Quant::Q8 | Quant::Auto | Quant::Auto4, Some(b)) => Weight::Q8(Q8Matrix::quantize(b, &t.shape)),
+            (Quant::Q8 | Quant::Auto | Quant::Auto4, None) => {
+                Weight::Q8(Q8Matrix::quantize(&t.to_bf16_vec(), &t.shape))
+            }
             (Quant::Bf16, Some(_)) => Weight::Mapped(t.clone()),
             (Quant::Bf16, None) => Weight::Owned(t.to_bf16_vec(), t.shape.clone()),
         };

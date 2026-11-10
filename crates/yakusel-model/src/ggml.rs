@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use half::f16;
 use rayon::prelude::*;
 
-use crate::quant::{Q4Data, Q4KData, Q6Data, Q8Data};
+use crate::quant::{Q2Data, Q3Data, Q4Data, Q4KData, Q6Data, Q8Data};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
@@ -339,6 +339,98 @@ pub fn q6_from_q6_k(bytes: &[u8], n: usize, k: usize) -> Q6Data {
     Q6Data { qs, meta, scales16 }
 }
 
+/// The 256 2-bit values of a Q2_K block in element order.
+fn q2k_values(b: &[u8]) -> [u8; 256] {
+    let qs = &b[16..80];
+    let mut out = [0u8; 256];
+    for (e, o) in out.iter_mut().enumerate() {
+        let (n, r) = (e / 128, e % 128);
+        *o = (qs[32 * n + r % 32] >> (2 * (r / 32))) & 3;
+    }
+    out
+}
+
+/// Q2_K as [`Q2Data`] for an `[n, k]` matrix: the same values.
+pub fn q2_from_q2_k(bytes: &[u8], n: usize, k: usize) -> Q2Data {
+    let bpr = k / 256;
+    let (row_bytes, ms) = (k / 4, 20 * bpr);
+    let mut qs = vec![0u8; n * row_bytes];
+    let mut meta = vec![0u8; n * ms];
+    let mut pairs16 = vec![f16::ZERO; n * k / 8];
+    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(pairs16.par_chunks_mut(k / 8));
+    rows.enumerate().for_each(|(r, ((q, m), p16))| {
+        for blk in 0..bpr {
+            let b = &bytes[(r * bpr + blk) * 84..][..84];
+            m[4 * blk..4 * blk + 4].copy_from_slice(&b[80..84]);
+            m[4 * bpr + 16 * blk..4 * bpr + 16 * blk + 16].copy_from_slice(&b[0..16]);
+            let (d, dmin) = (h(b, 80), h(b, 82));
+            for g in 0..16 {
+                let sc = b[g];
+                p16[2 * (16 * blk + g)] = f16::from_f32(d * (sc & 0xF) as f32);
+                p16[2 * (16 * blk + g) + 1] = f16::from_f32(dmin * (sc >> 4) as f32);
+            }
+            for (i, v) in q2k_values(b).into_iter().enumerate() {
+                let e = blk * 256 + i;
+                q[e / 4] |= v << (2 * (e % 4));
+            }
+        }
+    });
+    Q2Data { qs, meta, pairs16 }
+}
+
+/// The 256 `(q - 4, scale - 32)` pairs of a Q3_K block in element order.
+fn q3k_values(b: &[u8]) -> Vec<(i8, i8)> {
+    let (hm, qs, raw) = (&b[0..32], &b[32..96], &b[96..108]);
+    let mut aux = [0u32; 4];
+    for (i, a) in aux.iter_mut().enumerate().take(3) {
+        *a = u32::from_le_bytes([raw[4 * i], raw[4 * i + 1], raw[4 * i + 2], raw[4 * i + 3]]);
+    }
+    let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & k2) | (((tmp >> 4) & k1) << 4);
+    aux[3] = ((aux[1] >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+    aux[0] = (aux[0] & k2) | ((tmp & k1) << 4);
+    aux[1] = (aux[1] & k2) | (((tmp >> 2) & k1) << 4);
+    let scales: Vec<i8> = aux.iter().flat_map(|a| a.to_le_bytes()).map(|x| x as i8 - 32).collect();
+    (0..256)
+        .map(|e| {
+            let (n, r) = (e / 128, e % 128);
+            let (j, idx) = (r / 32, r % 32);
+            let lo = (qs[32 * n + idx] >> (2 * j)) & 3;
+            let hi = (hm[idx] >> (4 * n + j)) & 1;
+            ((lo | (hi << 2)) as i8 - 4, scales[e / 16])
+        })
+        .collect()
+}
+
+/// Q3_K as [`Q3Data`] for an `[n, k]` matrix: the same values.
+pub fn q3_from_q3_k(bytes: &[u8], n: usize, k: usize) -> Q3Data {
+    let bpr = k / 256;
+    let row_bytes = 3 * k / 8;
+    let ms = crate::quant::q6_meta_stride(k);
+    let mut qs = vec![0u8; n * row_bytes];
+    let mut meta = vec![0u8; n * ms];
+    let mut scales16 = vec![f16::ZERO; n * k / 16];
+    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(scales16.par_chunks_mut(k / 16));
+    rows.enumerate().for_each(|(r, ((q, m), s16))| {
+        for blk in 0..bpr {
+            let b = &bytes[(r * bpr + blk) * 110..][..110];
+            m[2 * blk..2 * blk + 2].copy_from_slice(&b[108..110]);
+            let d = h(b, 108);
+            for (i, (v, sc)) in q3k_values(b).into_iter().enumerate() {
+                let e = blk * 256 + i;
+                let (g, o) = (e / 32, e % 32);
+                let u = (v + 4) as u8;
+                q[12 * g + o / 4] |= (u & 3) << (2 * (o % 4));
+                q[12 * g + 8 + o / 8] |= (u >> 2) << (o % 8);
+                m[2 * bpr + e / 16] = sc as u8;
+                s16[e / 16] = f16::from_f32(d * sc as f32);
+            }
+        }
+    });
+    Q3Data { qs, meta, scales16 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +475,48 @@ mod tests {
             let sc = m[2 * (k / 256) + c / 16] as i8 as f32;
             let got = ((lo | (hi << 4)) as f32 - 32.0) * (d * sc);
             assert_eq!(got, w, "{e}");
+        }
+    }
+
+    #[test]
+    fn q2_and_q3_layouts_match_dequant() {
+        let (n, k) = (2usize, 512usize);
+        // Q2_K: two rows of two blocks.
+        let mut b: Vec<u8> = (0..4 * 84u32).map(|i| (i.wrapping_mul(2654435761) >> 9) as u8).collect();
+        for blk in 0..4 {
+            b[84 * blk + 80..84 * blk + 82].copy_from_slice(&f16::from_f32(0.01).to_le_bytes());
+            b[84 * blk + 82..84 * blk + 84].copy_from_slice(&f16::from_f32(0.004).to_le_bytes());
+        }
+        let want = dequantize(GgmlType::Q2K, &b, n * k);
+        let p = q2_from_q2_k(&b, n, k);
+        for (e, &w) in want.iter().enumerate() {
+            let (r, c) = (e / k, e % k);
+            let q = ((p.qs[r * k / 4 + c / 4] >> (2 * (c % 4))) & 3) as f32;
+            let m = &p.meta[r * 20 * (k / 256)..];
+            let (d, dmin) = (h(m, 4 * (c / 256)), h(m, 4 * (c / 256) + 2));
+            let sc = m[4 * (k / 256) + c / 16];
+            assert_eq!(d * (sc & 0xF) as f32 * q - dmin * (sc >> 4) as f32, w, "q2 {e}");
+            let (s16, m16) = (p.pairs16[2 * (e / 16)].to_f32(), p.pairs16[2 * (e / 16) + 1].to_f32());
+            // Each f16 product is within 2^-11 of its value.
+            assert!((q * s16 - m16 - w).abs() <= 1e-3 * (q * s16 + m16), "q2 pairs {e}");
+        }
+        // Q3_K.
+        let mut b: Vec<u8> = (0..4 * 110u32).map(|i| (i.wrapping_mul(2246822519) >> 10) as u8).collect();
+        for blk in 0..4 {
+            b[110 * blk + 108..110 * blk + 110].copy_from_slice(&f16::from_f32(0.003).to_le_bytes());
+        }
+        let want = dequantize(GgmlType::Q3K, &b, n * k);
+        let p = q3_from_q3_k(&b, n, k);
+        for (e, &w) in want.iter().enumerate() {
+            let (r, c) = (e / k, e % k);
+            let grp = &p.qs[r * 3 * k / 8 + 12 * (c / 32)..];
+            let o = c % 32;
+            let q = ((grp[o / 4] >> (2 * (o % 4))) & 3) | (((grp[8 + o / 8] >> (o % 8)) & 1) << 2);
+            let m = &p.meta[r * crate::quant::q6_meta_stride(k)..];
+            let d = h(m, 2 * (c / 256));
+            let sc = m[2 * (k / 256) + c / 16] as i8 as f32;
+            assert_eq!(d * sc * (q as f32 - 4.0), w, "q3 {e}");
+            assert!(((q as f32 - 4.0) * p.scales16[e / 16].to_f32() - w).abs() <= 2e-3 * w.abs().max(1e-2), "q3 s16 {e}");
         }
     }
 

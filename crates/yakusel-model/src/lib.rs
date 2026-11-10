@@ -28,9 +28,13 @@ pub enum Quant {
     /// As in the checkpoint (bf16), lossless.
     #[default]
     Bf16,
-    /// The file's own format where the backend can keep it (GGUF Q8_0, Q4_0, Q4_K, Q6_K
-    /// on Vulkan), otherwise Q8.
+    /// The file's own format where the backend can keep it (GGUF Q8_0, Q4_0, Q2_K, Q3_K,
+    /// Q4_K, Q6_K on Vulkan), otherwise Q8.
     Auto,
+    /// For draft models: like `Auto` for tensors of at most 4 bits per weight, `Q4` for
+    /// the others (a Q2_K file keeps its Q2_K/Q3_K/Q4_K tensors and gets its Q6_K output
+    /// matrix at 4 bits; a checkpoint becomes Q4 throughout).
+    Auto4,
     /// Blocks of 32 int8 values sharing one f16 scale (`max|w| / 127`).
     Q8,
     /// Blocks of 32 4-bit values sharing one f16 scale (`max|w| / 7`). Lossy enough to
@@ -44,9 +48,10 @@ impl std::str::FromStr for Quant {
         match s {
             "bf16" => Ok(Quant::Bf16),
             "auto" => Ok(Quant::Auto),
+            "auto4" => Ok(Quant::Auto4),
             "q8" => Ok(Quant::Q8),
             "q4" => Ok(Quant::Q4),
-            _ => anyhow::bail!("unknown quantization {s:?} (expected auto, bf16, q8 or q4)"),
+            _ => anyhow::bail!("unknown quantization {s:?} (expected auto, auto4, bf16, q8 or q4)"),
         }
     }
 }

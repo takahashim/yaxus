@@ -94,3 +94,24 @@ pub fn q6_meta_stride(k: usize) -> usize {
 pub struct Q4KData {
     pub data: Vec<u8>,
 }
+
+/// `[N, K]` matrix with GGUF Q2_K's values: 2-bit values in element order (element `e`
+/// of a row at bits `2 * (e % 4)` of byte `e / 4`). Per row, `meta` holds `K / 256`
+/// pairs of f16 (`d`, `dmin`), then `K / 16` bytes with a 4-bit scale (low) and a 4-bit
+/// min (high): weight = `q * d * sc - dmin * mn`. `pairs16` holds (`d * sc`,
+/// `dmin * mn`) as f16 per 16 values for the prefill GEMMs.
+pub struct Q2Data {
+    pub qs: Vec<u8>,
+    pub meta: Vec<u8>,
+    pub pairs16: Vec<f16>,
+}
+
+/// `[N, K]` matrix with GGUF Q3_K's values in 12-byte groups of 32: 8 bytes of low
+/// 2-bit fields in element order, then 4 bytes with the high bit of each element.
+/// Weight = `(q - 4) * d * sc` with `meta` as in [`Q6Data`] (`sc` already offset by
+/// -32) and `scales16` its f16 products per 16 values.
+pub struct Q3Data {
+    pub qs: Vec<u8>,
+    pub meta: Vec<u8>,
+    pub scales16: Vec<f16>,
+}

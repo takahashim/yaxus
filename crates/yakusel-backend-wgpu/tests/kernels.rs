@@ -31,7 +31,7 @@ fn dequant(w: &[u16], k: usize, quant: Quant) -> Vec<f32> {
             let q = quantize_q8(w, k);
             q.qs.iter().enumerate().map(|(i, &v)| v as f32 * q.scales[i / Q8_BLOCK].to_f32()).collect()
         }
-        Quant::Q4 => {
+        Quant::Q4 | Quant::Auto4 => {
             let q = quantize_q4(w, k);
             (0..w.len())
                 .map(|i| {
@@ -112,6 +112,11 @@ fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
                 blk[2..4].copy_from_slice(&f16b(0.001));
             }
             GgmlType::Q6K => blk[208..210].copy_from_slice(&f16b(0.0005)),
+            GgmlType::Q3K => blk[108..110].copy_from_slice(&f16b(0.0015)),
+            GgmlType::Q2K => {
+                blk[80..82].copy_from_slice(&f16b(0.003));
+                blk[82..84].copy_from_slice(&f16b(0.002));
+            }
             GgmlType::Q8_0 => blk[0..2].copy_from_slice(&f16b(0.0004)),
             GgmlType::Q4_0 => blk[0..2].copy_from_slice(&f16b(0.006)),
             _ => unreachable!(),
@@ -128,7 +133,7 @@ fn ggml_matmul_kernels_match_host() {
     // K a multiple of 256 (K-quant super-blocks); K = 4096 and 8192 pad the per-16 scale
     // rows, K = 8192 and 16384 the Q4_K header rows.
     for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096), (64, 16384)] {
-        for dtype in [GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
+        for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
             let bytes = ggml_blocks(dtype, n, k, 3);
             let wd = yakusel_model::ggml::dequantize(dtype, &bytes, n * k);
             for t in [1, 2, 5, 8, 16, 20, 70] {

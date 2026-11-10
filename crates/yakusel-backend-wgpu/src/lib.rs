@@ -61,6 +61,11 @@ pub enum Weight {
     /// 6-bit values (GGUF Q6_K): `s` holds Q6_K's scales for the decode kernels, `s16` an
     /// f16 scale per 16 for the prefill GEMMs.
     Q6 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
+    /// 3-bit values (GGUF Q3_K), scales as for `Q6`.
+    Q3 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
+    /// 2-bit values (GGUF Q2_K): `s` holds Q2_K's scales and mins for the decode kernels,
+    /// `s16` a pair of f16 per 16 for the prefill GEMMs.
+    Q2 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
     Bf16 { w: wgpu::Buffer, n: usize, k: usize },
     /// 1-D weights (norms), converted to f32.
     Vector(wgpu::Buffer),
@@ -508,8 +513,10 @@ impl Gpu {
             let f32src = format!("{MM_PARAMS}{wsrc}{GEMM2}");
             self.add_kernel(Box::leak(format!("gemm2f32_{w}").into_boxed_str()), &f32src, layout);
         }
-        // GGUF Q4_K and Q6_K at their own bit widths.
-        for (w, w4, w16) in [("q4k", W_Q4K, W_Q4K_16), ("q6", W_Q6, W_Q6_16)] {
+        // GGUF K-quants at their own bit widths.
+        for (w, w4, w16) in
+            [("q4k", W_Q4K, W_Q4K_16), ("q6", W_Q6, W_Q6_16), ("q3", W_Q3, W_Q3_16), ("q2", W_Q2, W_Q2_16)]
+        {
             let name = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
             self.add_kernel(name(format!("gemv1_{w}")), &gemv1(w16), &q8);
             self.add_kernel(name(format!("gemv8_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), &q8);
@@ -779,7 +786,9 @@ impl Gpu {
             return Ok(Weight::Vector(self.upload("vector", bytemuck::cast_slice(&v))));
         }
         let (n, k) = (t.shape[0], t.shape[1]);
-        if quant == Quant::Auto
+        use yakusel_model::ggml::GgmlType;
+        let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
+        if (quant == Quant::Auto || (quant == Quant::Auto4 && low_bit))
             && let Some(w) = self.load_gguf_matrix(t, n, k)
         {
             return Ok(w);
@@ -940,6 +949,8 @@ impl Gpu {
             Weight::Q4 { q, s, n, k } => (*n, *k, "q4", vec![q, s]),
             Weight::Q4K { q, s, n, k } => (*n, *k, "q4k", vec![q, s]),
             Weight::Q6 { q, s, n, k, .. } => (*n, *k, "q6", vec![q, s]),
+            Weight::Q3 { q, s, n, k, .. } => (*n, *k, "q3", vec![q, s]),
+            Weight::Q2 { q, s, n, k, .. } => (*n, *k, "q2", vec![q, s]),
             Weight::Bf16 { w, n, k } => (*n, *k, "bf16", vec![w]),
             _ => panic!("matmul needs a matrix"),
         };
@@ -984,8 +995,8 @@ impl Gpu {
         } else if t <= GEMV_MAX_T {
             (format!("gemv8_{suffix}"), grid(n.div_ceil(8) as u32))
         } else {
-            // The prefill GEMMs read Q6's per-16 f16 scales (see `W_Q6`).
-            if let Weight::Q6 { s16, .. } = w {
+            // The prefill GEMMs read the per-16 f16 scales (see `W_Q6`).
+            if let Weight::Q6 { s16, .. } | Weight::Q3 { s16, .. } | Weight::Q2 { s16, .. } = w {
                 all[3] = s16;
             }
             match self.gemm {
@@ -1143,6 +1154,8 @@ impl Gpu {
             Weight::Q4 { q, s, n, k } => (*n, *k, "glu_q4", vec![q.clone(), s.clone()]),
             Weight::Q4K { q, s, n, k } => (*n, *k, "glu_q4k", vec![q.clone(), s.clone()]),
             Weight::Q6 { q, s, n, k, .. } => (*n, *k, "glu_q6", vec![q.clone(), s.clone()]),
+            Weight::Q3 { q, s, n, k, .. } => (*n, *k, "glu_q3", vec![q.clone(), s.clone()]),
+            Weight::Q2 { q, s, n, k, .. } => (*n, *k, "glu_q2", vec![q.clone(), s.clone()]),
             Weight::Bf16 { w, n, k } => (*n, *k, "glu_bf16", vec![w.clone()]),
             _ => panic!("matmul_glu needs a matrix"),
         };
@@ -1228,7 +1241,7 @@ impl Gpu {
         anyhow::ensure!(k % 32 == 0, "K={k} must be a multiple of 32");
         Ok(match quant {
             Quant::Q8 | Quant::Auto => self.upload_q8(yakusel_model::quant::quantize_q8(bf16, k), n, k),
-            Quant::Q4 => self.upload_q4(yakusel_model::quant::quantize_q4(bf16, k), n, k),
+            Quant::Q4 | Quant::Auto4 => self.upload_q4(yakusel_model::quant::quantize_q4(bf16, k), n, k),
             Quant::Bf16 => Weight::Bf16 { w: self.upload("bf16", bytemuck::cast_slice(bf16)), n, k },
         })
     }
@@ -1257,6 +1270,22 @@ impl Gpu {
                 let s16 = self.upload("q6-scales", bytemuck::cast_slice(&s16));
                 Weight::Q6 { q: qb, s: sb, s16, n, k }
             }
+            GgmlType::Q3K => {
+                let q = ggml::q3_from_q3_k(b, n, k);
+                let qb = self.upload("q3", &q.qs);
+                let sb = self.upload("q3-meta", &q.meta);
+                let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
+                let s16 = self.upload("q3-scales", bytemuck::cast_slice(&s16));
+                Weight::Q3 { q: qb, s: sb, s16, n, k }
+            }
+            GgmlType::Q2K => {
+                let q = ggml::q2_from_q2_k(b, n, k);
+                let qb = self.upload("q2", &q.qs);
+                let sb = self.upload("q2-meta", &q.meta);
+                let s16 = pad_scales(q.pairs16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 2);
+                let s16 = self.upload("q2-scales", bytemuck::cast_slice(&s16));
+                Weight::Q2 { q: qb, s: sb, s16, n, k }
+            }
             _ => return None,
         })
     }
@@ -1284,7 +1313,7 @@ impl Gpu {
     }
 
     /// Test hook: like `debug_matmul` for a matrix given as raw GGML blocks, kept in its
-    /// GPU layout (Q8_0, Q4_0, Q4_K, Q6_K).
+    /// GPU layout (Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q6_K).
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
     pub fn debug_matmul_ggml(
