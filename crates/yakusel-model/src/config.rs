@@ -68,7 +68,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.scale_embedding, "scale_embedding=true is not supported");
         ensure!(!self.tie_word_embeddings, "tied embeddings are not supported");
         ensure!(self.num_attention_heads % self.num_key_value_heads == 0);

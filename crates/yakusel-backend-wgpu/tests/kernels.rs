@@ -4,6 +4,7 @@
 
 use yakusel_backend_wgpu::WgpuBackend;
 use yakusel_model::Quant;
+use yakusel_model::ggml::GgmlType;
 use yakusel_model::quant::{Q8_BLOCK, quantize_q4, quantize_q8};
 
 fn f32_to_bf16(x: f32) -> u16 {
@@ -26,7 +27,7 @@ fn dequant(w: &[u16], k: usize, quant: Quant) -> Vec<f32> {
     let bf = |x: u16| f32::from_bits((x as u32) << 16);
     match quant {
         Quant::Bf16 => w.iter().map(|&x| bf(x)).collect(),
-        Quant::Q8 => {
+        Quant::Q8 | Quant::Auto => {
             let q = quantize_q8(w, k);
             q.qs.iter().enumerate().map(|(i, &v)| v as f32 * q.scales[i / Q8_BLOCK].to_f32()).collect()
         }
@@ -90,6 +91,59 @@ fn matmul_kernels_match_host() {
                     // f16 operands (matrix cores) round each input to 11 bits.
                     let tol = if f16_gemm && t > 8 && n % 64 == 0 { 3e-3 } else { 1e-4 };
                     assert!(err <= tol * scale.max(1.0), "{quant:?} n={n} k={k} t={t} glu={glu}: err {err}");
+                }
+            }
+        }
+    }
+}
+
+/// Random but valid GGML blocks for an `[n, k]` matrix of type `t` (scales kept small so
+/// the products stay in a sane range).
+fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let (e, b) = t.block();
+    let blocks = n * k / e;
+    let mut out: Vec<u8> = values(blocks * b, seed).iter().map(|v| ((v + 1.0) * 127.5) as u8).collect();
+    let f16b = |v: f32| half::f16::from_f32(v).to_le_bytes();
+    for i in 0..blocks {
+        let blk = &mut out[i * b..(i + 1) * b];
+        match t {
+            GgmlType::Q4K => {
+                blk[0..2].copy_from_slice(&f16b(0.002));
+                blk[2..4].copy_from_slice(&f16b(0.001));
+            }
+            GgmlType::Q6K => blk[208..210].copy_from_slice(&f16b(0.0005)),
+            GgmlType::Q8_0 => blk[0..2].copy_from_slice(&f16b(0.0004)),
+            GgmlType::Q4_0 => blk[0..2].copy_from_slice(&f16b(0.006)),
+            _ => unreachable!(),
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore]
+fn ggml_matmul_kernels_match_host() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let f16_gemm = gpu.gemm_uses_f16();
+    // K a multiple of 256 (K-quant super-blocks); 2048 rows of 256 blocks = 8192 test
+    // the padded scale stride.
+    for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096)] {
+        for dtype in [GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
+            let bytes = ggml_blocks(dtype, n, k, 3);
+            let wd = yakusel_model::ggml::dequantize(dtype, &bytes, n * k);
+            for t in [1, 2, 5, 8, 16, 20, 70] {
+                for glu in [false, true] {
+                    if glu && t > 1 {
+                        continue;
+                    }
+                    let x = values(t * k, 21 + t as u64);
+                    let want = reference(&x, t, &wd, n, k, glu);
+                    let got = gpu.debug_matmul_ggml(&x, t, dtype, &bytes, n, k, glu);
+                    let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                    let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
+                    // Q4_K/Q6_K scales are rounded to f16 on the GPU (~5e-4 relative).
+                    let tol = if f16_gemm && t > 8 && n % 64 == 0 { 3e-3 } else { 1e-3 };
+                    assert!(err <= tol * scale.max(1.0), "{dtype:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})");
                 }
             }
         }

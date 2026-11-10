@@ -67,3 +67,16 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
         });
     Q4Data { qs, scales }
 }
+
+/// `[N, K]` matrix of 4-bit values with a scale and a min per 32-block (from GGUF Q4_K):
+/// weight = `q * sm[2b] - sm[2b + 1]`, `q` in 0..=15, nibbles laid out as in [`Q4Data`].
+pub struct Q4MData {
+    pub qs: Vec<u8>,
+    pub sm: Vec<f16>,
+}
+
+/// `[N, K]` matrix of int8 values with one f16 scale per 16 (from GGUF Q6_K).
+pub struct Q8B16Data {
+    pub qs: Vec<i8>,
+    pub scales: Vec<f16>,
+}

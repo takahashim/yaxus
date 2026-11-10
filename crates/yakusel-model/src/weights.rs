@@ -8,17 +8,24 @@ use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
-/// A raw bf16 tensor living inside a memory-mapped file.
+use crate::ggml::GgmlType;
+
+/// A tensor living inside a memory-mapped file: bf16 from safetensors, or any
+/// [`GgmlType`] from a GGUF file. `shape` is row-major (`[N, K]` for matrices).
 #[derive(Clone)]
 pub struct TensorRef {
-    mmap: Arc<Mmap>,
-    start: usize,
-    len: usize,
+    pub(crate) mmap: Arc<Mmap>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
     pub shape: Vec<usize>,
+    pub dtype: GgmlType,
+    /// Subtracted from every value read through `to_f32_vec`/`to_bf16_vec` (GGUF files
+    /// store RMSNorm weights with their offset added).
+    pub(crate) minus: f32,
 }
 
 impl TensorRef {
-    /// Little-endian bf16 bytes.
+    /// Raw bytes in the file's encoding.
     pub fn bytes(&self) -> &[u8] {
         &self.mmap[self.start..self.start + self.len]
     }
@@ -27,10 +34,14 @@ impl TensorRef {
         self.shape.iter().product()
     }
 
-    /// Borrows the data as raw bf16 `u16`s when the mapping is suitably aligned.
+    /// Borrows the data as raw bf16 `u16`s when it is bf16 and suitably aligned.
     pub fn as_bf16(&self) -> Option<&[u16]> {
         let b = self.bytes();
-        if cfg!(target_endian = "little") && (b.as_ptr() as usize) % 2 == 0 {
+        if self.dtype == GgmlType::Bf16
+            && self.minus == 0.0
+            && cfg!(target_endian = "little")
+            && (b.as_ptr() as usize).is_multiple_of(2)
+        {
             // SAFETY: aligned, length is even (bf16), and every bit pattern is a valid u16.
             Some(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const u16, b.len() / 2) })
         } else {
@@ -38,20 +49,31 @@ impl TensorRef {
         }
     }
 
-    /// bf16 values as raw `u16`, copied out (handles unaligned offsets).
+    /// The values as bf16 (`u16`), dequantized and rounded when stored otherwise.
     pub fn to_bf16_vec(&self) -> Vec<u16> {
-        self.bytes()
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect()
+        if self.dtype == GgmlType::Bf16 && self.minus == 0.0 {
+            return self.bytes().chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        }
+        self.to_f32_vec().into_iter().map(f32_to_bf16).collect()
     }
 
     pub fn to_f32_vec(&self) -> Vec<f32> {
-        self.bytes()
-            .chunks_exact(2)
-            .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
-            .collect()
+        let mut v = crate::ggml::dequantize(self.dtype, self.bytes(), self.numel());
+        if self.minus != 0.0 {
+            v.iter_mut().for_each(|x| *x -= self.minus);
+        }
+        v
     }
+}
+
+/// Round to nearest even (NaN stays NaN).
+#[inline]
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    if x.is_nan() {
+        return ((b >> 16) | 0x40) as u16;
+    }
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
 }
 
 #[inline]
@@ -60,7 +82,7 @@ pub fn bf16_to_f32(x: u16) -> f32 {
 }
 
 pub struct Weights {
-    tensors: HashMap<String, TensorRef>,
+    pub(crate) tensors: HashMap<String, TensorRef>,
 }
 
 impl Weights {
@@ -97,11 +119,17 @@ impl Weights {
                         start: data_start + s,
                         len: e - s,
                         shape: info.shape.clone(),
+                        dtype: GgmlType::Bf16,
+                        minus: 0.0,
                     },
                 );
             }
         }
         Ok(Weights { tensors })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
     }
 
     pub fn get(&self, name: &str) -> Result<&TensorRef> {

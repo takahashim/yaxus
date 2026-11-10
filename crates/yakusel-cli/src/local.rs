@@ -16,12 +16,15 @@ use crate::LangArgs;
 
 #[derive(Args)]
 pub struct ModelArgs {
-    /// Model directory, a Hugging Face repo id found in the local cache, or a size
-    /// (0.8b, 2b, 8b, 31b) for pfnet/plamo-3-translate-<size>.
+    /// Model: a Hugging Face directory, a GGUF file, a repo id in the local HF cache, or a
+    /// size (0.8b, 2b, 8b, 31b) for pfnet/plamo-3-translate-<size>. `REPO:QUANT` or
+    /// `SIZE:QUANT` picks a file of a GGUF repo (e.g. `2b:Q4_K_M` for
+    /// pfnet/plamo-3-translate-2b-GGUF).
     #[arg(long, default_value = "pfnet/plamo-3-translate-2b")]
     model: String,
-    /// Weight format for matrices: q8 (quantized at load, ~1.8x faster decode) or bf16 (lossless).
-    #[arg(long, default_value = "q8")]
+    /// Weight format for matrices: auto (GGUF: as in the file where possible, else q8;
+    /// safetensors: q8), q8, q4 or bf16 (lossless for safetensors).
+    #[arg(long, default_value = "auto")]
     quant: Quant,
     /// auto (Vulkan GPU if available, else CPU), vulkan or cpu.
     #[arg(long, default_value = "auto")]
@@ -63,7 +66,7 @@ impl ModelArgs {
         const AUTO_DRAFT: &str = "pfnet/plamo-3-translate-0.8b";
         let dir = match self.draft.as_str() {
             "none" => return Ok(None),
-            "auto" => match resolve_model(AUTO_DRAFT) {
+            "auto" => match resolve_model(AUTO_DRAFT).or_else(|_| resolve_model("0.8b:Q4_K_M")) {
                 Ok((d, _)) => d,
                 Err(_) => return Ok(None),
             },
@@ -74,7 +77,13 @@ impl ModelArgs {
         if same(&dir, &target) {
             return Ok(None); // the target is the draft model itself
         }
-        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, quant: self.draft_quant }))
+        // A GGUF draft in Q4_K etc. is already 4-bit: keep it rather than quantizing twice.
+        let quant = if yakusel_model::gguf::is_gguf(&dir) && self.draft_quant == Quant::Q4 {
+            Quant::Auto
+        } else {
+            self.draft_quant
+        };
+        Ok(Some(yakusel_server::DraftOptions { dir, k: self.draft_k, quant }))
     }
 
     /// Returns (directory, display name).
@@ -111,10 +120,38 @@ impl ModelArgs {
 /// Resolves a model directory or a Hugging Face repo id in the local cache.
 /// Returns (directory, display name).
 fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
+    const SIZES: [&str; 4] = ["0.8b", "2b", "8b", "31b"];
     let p = Path::new(model);
+    if p.is_file() {
+        anyhow::ensure!(yakusel_model::gguf::is_gguf(p), "{model} is not a GGUF file");
+        let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| model.to_string());
+        return Ok((p.to_path_buf(), name));
+    }
     let size = model.to_ascii_lowercase();
-    if !p.is_dir() && ["0.8b", "2b", "8b", "31b"].contains(&size.as_str()) {
+    if !p.is_dir() && SIZES.contains(&size.as_str()) {
         return resolve_model(&format!("pfnet/plamo-3-translate-{size}"));
+    }
+    // REPO:QUANT or SIZE:QUANT: one file of a GGUF repository.
+    if !p.exists()
+        && let Some((repo, quant)) = model.rsplit_once(':')
+    {
+        let repo = if SIZES.contains(&repo.to_ascii_lowercase().as_str()) {
+            format!("pfnet/plamo-3-translate-{}-GGUF", repo.to_ascii_lowercase())
+        } else {
+            repo.to_string()
+        };
+        let dir = hf_snapshot(&repo).with_context(|| format!("download it with `hf download {repo} --include '*{quant}.gguf'`"))?;
+        let want = format!("{}.gguf", quant.to_ascii_lowercase());
+        let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().ends_with(&want)))
+            .collect();
+        found.sort();
+        let file = found.into_iter().next().with_context(|| {
+            format!("no *{quant}.gguf in {}; download it with `hf download {repo} --include '*{quant}.gguf'`", dir.display())
+        })?;
+        return resolve_model(file.to_str().context("non-UTF-8 path")?);
     }
     if p.is_dir() {
         let name = p
@@ -128,6 +165,27 @@ fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
             .unwrap_or_else(|| model.to_string());
         return Ok((p.to_path_buf(), name));
     }
+    let snapshot = hf_snapshot(model)?;
+    if !snapshot.join("config.json").exists() {
+        let mut quants: Vec<String> = std::fs::read_dir(&snapshot)?
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let stem = n.strip_suffix(".gguf")?;
+                Some(format!("{model}:{}", stem.rsplit('-').next().unwrap_or(stem)))
+            })
+            .collect();
+        quants.sort();
+        if !quants.is_empty() {
+            anyhow::bail!("{model} holds GGUF files; choose one: {}", quants.join(", "));
+        }
+    }
+    let name = model.rsplit('/').next().unwrap_or(model).to_string();
+    Ok((snapshot, name))
+}
+
+/// The snapshot directory of repo `model` in the local Hugging Face cache.
+fn hf_snapshot(model: &str) -> Result<PathBuf> {
     let cache = std::env::var_os("HF_HUB_CACHE")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
@@ -155,8 +213,7 @@ fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
                 model
             )
         })?;
-    let name = model.rsplit('/').next().unwrap_or(model).to_string();
-    Ok((snapshot, name))
+    Ok(snapshot)
 }
 
 #[derive(Args)]
@@ -281,13 +338,13 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     use yakusel_server::document::{DocEvent, DocJob, DocOptions, run_document};
     let req = lang.document(true)?;
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let t0 = Instant::now();
     let mut model = m.load(&dir)?;
     if verbose {
         eprintln!(
-            "loaded {name} ({:?}, {:.2} GB) on {} in {:.2?}",
-            m.quant,
+            "loaded {name} ({}, {:.2} GB) on {} in {:.2?}",
+            yakusel_server::quant_label(&dir, m.quant),
             model.weight_bytes() as f64 / 1e9,
             model.backend_name(),
             t0.elapsed()
@@ -443,7 +500,8 @@ enum BenchKind {
 const SYNTHETIC: &str = "The quick brown fox jumps over the lazy dog while the committee reviews every proposal. ";
 
 fn header(name: &str, model: &ModelArgs, g: &dyn yakusel_model::Generator) {
-    println!("{name} {:?} on {}", model.quant, g.backend_name());
+    let quant = model.resolve().map(|(dir, _)| yakusel_server::quant_label(&dir, model.quant)).unwrap_or_default();
+    println!("{name} {quant} on {}", g.backend_name());
 }
 
 pub fn bench(a: BenchArgs) -> Result<()> {
@@ -464,7 +522,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
     // Each prompt is a prefix of the next one: the prefix cache would hide the work.
     m.no_kv_cache = true;
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let all = tok.encode(&SYNTHETIC.repeat(200), true);
@@ -486,7 +544,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
 fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
     m.no_kv_cache = true;
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let all = tok.encode(&SYNTHETIC.repeat(200), true);
@@ -522,7 +580,7 @@ fn escape_line(s: &str) -> String {
 fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option<PathBuf>) -> Result<()> {
     m.no_response_cache = true;
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let set = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
@@ -573,7 +631,7 @@ fn bench_streams(mut m: ModelArgs, ns: Vec<usize>, file: PathBuf, compare: Optio
     // The same prompts run for every N.
     m.no_response_cache = true;
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let set = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
@@ -707,7 +765,7 @@ fn bench_doc(
     use yakusel_server::document::{DocEvent, DocJob, DocOptions, run_document};
     use yakusel_server::memory::{DEFAULT_ENTRIES, Memory};
     let (dir, name) = m.resolve()?;
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
+    let tok = yakusel_server::load_tokenizer(&dir)?;
     let paras: Vec<String> = match &file {
         Some(f) => yakusel_api::split_paragraphs(&std::fs::read_to_string(f)?),
         None => prose_paragraphs(&std::fs::read_to_string(dir.join("README_ja.md"))?),

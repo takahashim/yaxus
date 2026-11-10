@@ -976,6 +976,102 @@ fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
 }
 "#;
 
+/// Weight access for `[N, K]` Q4M matrices (GGUF Q4_K): 8 nibbles per u32 as in Q4, and
+/// one u32 per 32-block holding the f16 scale and min: weight = `q * scale - min`.
+pub const W_Q4M: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let u = wq[row * (p.k / 8u) + i / 2u] >> (16u * (i & 1u));
+    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + i / 8u]);
+    return vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u)) * sm.x - sm.y;
+}
+"#;
+
+pub const W_Q4M_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn unpack_q4m(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
+    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
+    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
+    return array<vec4<f32>, 2>(lo * sm.x - sm.y, hi * sm.x - sm.y);
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let u = wq[row * (p.k / 16u) + j];
+    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + j / 2u]);
+    let a = unpack_q4m(u.x, sm);
+    let c = unpack_q4m(u.y, sm);
+    return array<vec4<f32>, 4>(a[0], a[1], c[0], c[1]);
+}
+"#;
+
+pub const W_Q4M_32: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn nib4(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
+    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
+    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
+    return array<vec4<f32>, 2>(lo * sm.x - sm.y, hi * sm.x - sm.y);
+}
+fn load32(row: u32, b: u32) -> array<vec4<f32>, 8> {
+    let u = wq[row * (p.k / 32u) + b];
+    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + b]);
+    let a = nib4(u.x, sm);
+    let c = nib4(u.y, sm);
+    let d = nib4(u.z, sm);
+    let e = nib4(u.w, sm);
+    return array<vec4<f32>, 8>(a[0], a[1], c[0], c[1], d[0], d[1], e[0], e[1]);
+}
+fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
+    var s = 0.0;
+    for (var m = 0u; m < 8u; m++) { s += dot(w[m], x[xb + m]); }
+    return s;
+}
+"#;
+
+/// Weight access for `[N, K]` Q8B16 matrices (GGUF Q6_K): int8 values as in Q8 with one
+/// f16 scale per 16 values.
+pub const W_Q8B16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let q = bitcast<i32>(wq[row * (p.k / 4u) + i]);
+    let b = row * sstride(p.k / 16u) + i / 4u;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    return vec4<f32>(
+        f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
+        f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u))) * s;
+}
+"#;
+
+pub const W_Q8B16_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+fn unpack_q8(u: u32) -> vec4<f32> {
+    let q = bitcast<i32>(u);
+    return vec4<f32>(f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
+                     f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u)));
+}
+fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
+    let u = wq[row * (p.k / 16u) + j];
+    let b = row * sstride(p.k / 16u) + j;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    let s = select(s2.x, s2.y, (b & 1u) == 1u);
+    return array<vec4<f32>, 4>(unpack_q8(u.x) * s, unpack_q8(u.y) * s, unpack_q8(u.z) * s, unpack_q8(u.w) * s);
+}
+"#;
+
 /// T=1 GEMV over whole Q4 blocks: `{RPW}` rows per workgroup of 256, `256 / {RPW}` lanes
 /// per row (a power of two <= 32), each lane taking one 32-weight block per step.
 /// (A gate/up+SwiGLU variant of this was slower than `GEMV_GLU` and is not used.)

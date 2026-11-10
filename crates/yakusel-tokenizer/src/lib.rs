@@ -132,6 +132,15 @@ impl Tokenizer {
         Self::build(tokens, kinds, scores)
     }
 
+    /// Builds the tokenizer from a vocabulary given as parallel arrays (e.g. the
+    /// `tokenizer.ggml.*` metadata of a GGUF file).
+    pub fn from_vocab(tokens: Vec<String>, kinds: Vec<TokenKind>, scores: Vec<f64>) -> Result<Self, Error> {
+        if tokens.len() != kinds.len() || tokens.len() != scores.len() {
+            return Err(Error::Format { line: 0, msg: "vocabulary arrays differ in length".into() });
+        }
+        Self::build(tokens, kinds, scores)
+    }
+
     fn build(tokens: Vec<String>, kinds: Vec<TokenKind>, scores: Vec<f64>) -> Result<Self, Error> {
         let mut t = Tokenizer {
             byte_of: vec![None; tokens.len()],

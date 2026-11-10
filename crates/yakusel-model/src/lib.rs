@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod engine;
+pub mod ggml;
+pub mod gguf;
 pub mod quant;
 pub mod weights;
 
@@ -26,6 +28,9 @@ pub enum Quant {
     /// As in the checkpoint (bf16), lossless.
     #[default]
     Bf16,
+    /// The file's own format where the backend can keep it (GGUF Q8_0, Q4_0, Q4_K, Q6_K
+    /// on Vulkan), otherwise Q8.
+    Auto,
     /// Blocks of 32 int8 values sharing one f16 scale (`max|w| / 127`).
     Q8,
     /// Blocks of 32 4-bit values sharing one f16 scale (`max|w| / 7`). Lossy enough to
@@ -38,9 +43,10 @@ impl std::str::FromStr for Quant {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "bf16" => Ok(Quant::Bf16),
+            "auto" => Ok(Quant::Auto),
             "q8" => Ok(Quant::Q8),
             "q4" => Ok(Quant::Q4),
-            _ => anyhow::bail!("unknown quantization {s:?} (expected bf16, q8 or q4)"),
+            _ => anyhow::bail!("unknown quantization {s:?} (expected auto, bf16, q8 or q4)"),
         }
     }
 }
@@ -255,9 +261,15 @@ pub struct Model<B: Backend> {
 }
 
 impl<B: Backend> Model<B> {
-    pub fn load(dir: &Path, mut backend: B, quant: Quant) -> Result<Self> {
-        let cfg = Config::from_file(dir.join("config.json"))?;
-        let w = Weights::open(dir)?;
+    /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
+    /// or a GGUF file.
+    pub fn load(path: &Path, mut backend: B, quant: Quant) -> Result<Self> {
+        let (cfg, w) = if gguf::is_gguf(path) {
+            let g = gguf::Gguf::open(path)?;
+            (g.config()?, g.weights()?)
+        } else {
+            (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
+        };
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);

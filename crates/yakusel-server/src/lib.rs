@@ -87,7 +87,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         LoadOptions {
             backend: BackendKind::Auto,
-            quant: Quant::Q8,
+            quant: Quant::Auto,
             draft: None,
             prefill_f32: false,
             prefix_cache: true,
@@ -101,6 +101,41 @@ fn prepare<B: yakusel_model::Backend>(mut m: Model<B>, o: &LoadOptions) -> Resul
     m.prefix_cache = o.prefix_cache;
     m.init_kv(o.kv_tokens, yakusel_model::DEFAULT_MAX_POS)?;
     Ok(m)
+}
+
+/// How the weights of `model` are stored, for display: the quantization, or for a GGUF
+/// file loaded with `auto` its main tensor type (`gguf Q4_K`).
+pub fn quant_label(model: &Path, quant: Quant) -> String {
+    if quant == Quant::Auto {
+        if yakusel_model::gguf::is_gguf(model) {
+            let main = yakusel_model::gguf::Gguf::open(model).ok().and_then(|g| g.main_type());
+            return format!("gguf {}", main.map_or("?", |t| t.name()));
+        }
+        return "q8".into();
+    }
+    format!("{quant:?}").to_lowercase()
+}
+
+/// The tokenizer of a model: `tokenizer.jsonl` of a Hugging Face directory, or the
+/// vocabulary embedded in a GGUF file.
+pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
+    use yakusel_tokenizer::TokenKind;
+    if !yakusel_model::gguf::is_gguf(model) {
+        return Ok(Tokenizer::from_file(model.join("tokenizer.jsonl"))?);
+    }
+    let v = yakusel_model::gguf::Gguf::open(model)?.vocab()?;
+    let kinds = v
+        .types
+        .iter()
+        .map(|t| match t {
+            1 => TokenKind::Normal,
+            2 => TokenKind::Unknown,
+            3 => TokenKind::Control,
+            6 => TokenKind::Byte,
+            _ => TokenKind::Other,
+        })
+        .collect();
+    Ok(Tokenizer::from_vocab(v.tokens, kinds, v.scores)?)
 }
 
 /// Loads the model (and optional draft model) on the requested backend.
@@ -476,14 +511,14 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         _ => anyhow::bail!("--cert and --key must be given together"),
     };
 
-    let tok = Arc::new(Tokenizer::from_file(opts.model_dir.join("tokenizer.jsonl"))?);
+    let tok = Arc::new(load_tokenizer(&opts.model_dir)?);
     let t0 = Instant::now();
     let model = load_generator(&opts.model_dir, &opts.load)
         .with_context(|| format!("loading model from {}", opts.model_dir.display()))?;
+    let quant = quant_label(&opts.model_dir, opts.load.quant);
     tracing::info!(
-        "loaded {} ({:?}, {:.2} GB) on {} in {:.2?}",
+        "loaded {} ({quant}, {:.2} GB) on {} in {:.2?}",
         opts.model_name,
-        opts.load.quant,
         model.weight_bytes() as f64 / 1e9,
         model.backend_name(),
         t0.elapsed()
@@ -492,7 +527,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         status: "ok".into(),
         model: opts.model_name.clone(),
         backend: model.backend_name(),
-        quant: format!("{:?}", opts.load.quant).to_lowercase(),
+        quant,
         queue: 0,
     };
 
@@ -550,6 +585,35 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(repo: &str) -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let snaps = Path::new(&home).join(format!(".cache/huggingface/hub/models--{}/snapshots", repo.replace('/', "--")));
+        std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
+    }
+
+    /// The vocabulary of a GGUF file gives the same tokenizer as `tokenizer.jsonl`.
+    #[test]
+    #[ignore]
+    fn gguf_tokenizer_matches_jsonl() {
+        let (Some(hf), Some(gg)) = (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF")) else {
+            eprintln!("0.8B model or GGUF files not found; skipping");
+            return;
+        };
+        let file = std::fs::read_dir(&gg).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "gguf")).unwrap();
+        let a = load_tokenizer(&hf).unwrap();
+        let b = load_tokenizer(&file).unwrap();
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/tokenizer.jsonl");
+        let mut n = 0;
+        for line in std::fs::read_to_string(golden).unwrap().lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                assert_eq!(a.encode(text, false), b.encode(text, false), "{text:?}");
+                n += 1;
+            }
+        }
+        assert!(n > 1000);
+    }
 
     #[test]
     fn token_compare() {
