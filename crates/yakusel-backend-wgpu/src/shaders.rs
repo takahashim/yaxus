@@ -760,3 +760,188 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
 }
 "#;
+
+/// Q4 access by whole blocks: `load32(row, b)` returns the 32 weights of block `b` (one
+/// 16-byte load and one scale), for the T=1 kernels below.
+pub const W_Q4_32: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read> wsc: array<u32>;
+fn nib4(u: u32, s: f32) -> array<vec4<f32>, 2> {
+    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
+    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
+    return array<vec4<f32>, 2>((lo - 8.0) * s, (hi - 8.0) * s);
+}
+fn load32(row: u32, b: u32) -> array<vec4<f32>, 8> {
+    let i = row * (p.k / 32u) + b;
+    let u = wq[i];
+    let s2 = unpack2x16float(wsc[i / 2u]);
+    let s = select(s2.x, s2.y, (i & 1u) == 1u);
+    let a = nib4(u.x, s);
+    let c = nib4(u.y, s);
+    let d = nib4(u.z, s);
+    let e = nib4(u.w, s);
+    return array<vec4<f32>, 8>(a[0], a[1], c[0], c[1], d[0], d[1], e[0], e[1]);
+}
+fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
+    var s = 0.0;
+    for (var m = 0u; m < 8u; m++) { s += dot(w[m], x[xb + m]); }
+    return s;
+}
+"#;
+
+/// T=1 GEMV over whole Q4 blocks: `{RPW}` rows per workgroup of 256, `256 / {RPW}` lanes
+/// per row (a power of two <= 32), each lane taking one 32-weight block per step.
+/// (A gate/up+SwiGLU variant of this was slower than `GEMV_GLU` and is not used.)
+pub const GEMV1_32: &str = r#"
+const RPW: u32 = {RPW}u;
+const LANES: u32 = 256u / RPW;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let group = wg.y * nw.x + wg.x;
+    let row = group * RPW + li / LANES;
+    let lane = li % LANES;
+    let k32 = p.k / 32u;
+    var acc = 0.0;
+    if (row < p.n) {
+        for (var b = lane; b < k32; b += LANES) { acc += dot32(load32(row, b), 8u * b); }
+    }
+    red[li] = acc;
+    workgroupBarrier();
+    for (var s = LANES / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[li] += red[li + s]; }
+        workgroupBarrier();
+    }
+    if (lane == 0u && row < p.n) { y[row] = red[li]; }
+}
+"#;
+
+/// Split-key attention for passes with few rows (decode, verification), part 1 of 2.
+/// One workgroup of 128 per (row, KV head, chunk of 64 keys): it handles all
+/// `G = hq / hkv` query heads sharing the KV head, so each key/value is read once, and
+/// writes per head the chunk's max score, sum of exp and unnormalized output for
+/// `ATTN_COMBINE`. Scores: two lanes per key (half the dimensions each, joined with a
+/// subgroup shuffle); values: one lane per dimension accumulating every head. `G <= 16`.
+pub const ATTN_SPLIT: &str = r#"
+struct P { hq: u32, hkv: u32, window: u32, scale: f32, nch: u32, _a: u32, _b: u32, _c: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> part: array<f32>;  // [row][hkv][nch][G][128]
+@group(0) @binding(1) var<storage, read_write> ml: array<vec2<f32>>; // [row][hkv][nch][G]
+@group(0) @binding(2) var<storage, read> q: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> kc: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read> vc: array<f32>;
+@group(0) @binding(5) var<storage, read> rmeta: array<vec4<u32>>;
+@group(0) @binding(6) var<storage, read> pages: array<u32>;
+var<workgroup> qs: array<vec4<f32>, 512>;  // [G][32]
+var<workgroup> sc: array<f32, 1024>;       // [G][64] scores, then exp(score - max)
+var<workgroup> kslot: array<u32, 64>;
+var<workgroup> hm: array<f32, 16>;
+
+const G: u32 = {G}u;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let g = G;
+    let kh = wg.x % p.hkv;
+    let c = wg.x / p.hkv;
+    let t = wg.y;
+    let kvd = p.hkv * 128u;
+    let m4 = rmeta[t];
+    let pos = m4.x;
+    let pt = m4.z;
+    var lo = 0u;
+    if (p.window > 0u && pos + 1u > p.window) { lo = pos + 1u - p.window; }
+    let start = lo + c * 64u;
+    let base = (((t * p.hkv + kh) * p.nch) + c) * g;
+    // Uniform per workgroup: chunks past this row's context only mark themselves empty.
+    if (start > pos) {
+        if (li < g) { ml[base + li] = vec2<f32>(-1e30, 0.0); }
+        return;
+    }
+    for (var i = li; i < g * 32u; i += 128u) {
+        qs[i] = q[(t * p.hq + kh * g) * 32u + i];
+    }
+    workgroupBarrier();
+    let j = li / 2u;
+    let half = li % 2u;
+    let key = start + j;
+    let live = key <= pos;
+    var d: array<f32, G>;
+    for (var h = 0u; h < G; h++) { d[h] = 0.0; }
+    var ks = 0u;
+    if (live) {
+        ks = pages[pt + key / 128u] * 128u + key % 128u;
+        let off = (ks * kvd + kh * 128u) / 4u + half * 16u;
+        for (var i = 0u; i < 16u; i++) {
+            let kv = kc[off + i];
+            for (var h = 0u; h < G; h++) { d[h] += dot(qs[h * 32u + half * 16u + i], kv); }
+        }
+    }
+    for (var h = 0u; h < G; h++) {
+        let full = d[h] + subgroupShuffleXor(d[h], 1u);
+        if (half == 0u) { sc[h * 64u + j] = select(-1e30, full * p.scale, live); }
+    }
+    if (half == 0u) { kslot[j] = ks; }
+    workgroupBarrier();
+    let n = min(64u, pos + 1u - start);
+    if (li < g) {
+        var mx = -1e30;
+        for (var k = 0u; k < n; k++) { mx = max(mx, sc[li * 64u + k]); }
+        hm[li] = mx;
+    }
+    workgroupBarrier();
+    for (var i = li; i < g * 64u; i += 128u) {
+        sc[i] = select(0.0, exp(sc[i] - hm[i / 64u]), i % 64u < n);
+    }
+    workgroupBarrier();
+    if (li < g) {
+        var l = 0.0;
+        for (var k = 0u; k < n; k++) { l += sc[li * 64u + k]; }
+        ml[base + li] = vec2<f32>(hm[li], l);
+    }
+    var acc: array<f32, G>;
+    for (var h = 0u; h < G; h++) { acc[h] = 0.0; }
+    for (var k = 0u; k < n; k++) {
+        let v = vc[kslot[k] * kvd + kh * 128u + li];
+        for (var h = 0u; h < G; h++) { acc[h] += sc[h * 64u + k] * v; }
+    }
+    for (var h = 0u; h < G; h++) { part[(base + h) * 128u + li] = acc[h]; }
+}
+"#;
+
+/// Split-key attention, part 2: merges the chunks of each (row, query head).
+pub const ATTN_COMBINE: &str = r#"
+struct P { hq: u32, hkv: u32, nch: u32, _a: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> o: array<f32>;
+@group(0) @binding(1) var<storage, read> part: array<f32>;
+@group(0) @binding(2) var<storage, read> ml: array<vec2<f32>>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let h = wg.x;
+    let t = wg.y;
+    let g = p.hq / p.hkv;
+    let kh = h / g;
+    let hi = h % g;
+    var mx = -1e30;
+    for (var c = 0u; c < p.nch; c++) {
+        let e = ml[(((t * p.hkv + kh) * p.nch) + c) * g + hi];
+        if (e.y > 0.0) { mx = max(mx, e.x); }
+    }
+    var l = 0.0;
+    var acc = 0.0;
+    for (var c = 0u; c < p.nch; c++) {
+        let i = (((t * p.hkv + kh) * p.nch) + c) * g + hi;
+        let e = ml[i];
+        if (e.y > 0.0) {
+            let w = exp(e.x - mx);
+            l += e.y * w;
+            acc += part[i * 128u + li] * w;
+        }
+    }
+    o[(t * p.hq + h) * 128u + li] = acc / l;
+}
+"#;

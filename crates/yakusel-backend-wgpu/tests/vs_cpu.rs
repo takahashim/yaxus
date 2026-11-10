@@ -87,6 +87,16 @@ fn gpu_matches_cpu_long_prompt() {
     let want = (1.0 / z) as f32;
     eprintln!("argmax {idx} (host p={want:.5})");
     assert_eq!(lg[idx as usize], m);
+    // One decode step at a 601-token context: the split-key attention path.
+    let lc = cpu.forward(&[(sc, &[idx])], false).unwrap();
+    let lc = cpu.backend.to_host(&lc);
+    let lt = gpu.forward(&[(sg, &[idx])], false).unwrap();
+    let lg = gpu.backend.to_host(&lt);
+    let max_err = lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    eprintln!("decode at 601 tokens: max |cpu - gpu| = {max_err:.2e}");
+    // An f16 prefill leaves a slightly different KV cache, which the decode step inherits.
+    let tol = if gpu.backend.gemm_uses_f16() { 1e-1 } else { 2e-2 };
+    assert!(max_err < tol);
 }
 
 #[test]

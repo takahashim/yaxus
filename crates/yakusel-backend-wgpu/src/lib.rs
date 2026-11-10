@@ -211,6 +211,16 @@ enum MetaBuf {
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 const ARGMAX_SLICES: usize = 64;
 
+/// Passes with at most this many rows use the split-key attention.
+const SPLIT_ATTN_MAX_ROWS: usize = 8;
+
+/// Rows per workgroup of the Q4 block GEMV: 16 (16 lanes per row) unless that leaves
+/// fewer than 128 workgroups, then 8. Measured on the 0.8B draft (o_proj 1536x2048:
+/// 53 -> 42 us, down 1536x6144: 105 -> 98 us, lm_head: 1219 -> 1169 us).
+fn q4_rows_per_wg(n: usize) -> u32 {
+    if n / 16 >= 128 { 16 } else { 8 }
+}
+
 /// Weight rows per 32-lane group in the multi-row GEMV for `t` activation rows.
 fn gemvm_rows(_t: usize) -> usize {
     std::env::var("YAKUSEL_GEMVM_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
@@ -259,6 +269,7 @@ impl Gpu {
             max_buffer_size: alimits.max_buffer_size,
             max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
             max_storage_buffers_per_shader_stage: 10,
+            max_compute_workgroup_storage_size: alimits.max_compute_workgroup_storage_size.min(65536),
             max_immediate_size: 32,
             ..wgpu::Limits::default()
         };
@@ -395,6 +406,10 @@ impl Gpu {
         let q8 = [false, true, true, true];
         let bf = [false, true, true];
         self.add_kernel("gemv1_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(1)), &q8);
+        for rpw in [8u32, 16] {
+            let src = format!("{MM_PARAMS}{W_Q4_32}{}", GEMV1_32.replace("{RPW}", &rpw.to_string()));
+            self.add_kernel(Box::leak(format!("gemv1b{rpw}_q4").into_boxed_str()), &src, &q8);
+        }
         self.add_kernel("gemv1_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(1)), &q8);
         self.add_kernel("gemv8_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(GEMV_MAX_T)), &q8);
         self.add_kernel("glu_q4", &format!("{MM_PARAMS}{W_Q4_16}{GEMV_GLU}"), &q8);
@@ -434,6 +449,11 @@ impl Gpu {
         self.add_kernel("qk_rope", QK_ROPE, &[false, false, false, true, true, true, true, true]);
         self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
         self.add_kernel("embed", EMBED, &[false, true, true]);
+        for g in [1usize, 2, 4, 6, 8, 12, 16] {
+            let name: &'static str = Box::leak(format!("attn_split{g}").into_boxed_str());
+            self.add_kernel(name, &ATTN_SPLIT.replace("{G}", &g.to_string()), &[false, false, true, true, true, true, true]);
+        }
+        self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
     }
@@ -791,7 +811,10 @@ impl Gpu {
         let mut all = vec![y.buf(), x.buf()];
         all.extend(bufs);
         let params = [n as u32, k as u32, t as u32];
-        let (name, groups) = if t == 1 {
+        let (name, groups) = if t == 1 && suffix == "q4" {
+            let rpw = q4_rows_per_wg(n);
+            (format!("gemv1b{rpw}_q4"), grid(n.div_ceil(rpw as usize) as u32))
+        } else if t == 1 {
             (format!("gemv1_{suffix}"), grid(n.div_ceil(8) as u32))
         } else if t <= GEMV_MAX_T && self.subgroups && k % 512 == 0 {
             (format!("gemvm{t}_{suffix}"), grid(n.div_ceil(8 * gemvm_rows(t)) as u32))
@@ -845,12 +868,43 @@ impl Gpu {
         );
         let o = self.tensor(t, hq * 128);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        self.dispatch(
-            "attention",
-            &[o.buf(), q.buf(), &kc, &vc, &rows, &pages],
-            &[hq as u32, hkv as u32, layer.window.unwrap_or(0) as u32, scale.to_bits()],
-            (hq as u32, t as u32),
-        );
+        let window = layer.window.unwrap_or(0) as u32;
+        let g = hq / hkv;
+        let ctx = match layer.window {
+            Some(w) => (self.pass_max_pos + 1).min(w),
+            None => self.pass_max_pos + 1,
+        };
+        let nch = ctx.div_ceil(64);
+        // Few rows and a context long enough to give the split kernel at least half the
+        // parallelism of the per-head kernel (a model with one KV head and a short context
+        // would otherwise run a single workgroup).
+        let split = t <= SPLIT_ATTN_MAX_ROWS
+            && self.subgroups
+            && 2 * nch * hkv >= hq
+            && self.kernels.contains_key(format!("attn_split{g}").as_str());
+        if split {
+            let part = self.tensor(t * hkv * nch * g, 128);
+            let ml = self.tensor(t * hkv * nch * g, 2);
+            self.dispatch(
+                &format!("attn_split{g}"),
+                &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
+                &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
+                ((hkv * nch) as u32, t as u32),
+            );
+            self.dispatch(
+                "attn_combine",
+                &[o.buf(), part.buf(), ml.buf()],
+                &[hq as u32, hkv as u32, nch as u32],
+                (hq as u32, t as u32),
+            );
+        } else {
+            self.dispatch(
+                "attention",
+                &[o.buf(), q.buf(), &kc, &vc, &rows, &pages],
+                &[hq as u32, hkv as u32, window, scale.to_bits()],
+                (hq as u32, t as u32),
+            );
+        }
         o
     }
 
@@ -884,6 +938,7 @@ impl Gpu {
         }
         let (n2, k, name, bufs): (usize, usize, &str, Vec<wgpu::Buffer>) = match w {
             Weight::Q8 { q, s, n, k } => (*n, *k, "glu_q8", vec![q.clone(), s.clone()]),
+            // The block variant (`GLU_32`) measured slower here (174 vs 138 us on 12288x1536).
             Weight::Q4 { q, s, n, k } => (*n, *k, "glu_q4", vec![q.clone(), s.clone()]),
             Weight::Bf16 { w, n, k } => (*n, *k, "glu_bf16", vec![w.clone()]),
             _ => panic!("matmul_glu needs a matrix"),
