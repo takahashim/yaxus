@@ -22,7 +22,10 @@ fn u32s(v: &Value) -> Vec<u32> {
 }
 
 fn cases() -> Vec<Value> {
-    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl");
+    // YAKUSEL_GOLDEN selects another model's file (e.g. logits_8b.jsonl with YAKUSEL_MODEL_DIR).
+    let golden = std::env::var("YAKUSEL_GOLDEN").map(PathBuf::from).unwrap_or_else(|_| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl")
+    });
     std::fs::read_to_string(golden)
         .unwrap()
         .lines()
@@ -58,6 +61,9 @@ fn q8_quality() {
             want.len(),
             got[..got.len().min(want.len())] == want[..got.len().min(want.len())]
         );
+        if agree < want.len().min(got.len()) {
+            eprintln!("  got  {got:?}\n  want {want:?}");
+        }
         let argmax = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
         assert_eq!(argmax as u32, top_ids[0], "{name}: Q8 changes the first token");
     }

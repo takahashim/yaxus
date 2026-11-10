@@ -20,7 +20,10 @@ fn model_dir() -> PathBuf {
 }
 
 fn cases() -> Vec<Value> {
-    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl");
+    // YAKUSEL_GOLDEN selects another model's file (e.g. logits_8b.jsonl with YAKUSEL_MODEL_DIR).
+    let golden = std::env::var("YAKUSEL_GOLDEN").map(PathBuf::from).unwrap_or_else(|_| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl")
+    });
     std::fs::read_to_string(golden).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 

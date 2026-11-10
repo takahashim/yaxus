@@ -110,6 +110,8 @@ pub struct Gpu {
     coop: bool,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
+    /// Bytes uploaded since the staging memory was last released.
+    unflushed_upload: usize,
     /// Tiled attention for passes of more than 8 rows: keys are split into chunks until
     /// about this many workgroups run (0: the per-row kernel instead).
     tile_wgs: usize,
@@ -217,6 +219,34 @@ enum MetaBuf {
     /// `(first row, rows, 0, 0)` per attention tile.
     Tiles = 3,
 }
+
+/// f16 values added to the scales of each row of a quantized matrix when the row has a
+/// multiple of 256 blocks (`sstride` in the shaders). At such a power-of-two stride the
+/// 64 rows of a matrix-core GEMM tile read their scales from conflicting addresses,
+/// which made the 8B `down_proj` (K = 16384) 1.6-2.2x slower.
+const SCALE_PAD: usize = 8;
+
+/// Per-row scales (`k / 32` per row) at the padded stride, as an even number of values.
+fn pad_scales(sc: Vec<u16>, n: usize, k: usize) -> Vec<u16> {
+    let blocks = k / 32;
+    let mut out = if !blocks.is_multiple_of(256) {
+        sc
+    } else {
+        let stride = blocks + SCALE_PAD;
+        let mut out = vec![0u16; n * stride];
+        for r in 0..n {
+            out[r * stride..r * stride + blocks].copy_from_slice(&sc[r * blocks..(r + 1) * blocks]);
+        }
+        out
+    };
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+    out
+}
+
+/// Weight bytes uploaded between flushes of the staging memory.
+const UPLOAD_FLUSH_BYTES: usize = 512 << 20;
 
 /// Rows per attention tile (`ATTN_TILE`'s `BM`).
 const ATTN_TILE_ROWS: usize = 32;
@@ -392,6 +422,7 @@ impl Gpu {
             coop,
             gemm: GemmKind::from_env(coop),
             tile_wgs: 384,
+            unflushed_upload: 0,
             profile: std::env::var_os("YAKUSEL_PROFILE").map(|_| Profile::default()),
         };
         b.build_kernels();
@@ -399,6 +430,7 @@ impl Gpu {
     }
 
     fn add_kernel(&mut self, name: &'static str, src: &str, read_only: &[bool]) {
+        let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -638,11 +670,21 @@ impl Gpu {
 
     fn upload(&mut self, label: &str, bytes: &[u8]) -> wgpu::Buffer {
         self.weight_bytes += bytes.len();
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
             contents: bytes,
             usage: wgpu::BufferUsages::STORAGE,
-        })
+        });
+        // Initial contents go through staging memory that is only released after the
+        // next submission; flush regularly so loading does not hold a second copy of
+        // the weights (an 8B model in bf16 would exceed the GTT limit).
+        self.unflushed_upload += bytes.len();
+        if self.unflushed_upload >= UPLOAD_FLUSH_BYTES {
+            self.unflushed_upload = 0;
+            self.queue.submit([]);
+            self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+        }
+        buf
     }
 
     fn rope_table(&self, meta: &LayerMeta, max_len: usize, d: usize) -> wgpu::Buffer {
@@ -1124,20 +1166,14 @@ impl Gpu {
             Quant::Q8 => {
                 let q = yakusel_model::quant::quantize_q8(bf16, k);
                 let qb = self.upload("q8", bytemuck::cast_slice(&q.qs));
-                let mut sc: Vec<u16> = q.scales.iter().map(|s| s.to_bits()).collect();
-                if sc.len() % 2 == 1 {
-                    sc.push(0);
-                }
+                let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k);
                 let sb = self.upload("q8-scales", bytemuck::cast_slice(&sc));
                 Weight::Q8 { q: qb, s: sb, n, k }
             }
             Quant::Q4 => {
                 let q = yakusel_model::quant::quantize_q4(bf16, k);
                 let qb = self.upload("q4", &q.qs);
-                let mut sc: Vec<u16> = q.scales.iter().map(|s| s.to_bits()).collect();
-                if sc.len() % 2 == 1 {
-                    sc.push(0);
-                }
+                let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k);
                 let sb = self.upload("q4-scales", bytemuck::cast_slice(&sc));
                 Weight::Q4 { q: qb, s: sb, n, k }
             }

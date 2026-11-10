@@ -16,7 +16,8 @@ use crate::LangArgs;
 
 #[derive(Args)]
 pub struct ModelArgs {
-    /// Model directory, or a Hugging Face repo id found in the local cache.
+    /// Model directory, a Hugging Face repo id found in the local cache, or a size
+    /// (0.8b, 2b, 8b, 31b) for pfnet/plamo-3-translate-<size>.
     #[arg(long, default_value = "pfnet/plamo-3-translate-2b")]
     model: String,
     /// Weight format for matrices: q8 (quantized at load, ~1.8x faster decode) or bf16 (lossless).
@@ -29,8 +30,8 @@ pub struct ModelArgs {
     /// the CPU reference by ~100x).
     #[arg(long, default_value = "f16", value_parser = ["f16", "f32"])]
     prefill_precision: String,
-    /// Draft model for speculative decoding: a directory or repo id, `auto` (use
-    /// pfnet/plamo-3-translate-0.8b when it is in the local cache) or `none`.
+    /// Draft model for speculative decoding: a directory, repo id or size (see --model),
+    /// `auto` (use pfnet/plamo-3-translate-0.8b when it is in the local cache) or `none`.
     /// The output is identical with or without it; only the speed differs.
     #[arg(long, default_value = "auto")]
     draft: String,
@@ -111,6 +112,10 @@ impl ModelArgs {
 /// Returns (directory, display name).
 fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
     let p = Path::new(model);
+    let size = model.to_ascii_lowercase();
+    if !p.is_dir() && ["0.8b", "2b", "8b", "31b"].contains(&size.as_str()) {
+        return resolve_model(&format!("pfnet/plamo-3-translate-{size}"));
+    }
     if p.is_dir() {
         let name = p
             .ancestors()

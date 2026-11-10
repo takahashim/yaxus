@@ -5,9 +5,12 @@
 pub const W_Q8: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
+// `pad_scales` on the host).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
 fn load4(row: u32, i: u32) -> vec4<f32> {
     let q = bitcast<i32>(wq[row * (p.k / 4u) + i]);
-    let b = row * (p.k / 32u) + i / 8u;
+    let b = row * sstride(p.k / 32u) + i / 8u;
     let s2 = unpack2x16float(wsc[b / 2u]);
     let s = select(s2.x, s2.y, (b & 1u) == 1u);
     return vec4<f32>(
@@ -20,9 +23,12 @@ fn load4(row: u32, i: u32) -> vec4<f32> {
 pub const W_Q4: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
+// `pad_scales` on the host).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
 fn load4(row: u32, i: u32) -> vec4<f32> {
     let u = wq[row * (p.k / 8u) + i / 2u] >> (16u * (i & 1u));
-    let b = row * (p.k / 32u) + i / 8u;
+    let b = row * sstride(p.k / 32u) + i / 8u;
     let s2 = unpack2x16float(wsc[b / 2u]);
     let s = select(s2.x, s2.y, (b & 1u) == 1u);
     return (vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u)) - 8.0) * s;
@@ -51,6 +57,9 @@ var<immediate> p: P;
 pub const W_Q8_16: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
+// `pad_scales` on the host).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
 fn unpack_q8(u: u32) -> vec4<f32> {
     let q = bitcast<i32>(u);
     return vec4<f32>(f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
@@ -58,7 +67,7 @@ fn unpack_q8(u: u32) -> vec4<f32> {
 }
 fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let u = wq[row * (p.k / 16u) + j];
-    let b = row * (p.k / 32u) + j / 2u;
+    let b = row * sstride(p.k / 32u) + j / 2u;
     let s2 = unpack2x16float(wsc[b / 2u]);
     let s = select(s2.x, s2.y, (b & 1u) == 1u);
     return array<vec4<f32>, 4>(unpack_q8(u.x) * s, unpack_q8(u.y) * s, unpack_q8(u.z) * s, unpack_q8(u.w) * s);
@@ -68,6 +77,9 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
 pub const W_Q4_16: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
+// `pad_scales` on the host).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
 fn unpack_q4(u: u32, s: f32) -> array<vec4<f32>, 2> {
     let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
     let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
@@ -75,7 +87,7 @@ fn unpack_q4(u: u32, s: f32) -> array<vec4<f32>, 2> {
 }
 fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let u = wq[row * (p.k / 16u) + j];
-    let b = row * (p.k / 32u) + j / 2u;
+    let b = row * sstride(p.k / 32u) + j / 2u;
     let s2 = unpack2x16float(wsc[b / 2u]);
     let s = select(s2.x, s2.y, (b & 1u) == 1u);
     let a = unpack_q4(u.x, s);
@@ -938,14 +950,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 pub const W_Q4_32: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
+// Scales of a row: `blocks` f16 values, padded when `blocks` is a multiple of 256 (see
+// `pad_scales` on the host).
+fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
 fn nib4(u: u32, s: f32) -> array<vec4<f32>, 2> {
     let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
     let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
     return array<vec4<f32>, 2>((lo - 8.0) * s, (hi - 8.0) * s);
 }
 fn load32(row: u32, b: u32) -> array<vec4<f32>, 8> {
-    let i = row * (p.k / 32u) + b;
-    let u = wq[i];
+    let i = row * sstride(p.k / 32u) + b;
+    let u = wq[row * (p.k / 32u) + b];
     let s2 = unpack2x16float(wsc[i / 2u]);
     let s = select(s2.x, s2.y, (i & 1u) == 1u);
     let a = nib4(u.x, s);
