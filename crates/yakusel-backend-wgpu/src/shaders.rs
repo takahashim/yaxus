@@ -976,99 +976,116 @@ fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
 }
 "#;
 
-/// Weight access for `[N, K]` Q4M matrices (GGUF Q4_K): 8 nibbles per u32 as in Q4, and
-/// one u32 per 32-block holding the f16 scale and min: weight = `q * scale - min`.
-pub const W_Q4M: &str = r#"
+/// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): nibbles as in Q4,
+/// per-256 headers in `wsc`.
+pub const W_Q4K: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
-fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+// Scale and min of 32-block `sub` of a row from its Q4_K header (4 u32 per 256: d and
+// dmin as f16, then 12 bytes of packed 6-bit scales and mins), as ggml computes them.
+fn hbyte(m: u32, i: u32) -> u32 { return (wsc[m + 1u + i / 4u] >> (8u * (i % 4u))) & 255u; }
+// Headers of a row, padded by one when their count is a multiple of 32 (`pad_q4k_meta`).
+fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
+    let hb = p.k / 256u;
+    let m = (row * (hb + select(0u, 1u, hb % 32u == 0u)) + sub / 8u) * 4u;
+    let dd = unpack2x16float(wsc[m]);
+    let j = sub % 8u;
+    let lo = j < 4u;
+    let a = hbyte(m, select(j - 4u, j, lo));        // q[j] or q[j - 4]
+    let b = hbyte(m, j + 4u);                        // q[j + 4]
+    let c = hbyte(m, select(j, j, lo));              // q[j]
+    let sc = select((b & 15u) | ((a >> 6u) << 4u), a & 63u, lo);
+    let mn = select((b >> 4u) | ((c >> 6u) << 4u), b & 63u, lo);
+    return vec2<f32>(dd.x * f32(sc), dd.y * f32(mn));
+}
 fn load4(row: u32, i: u32) -> vec4<f32> {
     let u = wq[row * (p.k / 8u) + i / 2u] >> (16u * (i & 1u));
-    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + i / 8u]);
+    let sm = q4k_sm(row, i / 8u);
     return vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u)) * sm.x - sm.y;
 }
 "#;
 
-pub const W_Q4M_16: &str = r#"
+pub const W_Q4K_16: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
-fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
-fn unpack_q4m(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
+// Scale and min of 32-block `sub` of a row from its Q4_K header (4 u32 per 256: d and
+// dmin as f16, then 12 bytes of packed 6-bit scales and mins), as ggml computes them.
+fn hbyte(m: u32, i: u32) -> u32 { return (wsc[m + 1u + i / 4u] >> (8u * (i % 4u))) & 255u; }
+// Headers of a row, padded by one when their count is a multiple of 32 (`pad_q4k_meta`).
+fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
+    let hb = p.k / 256u;
+    let m = (row * (hb + select(0u, 1u, hb % 32u == 0u)) + sub / 8u) * 4u;
+    let dd = unpack2x16float(wsc[m]);
+    let j = sub % 8u;
+    let lo = j < 4u;
+    let a = hbyte(m, select(j - 4u, j, lo));        // q[j] or q[j - 4]
+    let b = hbyte(m, j + 4u);                        // q[j + 4]
+    let c = hbyte(m, select(j, j, lo));              // q[j]
+    let sc = select((b & 15u) | ((a >> 6u) << 4u), a & 63u, lo);
+    let mn = select((b >> 4u) | ((c >> 6u) << 4u), b & 63u, lo);
+    return vec2<f32>(dd.x * f32(sc), dd.y * f32(mn));
+}
+fn unpack_q4k(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
     let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
     let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
     return array<vec4<f32>, 2>(lo * sm.x - sm.y, hi * sm.x - sm.y);
 }
 fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let u = wq[row * (p.k / 16u) + j];
-    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + j / 2u]);
-    let a = unpack_q4m(u.x, sm);
-    let c = unpack_q4m(u.y, sm);
+    let sm = q4k_sm(row, j / 2u);
+    let a = unpack_q4k(u.x, sm);
+    let c = unpack_q4k(u.y, sm);
     return array<vec4<f32>, 4>(a[0], a[1], c[0], c[1]);
 }
 "#;
 
-pub const W_Q4M_32: &str = r#"
-@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
-@group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
-fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
-fn nib4(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
-    let lo = vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u));
-    let hi = vec4<f32>(f32((u >> 16u) & 15u), f32((u >> 20u) & 15u), f32((u >> 24u) & 15u), f32(u >> 28u));
-    return array<vec4<f32>, 2>(lo * sm.x - sm.y, hi * sm.x - sm.y);
-}
-fn load32(row: u32, b: u32) -> array<vec4<f32>, 8> {
-    let u = wq[row * (p.k / 32u) + b];
-    let sm = unpack2x16float(wsc[row * sstride(p.k / 32u) + b]);
-    let a = nib4(u.x, sm);
-    let c = nib4(u.y, sm);
-    let d = nib4(u.z, sm);
-    let e = nib4(u.w, sm);
-    return array<vec4<f32>, 8>(a[0], a[1], c[0], c[1], d[0], d[1], e[0], e[1]);
-}
-fn dot32(w: array<vec4<f32>, 8>, xb: u32) -> f32 {
-    var s = 0.0;
-    for (var m = 0u; m < 8u; m++) { s += dot(w[m], x[xb + m]); }
-    return s;
-}
-"#;
-
-/// Weight access for `[N, K]` Q8B16 matrices (GGUF Q6_K): int8 values as in Q8 with one
-/// f16 scale per 16 values.
-pub const W_Q8B16: &str = r#"
+/// Weight access for `[N, K]` Q6 matrices (GGUF Q6_K): 6 u32 per 32 values (4 of low
+/// nibbles, 2 of high 2-bit fields); one f16 scale per 16 values.
+pub const W_Q6: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 // Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
 fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
-fn load4(row: u32, i: u32) -> vec4<f32> {
-    let q = bitcast<i32>(wq[row * (p.k / 4u) + i]);
-    let b = row * sstride(p.k / 16u) + i / 4u;
+fn q6scale(row: u32, blk: u32) -> f32 {
+    let b = row * sstride(p.k / 16u) + blk;
     let s2 = unpack2x16float(wsc[b / 2u]);
-    let s = select(s2.x, s2.y, (b & 1u) == 1u);
-    return vec4<f32>(
-        f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
-        f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u))) * s;
+    return select(s2.x, s2.y, (b & 1u) == 1u);
+}
+fn q6x4(lo: u32, hi: u32) -> vec4<f32> {
+    let q = (vec4<u32>(lo, lo >> 4u, lo >> 8u, lo >> 12u) & vec4<u32>(15u))
+          | ((vec4<u32>(hi, hi >> 2u, hi >> 4u, hi >> 6u) & vec4<u32>(3u)) << vec4<u32>(4u));
+    return vec4<f32>(q) - 32.0;
+}
+fn load4(row: u32, i: u32) -> vec4<f32> {
+    let g = row * (3u * p.k / 16u) + (i / 8u) * 6u;
+    let lo = wq[g + (i % 8u) / 2u] >> (16u * (i & 1u));
+    let hi = wq[g + 4u + (i % 8u) / 4u] >> (8u * (i & 3u));
+    return q6x4(lo, hi) * q6scale(row, i / 4u);
 }
 "#;
 
-pub const W_Q8B16_16: &str = r#"
-@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
+pub const W_Q6_16: &str = r#"
+@group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 // Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
 fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
-fn unpack_q8(u: u32) -> vec4<f32> {
-    let q = bitcast<i32>(u);
-    return vec4<f32>(f32(extractBits(q, 0u, 8u)), f32(extractBits(q, 8u, 8u)),
-                     f32(extractBits(q, 16u, 8u)), f32(extractBits(q, 24u, 8u)));
+fn q6scale(row: u32, blk: u32) -> f32 {
+    let b = row * sstride(p.k / 16u) + blk;
+    let s2 = unpack2x16float(wsc[b / 2u]);
+    return select(s2.x, s2.y, (b & 1u) == 1u);
+}
+fn q6x4(lo: u32, hi: u32) -> vec4<f32> {
+    let q = (vec4<u32>(lo, lo >> 4u, lo >> 8u, lo >> 12u) & vec4<u32>(15u))
+          | ((vec4<u32>(hi, hi >> 2u, hi >> 4u, hi >> 6u) & vec4<u32>(3u)) << vec4<u32>(4u));
+    return vec4<f32>(q) - 32.0;
 }
 fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
-    let u = wq[row * (p.k / 16u) + j];
-    let b = row * sstride(p.k / 16u) + j;
-    let s2 = unpack2x16float(wsc[b / 2u]);
-    let s = select(s2.x, s2.y, (b & 1u) == 1u);
-    return array<vec4<f32>, 4>(unpack_q8(u.x) * s, unpack_q8(u.y) * s, unpack_q8(u.z) * s, unpack_q8(u.w) * s);
+    let g = row * (3u * p.k / 16u) + (j / 2u) * 6u;
+    let l0 = wq[g + 2u * (j & 1u)];
+    let l1 = wq[g + 2u * (j & 1u) + 1u];
+    let h = wq[g + 4u + (j & 1u)];
+    let s = q6scale(row, j);
+    return array<vec4<f32>, 4>(q6x4(l0, h) * s, q6x4(l0 >> 16u, h >> 8u) * s, q6x4(l1, h >> 16u) * s, q6x4(l1 >> 16u, h >> 24u) * s);
 }
 "#;
 

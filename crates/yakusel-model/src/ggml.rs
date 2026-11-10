@@ -1,5 +1,6 @@
 //! GGML tensor types (as stored in GGUF files): dequantization to f32 on the CPU and
-//! lossless repacking of the common types into the layouts of [`crate::quant`].
+//! repacking of the common types into the layouts of [`crate::quant`] that the GPU
+//! kernels read.
 //!
 //! Block layouts follow ggml's `ggml-common.h` / `dequantize_row_*` (QK_K = 256).
 
@@ -7,7 +8,7 @@ use anyhow::{Result, bail};
 use half::f16;
 use rayon::prelude::*;
 
-use crate::quant::{Q4Data, Q4MData, Q8B16Data, Q8Data};
+use crate::quant::{Q4Data, Q4KData, Q6Data, Q8Data};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlType {
@@ -291,20 +292,15 @@ pub fn q4_from_q4_0(bytes: &[u8]) -> Q4Data {
     Q4Data { qs, scales }
 }
 
-/// Q4_K as [`Q4MData`]: each 32-element sub-block becomes 16 bytes of nibbles with its
-/// scale `d * sc` and min `dmin * m` (rounded to f16; Q4_K keeps them as 6-bit integers
-/// times f16 super-block factors).
-pub fn q4m_from_q4_k(bytes: &[u8]) -> Q4MData {
+/// Q4_K as [`Q4KData`]: the same values; only the nibbles are reordered.
+pub fn q4k_from_q4_k(bytes: &[u8]) -> Q4KData {
     let nb = bytes.len() / 144;
     let mut qs = vec![0u8; nb * 128];
-    let mut sm = vec![f16::ZERO; nb * 16];
-    qs.par_chunks_mut(128).zip(sm.par_chunks_mut(16)).zip(bytes.par_chunks(144)).for_each(|((q, s), b)| {
-        let (d, dmin) = (h(b, 0), h(b, 2));
-        let (sc, ql) = (&b[4..16], &b[16..144]);
+    let mut meta = vec![0u8; nb * 16];
+    qs.par_chunks_mut(128).zip(meta.par_chunks_mut(16)).zip(bytes.par_chunks(144)).for_each(|((q, m), b)| {
+        m.copy_from_slice(&b[0..16]);
+        let ql = &b[16..144];
         for sub in 0..8 {
-            let (sv, mv) = scale_min_k4(sub, sc);
-            s[2 * sub] = f16::from_f32(d * sv as f32);
-            s[2 * sub + 1] = f16::from_f32(dmin * mv as f32);
             let (c, hi) = (sub / 2, sub % 2 == 1);
             let nib = |l: usize| {
                 let x = ql[32 * c + l];
@@ -315,22 +311,30 @@ pub fn q4m_from_q4_k(bytes: &[u8]) -> Q4MData {
             }
         }
     });
-    Q4MData { qs, sm }
+    Q4KData { qs, meta }
 }
 
-/// Q6_K as [`Q8B16Data`]: the 6-bit values `q - 32` as int8 with one f16 scale
-/// (`d * sc`) per 16 elements.
-pub fn q8b16_from_q6_k(bytes: &[u8]) -> Q8B16Data {
-    let nb = bytes.len() / 210;
-    let mut qs = vec![0i8; nb * 256];
-    let mut scales = vec![f16::ZERO; nb * 16];
-    qs.par_chunks_mut(256).zip(scales.par_chunks_mut(16)).zip(bytes.par_chunks(210)).for_each(|((q, s), b)| {
-        for (i, (v, sc)) in q6k_values(b).into_iter().enumerate() {
-            q[i] = v as i8;
-            s[i / 16] = f16::from_f32(sc);
+/// Q6_K as [`Q6Data`] for an `[n, k]` matrix: the same 6-bit values, with `d * sc`
+/// rounded to f16 per 16 elements.
+pub fn q6_from_q6_k(bytes: &[u8], n: usize, k: usize) -> Q6Data {
+    let bpr = k / 256;
+    let row_bytes = 3 * k / 4;
+    let mut qs = vec![0u8; n * row_bytes];
+    let mut scales = vec![f16::ZERO; n * k / 16];
+    qs.par_chunks_mut(row_bytes).zip(scales.par_chunks_mut(k / 16)).enumerate().for_each(|(r, (q, s))| {
+        for blk in 0..bpr {
+            let b = &bytes[(r * bpr + blk) * 210..][..210];
+            for (i, (v, sc)) in q6k_values(b).into_iter().enumerate() {
+                let e = blk * 256 + i;
+                let (g, o) = (e / 32, e % 32);
+                let u = (v + 32) as u8;
+                q[24 * g + o / 2] |= (u & 0xF) << (4 * (o % 2));
+                q[24 * g + 16 + o / 4] |= (u >> 4) << (2 * (o % 4));
+                s[e / 16] = f16::from_f32(sc);
+            }
         }
     });
-    Q8B16Data { qs, scales }
+    Q6Data { qs, scales }
 }
 
 #[cfg(test)]
@@ -345,29 +349,33 @@ mod tests {
     }
 
     #[test]
-    fn repacked_q4_k_matches_dequant() {
-        let b: Vec<u8> = (0..3).flat_map(q4k_block).collect();
-        let want = dequantize(GgmlType::Q4K, &b, 768);
-        let p = q4m_from_q4_k(&b);
+    fn q4k_and_q6_layouts_match_dequant() {
+        // Two rows of two blocks each.
+        let b: Vec<u8> = (0..4).flat_map(q4k_block).collect();
+        let want = dequantize(GgmlType::Q4K, &b, 1024);
+        let p = q4k_from_q4_k(&b);
         for (e, &w) in want.iter().enumerate() {
             let byte = p.qs[e / 2];
             let q = if e % 2 == 0 { byte & 0xF } else { byte >> 4 } as f32;
-            let blk = e / 32;
-            let got = q * p.sm[2 * blk].to_f32() - p.sm[2 * blk + 1].to_f32();
-            assert!((got - w).abs() <= 1e-3 * w.abs().max(1e-2), "{e}: {got} vs {w}");
+            let m = &p.meta[(e / 256) * 16..][..16];
+            let (d, dmin) = (h(m, 0), h(m, 2));
+            let (sc, mn) = scale_min_k4((e % 256) / 32, &m[4..16]);
+            assert_eq!(q * (d * sc as f32) - dmin * mn as f32, w, "{e}");
         }
-    }
-
-    #[test]
-    fn repacked_q6_k_matches_dequant() {
-        let mut b: Vec<u8> = (0..420u32).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
-        for blk in 0..2 {
+        let mut b: Vec<u8> = (0..840u32).map(|i| (i.wrapping_mul(2246822519) >> 11) as u8).collect();
+        for blk in 0..4 {
             b[210 * blk + 208..210 * blk + 210].copy_from_slice(&f16::from_f32(0.002).to_le_bytes());
         }
-        let want = dequantize(GgmlType::Q6K, &b, 512);
-        let p = q8b16_from_q6_k(&b);
+        let want = dequantize(GgmlType::Q6K, &b, 1024);
+        let (n, k) = (2, 512);
+        let p = q6_from_q6_k(&b, n, k);
         for (e, &w) in want.iter().enumerate() {
-            let got = p.qs[e] as f32 * p.scales[e / 16].to_f32();
+            let (r, c) = (e / k, e % k);
+            let grp = &p.qs[r * 3 * k / 4 + 24 * (c / 32)..];
+            let o = c % 32;
+            let lo = (grp[o / 2] >> (4 * (o % 2))) & 0xF;
+            let hi = (grp[16 + o / 4] >> (2 * (o % 4))) & 3;
+            let got = ((lo | (hi << 4)) as f32 - 32.0) * p.scales[e / 16].to_f32();
             assert!((got - w).abs() <= 1e-3 * w.abs().max(1e-2), "{e}: {got} vs {w}");
         }
     }

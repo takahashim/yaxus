@@ -125,9 +125,9 @@ fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
 fn ggml_matmul_kernels_match_host() {
     let mut gpu = WgpuBackend::new().unwrap();
     let f16_gemm = gpu.gemm_uses_f16();
-    // K a multiple of 256 (K-quant super-blocks); 2048 rows of 256 blocks = 8192 test
-    // the padded scale stride.
-    for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096)] {
+    // K a multiple of 256 (K-quant super-blocks); K = 4096 and 8192 pad the per-16 scale
+    // rows, K = 8192 and 16384 the Q4_K header rows.
+    for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096), (64, 16384)] {
         for dtype in [GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
             let bytes = ggml_blocks(dtype, n, k, 3);
             let wd = yakusel_model::ggml::dequantize(dtype, &bytes, n * k);

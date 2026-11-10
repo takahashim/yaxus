@@ -52,10 +52,10 @@ impl Drop for Tensor {
 pub enum Weight {
     Q8 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
     Q4 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
-    /// 4-bit values with an f16 scale and min per 32 (GGUF Q4_K).
-    Q4M { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
-    /// int8 values with an f16 scale per 16 (GGUF Q6_K).
-    Q8B16 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
+    /// GGUF Q4_K values: nibbles and the per-256 headers, decoded in the kernels.
+    Q4K { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
+    /// 6-bit values with an f16 scale per 16 (GGUF Q6_K).
+    Q6 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
     Bf16 { w: wgpu::Buffer, n: usize, k: usize },
     /// 1-D weights (norms), converted to f32.
     Vector(wgpu::Buffer),
@@ -231,8 +231,7 @@ enum MetaBuf {
 const SCALE_PAD: usize = 8;
 
 /// Per-row scales at the padded stride (`sstride` in the shaders), as an even number of
-/// u16. A row has `blocks` entries of `unit` u16 each (1 for an f16 scale, 2 for a Q4M
-/// scale/min pair); rows of a multiple of 256 entries get `SCALE_PAD` more.
+/// u16. A row has `blocks` entries of `unit` u16 each (1 for an f16 scale, 2 for a pair); rows of a multiple of 256 entries get `SCALE_PAD` more.
 fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> Vec<u16> {
     let row = blocks * unit;
     let mut out = if !blocks.is_multiple_of(256) {
@@ -247,6 +246,20 @@ fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> Vec<u16> {
     };
     if out.len() % 2 == 1 {
         out.push(0);
+    }
+    out
+}
+
+/// Q4_K headers (16 bytes per 256 values) with one more per row when a row has a
+/// multiple of 32 (a power-of-two stride, see `SCALE_PAD`); `q4k_sm` in the shaders.
+fn pad_q4k_meta(meta: Vec<u8>, n: usize, blocks: usize) -> Vec<u8> {
+    if !blocks.is_multiple_of(32) {
+        return meta;
+    }
+    let (row, stride) = (16 * blocks, 16 * (blocks + 1));
+    let mut out = vec![0u8; n * stride];
+    for r in 0..n {
+        out[r * stride..r * stride + row].copy_from_slice(&meta[r * row..(r + 1) * row]);
     }
     out
 }
@@ -500,8 +513,8 @@ impl Gpu {
             let f32src = format!("{MM_PARAMS}{wsrc}{GEMM2}");
             self.add_kernel(Box::leak(format!("gemm2f32_{w}").into_boxed_str()), &f32src, layout);
         }
-        // GGUF formats kept as loaded (Q4_K as Q4M, Q6_K as Q8B16).
-        for (w, w4, w16) in [("q4m", W_Q4M, W_Q4M_16), ("q8b16", W_Q8B16, W_Q8B16_16)] {
+        // GGUF Q4_K and Q6_K at their own bit widths.
+        for (w, w4, w16) in [("q4k", W_Q4K, W_Q4K_16), ("q6", W_Q6, W_Q6_16)] {
             let name = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
             self.add_kernel(name(format!("gemv1_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(1)), &q8);
             self.add_kernel(name(format!("gemv8_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), &q8);
@@ -522,10 +535,6 @@ impl Gpu {
                 self.add_kernel(name(format!("gemmcoop_{w}")), &c, &q8);
             }
             self.add_kernel(name(format!("gemm2f32_{w}")), &format!("{MM_PARAMS}{w4}{GEMM2}"), &q8);
-        }
-        for rpw in [8u32, 16] {
-            let src = format!("{MM_PARAMS}{W_Q4M_32}{}", GEMV1_32.replace("{RPW}", &rpw.to_string()));
-            self.add_kernel(Box::leak(format!("gemv1b{rpw}_q4m").into_boxed_str()), &src, &q8);
         }
         self.add_kernel("gemv1_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(1)), &bf);
         self.add_kernel("gemv8_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(GEMV_MAX_T)), &bf);
@@ -918,8 +927,8 @@ impl Gpu {
         let (n, k, suffix, bufs): (usize, usize, &str, Vec<&wgpu::Buffer>) = match w {
             Weight::Q8 { q, s, n, k } => (*n, *k, "q8", vec![q, s]),
             Weight::Q4 { q, s, n, k } => (*n, *k, "q4", vec![q, s]),
-            Weight::Q4M { q, s, n, k } => (*n, *k, "q4m", vec![q, s]),
-            Weight::Q8B16 { q, s, n, k } => (*n, *k, "q8b16", vec![q, s]),
+            Weight::Q4K { q, s, n, k } => (*n, *k, "q4k", vec![q, s]),
+            Weight::Q6 { q, s, n, k } => (*n, *k, "q6", vec![q, s]),
             Weight::Bf16 { w, n, k } => (*n, *k, "bf16", vec![w]),
             _ => panic!("matmul needs a matrix"),
         };
@@ -957,7 +966,7 @@ impl Gpu {
             return y;
         }
         let params = [n as u32, k as u32, t as u32, 0];
-        let (name, groups) = if t == 1 && (suffix == "q4" || suffix == "q4m") {
+        let (name, groups) = if t == 1 && suffix == "q4" {
             let rpw = q4_rows_per_wg(n);
             (format!("gemv1b{rpw}_{suffix}"), grid(n.div_ceil(rpw as usize) as u32))
         } else if t == 1 {
@@ -1119,8 +1128,8 @@ impl Gpu {
             Weight::Q8 { q, s, n, k } => (*n, *k, "glu_q8", vec![q.clone(), s.clone()]),
             // The block variant (`GLU_32`) measured slower here (174 vs 138 us on 12288x1536).
             Weight::Q4 { q, s, n, k } => (*n, *k, "glu_q4", vec![q.clone(), s.clone()]),
-            Weight::Q4M { q, s, n, k } => (*n, *k, "glu_q4m", vec![q.clone(), s.clone()]),
-            Weight::Q8B16 { q, s, n, k } => (*n, *k, "glu_q8b16", vec![q.clone(), s.clone()]),
+            Weight::Q4K { q, s, n, k } => (*n, *k, "glu_q4k", vec![q.clone(), s.clone()]),
+            Weight::Q6 { q, s, n, k } => (*n, *k, "glu_q6", vec![q.clone(), s.clone()]),
             Weight::Bf16 { w, n, k } => (*n, *k, "glu_bf16", vec![w.clone()]),
             _ => panic!("matmul_glu needs a matrix"),
         };
@@ -1212,7 +1221,7 @@ impl Gpu {
     }
 
     /// A GGUF matrix in a layout the kernels read directly, without changing its values
-    /// (up to f16 rounding of Q4_K/Q6_K's combined scales); `None` for other types.
+    /// (up to f16 rounding of Q6_K's combined scales); `None` for other types.
     fn load_gguf_matrix(&mut self, t: &TensorRef, n: usize, k: usize) -> Option<Weight> {
         self.load_ggml(t.dtype, t.bytes(), n, k)
     }
@@ -1223,18 +1232,17 @@ impl Gpu {
             GgmlType::Q8_0 => self.upload_q8(ggml::q8_from_q8_0(b), n, k),
             GgmlType::Q4_0 => self.upload_q4(ggml::q4_from_q4_0(b), n, k),
             GgmlType::Q4K => {
-                let q = ggml::q4m_from_q4_k(b);
-                let qb = self.upload("q4m", &q.qs);
-                let sc = pad_scales(q.sm.iter().map(|s| s.to_bits()).collect(), n, k / 32, 2);
-                let sb = self.upload("q4m-scales", bytemuck::cast_slice(&sc));
-                Weight::Q4M { q: qb, s: sb, n, k }
+                let q = ggml::q4k_from_q4_k(b);
+                let qb = self.upload("q4k", &q.qs);
+                let sb = self.upload("q4k-meta", &pad_q4k_meta(q.meta, n, k / 256));
+                Weight::Q4K { q: qb, s: sb, n, k }
             }
             GgmlType::Q6K => {
-                let q = ggml::q8b16_from_q6_k(b);
-                let qb = self.upload("q8b16", bytemuck::cast_slice(&q.qs));
+                let q = ggml::q6_from_q6_k(b, n, k);
+                let qb = self.upload("q6", &q.qs);
                 let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
-                let sb = self.upload("q8b16-scales", bytemuck::cast_slice(&sc));
-                Weight::Q8B16 { q: qb, s: sb, n, k }
+                let sb = self.upload("q6-scales", bytemuck::cast_slice(&sc));
+                Weight::Q6 { q: qb, s: sb, n, k }
             }
             _ => return None,
         })

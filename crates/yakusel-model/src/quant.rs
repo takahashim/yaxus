@@ -68,15 +68,19 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
     Q4Data { qs, scales }
 }
 
-/// `[N, K]` matrix of 4-bit values with a scale and a min per 32-block (from GGUF Q4_K):
-/// weight = `q * sm[2b] - sm[2b + 1]`, `q` in 0..=15, nibbles laid out as in [`Q4Data`].
-pub struct Q4MData {
+/// `[N, K]` matrix of 6-bit values (from GGUF Q6_K) in 24-byte groups of 32: 16 bytes
+/// of low nibbles (element `e` of the group in byte `e / 2`, low nibble for even `e`),
+/// then 8 bytes of high 2-bit fields (element `e` at bits `2 * (e % 4)` of byte
+/// `16 + e / 4`); weight = `(q - 32) * scale` with one f16 scale per 16.
+pub struct Q6Data {
     pub qs: Vec<u8>,
-    pub sm: Vec<f16>,
+    pub scales: Vec<f16>,
 }
 
-/// `[N, K]` matrix of int8 values with one f16 scale per 16 (from GGUF Q6_K).
-pub struct Q8B16Data {
-    pub qs: Vec<i8>,
-    pub scales: Vec<f16>,
+/// `[N, K]` matrix as GGUF Q4_K: nibbles laid out as in [`Q4Data`], and per 256
+/// elements the 16 header bytes of the block (`d`, `dmin` as f16, then the 12 bytes of
+/// packed 6-bit scales and mins).
+pub struct Q4KData {
+    pub qs: Vec<u8>,
+    pub meta: Vec<u8>,
 }
