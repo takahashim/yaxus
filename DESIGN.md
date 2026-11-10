@@ -310,7 +310,7 @@ yakusel bench   --model ...                                         # プリフ�
 
 | フェーズ | 状態 | メモ |
 |---|---|---|
-| M0 | 完了 | `yakusel-tokenizer`: ゴールデン 1,814 件の encode/decode、プロンプトテンプレート 14 件 (エラー系含む)、ストリーミングデコードが Python と完全一致。`(.)\2{3,}` の後方参照と Python の `\s` 定義は手書きで再現 |
+| M0 | 完了 | `yakusel-tokenizer`: ゴールデン 1,814 件 (2026-11-10 にモデルカード由来の行を除き、パブリックドメイン作品の抜粋 `tests/golden/corpus/` に置き換えて 1,696 件) の encode/decode、プロンプトテンプレート 14 件 (エラー系含む)、ストリーミングデコードが Python と完全一致。`(.)\2{3,}` の後方参照と Python の `\s` 定義は手書きで再現 |
 | M1 | 完了 | `yakusel-model` (Backend トレイト、forward、greedy 生成)、`yakusel-backend-cpu`。HF (f32) と最終 logits の最大誤差 3e-5、greedy 48 トークンが 3 ケースとも一致 |
 | 高速化 1 | 完了 | rayon を物理コア数 (8) で起動 (`RAYON_NUM_THREADS` で上書き可)、`.cargo/config.toml` で `target-cpu=native`、T<4 では bf16/Q8 を一時バッファなしで直接内積 |
 | 高速化 2 (Q8) | 完了 | ロード時量子化 (32 要素ブロック、f16 スケール = max\|w\|/127)。行列 + `lm_head` が対象、埋め込みと norm は bf16 のまま。重み 5.76→3.32 GB、ロード時の変換 約 0.65 s。CLI の既定を q8 に変更 (`--quant bf16` で無損失) |
