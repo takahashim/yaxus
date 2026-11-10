@@ -71,16 +71,26 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
 /// `[N, K]` matrix of 6-bit values (from GGUF Q6_K) in 24-byte groups of 32: 16 bytes
 /// of low nibbles (element `e` of the group in byte `e / 2`, low nibble for even `e`),
 /// then 8 bytes of high 2-bit fields (element `e` at bits `2 * (e % 4)` of byte
-/// `16 + e / 4`); weight = `(q - 32) * scale` with one f16 scale per 16.
+/// `16 + e / 4`). Weight = `(q - 32) * d * sc` as in Q6_K: per row, `meta` holds the
+/// `K / 256` f16 `d` values, then the `K / 16` int8 `sc` values, padded as
+/// [`q6_meta_stride`] says. `scales16` holds `d * sc` as one f16 per 16 values, for
+/// kernels that look a scale up per 4 values (the prefill GEMMs).
 pub struct Q6Data {
     pub qs: Vec<u8>,
-    pub scales: Vec<f16>,
+    pub meta: Vec<u8>,
+    pub scales16: Vec<f16>,
 }
 
-/// `[N, K]` matrix as GGUF Q4_K: nibbles laid out as in [`Q4Data`], and per 256
-/// elements the 16 header bytes of the block (`d`, `dmin` as f16, then the 12 bytes of
-/// packed 6-bit scales and mins).
+/// Bytes per row of [`Q6Data::meta`]: `18 * K / 256` rounded up to 4, plus 16 when that
+/// is a multiple of 512 (power-of-two strides slow the GPU GEMMs; `q6row` in the shaders).
+pub fn q6_meta_stride(k: usize) -> usize {
+    let s = (18 * (k / 256)).div_ceil(4) * 4;
+    if s.is_multiple_of(512) { s + 16 } else { s }
+}
+
+/// `[N, K]` matrix as GGUF Q4_K blocks of 144 bytes per 256 elements: the 16 header
+/// bytes (`d`, `dmin` as f16, then the 12 bytes of packed 6-bit scales and mins), then
+/// the nibbles laid out as in [`Q4Data`] (ggml interleaves them by 32-byte chunk).
 pub struct Q4KData {
-    pub qs: Vec<u8>,
-    pub meta: Vec<u8>,
+    pub data: Vec<u8>,
 }

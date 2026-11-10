@@ -54,8 +54,9 @@ pub enum Weight {
     Q4 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
     /// GGUF Q4_K values: nibbles and the per-256 headers, decoded in the kernels.
     Q4K { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
-    /// 6-bit values with an f16 scale per 16 (GGUF Q6_K).
-    Q6 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
+    /// 6-bit values (GGUF Q6_K): `s` holds Q6_K's scales for the decode kernels, `s16` an
+    /// f16 scale per 16 for the prefill GEMMs.
+    Q6 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
     Bf16 { w: wgpu::Buffer, n: usize, k: usize },
     /// 1-D weights (norms), converted to f32.
     Vector(wgpu::Buffer),
@@ -246,20 +247,6 @@ fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> Vec<u16> {
     };
     if out.len() % 2 == 1 {
         out.push(0);
-    }
-    out
-}
-
-/// Q4_K headers (16 bytes per 256 values) with one more per row when a row has a
-/// multiple of 32 (a power-of-two stride, see `SCALE_PAD`); `q4k_sm` in the shaders.
-fn pad_q4k_meta(meta: Vec<u8>, n: usize, blocks: usize) -> Vec<u8> {
-    if !blocks.is_multiple_of(32) {
-        return meta;
-    }
-    let (row, stride) = (16 * blocks, 16 * (blocks + 1));
-    let mut out = vec![0u8; n * stride];
-    for r in 0..n {
-        out[r * stride..r * stride + row].copy_from_slice(&meta[r * row..(r + 1) * row]);
     }
     out
 }
@@ -935,7 +922,7 @@ impl Gpu {
             Weight::Q8 { q, s, n, k } => (*n, *k, "q8", vec![q, s]),
             Weight::Q4 { q, s, n, k } => (*n, *k, "q4", vec![q, s]),
             Weight::Q4K { q, s, n, k } => (*n, *k, "q4k", vec![q, s]),
-            Weight::Q6 { q, s, n, k } => (*n, *k, "q6", vec![q, s]),
+            Weight::Q6 { q, s, n, k, .. } => (*n, *k, "q6", vec![q, s]),
             Weight::Bf16 { w, n, k } => (*n, *k, "bf16", vec![w]),
             _ => panic!("matmul needs a matrix"),
         };
@@ -980,6 +967,10 @@ impl Gpu {
         } else if t <= GEMV_MAX_T {
             (format!("gemv8_{suffix}"), grid(n.div_ceil(8) as u32))
         } else {
+            // The prefill GEMMs read Q6's per-16 f16 scales (see `W_Q6`).
+            if let Weight::Q6 { s16, .. } = w {
+                all[3] = s16;
+            }
             match self.gemm {
                 GemmKind::Coop if n % 64 == 0 => {
                     (format!("gemmcoop_{suffix}"), ((n / 64) as u32, t.div_ceil(64) as u32))
@@ -1134,7 +1125,7 @@ impl Gpu {
             // The block variant (`GLU_32`) measured slower here (174 vs 138 us on 12288x1536).
             Weight::Q4 { q, s, n, k } => (*n, *k, "glu_q4", vec![q.clone(), s.clone()]),
             Weight::Q4K { q, s, n, k } => (*n, *k, "glu_q4k", vec![q.clone(), s.clone()]),
-            Weight::Q6 { q, s, n, k } => (*n, *k, "glu_q6", vec![q.clone(), s.clone()]),
+            Weight::Q6 { q, s, n, k, .. } => (*n, *k, "glu_q6", vec![q.clone(), s.clone()]),
             Weight::Bf16 { w, n, k } => (*n, *k, "glu_bf16", vec![w.clone()]),
             _ => panic!("matmul_glu needs a matrix"),
         };
@@ -1237,17 +1228,17 @@ impl Gpu {
             GgmlType::Q8_0 => self.upload_q8(ggml::q8_from_q8_0(b), n, k),
             GgmlType::Q4_0 => self.upload_q4(ggml::q4_from_q4_0(b), n, k),
             GgmlType::Q4K => {
-                let q = ggml::q4k_from_q4_k(b);
-                let qb = self.upload("q4k", &q.qs);
-                let sb = self.upload("q4k-meta", &pad_q4k_meta(q.meta, n, k / 256));
-                Weight::Q4K { q: qb, s: sb, n, k }
+                // One buffer, read through two bindings (nibbles and headers).
+                let qb = self.upload("q4k", &ggml::q4k_from_q4_k(b).data);
+                Weight::Q4K { q: qb.clone(), s: qb, n, k }
             }
             GgmlType::Q6K => {
                 let q = ggml::q6_from_q6_k(b, n, k);
                 let qb = self.upload("q6", &q.qs);
-                let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
-                let sb = self.upload("q6-scales", bytemuck::cast_slice(&sc));
-                Weight::Q6 { q: qb, s: sb, n, k }
+                let sb = self.upload("q6-meta", &q.meta);
+                let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
+                let s16 = self.upload("q6-scales", bytemuck::cast_slice(&s16));
+                Weight::Q6 { q: qb, s: sb, s16, n, k }
             }
             _ => return None,
         })

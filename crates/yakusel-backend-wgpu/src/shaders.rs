@@ -72,6 +72,10 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let s = select(s2.x, s2.y, (b & 1u) == 1u);
     return array<vec4<f32>, 4>(unpack_q8(u.x) * s, unpack_q8(u.y) * s, unpack_q8(u.z) * s, unpack_q8(u.w) * s);
 }
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let w = load16(row, j);
+    return dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
+}
 "#;
 
 pub const W_Q4_16: &str = r#"
@@ -94,6 +98,10 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let c = unpack_q4(u.y, s);
     return array<vec4<f32>, 4>(a[0], a[1], c[0], c[1]);
 }
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let w = load16(row, j);
+    return dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
+}
 "#;
 
 pub const W_BF16_16: &str = r#"
@@ -105,6 +113,10 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let b = wb[i + 1u];
     return array<vec4<f32>, 4>(vec4<f32>(bf2(a.x), bf2(a.y)), vec4<f32>(bf2(a.z), bf2(a.w)),
                                vec4<f32>(bf2(b.x), bf2(b.y)), vec4<f32>(bf2(b.z), bf2(b.w)));
+}
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let w = load16(row, j);
+    return dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
 }
 "#;
 
@@ -130,8 +142,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
         let x1 = x[xb + 1u];
         let x2 = x[xb + 2u];
         let x3 = x[xb + 3u];
-        let w = load16(r, j);
-        acc += dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
+        acc += wdot16(r, j, x0, x1, x2, x3);
     }
     for (var s = 16u; s > 0u; s >>= 1u) { acc += subgroupShuffleXor(acc, s); }
     if (lane == 0u && row < p.n) { y[row] = acc; }
@@ -670,9 +681,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
     var acc = 0.0;
     if (u < p.n) {
         for (var j = lane; j < k16; j += 32u) {
-            let w = load16(row, j);
             let xb = 4u * j;
-            acc += dot(w[0], x[xb]) + dot(w[1], x[xb + 1u]) + dot(w[2], x[xb + 2u]) + dot(w[3], x[xb + 3u]);
+            acc += wdot16(row, j, x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
         }
     }
     red[li] = acc;
@@ -976,18 +986,17 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 "#;
 
 
-/// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): nibbles as in Q4,
-/// per-256 headers in `wsc`.
+/// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): 144-byte blocks of a
+/// header and nibbles as in Q4, bound twice (`wq` for the nibbles, `wsc` for headers).
 pub const W_Q4K: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Scale and min of 32-block `sub` of a row from its Q4_K header (4 u32 per 256: d and
-// dmin as f16, then 12 bytes of packed 6-bit scales and mins), as ggml computes them.
+// Scale and min of 32-block `sub` of a row from its Q4_K header (the first 4 of the
+// 36 u32 of a block: d and dmin as f16, then 12 bytes of packed 6-bit scales and
+// mins), as ggml computes them. `wq` and `wsc` are the same buffer.
 fn hbyte(m: u32, i: u32) -> u32 { return (wsc[m + 1u + i / 4u] >> (8u * (i % 4u))) & 255u; }
-// Headers of a row, padded by one when their count is a multiple of 32 (`pad_q4k_meta`).
 fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
-    let hb = p.k / 256u;
-    let m = (row * (hb + select(0u, 1u, hb % 32u == 0u)) + sub / 8u) * 4u;
+    let m = (row * (p.k / 256u) + sub / 8u) * 36u;
     let dd = unpack2x16float(wsc[m]);
     let j = sub % 8u;
     let lo = j < 4u;
@@ -999,7 +1008,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
     return vec2<f32>(dd.x * f32(sc), dd.y * f32(mn));
 }
 fn load4(row: u32, i: u32) -> vec4<f32> {
-    let u = wq[row * (p.k / 8u) + i / 2u] >> (16u * (i & 1u));
+    let u = wq[(row * (p.k / 256u) + i / 64u) * 36u + 4u + (i % 64u) / 2u] >> (16u * (i & 1u));
     let sm = q4k_sm(row, i / 8u);
     return vec4<f32>(f32(u & 15u), f32((u >> 4u) & 15u), f32((u >> 8u) & 15u), f32((u >> 12u) & 15u)) * sm.x - sm.y;
 }
@@ -1008,13 +1017,12 @@ fn load4(row: u32, i: u32) -> vec4<f32> {
 pub const W_Q4K_16: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
-// Scale and min of 32-block `sub` of a row from its Q4_K header (4 u32 per 256: d and
-// dmin as f16, then 12 bytes of packed 6-bit scales and mins), as ggml computes them.
+// Scale and min of 32-block `sub` of a row from its Q4_K header (the first 4 of the
+// 36 u32 of a block: d and dmin as f16, then 12 bytes of packed 6-bit scales and
+// mins), as ggml computes them. `wq` and `wsc` are the same buffer.
 fn hbyte(m: u32, i: u32) -> u32 { return (wsc[m + 1u + i / 4u] >> (8u * (i % 4u))) & 255u; }
-// Headers of a row, padded by one when their count is a multiple of 32 (`pad_q4k_meta`).
 fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
-    let hb = p.k / 256u;
-    let m = (row * (hb + select(0u, 1u, hb % 32u == 0u)) + sub / 8u) * 4u;
+    let m = (row * (p.k / 256u) + sub / 8u) * 36u;
     let dd = unpack2x16float(wsc[m]);
     let j = sub % 8u;
     let lo = j < 4u;
@@ -1031,21 +1039,28 @@ fn unpack_q4k(u: u32, sm: vec2<f32>) -> array<vec4<f32>, 2> {
     return array<vec4<f32>, 2>(lo * sm.x - sm.y, hi * sm.x - sm.y);
 }
 fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
-    let u = wq[row * (p.k / 16u) + j];
+    let u = wq[(row * (p.k / 256u) + j / 16u) * 18u + 2u + j % 16u];
     let sm = q4k_sm(row, j / 2u);
     let a = unpack_q4k(u.x, sm);
     let c = unpack_q4k(u.y, sm);
     return array<vec4<f32>, 4>(a[0], a[1], c[0], c[1]);
 }
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let w = load16(row, j);
+    return dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
+}
 "#;
 
 /// Weight access for `[N, K]` Q6 matrices (GGUF Q6_K): 6 u32 per 32 values (4 of low
-/// nibbles, 2 of high 2-bit fields); one f16 scale per 16 values.
+/// nibbles, 2 of high 2-bit fields). The decode kernels (`W_Q6_16`) read the scales as in
+/// Q6_K (int8 per 16 times f16 per 256); the prefill ones (`W_Q6`) an f16 per 16.
 pub const W_Q6: &str = r#"
 @group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 // Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
 fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+// The prefill kernels read a second scale array: one f16 (`d * sc`) per 16 values, so a
+// lookup is a single load (the compact one costs the matrix-core GEMM 1.5x).
 fn q6scale(row: u32, blk: u32) -> f32 {
     let b = row * sstride(p.k / 16u) + blk;
     let s2 = unpack2x16float(wsc[b / 2u]);
@@ -1069,10 +1084,16 @@ pub const W_Q6_16: &str = r#"
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 // Per-row scale blocks, padded when their count is a multiple of 256 (`pad_scales`).
 fn sstride(blocks: u32) -> u32 { return blocks + select(0u, {SPAD}u, blocks % 256u == 0u); }
+// Per row: K / 256 f16 `d`, then K / 16 int8 scales (`q6_meta_stride` on the host).
 fn q6scale(row: u32, blk: u32) -> f32 {
-    let b = row * sstride(p.k / 16u) + blk;
-    let s2 = unpack2x16float(wsc[b / 2u]);
-    return select(s2.x, s2.y, (b & 1u) == 1u);
+    let hb = p.k / 256u;
+    var rs = (18u * hb + 3u) / 4u;
+    rs += select(0u, 4u, (rs * 4u) % 512u == 0u);
+    let base = row * rs;
+    let d = unpack2x16float(wsc[base + blk / 32u])[(blk / 16u) & 1u];
+    let off = 2u * hb + blk;
+    let sc = extractBits(bitcast<i32>(wsc[base + off / 4u]), 8u * (off % 4u), 8u);
+    return d * f32(sc);
 }
 fn q6x4(lo: u32, hi: u32) -> vec4<f32> {
     let q = (vec4<u32>(lo, lo >> 4u, lo >> 8u, lo >> 12u) & vec4<u32>(15u))
@@ -1086,6 +1107,10 @@ fn load16(row: u32, j: u32) -> array<vec4<f32>, 4> {
     let h = wq[g + 4u + (j & 1u)];
     let s = q6scale(row, j);
     return array<vec4<f32>, 4>(q6x4(l0, h) * s, q6x4(l0 >> 16u, h >> 8u) * s, q6x4(l1, h >> 16u) * s, q6x4(l1 >> 16u, h >> 24u) * s);
+}
+fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>) -> f32 {
+    let w = load16(row, j);
+    return dot(w[0], x0) + dot(w[1], x1) + dot(w[2], x2) + dot(w[3], x3);
 }
 "#;
 

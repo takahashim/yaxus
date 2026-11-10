@@ -292,14 +292,12 @@ pub fn q4_from_q4_0(bytes: &[u8]) -> Q4Data {
     Q4Data { qs, scales }
 }
 
-/// Q4_K as [`Q4KData`]: the same values; only the nibbles are reordered.
+/// Q4_K as [`Q4KData`]: the same bytes with the nibbles of each block reordered.
 pub fn q4k_from_q4_k(bytes: &[u8]) -> Q4KData {
-    let nb = bytes.len() / 144;
-    let mut qs = vec![0u8; nb * 128];
-    let mut meta = vec![0u8; nb * 16];
-    qs.par_chunks_mut(128).zip(meta.par_chunks_mut(16)).zip(bytes.par_chunks(144)).for_each(|((q, m), b)| {
-        m.copy_from_slice(&b[0..16]);
-        let ql = &b[16..144];
+    let mut data = vec![0u8; bytes.len()];
+    data.par_chunks_mut(144).zip(bytes.par_chunks(144)).for_each(|(o, b)| {
+        o[0..16].copy_from_slice(&b[0..16]);
+        let (q, ql) = (&mut o[16..144], &b[16..144]);
         for sub in 0..8 {
             let (c, hi) = (sub / 2, sub % 2 == 1);
             let nib = |l: usize| {
@@ -311,30 +309,34 @@ pub fn q4k_from_q4_k(bytes: &[u8]) -> Q4KData {
             }
         }
     });
-    Q4KData { qs, meta }
+    Q4KData { data }
 }
 
-/// Q6_K as [`Q6Data`] for an `[n, k]` matrix: the same 6-bit values, with `d * sc`
-/// rounded to f16 per 16 elements.
+/// Q6_K as [`Q6Data`] for an `[n, k]` matrix: the same values, scales and `d`.
 pub fn q6_from_q6_k(bytes: &[u8], n: usize, k: usize) -> Q6Data {
     let bpr = k / 256;
     let row_bytes = 3 * k / 4;
+    let ms = crate::quant::q6_meta_stride(k);
     let mut qs = vec![0u8; n * row_bytes];
-    let mut scales = vec![f16::ZERO; n * k / 16];
-    qs.par_chunks_mut(row_bytes).zip(scales.par_chunks_mut(k / 16)).enumerate().for_each(|(r, (q, s))| {
+    let mut meta = vec![0u8; n * ms];
+    let mut scales16 = vec![f16::ZERO; n * k / 16];
+    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(scales16.par_chunks_mut(k / 16));
+    rows.enumerate().for_each(|(r, ((q, m), s16))| {
         for blk in 0..bpr {
             let b = &bytes[(r * bpr + blk) * 210..][..210];
+            m[2 * blk..2 * blk + 2].copy_from_slice(&b[208..210]);
+            m[2 * bpr + 16 * blk..2 * bpr + 16 * blk + 16].copy_from_slice(&b[192..208]);
             for (i, (v, sc)) in q6k_values(b).into_iter().enumerate() {
+                s16[(blk * 256 + i) / 16] = f16::from_f32(sc);
                 let e = blk * 256 + i;
                 let (g, o) = (e / 32, e % 32);
                 let u = (v + 32) as u8;
                 q[24 * g + o / 2] |= (u & 0xF) << (4 * (o % 2));
                 q[24 * g + 16 + o / 4] |= (u >> 4) << (2 * (o % 4));
-                s[e / 16] = f16::from_f32(sc);
             }
         }
     });
-    Q6Data { qs, scales }
+    Q6Data { qs, meta, scales16 }
 }
 
 #[cfg(test)]
@@ -355,9 +357,10 @@ mod tests {
         let want = dequantize(GgmlType::Q4K, &b, 1024);
         let p = q4k_from_q4_k(&b);
         for (e, &w) in want.iter().enumerate() {
-            let byte = p.qs[e / 2];
+            let blk = &p.data[(e / 256) * 144..][..144];
+            let byte = blk[16 + (e % 256) / 2];
             let q = if e % 2 == 0 { byte & 0xF } else { byte >> 4 } as f32;
-            let m = &p.meta[(e / 256) * 16..][..16];
+            let m = &blk[..16];
             let (d, dmin) = (h(m, 0), h(m, 2));
             let (sc, mn) = scale_min_k4((e % 256) / 32, &m[4..16]);
             assert_eq!(q * (d * sc as f32) - dmin * mn as f32, w, "{e}");
@@ -375,8 +378,11 @@ mod tests {
             let o = c % 32;
             let lo = (grp[o / 2] >> (4 * (o % 2))) & 0xF;
             let hi = (grp[16 + o / 4] >> (2 * (o % 4))) & 3;
-            let got = ((lo | (hi << 4)) as f32 - 32.0) * p.scales[e / 16].to_f32();
-            assert!((got - w).abs() <= 1e-3 * w.abs().max(1e-2), "{e}: {got} vs {w}");
+            let m = &p.meta[r * crate::quant::q6_meta_stride(k)..];
+            let d = h(m, 2 * (c / 256));
+            let sc = m[2 * (k / 256) + c / 16] as i8 as f32;
+            let got = ((lo | (hi << 4)) as f32 - 32.0) * (d * sc);
+            assert_eq!(got, w, "{e}");
         }
     }
 
