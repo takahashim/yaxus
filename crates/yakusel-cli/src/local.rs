@@ -38,8 +38,9 @@ pub struct ModelArgs {
     /// The output is identical with or without it; only the speed differs.
     #[arg(long, default_value = "auto")]
     draft: String,
-    /// Maximum tokens the draft model proposes per step.
-    #[arg(long, default_value_t = 5)]
+    /// Most tokens the draft model proposes per round (the length adapts to how often
+    /// they are accepted).
+    #[arg(long, default_value_t = 7)]
     draft_k: usize,
     /// Do not reuse the KV or the answers of earlier requests (prefix and response caches).
     #[arg(long)]

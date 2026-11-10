@@ -6,7 +6,8 @@
 //! - Decoding requests advance together: one pass takes the next token of up to
 //!   `decode_rows` of them (round robin), reading the weights once for all.
 //! - With at most `spec_max_streams` decoding requests and a draft model, a request
-//!   advances by a speculative round instead (the draft proposes `draft_k` tokens, the
+//!   advances by a speculative round instead (the draft proposes up to `draft_k` tokens,
+//!   as many as the measured acceptance and pass times make worthwhile, or none; the
 //!   target checks them in one pass). The draft catches up from the target's tokens,
 //!   so a request can switch between speculative and batched decoding at any time.
 //!
@@ -73,7 +74,8 @@ pub struct EngineConfig {
     pub decode_rows: usize,
     /// Prompt rows per pass while other requests are decoding.
     pub busy_prefill_rows: usize,
-    /// Draft tokens per speculative round.
+    /// Most draft tokens per speculative round (the engine picks the length per round
+    /// from the measured acceptance and pass times, see `Engine::draft_len`).
     pub draft_k: usize,
     /// Speculative decoding is used while at most this many requests are decoding.
     pub spec_max_streams: usize,
@@ -89,7 +91,7 @@ impl Default for EngineConfig {
             max_streams: 16,
             decode_rows: 8,
             busy_prefill_rows: 64,
-            draft_k: 5,
+            draft_k: 7,
             spec_max_streams: 1,
             hint_k: 7,
             response_cache: 256,
@@ -106,6 +108,8 @@ pub struct SpecStats {
     pub accepted: usize,
     /// Rounds that verified hint tokens instead of draft tokens (included above).
     pub hint_rounds: usize,
+    /// Single decode steps taken instead of a round (the draft was not worth it).
+    pub plain_steps: usize,
     /// Requests answered from the response cache.
     pub cache_hits: usize,
 }
@@ -130,6 +134,10 @@ struct Stream {
     hint_pos: usize,
     /// Rounds in a row in which the output did not match the hint.
     hint_misses: usize,
+    /// Draft acceptance by depth (this request's rounds; see `Accept`).
+    accept: Accept,
+    /// Single decode steps since the last draft round.
+    plain_run: usize,
     start: StartInfo,
     finish: Option<Finish>,
     error: Option<String>,
@@ -191,6 +199,99 @@ impl ResponseCache {
     }
 }
 
+/// Exponential moving average of a duration in seconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ema {
+    v: f64,
+    n: u32,
+}
+
+impl Ema {
+    fn add(&mut self, x: f64) {
+        self.v = if self.n == 0 { x } else { 0.8 * self.v + 0.2 * x };
+        self.n += 1;
+    }
+    fn get(&self) -> Option<f64> {
+        (self.n > 0).then_some(self.v)
+    }
+}
+
+/// Measured pass times that choose the draft length (see `Engine::draft_len`).
+#[derive(Debug, Default)]
+struct Timing {
+    /// One target decode step (one row).
+    plain: Ema,
+    /// One draft step.
+    draft: Ema,
+    /// A target verification pass, by rows.
+    verify: [Ema; 18],
+    /// What a whole draft round takes beyond its draft steps and verification (host
+    /// work, the draft's first step and truncation).
+    round_extra: Ema,
+}
+
+impl Timing {
+    /// Time of a target pass of `rows` rows: measured, else extrapolated from the
+    /// nearest measurement (a few % per extra row on a bandwidth-bound GPU).
+    fn target(&self, rows: usize) -> Option<f64> {
+        let measured = |r: usize| if r == 1 { self.plain.get() } else { self.verify.get(r).and_then(Ema::get) };
+        if let Some(t) = measured(rows) {
+            return Some(t);
+        }
+        (1..self.verify.len())
+            .filter_map(|r| measured(r).map(|t| (r, t)))
+            .min_by_key(|&(r, _)| r.abs_diff(rows))
+            .map(|(r, t)| t * (1.0 + 0.04 * rows as f64) / (1.0 + 0.04 * r as f64))
+    }
+}
+
+/// Draft length until the pass times are known, and unless another one is expected to
+/// be `SWITCH_GAIN` times faster.
+const DEFAULT_DRAFT_K: usize = 5;
+const SWITCH_GAIN: f64 = 1.05;
+/// Rounds (decayed) observed before the length adapts.
+const WARMUP_ROUNDS: f64 = 30.0;
+
+/// Decayed counts of draft rounds: `reach1`/`hit1` for the first draft token (drafted /
+/// accepted), `reach`/`hit` for the later ones (drafted after all earlier ones of the
+/// round were accepted / accepted too). Acceptance is bursty, so the first token gets its
+/// own rate and the later ones share one (pooled over depths: depth-wise counts went
+/// stale at depths the chosen length stopped reaching).
+#[derive(Debug, Clone, Copy, Default)]
+struct Accept {
+    reach1: f64,
+    hit1: f64,
+    reach: f64,
+    hit: f64,
+}
+
+impl Accept {
+    /// Records a round of `k` drafts of which the first `m` were accepted.
+    fn add(&mut self, k: usize, m: usize, decay: f64) {
+        for v in [&mut self.reach1, &mut self.hit1, &mut self.reach, &mut self.hit] {
+            *v *= decay;
+        }
+        if k == 0 {
+            return;
+        }
+        self.reach1 += 1.0;
+        self.hit1 += (m >= 1) as u8 as f64;
+        // Depths 2..=k reached while the run went on: min(k, m + 1) - 1 of them.
+        let later = k.min(m + 1).saturating_sub(1);
+        self.reach += later as f64;
+        self.hit += m.saturating_sub(1).min(later) as f64;
+    }
+
+    /// (first, later) acceptance with `weight` pseudo-rounds of `prior`.
+    fn rates(&self, prior: (f64, f64), weight: f64) -> (f64, f64) {
+        let r = |hit: f64, reach: f64, p: f64| ((hit + weight * p) / (reach + weight)).min(0.995);
+        (r(self.hit1, self.reach1, prior.0), r(self.hit, self.reach, prior.1))
+    }
+}
+
+/// Single steps after which a stream that stopped drafting tries a short round again.
+const PROBE_AFTER: usize = 16;
+
 /// Single decode steps tried after the output left its hint before the draft model
 /// takes over.
 const HINT_PATIENCE: usize = 4;
@@ -227,6 +328,11 @@ pub struct Engine<B: Backend> {
     next_id: ReqId,
     last_start: StartInfo,
     cache: ResponseCache,
+    timing: Timing,
+    /// Draft acceptance by depth over all requests (the prior of each request's own).
+    accept: Accept,
+    /// The last draft run started in sync with the target (no catch-up prefill).
+    draft_in_sync: bool,
     /// The stop token that ended the last stopped request: hints (outputs without their
     /// stop token) are extended by it, so the end of an output is verified with the hint.
     end_token: Option<u32>,
@@ -257,6 +363,9 @@ impl<B: Backend> Engine<B> {
             next_id: 1 << 48,
             last_start: StartInfo::default(),
             cache: ResponseCache::default(),
+            timing: Timing::default(),
+            accept: Accept::default(),
+            draft_in_sync: false,
             end_token: None,
         })
     }
@@ -365,6 +474,8 @@ impl<B: Backend> Engine<B> {
                         out: Vec::new(),
                         hint_pos: 0,
                         hint_misses: 0,
+                        accept: Accept::default(),
+                        plain_run: 0,
                         start,
                         finish: None,
                         error: None,
@@ -430,9 +541,13 @@ impl<B: Backend> Engine<B> {
             .collect();
         let items: Vec<(SeqId, &[u32])> =
             picked.iter().zip(&nexts).map(|(&i, n)| (self.streams[i].ts, n.as_slice())).collect();
+        let t0 = std::time::Instant::now();
         let logits = self.target.forward(&items, false)?;
         let toks = self.target.backend.argmax_rows(&logits);
         drop(logits);
+        if picked.len() == 1 {
+            self.timing.plain.add(t0.elapsed().as_secs_f64());
+        }
         for (&i, &t) in picked.iter().zip(&toks) {
             self.on_token(i, t, emit);
         }
@@ -457,6 +572,7 @@ impl<B: Backend> Engine<B> {
             (p, props)
         });
         let hinted = !s.req.hint.is_empty();
+        let mut round_t0 = None;
         // After the output leaves the hint it often rejoins it a few tokens later; until
         // then single decode steps are cheaper than catching the draft model up.
         let draft_lag = s.ds.map_or(usize::MAX, |d| {
@@ -471,7 +587,18 @@ impl<B: Backend> Engine<B> {
                 self.streams[i].hint_misses += 1;
                 return self.decode_step(&[i], emit);
             }
-            _ if self.draft.is_some() => (self.draft_tokens(i, next, left)?, None),
+            _ if self.draft.is_some() => match self.draft_len(i, left) {
+                0 => {
+                    self.streams[i].plain_run += 1;
+                    self.spec.plain_steps += 1;
+                    return self.decode_step(&[i], emit);
+                }
+                k => {
+                    self.streams[i].plain_run = 0;
+                    round_t0 = Some(std::time::Instant::now());
+                    (self.draft_tokens(i, next, k)?, None)
+                }
+            },
             _ => return self.decode_step(&[i], emit),
         };
         let ts = self.streams[i].ts;
@@ -481,16 +608,30 @@ impl<B: Backend> Engine<B> {
         let mut ver = Vec::with_capacity(props.len() + 1);
         ver.push(next);
         ver.extend_from_slice(&props);
+        let t0 = std::time::Instant::now();
         let logits = self.target.forward(&[(ts, &ver)], true)?;
         let g = self.target.backend.argmax_rows(&logits);
         drop(logits);
+        if let Some(e) = self.timing.verify.get_mut(ver.len()) {
+            e.add(t0.elapsed().as_secs_f64());
+        }
         let m = props.iter().zip(&g).take_while(|(p, t)| p == t).count();
         self.spec.rounds += 1;
         self.spec.proposed += props.len();
         self.spec.accepted += m;
+        // Rounds that first caught the draft up are not typical: leave them out.
+        if let (Some(r0), true, Some(d), Some(v)) =
+            (round_t0, self.draft_in_sync, self.timing.draft.get(), self.timing.target(ver.len()))
+        {
+            let model = props.len() as f64 * d + v;
+            self.timing.round_extra.add((r0.elapsed().as_secs_f64() - model).max(0.0));
+        }
         if let Some(p) = hint_at {
             self.spec.hint_rounds += 1;
             self.streams[i].hint_pos = p + m + 1;
+        } else {
+            self.streams[i].accept.add(props.len(), m, 0.9);
+            self.accept.add(props.len(), m, 0.995);
         }
 
         self.target.truncate(ts, base + 1 + m);
@@ -508,9 +649,46 @@ impl<B: Backend> Engine<B> {
         Ok(())
     }
 
+    /// The draft length for stream `i`'s next round (0: a single decode step is faster).
+    /// It maximizes the expected tokens per second: a round of `k` drafts yields
+    /// `1 + sum_j P(first j accepted)` tokens and costs `k` draft steps plus a target pass
+    /// of `k + 1` rows, against one token per plain step.
+    fn draft_len(&self, i: usize, left: usize) -> usize {
+        let s = &self.streams[i];
+        let kmax = self.cfg.draft_k.min(left);
+        let (Some(plain), Some(draft)) = (self.timing.target(1), self.timing.draft.get()) else {
+            return kmax.min(DEFAULT_DRAFT_K); // measure first
+        };
+        if self.accept.reach1 < WARMUP_ROUNDS {
+            return kmax.min(DEFAULT_DRAFT_K); // too little acceptance data yet
+        }
+        // This request's acceptance, starting from that of all requests so far.
+        let global = self.accept.rates((0.75, 0.75), 1.0);
+        let (c1, c) = s.accept.rates(global, 20.0);
+        let extra = self.timing.round_extra.get().unwrap_or(0.0);
+        // Expected tokens per second of each length (0: a plain step).
+        let mut rates = vec![1.0 / plain];
+        let (mut tokens, mut surv) = (1.0, 1.0);
+        for k in 1..=kmax {
+            surv *= if k == 1 { c1 } else { c };
+            tokens += surv;
+            let rate = self.timing.target(k + 1).map_or(0.0, |verify| tokens / (k as f64 * draft + verify + extra));
+            rates.push(rate);
+        }
+        // Keep the default length unless another one is clearly better: the estimates are
+        // rough, and small mispredictions cost more than they gain.
+        let default = kmax.min(DEFAULT_DRAFT_K);
+        let (k_best, r_best) = rates.iter().copied().enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        let best = (r_best, if r_best > SWITCH_GAIN * rates[default] { k_best } else { default });
+        if best.1 == 0 && s.plain_run >= PROBE_AFTER {
+            return kmax.min(2); // re-measure the acceptance now and then
+        }
+        best.1
+    }
+
     /// Runs the draft model for stream `i` (whose next input is `next`) and returns up
-    /// to `draft_k` proposals, ending early at a stop token.
-    fn draft_tokens(&mut self, i: usize, next: u32, left: usize) -> Result<Vec<u32>> {
+    /// to `k` proposals, ending early at a stop token.
+    fn draft_tokens(&mut self, i: usize, next: u32, k: usize) -> Result<Vec<u32>> {
         let ts = self.streams[i].ts;
         let draft = self.draft.as_mut().unwrap();
         let ds = match self.streams[i].ds {
@@ -525,9 +703,10 @@ impl<B: Backend> Engine<B> {
         // `next`, which gives its first proposal.
         let mut feed = self.target.seq_tokens(ts)[draft.seq_len(ds)..].to_vec();
         feed.push(next);
-        let k = self.cfg.draft_k.min(left);
         let stop = &self.streams[i].req.stop;
         let mut props = Vec::with_capacity(k);
+        let caught_up = feed.len() == 1;
+        let t0 = std::time::Instant::now();
         let mut dl = draft.prefill(ds, &feed)?;
         loop {
             let d = draft.backend.argmax(&dl);
@@ -536,6 +715,11 @@ impl<B: Backend> Engine<B> {
                 break;
             }
             dl = draft.forward(&[(ds, &[d])], false)?;
+        }
+        // Steps after a catch-up include its prefill; time only the plain ones.
+        self.draft_in_sync = caught_up;
+        if caught_up {
+            self.timing.draft.add(t0.elapsed().as_secs_f64() / props.len() as f64);
         }
         Ok(props)
     }
@@ -682,9 +866,10 @@ where
         let mut parts = Vec::new();
         if s.rounds > 0 {
             parts.push(format!(
-                "{} rounds ({} from hints), {:.0}% of drafts accepted, {:.2} tokens per target pass",
+                "{} rounds ({} from hints, {} plain steps), {:.0}% of drafts accepted, {:.2} tokens per target pass",
                 s.rounds,
                 s.hint_rounds,
+                s.plain_steps,
                 100.0 * s.accepted as f64 / s.proposed.max(1) as f64,
                 (s.accepted + s.rounds) as f64 / s.rounds as f64
             ));
@@ -715,6 +900,23 @@ mod tests {
         // One token far from the alignment is not trusted.
         assert_eq!(hint_match(&hint, &[9, 14], 0), None);
         assert_eq!(hint_match(&hint, &[99], 0), None);
+    }
+
+    #[test]
+    fn acceptance_counts_by_position() {
+        let mut a = Accept::default();
+        // 5 drafts, 2 accepted: first token accepted, later ones reached twice (depths 2
+        // and 3), accepted once.
+        a.add(5, 2, 1.0);
+        assert_eq!((a.reach1, a.hit1, a.reach, a.hit), (1.0, 1.0, 2.0, 1.0));
+        // All of 3 accepted: depths 2 and 3 reached and accepted.
+        a.add(3, 3, 1.0);
+        assert_eq!((a.reach1, a.hit1, a.reach, a.hit), (2.0, 2.0, 4.0, 3.0));
+        // First rejected: only depth 1 reached.
+        a.add(4, 0, 1.0);
+        assert_eq!((a.reach1, a.hit1, a.reach, a.hit), (3.0, 2.0, 4.0, 3.0));
+        let (c1, c) = a.rates((0.5, 0.5), 1.0);
+        assert!((c1 - 2.5 / 4.0).abs() < 1e-9 && (c - 3.5 / 5.0).abs() < 1e-9);
     }
 
     #[test]
