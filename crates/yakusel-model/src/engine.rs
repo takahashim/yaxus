@@ -10,10 +10,18 @@
 //!   target checks them in one pass). The draft catches up from the target's tokens,
 //!   so a request can switch between speculative and batched decoding at any time.
 //!
+//! - A request may carry a `hint`, tokens its output is likely to repeat (an earlier
+//!   translation of the same text). Where the output so far matches the hint, the
+//!   following hint tokens are verified like draft tokens, without running the draft.
+//! - Finished outputs are kept in a small response cache keyed by the prompt; a repeated
+//!   request is answered from it without any pass.
+//!
 //! Decoding is greedy, so every request produces the target model's greedy output
 //! whatever else is running (up to the summation-order differences of the kernels).
 
-use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use anyhow::Result;
 
@@ -28,6 +36,15 @@ pub struct Request {
     pub max_new_tokens: usize,
     /// Tokens that end the generation (not emitted).
     pub stop: Vec<u32>,
+    /// Tokens the output is likely to repeat, proposed as draft tokens where the output
+    /// matches them. It never changes the output, only the speed.
+    pub hint: Vec<u32>,
+}
+
+impl Request {
+    pub fn new(id: ReqId, prompt: Vec<u32>, max_new_tokens: usize, stop: Vec<u32>) -> Self {
+        Request { id, prompt, max_new_tokens, stop, hint: Vec::new() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,11 +77,23 @@ pub struct EngineConfig {
     pub draft_k: usize,
     /// Speculative decoding is used while at most this many requests are decoding.
     pub spec_max_streams: usize,
+    /// Hint tokens verified per pass (verifying 8 rows costs little more than 1).
+    pub hint_k: usize,
+    /// Finished requests kept in the response cache (0: no cache).
+    pub response_cache: usize,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { max_streams: 16, decode_rows: 8, busy_prefill_rows: 64, draft_k: 5, spec_max_streams: 1 }
+        EngineConfig {
+            max_streams: 16,
+            decode_rows: 8,
+            busy_prefill_rows: 64,
+            draft_k: 5,
+            spec_max_streams: 1,
+            hint_k: 7,
+            response_cache: 256,
+        }
     }
 }
 
@@ -75,6 +104,10 @@ pub struct SpecStats {
     /// Draft tokens proposed / accepted by the target.
     pub proposed: usize,
     pub accepted: usize,
+    /// Rounds that verified hint tokens instead of draft tokens (included above).
+    pub hint_rounds: usize,
+    /// Requests answered from the response cache.
+    pub cache_hits: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,9 +124,93 @@ struct Stream {
     ds: Option<SeqId>,
     phase: Phase,
     generated: usize,
+    /// Emitted tokens.
+    out: Vec<u32>,
+    /// Where the hint is expected to continue the output.
+    hint_pos: usize,
+    /// Rounds in a row in which the output did not match the hint.
+    hint_misses: usize,
     start: StartInfo,
     finish: Option<Finish>,
     error: Option<String>,
+}
+
+struct Cached {
+    prompt: Vec<u32>,
+    stop: Vec<u32>,
+    out: Vec<u32>,
+    finish: Finish,
+}
+
+/// Outputs of finished requests by prompt (least recently used first in `order`).
+#[derive(Default)]
+struct ResponseCache {
+    map: HashMap<u64, Cached>,
+    order: VecDeque<u64>,
+}
+
+fn cache_key(prompt: &[u32], stop: &[u32]) -> u64 {
+    let mut h = DefaultHasher::new();
+    prompt.hash(&mut h);
+    stop.hash(&mut h);
+    h.finish()
+}
+
+impl ResponseCache {
+    /// The cached output for `req`, if it is the full answer to it.
+    fn get(&mut self, req: &Request) -> Option<(Vec<u32>, Finish)> {
+        let key = cache_key(&req.prompt, &req.stop);
+        let c = self.map.get(&key).filter(|c| c.prompt == req.prompt && c.stop == req.stop)?;
+        let hit = if c.out.len() >= req.max_new_tokens {
+            Some((c.out[..req.max_new_tokens].to_vec(), Finish::Length))
+        } else if c.finish == Finish::Stop {
+            Some((c.out.clone(), Finish::Stop))
+        } else {
+            None // cut by a smaller limit
+        };
+        if hit.is_some() {
+            self.touch(key);
+        }
+        hit
+    }
+
+    fn put(&mut self, cap: usize, prompt: Vec<u32>, stop: Vec<u32>, out: Vec<u32>, finish: Finish) {
+        let key = cache_key(&prompt, &stop);
+        self.map.insert(key, Cached { prompt, stop, out, finish });
+        self.touch(key);
+        while self.map.len() > cap
+            && let Some(old) = self.order.pop_front()
+        {
+            self.map.remove(&old);
+        }
+    }
+
+    fn touch(&mut self, key: u64) {
+        self.order.retain(|&k| k != key);
+        self.order.push_back(key);
+    }
+}
+
+/// Single decode steps tried after the output left its hint before the draft model
+/// takes over.
+const HINT_PATIENCE: usize = 4;
+
+/// Hint tokens to verify after `out`: the ones following the latest `n` output tokens
+/// (n = 3, 2, or 1 near `pos`) in the hint, at the occurrence closest to `pos`.
+/// Returns the hint index of the first proposed token.
+fn hint_match(hint: &[u32], out: &[u32], pos: usize) -> Option<usize> {
+    for n in (1..=out.len().min(3)).rev() {
+        let tail = &out[out.len() - n..];
+        let best = (n..hint.len())
+            .filter(|&p| &hint[p - n..p] == tail)
+            .min_by_key(|&p| p.abs_diff(pos));
+        match best {
+            // A single token matches too easily far from where the hint is aligned.
+            Some(p) if n > 1 || p.abs_diff(pos) <= 4 => return Some(p),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub struct Engine<B: Backend> {
@@ -109,6 +226,10 @@ pub struct Engine<B: Backend> {
     prefill_turn: bool,
     next_id: ReqId,
     last_start: StartInfo,
+    cache: ResponseCache,
+    /// The stop token that ended the last stopped request: hints (outputs without their
+    /// stop token) are extended by it, so the end of an output is verified with the hint.
+    end_token: Option<u32>,
 }
 
 impl<B: Backend> Engine<B> {
@@ -135,6 +256,8 @@ impl<B: Backend> Engine<B> {
             prefill_turn: false,
             next_id: 1 << 48,
             last_start: StartInfo::default(),
+            cache: ResponseCache::default(),
+            end_token: None,
         })
     }
 
@@ -181,7 +304,8 @@ impl<B: Backend> Engine<B> {
             }
             _ => {
                 self.prefill_turn = true;
-                if decoding.len() <= self.cfg.spec_max_streams && self.draft.is_some() {
+                let speculate = |s: &Stream| self.draft.is_some() || !s.req.hint.is_empty();
+                if decoding.len() <= self.cfg.spec_max_streams && decoding.iter().all(|&i| speculate(&self.streams[i])) {
                     for &i in &decoding {
                         if let Err(e) = self.spec_round(i, emit) {
                             self.streams[i].error = Some(format!("{e:#}"));
@@ -212,15 +336,35 @@ impl<B: Backend> Engine<B> {
                 emit(Event::Done { id: req.id, finish: Finish::Length, generated: 0, start: StartInfo::default() });
                 continue;
             }
+            if self.cfg.response_cache > 0
+                && let Some((out, mut finish)) = self.cache.get(&req)
+            {
+                self.spec.cache_hits += 1;
+                let mut generated = 0;
+                for &token in &out {
+                    generated += 1;
+                    if !emit(Event::Token { id: req.id, token }) {
+                        finish = Finish::Cancelled;
+                        break;
+                    }
+                }
+                let start = StartInfo { reused: req.prompt.len(), computed: 0, cached: true };
+                self.last_start = start;
+                emit(Event::Done { id: req.id, finish, generated, start });
+                continue;
+            }
             match self.target.begin(&req.prompt) {
                 Ok((ts, reused)) => {
-                    let start = StartInfo { reused, computed: req.prompt.len() - reused };
+                    let start = StartInfo { reused, computed: req.prompt.len() - reused, cached: false };
                     self.streams.push(Stream {
                         req,
                         ts,
                         ds: None,
                         phase: Phase::Prefill { done: reused },
                         generated: 0,
+                        out: Vec::new(),
+                        hint_pos: 0,
+                        hint_misses: 0,
                         start,
                         finish: None,
                         error: None,
@@ -295,38 +439,43 @@ impl<B: Backend> Engine<B> {
         Ok(())
     }
 
-    /// One speculative round for decoding stream `i`.
+    /// One speculative round for decoding stream `i`: verifies hint tokens when the
+    /// output matches the hint, else draft tokens; without either, decodes one token.
     fn spec_round(&mut self, i: usize, emit: &mut dyn FnMut(Event) -> bool) -> Result<()> {
         let Phase::Decode { next } = self.streams[i].phase else { unreachable!() };
-        let ts = self.streams[i].ts;
-        let draft = self.draft.as_mut().unwrap();
-        let ds = match self.streams[i].ds {
-            Some(d) => d,
-            None => {
-                let (d, _) = draft.begin(&self.streams[i].req.prompt)?;
-                self.streams[i].ds = Some(d);
-                d
-            }
-        };
-        // The draft's tokens are always a prefix of the target's; feed it the rest plus
-        // `next`, which gives its first proposal.
-        let base = self.target.seq_len(ts);
-        let mut feed = self.target.seq_tokens(ts)[draft.seq_len(ds)..].to_vec();
-        feed.push(next);
         let left = self.streams[i].req.max_new_tokens - self.streams[i].generated;
-        let k = self.cfg.draft_k.min(left);
-        let stop = &self.streams[i].req.stop;
-        let mut props = Vec::with_capacity(k);
-        let mut dl = draft.prefill(ds, &feed)?;
-        loop {
-            let d = draft.backend.argmax(&dl);
-            props.push(d);
-            if props.len() == k || stop.contains(&d) {
-                break;
+        let s = &self.streams[i];
+        let from_hint = hint_match(&s.req.hint, &s.out, s.hint_pos).map(|p| {
+            let hint = &s.req.hint;
+            let k = self.cfg.hint_k.min(left);
+            let mut props = hint[p..(p + k).min(hint.len())].to_vec();
+            if props.len() < k
+                && let Some(end) = self.end_token.filter(|e| s.req.stop.contains(e))
+            {
+                props.push(end);
             }
-            dl = draft.forward(&[(ds, &[d])], false)?;
-        }
-        drop(dl);
+            (p, props)
+        });
+        let hinted = !s.req.hint.is_empty();
+        // After the output leaves the hint it often rejoins it a few tokens later; until
+        // then single decode steps are cheaper than catching the draft model up.
+        let draft_lag = s.ds.map_or(usize::MAX, |d| {
+            self.target.seq_len(s.ts) - self.draft.as_ref().map_or(0, |m| m.seq_len(d))
+        });
+        let (props, hint_at) = match from_hint {
+            Some((p, props)) if !props.is_empty() => {
+                self.streams[i].hint_misses = 0;
+                (props, Some(p))
+            }
+            _ if hinted && self.streams[i].hint_misses < HINT_PATIENCE && draft_lag > 16 => {
+                self.streams[i].hint_misses += 1;
+                return self.decode_step(&[i], emit);
+            }
+            _ if self.draft.is_some() => (self.draft_tokens(i, next, left)?, None),
+            _ => return self.decode_step(&[i], emit),
+        };
+        let ts = self.streams[i].ts;
+        let base = self.target.seq_len(ts);
 
         // Verify: g[j] is the target's choice after consuming ver[..=j].
         let mut ver = Vec::with_capacity(props.len() + 1);
@@ -339,10 +488,15 @@ impl<B: Backend> Engine<B> {
         self.spec.rounds += 1;
         self.spec.proposed += props.len();
         self.spec.accepted += m;
+        if let Some(p) = hint_at {
+            self.spec.hint_rounds += 1;
+            self.streams[i].hint_pos = p + m + 1;
+        }
 
         self.target.truncate(ts, base + 1 + m);
-        let draft = self.draft.as_mut().unwrap();
-        if draft.seq_len(ds) > base + 1 + m {
+        if let (Some(ds), Some(draft)) = (self.streams[i].ds, self.draft.as_mut())
+            && draft.seq_len(ds) > base + 1 + m
+        {
             draft.truncate(ds, base + 1 + m);
         }
         for &t in props[..m].iter().chain(std::iter::once(&g[m])) {
@@ -354,14 +508,48 @@ impl<B: Backend> Engine<B> {
         Ok(())
     }
 
+    /// Runs the draft model for stream `i` (whose next input is `next`) and returns up
+    /// to `draft_k` proposals, ending early at a stop token.
+    fn draft_tokens(&mut self, i: usize, next: u32, left: usize) -> Result<Vec<u32>> {
+        let ts = self.streams[i].ts;
+        let draft = self.draft.as_mut().unwrap();
+        let ds = match self.streams[i].ds {
+            Some(d) => d,
+            None => {
+                let (d, _) = draft.begin(&self.streams[i].req.prompt)?;
+                self.streams[i].ds = Some(d);
+                d
+            }
+        };
+        // The draft's tokens are always a prefix of the target's; feed it the rest plus
+        // `next`, which gives its first proposal.
+        let mut feed = self.target.seq_tokens(ts)[draft.seq_len(ds)..].to_vec();
+        feed.push(next);
+        let k = self.cfg.draft_k.min(left);
+        let stop = &self.streams[i].req.stop;
+        let mut props = Vec::with_capacity(k);
+        let mut dl = draft.prefill(ds, &feed)?;
+        loop {
+            let d = draft.backend.argmax(&dl);
+            props.push(d);
+            if props.len() == k || stop.contains(&d) {
+                break;
+            }
+            dl = draft.forward(&[(ds, &[d])], false)?;
+        }
+        Ok(props)
+    }
+
     /// A token computed for stream `i`: emit it, or end the stream.
     fn on_token(&mut self, i: usize, tok: u32, emit: &mut dyn FnMut(Event) -> bool) {
         let s = &mut self.streams[i];
         if s.req.stop.contains(&tok) {
             s.finish = Some(Finish::Stop);
+            self.end_token = Some(tok);
             return;
         }
         s.generated += 1;
+        s.out.push(tok);
         if !emit(Event::Token { id: s.req.id, token: tok }) {
             s.finish = Some(Finish::Cancelled);
         } else if s.generated >= s.req.max_new_tokens {
@@ -395,7 +583,11 @@ impl<B: Backend> Engine<B> {
                         dm.finish(d);
                     }
                     self.last_start = s.start;
-                    emit(Event::Done { id: s.req.id, finish: s.finish.unwrap(), generated: s.generated, start: s.start });
+                    let finish = s.finish.unwrap();
+                    emit(Event::Done { id: s.req.id, finish, generated: s.generated, start: s.start });
+                    if self.cfg.response_cache > 0 && finish != Finish::Cancelled {
+                        self.cache.put(self.cfg.response_cache, s.req.prompt, s.req.stop, s.out, finish);
+                    }
                 }
             }
         }
@@ -426,7 +618,7 @@ pub trait Generator: Send {
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<Vec<u32>> {
         let id = self.fresh_id();
-        self.submit(Request { id, prompt: prompt.to_vec(), max_new_tokens, stop: stop.to_vec() });
+        self.submit(Request::new(id, prompt.to_vec(), max_new_tokens, stop.to_vec()));
         let mut out = Vec::new();
         let mut done = false;
         let mut error = None;
@@ -487,16 +679,59 @@ where
     }
     fn stats(&self) -> Option<String> {
         let s = &self.spec;
-        (s.rounds > 0).then(|| {
-            format!(
-                "{} rounds, {:.0}% of drafts accepted, {:.2} tokens per target pass",
+        let mut parts = Vec::new();
+        if s.rounds > 0 {
+            parts.push(format!(
+                "{} rounds ({} from hints), {:.0}% of drafts accepted, {:.2} tokens per target pass",
                 s.rounds,
+                s.hint_rounds,
                 100.0 * s.accepted as f64 / s.proposed.max(1) as f64,
                 (s.accepted + s.rounds) as f64 / s.rounds as f64
-            )
-        })
+            ));
+        }
+        if s.cache_hits > 0 {
+            parts.push(format!("{} answered from the response cache", s.cache_hits));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
     }
     fn last_start(&self) -> StartInfo {
         self.last_start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_follows_the_output() {
+        let hint = [10, 11, 12, 13, 11, 12, 14];
+        // Start of the output: the first token matches near the start of the hint.
+        assert_eq!(hint_match(&hint, &[10], 0), Some(1));
+        // A longer match wins; between equal ones, the one closest to `pos`.
+        assert_eq!(hint_match(&hint, &[10, 11, 12], 3), Some(3));
+        assert_eq!(hint_match(&hint, &[13, 11, 12], 3), Some(6));
+        assert_eq!(hint_match(&hint, &[9, 11, 12], 6), Some(6));
+        // One token far from the alignment is not trusted.
+        assert_eq!(hint_match(&hint, &[9, 14], 0), None);
+        assert_eq!(hint_match(&hint, &[99], 0), None);
+    }
+
+    #[test]
+    fn response_cache_answers_only_complete_outputs() {
+        let mut c = ResponseCache::default();
+        let req = |max| Request::new(0, vec![1, 2, 3], max, vec![7]);
+        c.put(2, vec![1, 2, 3], vec![7], vec![4, 5], Finish::Stop);
+        assert_eq!(c.get(&req(10)), Some((vec![4, 5], Finish::Stop)));
+        assert_eq!(c.get(&req(1)), Some((vec![4], Finish::Length)));
+        // Another stop list is another request.
+        assert_eq!(c.get(&Request::new(0, vec![1, 2, 3], 10, vec![8])), None);
+        // An output cut at the limit does not answer a request with a larger limit.
+        c.put(2, vec![9], vec![7], vec![4, 5], Finish::Length);
+        assert_eq!(c.get(&Request::new(0, vec![9], 3, vec![7])), None);
+        assert_eq!(c.get(&Request::new(0, vec![9], 2, vec![7])), Some((vec![4, 5], Finish::Length)));
+        // Least recently used entries go first.
+        c.put(2, vec![8], vec![7], vec![1], Finish::Stop);
+        assert_eq!(c.get(&req(10)), None);
     }
 }

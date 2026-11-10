@@ -160,7 +160,8 @@ fn concurrent_matches_solo() {
     // different kernel than alone (64-row tiles vs. multi-row GEMV).
     gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
     let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap());
-    let cfg = EngineConfig { decode_rows: 4, busy_prefill_rows: 16, ..EngineConfig::default() };
+    // No response cache: the requests run again after running alone.
+    let cfg = EngineConfig { decode_rows: 4, busy_prefill_rows: 16, response_cache: 0, ..EngineConfig::default() };
     let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
     eng.target.prefix_cache = false;
     if let Some(d) = eng.draft.as_mut() {
@@ -176,7 +177,7 @@ fn concurrent_matches_solo() {
     }
     let solo: Vec<Vec<u32>> = prompts.iter().map(|p| eng.generate(p, 24, &[1, 16], &mut |_| true).unwrap()).collect();
     for (i, p) in prompts.iter().enumerate() {
-        eng.submit(Request { id: i as u64, prompt: p.clone(), max_new_tokens: 24, stop: vec![1, 16] });
+        eng.submit(Request::new(i as u64, p.clone(), 24, vec![1, 16]));
     }
     let mut outs: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
     let mut done = 0;
@@ -197,4 +198,70 @@ fn concurrent_matches_solo() {
         assert_eq!(outs[i], solo[i], "request {i} differs when run together");
     }
     eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec);
+}
+
+/// Hint tokens, right, partly wrong or unrelated, never change the output; with an exact
+/// hint the response cache answers a repeated request without running it.
+#[test]
+#[ignore]
+fn hints_and_response_cache_keep_output() {
+    let dir = model_dir();
+    let gpu = WgpuBackend::new().unwrap();
+    gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
+    for with_draft in [false, true] {
+        let draft = if with_draft { draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap()) } else { None };
+        if with_draft && draft.is_none() {
+            continue;
+        }
+        let cfg = EngineConfig { response_cache: 0, ..EngineConfig::default() };
+        let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
+        eng.target.prefix_cache = false;
+        if let Some(d) = eng.draft.as_mut() {
+            d.prefix_cache = false;
+        }
+        let run = |eng: &mut Engine<WgpuBackend>, p: &[u32], max: usize, hint: Vec<u32>| {
+            let mut r = Request::new(7, p.to_vec(), max, vec![1, 16]);
+            r.hint = hint;
+            eng.submit(r);
+            let mut out = Vec::new();
+            let mut done = false;
+            while !done {
+                eng.step(&mut |ev| {
+                    match ev {
+                        Event::Token { token, .. } => out.push(token),
+                        Event::Done { .. } => done = true,
+                        Event::Error { message, .. } => panic!("{message}"),
+                    }
+                    true
+                })
+                .unwrap();
+            }
+            out
+        };
+        for c in &cases() {
+            let ids = u32s(&c["ids"]);
+            let solo = run(&mut eng, &ids, 40, vec![]);
+            let mut wrong = solo.clone();
+            for j in (2..wrong.len()).step_by(5) {
+                wrong[j] = wrong[j].wrapping_add(1);
+            }
+            let mut shifted = solo[3.min(solo.len())..].to_vec();
+            shifted.extend_from_slice(&solo);
+            for (name, hint) in [("exact", solo.clone()), ("wrong", wrong), ("shifted", shifted), ("other", vec![5, 6, 7, 8])] {
+                assert_eq!(run(&mut eng, &ids, 40, hint.clone()), solo, "{} hint {name} draft {with_draft}", c["name"]);
+                // A budget that ends inside a round.
+                assert_eq!(run(&mut eng, &ids, 6, hint), solo[..6.min(solo.len())], "{} hint {name} max 6", c["name"]);
+            }
+        }
+        eprintln!("draft {with_draft}: {:?}", eng.spec);
+        // The response cache: a repeated request gives the same tokens without a pass.
+        eng.cfg.response_cache = 8;
+        let ids = u32s(&cases()[0]["ids"]);
+        let first = run(&mut eng, &ids, 40, vec![]);
+        let rounds = eng.spec.rounds;
+        assert_eq!(run(&mut eng, &ids, 40, vec![]), first);
+        assert_eq!(run(&mut eng, &ids, 5, vec![]), first[..5.min(first.len())]);
+        assert_eq!(eng.spec.cache_hits, 2);
+        assert_eq!(eng.spec.rounds, rounds);
+    }
 }

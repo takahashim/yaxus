@@ -37,9 +37,12 @@ pub struct ModelArgs {
     /// Maximum tokens the draft model proposes per step.
     #[arg(long, default_value_t = 5)]
     draft_k: usize,
-    /// Do not reuse the KV of earlier requests (prefix cache).
+    /// Do not reuse the KV or the answers of earlier requests (prefix and response caches).
     #[arg(long)]
     no_kv_cache: bool,
+    /// Do not answer repeated requests from the response cache.
+    #[arg(long)]
+    no_response_cache: bool,
     /// KV arena size in tokens, per model.
     #[arg(long, default_value_t = yakusel_model::DEFAULT_KV_TOKENS)]
     kv_tokens: usize,
@@ -89,6 +92,11 @@ impl ModelArgs {
             engine: yakusel_model::EngineConfig {
                 max_streams: self.max_streams,
                 decode_rows: self.decode_rows,
+                response_cache: if self.no_kv_cache || self.no_response_cache {
+                    0
+                } else {
+                    yakusel_model::EngineConfig::default().response_cache
+                },
                 ..Default::default()
             },
         })
@@ -300,7 +308,8 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     let mut first: Option<Duration> = None;
     let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
     let mut io_err = None;
-    run_document(model.as_mut(), &tok, &mut job, &mut |ev| match ev {
+    let mut memory = yakusel_server::memory::Memory::new(yakusel_server::memory::DEFAULT_ENTRIES);
+    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| match ev {
         DocEvent::Delta { segment, text } => {
             first.get_or_insert(t1.elapsed());
             if let Err(e) = out.delta(segment, text) {
@@ -419,6 +428,10 @@ enum BenchKind {
         /// Print a line per paragraph.
         #[arg(long, short)]
         verbose: bool,
+        /// Then translate the document again with paragraph N (1-based) edited (its last
+        /// sentence removed), as after an edit in the web UI.
+        #[arg(long)]
+        edit: Option<usize>,
     },
 }
 
@@ -436,8 +449,8 @@ pub fn bench(a: BenchArgs) -> Result<()> {
         }
         BenchKind::Set { model, file, save, compare } => bench_set(model, file, save, compare),
         BenchKind::Streams { model, n, file, compare, fixed_gen } => bench_streams(model, n, file, compare, fixed_gen),
-        BenchKind::Doc { model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose } => {
-            bench_doc(model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose)
+        BenchKind::Doc { model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose, edit } => {
+            bench_doc(model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose, edit)
         }
     }
 }
@@ -501,7 +514,8 @@ fn escape_line(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
-fn bench_set(m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option<PathBuf>) -> Result<()> {
+fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option<PathBuf>) -> Result<()> {
+    m.no_response_cache = true;
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let mut model = m.load(&dir)?;
@@ -550,7 +564,9 @@ fn bench_set(m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option
     Ok(())
 }
 
-fn bench_streams(m: ModelArgs, ns: Vec<usize>, file: PathBuf, compare: Option<PathBuf>, fixed_gen: Option<usize>) -> Result<()> {
+fn bench_streams(mut m: ModelArgs, ns: Vec<usize>, file: PathBuf, compare: Option<PathBuf>, fixed_gen: Option<usize>) -> Result<()> {
+    // The same prompts run for every N.
+    m.no_response_cache = true;
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let mut model = m.load(&dir)?;
@@ -572,12 +588,12 @@ fn bench_streams(m: ModelArgs, ns: Vec<usize>, file: PathBuf, compare: Option<Pa
     for &n in &ns {
         let picked: Vec<usize> = (0..n).map(|i| i % prompts.len()).collect();
         for (r, &i) in picked.iter().enumerate() {
-            model.submit(yakusel_model::Request {
-                id: r as u64,
-                prompt: prompts[i].clone(),
-                max_new_tokens: fixed_gen.unwrap_or(yakusel_api::DEFAULT_MAX_NEW_TOKENS),
-                stop: if fixed_gen.is_some() { vec![] } else { vec![EOS_ID, TAG_ID] },
-            });
+            model.submit(yakusel_model::Request::new(
+                r as u64,
+                prompts[i].clone(),
+                fixed_gen.unwrap_or(yakusel_api::DEFAULT_MAX_NEW_TOKENS),
+                if fixed_gen.is_some() { vec![] } else { vec![EOS_ID, TAG_ID] },
+            ));
         }
         let mut first_all: Option<Instant> = None;
         let mut outs: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -660,6 +676,16 @@ fn prose_paragraphs(markdown: &str) -> Vec<String> {
     out
 }
 
+/// Removes the last sentence of a paragraph (or appends one when it has a single one).
+fn edit_paragraph(p: &str) -> String {
+    let ends: Vec<usize> =
+        p.char_indices().filter(|(_, c)| "。．！？.!?".contains(*c)).map(|(i, c)| i + c.len_utf8()).collect();
+    match ends.len() {
+        0 | 1 => format!("{p}（追記）"),
+        n => p[..ends[n - 2]].to_string(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn bench_doc(
     m: ModelArgs,
@@ -671,16 +697,21 @@ fn bench_doc(
     max_paragraphs: usize,
     save: Option<PathBuf>,
     verbose: bool,
+    edit: Option<usize>,
 ) -> Result<()> {
     use yakusel_server::document::{DocEvent, DocJob, DocOptions, run_document};
+    use yakusel_server::memory::{DEFAULT_ENTRIES, Memory};
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let paras: Vec<String> = match &file {
         Some(f) => yakusel_api::split_paragraphs(&std::fs::read_to_string(f)?),
         None => prose_paragraphs(&std::fs::read_to_string(dir.join("README_ja.md"))?),
     };
-    let paras: Vec<String> = paras.into_iter().take(max_paragraphs).collect();
+    let mut paras: Vec<String> = paras.into_iter().take(max_paragraphs).collect();
     anyhow::ensure!(!paras.is_empty(), "no paragraphs");
+    if let Some(e) = edit {
+        anyhow::ensure!((1..=paras.len()).contains(&e), "--edit must be 1..={}", paras.len());
+    }
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
@@ -695,41 +726,47 @@ fn bench_doc(
         neighbor_context,
         max_new_tokens: yakusel_api::DEFAULT_MAX_NEW_TOKENS,
     };
-    let mut job = DocJob::new(paras, opts);
-    println!(
-        "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
-        job.segments.len(),
-        job.chains(),
-        if neighbor_context { ", neighbours as context" } else { "" }
-    );
-    let t0 = Instant::now();
-    let mut first: Vec<Option<f64>> = vec![None; job.segments.len()];
-    let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
-    run_document(model.as_mut(), &tok, &mut job, &mut |ev| match ev {
-        DocEvent::Delta { segment, .. } => {
-            first[segment].get_or_insert(t0.elapsed().as_secs_f64());
-        }
-        DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
-            prompt += prompt_tokens;
-            reused += r;
-            generated += g;
-            if verbose {
-                println!(
-                    "  #{:<2} prompt {prompt_tokens:>4}, reused {r:>4}, generated {g:>3}, done at {:>6.2} s",
-                    segment + 1,
-                    t0.elapsed().as_secs_f64()
-                );
+    let mut memory = Memory::new(DEFAULT_ENTRIES);
+    let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
+        let mut job = DocJob::new(paras, opts.clone());
+        println!(
+            "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
+            job.segments.len(),
+            job.chains(),
+            if neighbor_context { ", neighbours as context" } else { "" }
+        );
+        let t0 = Instant::now();
+        let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
+        run_document(model.as_mut(), &tok, &mut job, memory, &mut |ev| {
+            if let DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } = ev {
+                prompt += prompt_tokens;
+                reused += r;
+                generated += g;
+                if verbose {
+                    println!(
+                        "  #{:<2} prompt {prompt_tokens:>4}, reused {r:>4}, generated {g:>3}, done at {:>6.2} s",
+                        segment + 1,
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
             }
+        })?;
+        let wall = t0.elapsed().as_secs_f64();
+        println!(
+            "wall {wall:.2} s, {generated} tokens generated: {:.1} tok/s end to end; prompt tokens {prompt}, {:.0}% reused",
+            generated as f64 / wall,
+            100.0 * reused as f64 / prompt.max(1) as f64
+        );
+        if let Some(s) = model.stats() {
+            println!("speculative: {s}");
         }
-    })?;
-    let wall = t0.elapsed().as_secs_f64();
-    println!(
-        "wall {wall:.2} s, {generated} tokens generated: {:.1} tok/s end to end; prompt tokens {prompt}, {:.0}% reused",
-        generated as f64 / wall,
-        100.0 * reused as f64 / prompt.max(1) as f64
-    );
-    if let Some(s) = model.stats() {
-        println!("speculative: {s}");
+        Ok(job)
+    };
+    let mut job = run(paras.clone(), &mut memory)?;
+    if let Some(e) = edit {
+        paras[e - 1] = edit_paragraph(&paras[e - 1]);
+        println!("again with paragraph {e} edited:");
+        job = run(paras, &mut memory)?;
     }
     if let Some(p) = save {
         let lines: Vec<String> = job.outputs.iter().map(|o| escape_line(o.as_deref().unwrap_or(""))).collect();

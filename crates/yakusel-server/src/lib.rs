@@ -1,6 +1,7 @@
 //! `yakusel serve`: HTTPS + bearer-token API, SSE streaming and an embedded web UI.
 
 pub mod document;
+pub mod memory;
 mod tls;
 mod worker;
 
@@ -302,7 +303,7 @@ async fn translate(
         req.target_lang
     );
     let job = Job {
-        work: Work::Single { prompt_ids: ids, max_new_tokens: max_new },
+        work: Work::Single { prompt_ids: ids, max_new_tokens: max_new, memo: memory::key(&to_prompt_request(&req)) },
         enqueued: Instant::now(),
         events: tx,
         label,

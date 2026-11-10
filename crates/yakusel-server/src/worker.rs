@@ -16,9 +16,11 @@ use yakusel_model::{Event as EngineEvent, Finish, Generator, ReqId, Request};
 use yakusel_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, Tokenizer};
 
 use crate::document::DocJob;
+use crate::memory::{self, Memory};
 
 pub enum Work {
-    Single { prompt_ids: Vec<u32>, max_new_tokens: usize },
+    /// `memo`: the request's translation memory key.
+    Single { prompt_ids: Vec<u32>, max_new_tokens: usize, memo: u64 },
     Document(Box<DocJob>),
 }
 
@@ -50,6 +52,8 @@ struct Active {
     owner: Owner,
     dec: StreamDecoder,
     text: String,
+    tokens: Vec<u32>,
+    memo: u64,
     /// When the engine accepted the request.
     start: Instant,
     first: Option<Instant>,
@@ -74,6 +78,7 @@ struct State {
     next_id: ReqId,
     /// Documents whose chains may continue after this step.
     resubmit: Vec<u64>,
+    memory: Memory,
 }
 
 pub fn run(
@@ -83,7 +88,13 @@ pub fn run(
     queued: Arc<AtomicUsize>,
     queue_limit: usize,
 ) {
-    let mut st = State { active: HashMap::new(), docs: HashMap::new(), next_id: 0, resubmit: Vec::new() };
+    let mut st = State {
+        active: HashMap::new(),
+        docs: HashMap::new(),
+        next_id: 0,
+        resubmit: Vec::new(),
+        memory: Memory::new(memory::DEFAULT_ENTRIES),
+    };
     loop {
         // Block only when there is nothing to run.
         if st.active.is_empty() {
@@ -135,16 +146,20 @@ fn add(job: Job, st: &mut State, engine: &mut dyn Generator, tok: &Tokenizer, qu
         return; // the client left while waiting
     }
     match job.work {
-        Work::Single { prompt_ids, max_new_tokens } => {
+        Work::Single { prompt_ids, max_new_tokens, memo } => {
             st.next_id += 1;
             let prompt_len = prompt_ids.len();
-            engine.submit(Request { id: st.next_id, prompt: prompt_ids, max_new_tokens, stop: vec![EOS_ID, TAG_ID] });
+            let mut req = Request::new(st.next_id, prompt_ids, max_new_tokens, vec![EOS_ID, TAG_ID]);
+            req.hint = st.memory.get(memo);
+            engine.submit(req);
             st.active.insert(
                 st.next_id,
                 Active {
                     owner: Owner::Single { events: job.events, label: job.label, enqueued: job.enqueued, prompt_len },
                     dec: StreamDecoder::new(),
                     text: String::new(),
+                    tokens: Vec::new(),
+                    memo,
                     start: Instant::now(),
                     first: None,
                 },
@@ -190,14 +205,18 @@ fn submit_ready(key: u64, st: &mut State, engine: &mut dyn Generator, tok: &Toke
             st.next_id += 1;
             d.usage.prompt_tokens += ids.len();
             d.live += 1;
-            let max_new = d.doc.opts.max_new_tokens;
-            engine.submit(Request { id: st.next_id, prompt: ids, max_new_tokens: max_new, stop: vec![EOS_ID, TAG_ID] });
+            let memo = memory::key(&req);
+            let mut r = Request::new(st.next_id, ids, d.doc.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
+            r.hint = st.memory.get(memo);
+            engine.submit(r);
             st.active.insert(
                 st.next_id,
                 Active {
                     owner: Owner::Doc { key, segment },
                     dec: StreamDecoder::new(),
                     text: String::new(),
+                    tokens: Vec::new(),
+                    memo,
                     start: Instant::now(),
                     first: None,
                 },
@@ -233,6 +252,7 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
         EngineEvent::Token { id, token } => {
             let Some(a) = st.active.get_mut(&id) else { return false };
             a.first.get_or_insert_with(Instant::now);
+            a.tokens.push(token);
             let s = a.dec.push(tok, token);
             a.text += &s;
             match &a.owner {
@@ -252,6 +272,9 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
         }
         EngineEvent::Done { id, finish, generated, start } => {
             let Some(mut a) = st.active.remove(&id) else { return true };
+            if finish == Finish::Stop {
+                st.memory.put(a.memo, std::mem::take(&mut a.tokens));
+            }
             let tail = a.dec.finish();
             a.text += &tail;
             let elapsed = a.start.elapsed();
@@ -269,10 +292,10 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
                         queue_ms: (a.start - enqueued).as_millis() as u64,
                     };
                     tracing::info!(
-                        "{label}: {} -> {} tokens in {elapsed:.2?} (reused {} prompt tokens, queued {} ms){}",
+                        "{label}: {} -> {} tokens in {elapsed:.2?} ({}, queued {} ms){}",
                         usage.prompt_tokens,
                         usage.completion_tokens,
-                        start.reused,
+                        if start.cached { "from the response cache".to_string() } else { format!("reused {} prompt tokens", start.reused) },
                         usage.queue_ms,
                         if finish == Finish::Cancelled { ", cancelled by client" } else { "" }
                     );

@@ -230,6 +230,8 @@ pub struct StartInfo {
     pub reused: usize,
     /// Prompt tokens processed now.
     pub computed: usize,
+    /// The whole answer came from the engine's response cache.
+    pub cached: bool,
 }
 
 /// Default KV arena size in tokens and maximum position.
@@ -403,7 +405,7 @@ impl<B: Backend> Model<B> {
             }
             _ => (self.new_seq()?, 0),
         };
-        self.last_start = StartInfo { reused: r.1, computed: prompt.len() - r.1 };
+        self.last_start = StartInfo { reused: r.1, computed: prompt.len() - r.1, cached: false };
         Ok(r)
     }
 

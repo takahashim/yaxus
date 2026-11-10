@@ -6,8 +6,10 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use yakusel_api::{HistoryWindow, Pair};
-use yakusel_model::{Event, Generator, ReqId, Request};
+use yakusel_model::{Event, Finish, Generator, ReqId, Request};
 use yakusel_tokenizer::{EOS_ID, GlossaryEntry, StreamDecoder, TAG_ID, Tokenizer, TranslationPair, TranslationRequest};
+
+use crate::memory::{self, Memory};
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
 pub fn auto_chains(segments: usize) -> usize {
@@ -170,29 +172,41 @@ pub enum DocEvent<'a> {
 }
 
 /// Translates a document on `engine` (which must not have other requests in flight).
+/// Earlier translations in `memory` serve as hints; the new ones are added to it.
 pub fn run_document(
     engine: &mut dyn Generator,
     tok: &Tokenizer,
     job: &mut DocJob,
+    memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent),
 ) -> Result<()> {
     struct Live {
         seg: usize,
         dec: StreamDecoder,
         text: String,
+        tokens: Vec<u32>,
         prompt_tokens: usize,
+        memo: u64,
     }
     let mut live: HashMap<ReqId, Live> = HashMap::new();
-    let submit = |engine: &mut dyn Generator, job: &mut DocJob, live: &mut HashMap<ReqId, Live>| -> Result<()> {
+    let submit = |engine: &mut dyn Generator,
+                  job: &mut DocJob,
+                  live: &mut HashMap<ReqId, Live>,
+                  memory: &Memory|
+     -> Result<()> {
         for (seg, req) in job.ready() {
             let ids = tok.encode(&req.to_prompt()?, false);
             let id = engine.fresh_id();
-            live.insert(id, Live { seg, dec: StreamDecoder::new(), text: String::new(), prompt_tokens: ids.len() });
-            engine.submit(Request { id, prompt: ids, max_new_tokens: job.opts.max_new_tokens, stop: vec![EOS_ID, TAG_ID] });
+            let memo = memory::key(&req);
+            let prompt_tokens = ids.len();
+            live.insert(id, Live { seg, dec: StreamDecoder::new(), text: String::new(), tokens: Vec::new(), prompt_tokens, memo });
+            let mut r = Request::new(id, ids, job.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
+            r.hint = memory.get(memo);
+            engine.submit(r);
         }
         Ok(())
     };
-    submit(engine, job, &mut live)?;
+    submit(engine, job, &mut live, memory)?;
     while !job.is_done() {
         let mut finished = Vec::new();
         let mut error = None;
@@ -200,6 +214,7 @@ pub fn run_document(
             match ev {
                 Event::Token { id, token } => {
                     if let Some(l) = live.get_mut(&id) {
+                        l.tokens.push(token);
                         let s = l.dec.push(tok, token);
                         if !s.is_empty() {
                             on(DocEvent::Delta { segment: l.seg, text: &s });
@@ -207,7 +222,7 @@ pub fn run_document(
                         }
                     }
                 }
-                Event::Done { id, generated, start, .. } => finished.push((id, generated, start.reused)),
+                Event::Done { id, generated, start, finish } => finished.push((id, generated, start.reused, finish)),
                 Event::Error { message, .. } => error = Some(message),
             }
             true
@@ -215,8 +230,11 @@ pub fn run_document(
         if let Some(e) = error {
             anyhow::bail!(e);
         }
-        for (id, generated, reused) in finished {
+        for (id, generated, reused, finish) in finished {
             if let Some(mut l) = live.remove(&id) {
+                if finish == Finish::Stop {
+                    memory.put(l.memo, std::mem::take(&mut l.tokens));
+                }
                 let tail = l.dec.finish();
                 if !tail.is_empty() {
                     on(DocEvent::Delta { segment: l.seg, text: &tail });
@@ -226,7 +244,7 @@ pub fn run_document(
                 job.finished(l.seg, l.text);
             }
         }
-        submit(engine, job, &mut live)?;
+        submit(engine, job, &mut live, memory)?;
         anyhow::ensure!(worked || job.is_done() || !live.is_empty(), "engine idle with segments left");
     }
     Ok(())
