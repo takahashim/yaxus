@@ -305,3 +305,35 @@ fn tiled_attention_matches_cpu() {
 }
 
 
+
+/// Decode steps (the split attention, 16-key chunks for short and 32-key chunks for long
+/// contexts, and its merge) against the CPU with the f32 prefill GEMM, teacher-forced.
+#[test]
+#[ignore]
+fn decode_attention_matches_cpu() {
+    let dir = model_dir();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
+    let gpu = WgpuBackend::new().unwrap();
+    gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
+    let mut gpu = Model::load(&dir, gpu, Quant::Q8).unwrap();
+    for n in [20u32, 600, 2100] {
+        let ids: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 50000).collect();
+        let sc = cpu.new_seq().unwrap();
+        let sg = gpu.new_seq().unwrap();
+        cpu.prefill(sc, &ids).unwrap();
+        gpu.prefill(sg, &ids).unwrap();
+        let mut worst = 0f32;
+        for step in 0..4u32 {
+            let tok = 2000 + step * 37;
+            let lc = cpu.forward(&[(sc, &[tok])], false).unwrap();
+            let lc = cpu.backend.to_host(&lc);
+            let lg = gpu.forward(&[(sg, &[tok])], false).unwrap();
+            let lg = gpu.backend.to_host(&lg);
+            worst = worst.max(lc.iter().zip(&lg).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+        }
+        cpu.free_seq(sc);
+        gpu.free_seq(sg);
+        eprintln!("{n}-token context: worst |cpu - gpu| over 4 decode steps = {worst:.2e}");
+        assert!(worst < 2e-3, "{n}: {worst}");
+    }
+}

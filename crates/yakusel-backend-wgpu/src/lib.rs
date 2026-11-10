@@ -276,6 +276,9 @@ const ARGMAX_SLICES: usize = 64;
 /// Passes with at most this many rows use the split-key attention.
 const SPLIT_ATTN_MAX_ROWS: usize = 8;
 
+/// Keys per chunk of the split attention kernels.
+const SPLIT_CHUNKS: [usize; 2] = [16, 32];
+
 impl Gpu {
     /// Whether a pass of `t` (17..=32) rows should run as two multi-row GEMVs rather than
     /// the 64-row-tile GEMM: measured on the 2B, two GEMVs win up to about 20 rows
@@ -548,8 +551,14 @@ impl Gpu {
         self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
         self.add_kernel("embed", EMBED, &[false, true, true]);
         for g in [1usize, 2, 4, 6, 8, 12, 16] {
-            let name: &'static str = Box::leak(format!("attn_split{g}").into_boxed_str());
-            self.add_kernel(name, &ATTN_SPLIT.replace("{G}", &g.to_string()), &[false, false, true, true, true, true, true]);
+            for ch in SPLIT_CHUNKS {
+                let name: &'static str = Box::leak(format!("attn_split{g}_{ch}").into_boxed_str());
+                let src = ATTN_SPLIT
+                    .replace("{G}", &g.to_string())
+                    .replace("{CH}", &ch.to_string())
+                    .replace("{GCH}", &(16 * ch).to_string());
+                self.add_kernel(name, &src, &[false, false, true, true, true, true, true]);
+            }
         }
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
         if self.subgroups {
@@ -1029,19 +1038,20 @@ impl Gpu {
             Some(w) => (self.pass_max_pos + 1).min(w),
             None => self.pass_max_pos + 1,
         };
-        let nch = ctx.div_ceil(64);
-        // Few rows and a context long enough to give the split kernel at least half the
-        // parallelism of the per-head kernel (a model with one KV head and a short context
-        // would otherwise run a single workgroup).
+        // Short chunks give short contexts more workgroups; longer ones keep the merge
+        // (`attn_combine`, linear in the chunk count) cheap. Measured on a 780M:
+        // decode attention at 1024 keys 129 -> 102 us per layer (2B), and the 0.8B (one
+        // KV head) gains 11% at 256 keys over the per-head kernel.
+        let ch = if ctx <= 64 { 16 } else { 32 };
+        let nch = ctx.div_ceil(ch);
         let split = t <= SPLIT_ATTN_MAX_ROWS
             && self.subgroups
-            && 2 * nch * hkv >= hq
-            && self.kernels.contains_key(format!("attn_split{g}").as_str());
+            && self.kernels.contains_key(format!("attn_split{g}_{ch}").as_str());
         if split {
             let part = self.tensor(t * hkv * nch * g, 128);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
-                &format!("attn_split{g}"),
+                &format!("attn_split{g}_{ch}"),
                 &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
                 &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
                 ((hkv * nch) as u32, t as u32),

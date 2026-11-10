@@ -1134,12 +1134,16 @@ var<immediate> p: P;
 @group(0) @binding(4) var<storage, read> vc: array<f32>;
 @group(0) @binding(5) var<storage, read> rmeta: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> pages: array<u32>;
-var<workgroup> qs: array<vec4<f32>, 512>;  // [G][32]
-var<workgroup> sc: array<f32, 1024>;       // [G][64] scores, then exp(score - max)
-var<workgroup> kslot: array<u32, 64>;
-var<workgroup> hm: array<f32, 16>;
 
 const G: u32 = {G}u;
+const CH: u32 = {CH}u;          // keys per chunk
+const LPK: u32 = 128u / CH;     // lanes per key (scores)
+const DV4: u32 = 32u / LPK;     // vec4 of the key per lane
+
+var<workgroup> qs: array<vec4<f32>, 512>;  // [G][32]
+var<workgroup> sc: array<f32, {GCH}>;      // [G][CH] scores, then exp(score - max)
+var<workgroup> kslot: array<u32, CH>;
+var<workgroup> hm: array<f32, 16>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -1153,7 +1157,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let pt = m4.z;
     var lo = 0u;
     if (p.window > 0u && pos + 1u > p.window) { lo = pos + 1u - p.window; }
-    let start = lo + c * 64u;
+    let start = lo + c * CH;
     let base = (((t * p.hkv + kh) * p.nch) + c) * g;
     // Uniform per workgroup: chunks past this row's context only mark themselves empty.
     if (start > pos) {
@@ -1164,8 +1168,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         qs[i] = q[(t * p.hq + kh * g) * 32u + i];
     }
     workgroupBarrier();
-    let j = li / 2u;
-    let half = li % 2u;
+    let j = li / LPK;
+    let sub = li % LPK;
     let key = start + j;
     let live = key <= pos;
     var d: array<f32, G>;
@@ -1173,39 +1177,53 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var ks = 0u;
     if (live) {
         ks = pages[pt + key / 128u] * 128u + key % 128u;
-        let off = (ks * kvd + kh * 128u) / 4u + half * 16u;
-        for (var i = 0u; i < 16u; i++) {
+        let off = (ks * kvd + kh * 128u) / 4u + sub * DV4;
+        for (var i = 0u; i < DV4; i++) {
             let kv = kc[off + i];
-            for (var h = 0u; h < G; h++) { d[h] += dot(qs[h * 32u + half * 16u + i], kv); }
+            for (var h = 0u; h < G; h++) { d[h] += dot(qs[h * 32u + sub * DV4 + i], kv); }
         }
     }
     for (var h = 0u; h < G; h++) {
-        let full = d[h] + subgroupShuffleXor(d[h], 1u);
-        if (half == 0u) { sc[h * 64u + j] = select(-1e30, full * p.scale, live); }
+        var full = d[h];
+        for (var s = 1u; s < LPK; s <<= 1u) { full += subgroupShuffleXor(full, s); }
+        if (sub == 0u) { sc[h * CH + j] = select(-1e30, full * p.scale, live); }
     }
-    if (half == 0u) { kslot[j] = ks; }
+    if (sub == 0u) { kslot[j] = ks; }
     workgroupBarrier();
-    let n = min(64u, pos + 1u - start);
+    let n = min(CH, pos + 1u - start);
     if (li < g) {
         var mx = -1e30;
-        for (var k = 0u; k < n; k++) { mx = max(mx, sc[li * 64u + k]); }
+        for (var k = 0u; k < n; k++) { mx = max(mx, sc[li * CH + k]); }
         hm[li] = mx;
     }
     workgroupBarrier();
-    for (var i = li; i < g * 64u; i += 128u) {
-        sc[i] = select(0.0, exp(sc[i] - hm[i / 64u]), i % 64u < n);
+    for (var i = li; i < g * CH; i += 128u) {
+        sc[i] = select(0.0, exp(sc[i] - hm[i / CH]), i % CH < n);
     }
     workgroupBarrier();
     if (li < g) {
         var l = 0.0;
-        for (var k = 0u; k < n; k++) { l += sc[li * 64u + k]; }
+        for (var k = 0u; k < n; k++) { l += sc[li * CH + k]; }
         ml[base + li] = vec2<f32>(hm[li], l);
     }
     var acc: array<f32, G>;
     for (var h = 0u; h < G; h++) { acc[h] = 0.0; }
-    for (var k = 0u; k < n; k++) {
-        let v = vc[kslot[k] * kvd + kh * 128u + li];
-        for (var h = 0u; h < G; h++) { acc[h] += sc[h * 64u + k] * v; }
+    let vo = kh * 128u + li;
+    var k = 0u;
+    // Four independent loads in flight per step.
+    for (; k + 4u <= n; k += 4u) {
+        let v0 = vc[kslot[k] * kvd + vo];
+        let v1 = vc[kslot[k + 1u] * kvd + vo];
+        let v2 = vc[kslot[k + 2u] * kvd + vo];
+        let v3 = vc[kslot[k + 3u] * kvd + vo];
+        for (var h = 0u; h < G; h++) {
+            let w = h * CH + k;
+            acc[h] += sc[w] * v0 + sc[w + 1u] * v1 + sc[w + 2u] * v2 + sc[w + 3u] * v3;
+        }
+    }
+    for (; k < n; k++) {
+        let v = vc[kslot[k] * kvd + vo];
+        for (var h = 0u; h < G; h++) { acc[h] += sc[h * CH + k] * v; }
     }
     for (var h = 0u; h < G; h++) { part[(base + h) * 128u + li] = acc[h]; }
 }
@@ -1226,21 +1244,44 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let g = p.hq / p.hkv;
     let kh = h / g;
     let hi = h % g;
+    // One pass with a running maximum; four chunks per step keep loads in flight.
+    // Empty chunks have (max, sum) = (-1e30, 0) and never wrote `part`: they are
+    // dropped by value, not just by weight.
+    let b0 = ((t * p.hkv + kh) * p.nch) * g + hi;
     var mx = -1e30;
-    for (var c = 0u; c < p.nch; c++) {
-        let e = ml[(((t * p.hkv + kh) * p.nch) + c) * g + hi];
-        if (e.y > 0.0) { mx = max(mx, e.x); }
-    }
     var l = 0.0;
     var acc = 0.0;
-    for (var c = 0u; c < p.nch; c++) {
-        let i = (((t * p.hkv + kh) * p.nch) + c) * g + hi;
+    var c = 0u;
+    for (; c + 4u <= p.nch; c += 4u) {
+        let i0 = b0 + c * g;
+        let e0 = ml[i0];
+        let e1 = ml[i0 + g];
+        let e2 = ml[i0 + 2u * g];
+        let e3 = ml[i0 + 3u * g];
+        let a0 = part[i0 * 128u + li];
+        let a1 = part[(i0 + g) * 128u + li];
+        let a2 = part[(i0 + 2u * g) * 128u + li];
+        let a3 = part[(i0 + 3u * g) * 128u + li];
+        let nm = max(max(mx, max(e0.x, e1.x)), max(e2.x, e3.x));
+        let r = exp(mx - nm);
+        let w0 = select(0.0, exp(e0.x - nm), e0.y > 0.0);
+        let w1 = select(0.0, exp(e1.x - nm), e1.y > 0.0);
+        let w2 = select(0.0, exp(e2.x - nm), e2.y > 0.0);
+        let w3 = select(0.0, exp(e3.x - nm), e3.y > 0.0);
+        l = l * r + e0.y * w0 + e1.y * w1 + e2.y * w2 + e3.y * w3;
+        acc = acc * r + select(0.0, a0 * w0, e0.y > 0.0) + select(0.0, a1 * w1, e1.y > 0.0)
+            + select(0.0, a2 * w2, e2.y > 0.0) + select(0.0, a3 * w3, e3.y > 0.0);
+        mx = nm;
+    }
+    for (; c < p.nch; c++) {
+        let i = b0 + c * g;
         let e = ml[i];
-        if (e.y > 0.0) {
-            let w = exp(e.x - mx);
-            l += e.y * w;
-            acc += part[i * 128u + li] * w;
-        }
+        let nm = max(mx, e.x);
+        let r = exp(mx - nm);
+        let w = select(0.0, exp(e.x - nm), e.y > 0.0);
+        l = l * r + e.y * w;
+        acc = acc * r + select(0.0, part[i * 128u + li] * w, e.y > 0.0);
+        mx = nm;
     }
     o[(t * p.hq + h) * 128u + li] = acc / l;
 }
