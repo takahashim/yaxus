@@ -2,7 +2,7 @@
 //! computed from the same quantized weights. Needs a Vulkan GPU:
 //! `cargo test --release -p yakusel-backend-wgpu --test kernels -- --ignored`
 
-use yakusel_backend_wgpu::WgpuBackend;
+use yakusel_backend_wgpu::{GemmKind, WgpuBackend};
 use yakusel_model::Quant;
 use yakusel_model::ggml::GgmlType;
 use yakusel_model::quant::{Q8_BLOCK, quantize_q4, quantize_q8};
@@ -66,31 +66,52 @@ fn reference(x: &[f32], t: usize, w: &[f32], n: usize, k: usize, glu: bool) -> V
         .collect()
 }
 
+/// The prefill GEMM kinds this device has, and the error each may add to a product
+/// relative to the largest output (operands rounded to f16, to 15 bits, to 7 bits).
+fn gemm_kinds(gpu: &WgpuBackend) -> Vec<(GemmKind, f32)> {
+    let mut kinds = vec![(GemmKind::F32, 0.0), (GemmKind::Int16, 3e-3), (GemmKind::Int8, 3e-2)];
+    if gpu.has_matrix_cores() {
+        kinds.push((GemmKind::Coop, 3e-3)); // (the default where matrix cores exist)
+    }
+    kinds
+}
+
 #[test]
 #[ignore]
 fn matmul_kernels_match_host() {
     let mut gpu = WgpuBackend::new().unwrap();
     // K multiple of 512 (gemvm) and not (fallback); N a multiple of 64 (matrix-core GEMM)
     // and not (tile tails).
-    let f16_gemm = gpu.gemm_uses_f16();
     for (n, k) in [(256, 1536), (200, 1536), (130, 320)] {
         let w: Vec<u16> = values(n * k, 7).iter().map(|&v| f32_to_bf16(v * 0.05)).collect();
         for quant in [Quant::Bf16, Quant::Q8, Quant::Q4] {
             let wd = dequant(&w, k, quant);
-            for t in [1, 2, 3, 5, 8, 12, 16, 20, 24, 70] {
+            // Up to 16 rows: the f32 GEMVs whatever the GEMM kind. Above: the GEMM, in
+            // tiles of 32, 64 and 128 tokens.
+            for t in [1, 2, 3, 5, 8, 12, 16, 20, 24, 40, 70, 150, 200] {
                 for glu in [false, true] {
                     if glu && t > 1 {
                         continue; // glu is fused only for decode; other T use matmul + swiglu
                     }
                     let x = values(t * k, 11 + t as u64);
                     let want = reference(&x, t, &wd, n, k, glu);
-                    let got = gpu.debug_matmul(&x, t, &w, n, k, quant, glu);
-                    assert_eq!(got.len(), want.len());
-                    let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                     let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-                    // f16 operands (matrix cores) round each input to 11 bits.
-                    let tol = if f16_gemm && t > 8 && n % 64 == 0 { 3e-3 } else { 1e-4 };
-                    assert!(err <= tol * scale.max(1.0), "{quant:?} n={n} k={k} t={t} glu={glu}: err {err}");
+                    for (kind, tol) in gemm_kinds(&gpu) {
+                        if t <= 16 && kind != GemmKind::F32 {
+                            continue;
+                        }
+                        gpu.set_gemm(kind);
+                        let got = gpu.debug_matmul(&x, t, &w, n, k, quant, glu);
+                        assert_eq!(got.len(), want.len());
+                        let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                        // bf16 weights have no integer form: the f16 or f32 GEMM takes them.
+                        let tol = if t > 16 && quant == Quant::Bf16 && kind != GemmKind::F32 { 3e-3 } else { tol };
+                        let tol = tol.max(1e-4);
+                        assert!(
+                            err <= tol * scale.max(1.0),
+                            "{quant:?} {kind:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
+                        );
+                    }
                 }
             }
         }
@@ -129,26 +150,34 @@ fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
 #[ignore]
 fn ggml_matmul_kernels_match_host() {
     let mut gpu = WgpuBackend::new().unwrap();
-    let f16_gemm = gpu.gemm_uses_f16();
     // K a multiple of 256 (K-quant super-blocks); K = 4096 and 8192 pad the per-16 scale
     // rows, K = 8192 and 16384 the Q4_K header rows.
     for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096), (64, 16384)] {
         for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
             let bytes = ggml_blocks(dtype, n, k, 3);
             let wd = yakusel_model::ggml::dequantize(dtype, &bytes, n * k);
-            for t in [1, 2, 5, 8, 16, 20, 70] {
+            for t in [1, 2, 5, 8, 16, 20, 40, 70, 150] {
                 for glu in [false, true] {
                     if glu && t > 1 {
                         continue;
                     }
                     let x = values(t * k, 21 + t as u64);
                     let want = reference(&x, t, &wd, n, k, glu);
-                    let got = gpu.debug_matmul_ggml(&x, t, dtype, &bytes, n, k, glu);
-                    let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                     let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-                    // Q4_K/Q6_K scales are rounded to f16 on the GPU (~5e-4 relative).
-                    let tol = if f16_gemm && t > 8 && n % 64 == 0 { 3e-3 } else { 1e-3 };
-                    assert!(err <= tol * scale.max(1.0), "{dtype:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})");
+                    for (kind, tol) in gemm_kinds(&gpu) {
+                        if t <= 16 && kind != GemmKind::F32 {
+                            continue;
+                        }
+                        gpu.set_gemm(kind);
+                        let got = gpu.debug_matmul_ggml(&x, t, dtype, &bytes, n, k, glu);
+                        let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                        // Q4_K/Q6_K scales are rounded to f16 on the GPU (~5e-4 relative).
+                        let tol = tol.max(1e-3);
+                        assert!(
+                            err <= tol * scale.max(1.0),
+                            "{dtype:?} {kind:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
+                        );
+                    }
                 }
             }
         }

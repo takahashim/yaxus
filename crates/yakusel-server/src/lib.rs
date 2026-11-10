@@ -67,14 +67,43 @@ pub struct DraftOptions {
     pub quant: Quant,
 }
 
+/// Arithmetic of the GPU prompt processing (passes of more than 16 rows; decoding is
+/// always f32). The figures are for a 780M against `F32`: speed of the pass and how far
+/// the logits of the first generated token move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefill {
+    /// Integer dot products, activations rounded to 15 bits per block of 32: 2.6x, 6e-3.
+    #[default]
+    Int16,
+    /// The same with 7 bits, as llama.cpp does: 3.9x, 4e-1 to 6e-1.
+    Int8,
+    /// Matrix cores with f16 operands: 2.0x, 2e-2 to 3e-2.
+    F16,
+    /// f32 throughout: the reference.
+    F32,
+}
+
+impl std::str::FromStr for Prefill {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "int16" => Ok(Prefill::Int16),
+            "int8" => Ok(Prefill::Int8),
+            "f16" => Ok(Prefill::F16),
+            "f32" => Ok(Prefill::F32),
+            _ => anyhow::bail!("unknown prefill precision {s:?} (expected int16, int8, f16 or f32)"),
+        }
+    }
+}
+
 /// How to load and run the model.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
     pub backend: BackendKind,
     pub quant: Quant,
     pub draft: Option<DraftOptions>,
-    /// Keep the GPU prefill GEMM in f32 instead of using the matrix cores.
-    pub prefill_f32: bool,
+    /// Arithmetic of the GPU prompt processing.
+    pub prefill: Prefill,
     /// Reuse the KV of finished requests for prompts sharing a prefix.
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
@@ -89,7 +118,7 @@ impl Default for LoadOptions {
             backend: BackendKind::Auto,
             quant: Quant::Auto,
             draft: None,
-            prefill_f32: false,
+            prefill: Prefill::default(),
             prefix_cache: true,
             kv_tokens: yakusel_model::DEFAULT_KV_TOKENS,
             engine: yakusel_model::EngineConfig::default(),
@@ -173,9 +202,13 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
         return Ok(Box::new(Engine::new(target, draft, cfg)?));
     };
     // One device for the target and the draft model.
-    if o.prefill_f32 {
-        gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
-    }
+    use yakusel_backend_wgpu::GemmKind;
+    gpu.set_gemm(match o.prefill {
+        Prefill::Int16 => GemmKind::Int16,
+        Prefill::Int8 => GemmKind::Int8,
+        Prefill::F16 => GemmKind::Coop,
+        Prefill::F32 => GemmKind::F32,
+    });
     let draft_gpu = gpu.share();
     let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
     let draft = match draft {

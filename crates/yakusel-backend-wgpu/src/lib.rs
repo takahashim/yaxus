@@ -4,6 +4,7 @@
 //! All ops are recorded into one command encoder and submitted at sync points
 //! (`argmax` / `to_host`), so a decode step is a single queue submission.
 
+mod gemm_int;
 mod shaders;
 
 use std::collections::HashMap;
@@ -210,15 +211,33 @@ pub enum GemmKind {
     /// Matrix cores (cooperative matrices): f16 operands, f32 accumulation. Logits move by
     /// ~5e-3 instead of ~5e-5 against the CPU; prefill is ~1.35x faster on a 780M.
     Coop,
+    /// Packed integer dot products on the weights' integer values, the activations
+    /// rounded to 15 bits and a sign per block of 32 (`gemm_int`, two int8 planes). Logits
+    /// move by ~6e-3 against the CPU (less than with `Coop`); 1.3x faster than `Coop`.
+    Int16,
+    /// The same with 7 bits and a sign (one plane), as llama.cpp does: logits move by
+    /// ~3e-1; 1.9x faster than `Coop`.
+    Int8,
 }
 
 impl GemmKind {
-    /// The default: matrix cores when available. `YAKUSEL_GEMM=f32|coop` overrides.
-    fn from_env(coop: bool) -> Self {
+    /// Activation planes of the integer GEMM, if that is the kind.
+    fn planes(self) -> Option<usize> {
+        match self {
+            GemmKind::Int8 => Some(1),
+            GemmKind::Int16 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// The default, `Int16`. `YAKUSEL_GEMM=f32|coop|int16|int8` overrides it (for tests;
+    /// the CLI and the server set the kind from `--prefill-precision`).
+    fn from_env() -> Self {
         match std::env::var("YAKUSEL_GEMM").as_deref() {
             Ok("f32") => GemmKind::F32,
-            _ if coop => GemmKind::Coop,
-            _ => GemmKind::F32,
+            Ok("coop") => GemmKind::Coop,
+            Ok("int8") => GemmKind::Int8,
+            _ => GemmKind::Int16,
         }
     }
 }
@@ -434,7 +453,7 @@ impl Gpu {
             pass_dispatches: 0,
             subgroups,
             coop,
-            gemm: GemmKind::from_env(coop),
+            gemm: GemmKind::from_env(),
             tile_wgs: 384,
             unflushed_upload: 0,
             profile: std::env::var_os("YAKUSEL_PROFILE").map(|_| Profile::default()),
@@ -957,7 +976,7 @@ impl Gpu {
         assert_eq!(x.cols, k, "matmul inner dim");
         let t = x.rows;
         // The matrix-core GEMM stores whole 64-token tiles.
-        let y = if t > GEMV_MAX_T && self.gemm == GemmKind::Coop {
+        let y = if t > GEMV_MAX_T && self.gemm != GemmKind::F32 {
             // (more than needed when a multi-row GEMV takes it; harmless)
             self.tensor_padded(t, n, t.div_ceil(64) * 64)
         } else {
@@ -965,6 +984,19 @@ impl Gpu {
         };
         let mut all = vec![y.buf(), x.buf()];
         all.extend(bufs);
+        if t > GEMV_MAX_T
+            && let Some(planes) = self.gemm.planes()
+            && let Some(f) = gemm_int::format(suffix)
+        {
+            // The integer GEMM reads the per-16 scale arrays where a format has them.
+            let scales = match w {
+                Weight::Q6 { s16, .. } | Weight::Q3 { s16, .. } | Weight::Q2 { s16, .. } => s16,
+                _ => all[3],
+            };
+            let (wq, scales) = (all[2].clone(), scales.clone());
+            self.gemm_int(x, &y, &wq, &scales, n, f, planes);
+            return y;
+        }
         let multi = self.subgroups && k % 512 == 0;
         if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || self.multi_split(t)) {
             // Up to 16 rows in one dispatch, up to 32 in two (each reads the weights once).
@@ -1000,7 +1032,7 @@ impl Gpu {
                 all[3] = s16;
             }
             match self.gemm {
-                GemmKind::Coop if n % 64 == 0 => {
+                GemmKind::Coop | GemmKind::Int8 | GemmKind::Int16 if n % 64 == 0 && self.coop => {
                     (format!("gemmcoop_{suffix}"), ((n / 64) as u32, t.div_ceil(64) as u32))
                 }
                 _ => (format!("gemm2f32_{suffix}"), (n.div_ceil(128) as u32, t.div_ceil(64) as u32)),
@@ -1141,6 +1173,74 @@ impl Gpu {
             (x.rows as u32, 1),
         );
         h
+    }
+
+    /// `y = x W^T` for more than 16 rows with integer dot products (`gemm_int`): the rows
+    /// are quantized to int8 planes, then tiles of 128 tokens and one of 64 or 32 for the
+    /// rest (a tile costs its full size whatever it holds).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_int(
+        &mut self,
+        x: &Tensor,
+        y: &Tensor,
+        wq: &wgpu::Buffer,
+        scales: &wgpu::Buffer,
+        n: usize,
+        f: &'static gemm_int::IntFmt,
+        planes: usize,
+    ) {
+        let (t, k) = (x.rows, x.cols);
+        let tp = t.div_ceil(128) * 128;
+        let xq = self.tensor(tp, planes * k / 4);
+        let xs = self.tensor(tp, k / 8);
+        let xquant = self.int_kernel(format!("xquant{planes}"), &[false, true, false], || {
+            gemm_int::xquant_source(planes)
+        });
+        let lanes = (tp / 4) * (k / 32);
+        self.dispatch(
+            xquant,
+            &[xq.buf(), x.buf(), xs.buf()],
+            &[k as u32, t as u32, f.xmode, 0],
+            grid(lanes.div_ceil(64) as u32),
+        );
+        let bufs = [y.buf().clone(), xq.buf().clone(), wq.clone(), scales.clone(), xs.buf().clone()];
+        let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+        let rest = t % 128;
+        let wide = t / 128 + usize::from(rest > 64);
+        let tail = match rest {
+            0 | 65.. => None,
+            33.. => Some(4),
+            _ => Some(2),
+        };
+        for (tn, r0, tiles) in [(8, 0, wide), (tail.unwrap_or(2), wide * 128, usize::from(tail.is_some()))] {
+            if tiles == 0 {
+                continue;
+            }
+            let name = self.int_kernel(
+                format!("gemmint{planes}_{tn}_{}", f.name),
+                &[false, true, true, true, true],
+                || gemm_int::source(f, tn, planes),
+            );
+            if self.kernels_profile.is_some() {
+                self.prof_detail = Some(format!("{n}x{k}"));
+            }
+            self.dispatch(name, &refs, &[n as u32, k as u32, t as u32, r0 as u32], (n.div_ceil(64) as u32, tiles as u32));
+        }
+        self.pending_flops += 2.0 * (t * n * k) as f64;
+        if self.pending_flops >= SUBMIT_FLOPS {
+            self.submit();
+        }
+    }
+
+    /// The name of a `gemm_int` kernel, compiled on first use (their sources are long, and
+    /// a model uses two or three of the formats).
+    fn int_kernel(&mut self, name: String, read_only: &[bool], source: impl FnOnce() -> String) -> &'static str {
+        if let Some((k, _)) = self.kernels.get_key_value(name.as_str()) {
+            return k;
+        }
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        self.add_kernel(name, &source(), read_only);
+        name
     }
 
     fn matmul_glu(&mut self, x: &Tensor, w: &Weight) -> Tensor {
@@ -1306,10 +1406,10 @@ impl Gpu {
 }
 
 impl Gpu {
-    /// Whether the prefill GEMM rounds its operands to f16.
+    /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
     #[doc(hidden)]
     pub fn gemm_uses_f16(&self) -> bool {
-        self.gemm == GemmKind::Coop
+        self.gemm != GemmKind::F32
     }
 
     /// Test hook: like `debug_matmul` for a matrix given as raw GGML blocks, kept in its
@@ -1381,10 +1481,16 @@ impl WgpuBackend {
         self.g().tile_wgs = target_wgs;
     }
 
-    /// Whether the prefill GEMM rounds its operands to f16.
+    /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
     #[doc(hidden)]
     pub fn gemm_uses_f16(&self) -> bool {
         self.g().gemm_uses_f16()
+    }
+
+    /// Whether the device has matrix cores (the `Coop` GEMM).
+    #[doc(hidden)]
+    pub fn has_matrix_cores(&self) -> bool {
+        self.g().coop
     }
 
     /// Test hook, see [`Gpu::debug_matmul_ggml`].

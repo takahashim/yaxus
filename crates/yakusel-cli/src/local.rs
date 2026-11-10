@@ -29,10 +29,11 @@ pub struct ModelArgs {
     /// auto (Vulkan GPU if available, else CPU), vulkan or cpu.
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
-    /// GPU prompt processing: f16 (matrix cores, ~1.35x faster) or f32 (logits closer to
-    /// the CPU reference by ~100x).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "f32"])]
-    prefill_precision: String,
+    /// Arithmetic of GPU prompt processing (decoding is always f32): int16 (integer dot
+    /// products, activations rounded to 15 bits), int8 (7 bits as llama.cpp does: 1.5x
+    /// faster than int16, logits move ~100x more), f16 (matrix cores) or f32 (reference).
+    #[arg(long, default_value = "int16")]
+    prefill_precision: yakusel_server::Prefill,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
     /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
@@ -98,7 +99,7 @@ impl ModelArgs {
             backend: self.backend,
             quant: self.quant,
             draft: self.draft_options()?,
-            prefill_f32: self.prefill_precision == "f32",
+            prefill: self.prefill_precision,
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
             engine: yakusel_model::EngineConfig {

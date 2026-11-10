@@ -337,3 +337,59 @@ fn decode_attention_matches_cpu() {
         assert!(worst < 2e-3, "{n}: {worst}");
     }
 }
+
+/// How far each prefill GEMM kind moves the logits of the first generated token from the
+/// f32 GEMM's, on the golden prompts and on a 600-token one: the largest difference and
+/// the KL divergence of the distributions. `YAKUSEL_MODEL_DIR` may name a GGUF file.
+#[test]
+#[ignore]
+fn prefill_kinds_against_f32() {
+    use yakusel_backend_wgpu::GemmKind;
+    let dir = model_dir();
+    let quant = if yakusel_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
+    gpu.prefix_cache = false;
+    let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
+    prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
+    let mut logits = |gpu: &mut Model<WgpuBackend>, kind| -> Vec<Vec<f32>> {
+        gpu.backend.set_gemm(kind);
+        prompts
+            .iter()
+            .map(|ids| {
+                let s = gpu.new_seq().unwrap();
+                let l = gpu.prefill(s, ids).unwrap();
+                let l = gpu.backend.to_host(&l);
+                gpu.free_seq(s);
+                l
+            })
+            .collect()
+    };
+    let softmax = |l: &[f32]| -> Vec<f64> {
+        let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f64> = l.iter().map(|&v| ((v - m) as f64).exp()).collect();
+        let z: f64 = e.iter().sum();
+        e.into_iter().map(|v| v / z).collect()
+    };
+    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let base = logits(&mut gpu, GemmKind::F32);
+    let mut kinds = vec![(GemmKind::Int16, 5e-2), (GemmKind::Int8, 3.0)];
+    if gpu.backend.has_matrix_cores() {
+        kinds.insert(0, (GemmKind::Coop, 3e-1));
+    }
+    for (kind, bound) in kinds {
+        let got = logits(&mut gpu, kind);
+        let (mut worst, mut kl_max, mut same) = (0f32, 0f64, 0);
+        for (a, b) in base.iter().zip(&got) {
+            worst = worst.max(a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max));
+            let (p, q) = (softmax(a), softmax(b));
+            let kl: f64 = p.iter().zip(&q).filter(|(p, _)| **p > 0.0).map(|(p, q)| p * (p / q.max(1e-300)).ln()).sum();
+            kl_max = kl_max.max(kl);
+            same += usize::from(argmax(a) == argmax(b));
+        }
+        eprintln!(
+            "{kind:?}: max |logit - f32| = {worst:.2e}, max KL = {kl_max:.2e}, same first token {same}/{}",
+            base.len()
+        );
+        assert!(worst < bound, "{kind:?}: {worst}");
+    }
+}
