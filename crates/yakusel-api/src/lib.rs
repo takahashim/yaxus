@@ -63,6 +63,70 @@ pub enum StreamEvent {
     Error { error: String },
 }
 
+/// `POST /v1/translate/document`: several segments (paragraphs) of one document.
+///
+/// The segments are split into chains of consecutive segments; a chain is translated in
+/// order with its earlier segments as history (up to `history_chars`), and the chains run
+/// in parallel. One chain gives the most consistent translation; more chains are faster.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentRequest {
+    pub segments: Vec<String>,
+    pub target_lang: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lang: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub glossary: Vec<Pair>,
+    /// Chains translated in parallel; 0 or absent: one per 4 segments, at most 8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chains: Option<usize>,
+    /// History budget per chain in characters (default `DEFAULT_HISTORY_CHARS`, 0: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_chars: Option<usize>,
+    /// Pass the neighbouring source segments as context (useful without history).
+    #[serde(default)]
+    pub neighbor_context: bool,
+    /// Per segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_new_tokens: Option<usize>,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DocumentUsage {
+    pub segments: usize,
+    pub chains: usize,
+    pub prompt_tokens: usize,
+    /// Prompt tokens whose KV was reused from earlier requests.
+    pub reused_tokens: usize,
+    pub completion_tokens: usize,
+    pub elapsed_ms: u64,
+    pub queue_ms: u64,
+}
+
+/// Response for `stream: false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentResponse {
+    pub segments: Vec<String>,
+    pub usage: DocumentUsage,
+}
+
+/// One `data:` payload of the SSE stream for `stream: true`. Segments progress in
+/// parallel, so deltas of different segments interleave.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DocumentEvent {
+    Delta { segment: usize, delta: String },
+    SegmentEnd { segment: usize, end: bool },
+    Done { done: bool, usage: DocumentUsage },
+    Error { error: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,

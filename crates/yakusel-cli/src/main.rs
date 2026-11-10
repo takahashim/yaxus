@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use yakusel_api::{DEFAULT_MAX_NEW_TOKENS, Pair, StreamEvent, TranslateRequest, TranslateResponse};
+use yakusel_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, Pair};
 
 #[cfg(feature = "server")]
 mod local;
@@ -35,12 +35,18 @@ struct LangArgs {
     glossary: Vec<String>,
     #[arg(long, default_value_t = DEFAULT_MAX_NEW_TOKENS)]
     max_new_tokens: usize,
-    /// History budget in characters: earlier paragraphs and their translations are sent
-    /// with each paragraph until this is exceeded (then the older half is dropped). 0 = none.
+    /// History budget per chain in characters: earlier paragraphs of the chain and their
+    /// translations are sent with each paragraph until this is exceeded. 0 = none.
     #[arg(long, default_value_t = yakusel_api::DEFAULT_HISTORY_CHARS)]
     history_chars: usize,
-    /// Text to translate (reads stdin if omitted). Paragraphs separated by blank lines
-    /// are translated one by one, with earlier ones as history (see --history-chars).
+    /// Chains of consecutive paragraphs translated in parallel (0: one per 4 paragraphs,
+    /// at most 8; 1: strictly in order, the most consistent).
+    #[arg(long, default_value_t = 0)]
+    chains: usize,
+    /// Pass the neighbouring source paragraphs as context (useful with --history-chars 0).
+    #[arg(long)]
+    neighbor_context: bool,
+    /// Text to translate (reads stdin if omitted). Paragraphs are separated by blank lines.
     text: Option<String>,
 }
 
@@ -77,7 +83,7 @@ enum Cmd {
         /// Do not verify the server certificate.
         #[arg(long)]
         insecure: bool,
-        /// Wait for each paragraph instead of streaming tokens.
+        /// Wait for the whole result instead of streaming tokens.
         #[arg(long)]
         no_stream: bool,
         #[command(flatten)]
@@ -120,55 +126,70 @@ fn parse_glossary(entries: &[String]) -> Result<Vec<Pair>> {
 }
 
 impl LangArgs {
-    /// The request for one paragraph (without history and text).
-    fn base_request(&self) -> Result<TranslateRequest> {
-        Ok(TranslateRequest {
-            text: String::new(),
+    /// The document request for the input text.
+    fn document(&self, stream: bool) -> Result<DocumentRequest> {
+        let input = read_input(self.text.clone())?;
+        let segments = yakusel_api::split_paragraphs(&input);
+        if segments.is_empty() {
+            bail!("no text to translate");
+        }
+        Ok(DocumentRequest {
+            segments,
             target_lang: self.to.clone(),
             source_lang: self.from.clone(),
             form: self.form.clone(),
             context: self.context.clone(),
             glossary: parse_glossary(&self.glossary)?,
-            history: vec![],
+            chains: Some(self.chains),
+            history_chars: Some(self.history_chars),
+            neighbor_context: self.neighbor_context,
             max_new_tokens: Some(self.max_new_tokens),
-            stream: false,
+            stream,
         })
     }
 }
 
-/// Translates paragraph by paragraph, printing as it goes. `one` translates a single
-/// request, calling the callback with streamed pieces, and returns the full translation.
-fn translate_paragraphs(
-    lang: &LangArgs,
-    mut one: impl FnMut(&TranslateRequest, &mut dyn FnMut(&str)) -> Result<String>,
-) -> Result<()> {
-    let input = read_input(lang.text.clone())?;
-    let paras = yakusel_api::split_paragraphs(&input);
-    if paras.is_empty() {
-        bail!("no text to translate");
+/// Prints segments in order while they are produced in parallel: the first unfinished
+/// segment streams live, later ones are buffered until their turn.
+pub struct OrderedPrinter<W: Write> {
+    out: W,
+    cursor: usize,
+    buf: Vec<String>,
+    ended: Vec<bool>,
+}
+
+impl<W: Write> OrderedPrinter<W> {
+    pub fn new(out: W, segments: usize) -> Self {
+        OrderedPrinter { out, cursor: 0, buf: vec![String::new(); segments], ended: vec![false; segments] }
     }
-    let base = lang.base_request()?;
-    let mut history: Vec<Pair> = Vec::new();
-    let mut window = yakusel_api::HistoryWindow::new(lang.history_chars);
-    let mut stdout = std::io::stdout().lock();
-    for (i, p) in paras.iter().enumerate() {
-        if i > 0 {
-            writeln!(stdout)?;
+
+    pub fn delta(&mut self, segment: usize, text: &str) -> Result<()> {
+        if segment == self.cursor {
+            self.out.write_all(text.as_bytes())?;
+            self.out.flush()?;
+        } else if segment < self.buf.len() {
+            self.buf[segment].push_str(text);
         }
-        let mut req = base.clone();
-        req.text = p.clone();
-        req.history = window.select(&history).to_vec();
-        let out = one(&req, &mut |s| {
-            let _ = stdout.write_all(s.as_bytes());
-            let _ = stdout.flush();
-        })?;
-        writeln!(stdout)?;
-        history.push(Pair {
-            source: p.clone(),
-            target: out,
-        });
+        Ok(())
     }
-    Ok(())
+
+    pub fn end(&mut self, segment: usize) -> Result<()> {
+        if segment >= self.ended.len() {
+            return Ok(());
+        }
+        self.ended[segment] = true;
+        while self.cursor < self.ended.len() && self.ended[self.cursor] {
+            writeln!(self.out)?;
+            self.cursor += 1;
+            if self.cursor < self.buf.len() {
+                writeln!(self.out)?;
+                let b = std::mem::take(&mut self.buf[self.cursor]);
+                self.out.write_all(b.as_bytes())?;
+            }
+        }
+        self.out.flush()?;
+        Ok(())
+    }
 }
 
 fn run_client(
@@ -185,9 +206,7 @@ fn run_client(
             .map(|t| t.trim().to_string())
             .context("no token: pass --token or set YAKUSEL_TOKEN")?,
     };
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(None)
-        .use_rustls_tls();
+    let mut builder = reqwest::blocking::Client::builder().timeout(None).use_rustls_tls();
     if let Some(ca) = &ca {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
         builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
@@ -196,53 +215,47 @@ fn run_client(
         builder = builder.danger_accept_invalid_certs(true);
     }
     let http = builder.build()?;
-    let url = format!("{}/v1/translate", server.trim_end_matches('/'));
-
-    translate_paragraphs(&lang, |req, emit| {
-        let mut req = req.clone();
-        req.stream = !no_stream;
-        let res = http.post(&url).bearer_auth(&token).json(&req).send().map_err(|e| {
-            let mut msg = format!("request to {url} failed: {e}");
-            let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
-            while let Some(s) = src {
-                msg += &format!(": {s}");
-                src = s.source();
-            }
-            if msg.contains("certificate") || msg.contains("UnknownIssuer") {
-                msg += "\nhint: pass the server's ca.pem with --ca (or --insecure to skip verification)";
-            }
-            anyhow::anyhow!(msg)
-        })?;
-        let status = res.status();
-        if !status.is_success() {
-            let body = res.text().unwrap_or_default();
-            let msg = serde_json::from_str::<yakusel_api::ErrorResponse>(&body)
-                .map(|e| e.error)
-                .unwrap_or(body);
-            bail!("server returned {status}: {msg}");
+    let url = format!("{}/v1/translate/document", server.trim_end_matches('/'));
+    let req = lang.document(!no_stream)?;
+    let n = req.segments.len();
+    let res = http.post(&url).bearer_auth(&token).json(&req).send().map_err(|e| {
+        let mut msg = format!("request to {url} failed: {e}");
+        let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+        while let Some(s) = src {
+            msg += &format!(": {s}");
+            src = s.source();
         }
-        if no_stream {
-            let r: TranslateResponse = res.json()?;
-            emit(&r.text);
-            return Ok(r.text);
+        if msg.contains("certificate") || msg.contains("UnknownIssuer") {
+            msg += "\nhint: pass the server's ca.pem with --ca (or --insecure to skip verification)";
         }
-        let mut out = String::new();
-        for line in BufReader::new(res).lines() {
-            let line = line?;
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            match serde_json::from_str::<StreamEvent>(data.trim_start())? {
-                StreamEvent::Delta { delta } => {
-                    emit(&delta);
-                    out += &delta;
-                }
-                StreamEvent::Done { .. } => return Ok(out),
-                StreamEvent::Error { error } => bail!("server error: {error}"),
-            }
+        anyhow::anyhow!(msg)
+    })?;
+    let status = res.status();
+    if !status.is_success() {
+        let body = res.text().unwrap_or_default();
+        let msg = serde_json::from_str::<yakusel_api::ErrorResponse>(&body).map(|e| e.error).unwrap_or(body);
+        bail!("server returned {status}: {msg}");
+    }
+    let mut out = OrderedPrinter::new(std::io::stdout().lock(), n);
+    if no_stream {
+        let r: DocumentResponse = res.json()?;
+        for (i, s) in r.segments.iter().enumerate() {
+            out.delta(i, s)?;
+            out.end(i)?;
         }
-        bail!("stream ended unexpectedly")
-    })
+        return Ok(());
+    }
+    for line in BufReader::new(res).lines() {
+        let line = line?;
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        match serde_json::from_str::<DocumentEvent>(data.trim_start())? {
+            DocumentEvent::Delta { segment, delta } => out.delta(segment, &delta)?,
+            DocumentEvent::SegmentEnd { segment, .. } => out.end(segment)?,
+            DocumentEvent::Done { .. } => return Ok(()),
+            DocumentEvent::Error { error } => bail!("server error: {error}"),
+        }
+    }
+    bail!("stream ended unexpectedly")
 }
 
 fn main() -> Result<()> {

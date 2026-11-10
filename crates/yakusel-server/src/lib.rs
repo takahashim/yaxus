@@ -1,5 +1,6 @@
 //! `yakusel serve`: HTTPS + bearer-token API, SSE streaming and an embedded web UI.
 
+pub mod document;
 mod tls;
 mod worker;
 
@@ -22,8 +23,8 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use yakusel_api::{
-    DEFAULT_MAX_NEW_TOKENS, ErrorResponse, Health, LANGUAGES, Language, StreamEvent, TranslateRequest,
-    TranslateResponse,
+    DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, ErrorResponse, Health, LANGUAGES,
+    Language, StreamEvent, TranslateRequest, TranslateResponse,
 };
 use yakusel_backend_cpu::CpuBackend;
 use yakusel_backend_wgpu::WgpuBackend;
@@ -31,7 +32,7 @@ use yakusel_model::{Engine, Generator, Model, Quant};
 use yakusel_tokenizer::{GlossaryEntry, Tokenizer, TranslationPair, TranslationRequest};
 
 pub use tls::default_sans;
-use worker::{Event, Job};
+use worker::{Event, Job, Work};
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 
@@ -300,18 +301,14 @@ async fn translate(
         req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"),
         req.target_lang
     );
-    let job = Job { prompt_ids: ids, max_new_tokens: max_new, enqueued: Instant::now(), events: tx, label };
-    st.queued.fetch_add(1, Ordering::SeqCst);
-    if let Err(e) = st.jobs.try_send(job) {
-        st.queued.fetch_sub(1, Ordering::SeqCst);
-        return match e {
-            mpsc::error::TrySendError::Full(_) => {
-                error(StatusCode::TOO_MANY_REQUESTS, "translation queue is full; retry later")
-            }
-            mpsc::error::TrySendError::Closed(_) => {
-                error(StatusCode::SERVICE_UNAVAILABLE, "inference worker stopped")
-            }
-        };
+    let job = Job {
+        work: Work::Single { prompt_ids: ids, max_new_tokens: max_new },
+        enqueued: Instant::now(),
+        events: tx,
+        label,
+    };
+    if let Err(r) = enqueue(&st, job) {
+        return r;
     }
 
     if req.stream {
@@ -320,6 +317,7 @@ async fn translate(
                 Event::Delta(delta) => StreamEvent::Delta { delta },
                 Event::Done(usage) => StreamEvent::Done { done: true, usage },
                 Event::Error(error) => StreamEvent::Error { error },
+                _ => StreamEvent::Error { error: "unexpected event".into() },
             })
         });
         let mut r = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
@@ -335,14 +333,119 @@ async fn translate(
             Event::Delta(d) => text.push_str(&d),
             Event::Done(usage) => return Json(TranslateResponse { text, usage }).into_response(),
             Event::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            _ => {}
         }
     }
     error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
 }
 
+fn enqueue(st: &AppState, job: Job) -> std::result::Result<(), Response> {
+    st.queued.fetch_add(1, Ordering::SeqCst);
+    match st.jobs.try_send(job) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            st.queued.fetch_sub(1, Ordering::SeqCst);
+            Err(match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    error(StatusCode::TOO_MANY_REQUESTS, "translation queue is full; retry later")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    error(StatusCode::SERVICE_UNAVAILABLE, "inference worker stopped")
+                }
+            })
+        }
+    }
+}
+
+/// Most segments accepted in one document request.
+const MAX_SEGMENTS: usize = 2000;
+
+async fn translate_document(
+    State(st): State<Shared>,
+    body: Result<Json<DocumentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
+    if req.segments.is_empty() || req.segments.len() > MAX_SEGMENTS {
+        return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
+    }
+    // Validate languages, options and every segment up front (blank segments are allowed
+    // and come back empty).
+    for (i, seg) in req.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
+        let one = TranslateRequest {
+            text: seg.clone(),
+            target_lang: req.target_lang.clone(),
+            source_lang: req.source_lang.clone(),
+            form: req.form.clone(),
+            context: req.context.clone(),
+            glossary: req.glossary.clone(),
+            ..Default::default()
+        };
+        if let Err(e) = to_prompt_request(&one).to_prompt() {
+            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {}", e.0));
+        }
+    }
+    let opts = document::DocOptions {
+        target_lang: req.target_lang.clone(),
+        source_lang: req.source_lang.clone().filter(|s| !s.is_empty()),
+        form: req.form.clone().filter(|s| !s.is_empty()),
+        context: req.context.clone(),
+        glossary: req.glossary.clone(),
+        history_chars: req.history_chars.unwrap_or(yakusel_api::DEFAULT_HISTORY_CHARS),
+        chains: req.chains.unwrap_or(0),
+        neighbor_context: req.neighbor_context,
+        max_new_tokens: req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context / 2),
+    };
+    let doc = document::DocJob::new(req.segments.clone(), opts);
+    let label = format!(
+        "{}->{}",
+        req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"),
+        req.target_lang
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+    let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
+    if let Err(r) = enqueue(&st, job) {
+        return r;
+    }
+    if req.stream {
+        let stream = UnboundedReceiverStream::new(rx).map(|ev| {
+            sse_json_doc(&match ev {
+                Event::SegmentDelta(segment, delta) => DocumentEvent::Delta { segment, delta },
+                Event::SegmentEnd(segment) => DocumentEvent::SegmentEnd { segment, end: true },
+                Event::DocumentDone(usage) => DocumentEvent::Done { done: true, usage },
+                Event::Error(error) => DocumentEvent::Error { error },
+                _ => DocumentEvent::Error { error: "unexpected event".into() },
+            })
+        });
+        let mut r = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+        r.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+        return r;
+    }
+    let mut rx = rx;
+    let mut out = vec![String::new(); req.segments.len()];
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            Event::SegmentDelta(i, d) => out[i].push_str(&d),
+            Event::DocumentDone(usage) => {
+                return Json(DocumentResponse { segments: out, usage }).into_response();
+            }
+            Event::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            _ => {}
+        }
+    }
+    error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
+}
+
+fn sse_json_doc(ev: &DocumentEvent) -> Result<SseEvent, Infallible> {
+    Ok(SseEvent::default().data(serde_json::to_string(ev).unwrap()))
+}
+
 fn router(st: Shared) -> Router {
     let api = Router::new()
         .route("/v1/translate", post(translate))
+        .route("/v1/translate/document", post(translate_document))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new()
         .route("/", get(index))

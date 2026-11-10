@@ -202,18 +202,11 @@ pub fn serve(a: ServeArgs) -> Result<()> {
 /// Timing of one translation request.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunStats {
-    pub prompt_tokens: usize,
     pub generated: usize,
     /// Request start to the first generated token (prompt processing).
     pub prefill: Duration,
     /// First token to the end.
     pub decode: Duration,
-}
-
-impl RunStats {
-    fn decode_rate(&self) -> f64 {
-        self.generated.saturating_sub(1) as f64 / self.decode.as_secs_f64().max(1e-9)
-    }
 }
 
 fn to_prompt_request(req: &yakusel_api::TranslateRequest) -> TranslationRequest {
@@ -267,11 +260,13 @@ pub fn run_request(
     let first = first.unwrap_or(end);
     Ok((
         text,
-        RunStats { prompt_tokens: ids.len(), generated: out.len(), prefill: first - t0, decode: end - first },
+        RunStats { generated: out.len(), prefill: first - t0, decode: end - first },
     ))
 }
 
 pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
+    use yakusel_server::document::{DocEvent, DocJob, DocOptions, run_document};
+    let req = lang.document(true)?;
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let t0 = Instant::now();
@@ -285,22 +280,56 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
             t0.elapsed()
         );
     }
-    crate::translate_paragraphs(&lang, |req, emit| {
-        let (text, st) = run_request(model.as_mut(), &tok, req, emit)?;
-        if verbose {
-            eprintln!(
-                "\n[prompt {} tok, prefill {:.2?} ({:.1} tok/s); generated {} tok, {:.2} tok/s]",
-                st.prompt_tokens,
-                st.prefill,
-                st.prompt_tokens as f64 / st.prefill.as_secs_f64(),
-                st.generated,
-                st.decode_rate()
-            );
+    let n = req.segments.len();
+    let mut job = DocJob::new(
+        req.segments,
+        DocOptions {
+            target_lang: req.target_lang,
+            source_lang: req.source_lang,
+            form: req.form,
+            context: req.context,
+            glossary: req.glossary,
+            history_chars: req.history_chars.unwrap_or(yakusel_api::DEFAULT_HISTORY_CHARS),
+            chains: req.chains.unwrap_or(0),
+            neighbor_context: req.neighbor_context,
+            max_new_tokens: req.max_new_tokens.unwrap_or(yakusel_api::DEFAULT_MAX_NEW_TOKENS),
+        },
+    );
+    let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
+    let t1 = Instant::now();
+    let mut first: Option<Duration> = None;
+    let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
+    let mut io_err = None;
+    run_document(model.as_mut(), &tok, &mut job, &mut |ev| match ev {
+        DocEvent::Delta { segment, text } => {
+            first.get_or_insert(t1.elapsed());
+            if let Err(e) = out.delta(segment, text) {
+                io_err.get_or_insert(e);
+            }
         }
-        Ok(text)
+        DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
+            prompt += prompt_tokens;
+            reused += r;
+            generated += g;
+            if let Err(e) = out.end(segment) {
+                io_err.get_or_insert(e);
+            }
+        }
     })?;
-    if verbose && let Some(s) = model.stats() {
-        eprintln!("[speculative: {s}]");
+    if let Some(e) = io_err {
+        return Err(e);
+    }
+    if verbose {
+        let wall = t1.elapsed();
+        eprintln!(
+            "[{n} paragraphs in {} chains: prompt {prompt} tok ({reused} reused), first output after {:.2?}; generated {generated} tok in {wall:.2?}, {:.1} tok/s]",
+            job.chains(),
+            first.unwrap_or_default(),
+            generated as f64 / wall.as_secs_f64()
+        );
+        if let Some(s) = model.stats() {
+            eprintln!("[speculative: {s}]");
+        }
     }
     Ok(())
 }
@@ -362,7 +391,8 @@ enum BenchKind {
         #[arg(long = "gen")]
         fixed_gen: Option<usize>,
     },
-    /// Document scenario: paragraphs translated in order, each with the previous ones as history.
+    /// Document scenario: paragraphs split into chains; within a chain in order with the
+    /// earlier paragraphs as history, chains in parallel.
     Doc {
         #[command(flatten)]
         model: ModelArgs,
@@ -372,12 +402,15 @@ enum BenchKind {
         file: Option<PathBuf>,
         #[arg(long, default_value = "en")]
         to: String,
-        /// History budget in characters (see `translate --history-chars`).
+        /// History budget per chain in characters (see `translate --history-chars`).
         #[arg(long, default_value_t = yakusel_api::DEFAULT_HISTORY_CHARS)]
         history_chars: usize,
-        /// Instead: a sliding window of the last N paragraphs (the pre-v2 behaviour).
+        /// Chains translated in parallel (0: one per 4 paragraphs, at most 8).
+        #[arg(long, default_value_t = 1)]
+        chains: usize,
+        /// Pass the neighbouring source paragraphs as context.
         #[arg(long)]
-        history_pairs: Option<usize>,
+        neighbor_context: bool,
         #[arg(long, default_value_t = 14)]
         max_paragraphs: usize,
         /// Write the translations here, one paragraph per line.
@@ -403,8 +436,8 @@ pub fn bench(a: BenchArgs) -> Result<()> {
         }
         BenchKind::Set { model, file, save, compare } => bench_set(model, file, save, compare),
         BenchKind::Streams { model, n, file, compare, fixed_gen } => bench_streams(model, n, file, compare, fixed_gen),
-        BenchKind::Doc { model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose } => {
-            bench_doc(model, file, to, history_chars, history_pairs, max_paragraphs, save, verbose)
+        BenchKind::Doc { model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose } => {
+            bench_doc(model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose)
         }
     }
 }
@@ -627,16 +660,19 @@ fn prose_paragraphs(markdown: &str) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bench_doc(
     m: ModelArgs,
     file: Option<PathBuf>,
     to: String,
     history_chars: usize,
-    history_pairs: Option<usize>,
+    chains: usize,
+    neighbor_context: bool,
     max_paragraphs: usize,
     save: Option<PathBuf>,
     verbose: bool,
 ) -> Result<()> {
+    use yakusel_server::document::{DocEvent, DocJob, DocOptions, run_document};
     let (dir, name) = m.resolve()?;
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl"))?;
     let paras: Vec<String> = match &file {
@@ -648,77 +684,55 @@ fn bench_doc(
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
     let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
-    let policy = match history_pairs {
-        Some(n) => format!("last {n} pairs"),
-        None => format!("{history_chars} chars"),
+    let opts = DocOptions {
+        target_lang: to.clone(),
+        source_lang: None,
+        form: None,
+        context: None,
+        glossary: vec![],
+        history_chars,
+        chains,
+        neighbor_context,
+        max_new_tokens: yakusel_api::DEFAULT_MAX_NEW_TOKENS,
     };
-    println!("{} paragraphs, {chars} characters, to {to}, history {policy}", paras.len());
-    let mut done: Vec<yakusel_api::Pair> = Vec::new();
-    let mut window = yakusel_api::HistoryWindow::new(history_chars);
-    let mut stats = Vec::new();
-    let mut computed = Vec::new();
+    let mut job = DocJob::new(paras, opts);
+    println!(
+        "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
+        job.segments.len(),
+        job.chains(),
+        if neighbor_context { ", neighbours as context" } else { "" }
+    );
     let t0 = Instant::now();
-    for p in &paras {
-        let req = yakusel_api::TranslateRequest {
-            text: p.clone(),
-            target_lang: to.clone(),
-            history: match history_pairs {
-                Some(n) => done[done.len().saturating_sub(n)..].to_vec(),
-                None => window.select(&done).to_vec(),
-            },
-            ..Default::default()
-        };
-        let (out, st) = run_request(model.as_mut(), &tok, &req, &mut |_| {})?;
-        done.push(yakusel_api::Pair { source: p.clone(), target: out });
-        stats.push(st);
-        computed.push(model.last_start().computed);
-        if verbose {
-            let src = tok.encode(p, false).len();
-            let out_ids = tok.encode(&done.last().unwrap().target, false).len();
-            println!(
-                "  #{:<2} history {:>2} pairs, prompt {:>4}, computed {:>4} (source {:>3}), generated {:>3} (re-encoded {:>3}), first token {:>4.0} ms",
-                done.len(),
-                req.history.len(),
-                st.prompt_tokens,
-                model.last_start().computed,
-                src,
-                st.generated,
-                out_ids,
-                st.prefill.as_secs_f64() * 1e3
-            );
+    let mut first: Vec<Option<f64>> = vec![None; job.segments.len()];
+    let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
+    run_document(model.as_mut(), &tok, &mut job, &mut |ev| match ev {
+        DocEvent::Delta { segment, .. } => {
+            first[segment].get_or_insert(t0.elapsed().as_secs_f64());
         }
-    }
+        DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
+            prompt += prompt_tokens;
+            reused += r;
+            generated += g;
+            if verbose {
+                println!(
+                    "  #{:<2} prompt {prompt_tokens:>4}, reused {r:>4}, generated {g:>3}, done at {:>6.2} s",
+                    segment + 1,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+        }
+    })?;
     let wall = t0.elapsed().as_secs_f64();
-    let sum = |f: &dyn Fn(&RunStats) -> f64| stats.iter().map(f).sum::<f64>();
-    let pf = sum(&|s| s.prefill.as_secs_f64());
-    let dc = sum(&|s| s.decode.as_secs_f64());
-    let generated_total = sum(&|s| s.generated as f64);
-    let prompt = sum(&|s| s.prompt_tokens as f64);
-    let n = stats.len() as f64;
-    let later: Vec<f64> = stats.iter().skip(1).map(|s| s.prefill.as_secs_f64()).collect();
-    println!("prompt tokens {prompt:.0} (avg {:.0}), generated {generated_total:.0} (avg {:.0})", prompt / n, generated_total / n);
     println!(
-        "prefill {pf:.2} s ({:.0}%), decode {dc:.2} s; end-to-end {:.1} tok/s, decode-only {:.1} tok/s, wall {wall:.2} s",
-        100.0 * pf / (pf + dc),
-        generated_total / (pf + dc),
-        generated_total / dc
-    );
-    println!(
-        "time to first token: mean {:.0} ms (paragraphs 2+: {:.0} ms)",
-        1e3 * pf / n,
-        1e3 * later.iter().sum::<f64>() / later.len().max(1) as f64
-    );
-    let comp: usize = computed.iter().sum();
-    println!(
-        "prompt tokens computed {comp} of {prompt:.0} ({:.0}% reused), {:.0} per paragraph",
-        100.0 * (1.0 - comp as f64 / prompt),
-        comp as f64 / n
+        "wall {wall:.2} s, {generated} tokens generated: {:.1} tok/s end to end; prompt tokens {prompt}, {:.0}% reused",
+        generated as f64 / wall,
+        100.0 * reused as f64 / prompt.max(1) as f64
     );
     if let Some(s) = model.stats() {
         println!("speculative: {s}");
     }
     if let Some(p) = save {
-        let lines: Vec<String> = done.iter().map(|d| escape_line(&d.target)).collect();
+        let lines: Vec<String> = job.outputs.iter().map(|o| escape_line(o.as_deref().unwrap_or(""))).collect();
         std::fs::write(&p, lines.join("\n") + "\n")?;
         println!("saved to {}", p.display());
     }

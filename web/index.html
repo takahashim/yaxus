@@ -106,23 +106,6 @@ const store = {
   get(k, d) { try { return localStorage.getItem("yakusel." + k) ?? d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem("yakusel." + k, v); } catch {} },
 };
-// History sent with each paragraph: the kept part starts at a fixed paragraph and is cut
-// (to the newest quarter of the budget) only when it exceeds the budget, so consecutive
-// prompts share a prefix the server can reuse. Same policy as yakusel_api::HistoryWindow.
-const HISTORY_CHARS = 4000;
-function historyWindow(budget) {
-  let start = 0;
-  const size = (p) => [...p.source].length + [...p.target].length;
-  return (all) => {
-    start = Math.min(start, all.length);
-    if (all.slice(start).reduce((n, p) => n + size(p), 0) > budget) {
-      let s = all.length - 1, kept = size(all[s]);
-      while (s > start && kept + size(all[s - 1]) <= budget / 4) { s--; kept += size(all[s]); }
-      start = s;
-    }
-    return all.slice(start);
-  };
-}
 let controller = null;
 
 function setStatus(text, isErr) {
@@ -174,8 +157,11 @@ function glossary() {
   }).filter(Boolean);
 }
 
-async function translateOne(body, onDelta, signal) {
-  const res = await fetch("v1/translate", {
+// The whole input goes to /v1/translate/document: the server splits the paragraphs into
+// chains (in order with history inside a chain, chains in parallel), so several
+// paragraphs fill in at once.
+async function translateDocument(body, onEvent, signal) {
+  const res = await fetch("v1/translate/document", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + $("token").value.trim() },
     body: JSON.stringify({ ...body, stream: true }),
@@ -202,9 +188,9 @@ async function translateOne(body, onDelta, signal) {
       for (const line of chunk.split("\n")) {
         if (!line.startsWith("data:")) continue;
         const ev = JSON.parse(line.slice(5));
-        if (ev.delta !== undefined) onDelta(ev.delta);
-        else if (ev.error) throw new Error(ev.error);
-        else if (ev.done) usage = ev.usage;
+        if (ev.error) throw new Error(ev.error);
+        if (ev.done) usage = ev.usage;
+        else onEvent(ev);
       }
     }
   }
@@ -216,7 +202,8 @@ async function run() {
   if (!paras.length) return;
   if (!$("token").value.trim()) { setStatus("トークンを入力してください", true); $("token").focus(); return; }
   store.set("token", $("token").value.trim());
-  const base = {
+  const body = {
+    segments: paras,
     target_lang: $("to").value,
     source_lang: $("from").value || undefined,
     form: $("to").value === "ja" && $("form").value ? $("form").value : undefined,
@@ -228,31 +215,23 @@ async function run() {
   $("stop").classList.remove("hidden");
   const out = $("output");
   out.value = "";
-  const done = [];
-  const selectHistory = historyWindow(HISTORY_CHARS);
-  let tokens = 0, decodeTokens = 0, decodeMs = 0;
+  const parts = paras.map(() => "");
+  let finished = 0;
   const t0 = performance.now();
+  $("stats").textContent = `0 / ${paras.length} 段落`;
   try {
-    for (const [k, p] of paras.entries()) {
-      let cur = "";
-      const prefix = done.map((d) => d.target).join("\n\n") + (done.length ? "\n\n" : "");
-      $("stats").textContent = `${k + 1} / ${paras.length} 段落を翻訳中…`;
-      const usage = await translateOne(
-        { ...base, text: p, history: selectHistory(done) },
-        (d) => { cur += d; out.value = prefix + cur; },
-        controller.signal,
-      );
-      done.push({ source: p, target: cur });
-      if (usage) {
-        tokens += usage.completion_tokens;
-        // The first token comes out of prompt processing; the rest measure decoding.
-        decodeTokens += Math.max(0, usage.completion_tokens - 1);
-        decodeMs += usage.elapsed_ms - usage.prefill_ms;
+    const usage = await translateDocument(body, (ev) => {
+      if (ev.delta !== undefined) {
+        parts[ev.segment] += ev.delta;
+        out.value = parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+      } else if (ev.end) {
+        finished++;
+        $("stats").textContent = `${finished} / ${paras.length} 段落`;
       }
-    }
+    }, controller.signal);
     const secs = (performance.now() - t0) / 1000;
-    $("stats").textContent = `${tokens} トークン · ${secs.toFixed(1)} 秒` +
-      (decodeMs > 0 ? ` · 生成 ${(decodeTokens / (decodeMs / 1000)).toFixed(1)} tok/s` : "");
+    const tokens = usage ? usage.completion_tokens : 0;
+    $("stats").textContent = `${paras.length} 段落 · ${tokens} トークン · ${secs.toFixed(1)} 秒 · ${(tokens / secs).toFixed(1)} tok/s`;
   } catch (e) {
     $("stats").textContent = e.name === "AbortError" ? "停止しました" : "エラー: " + e.message;
   } finally {
