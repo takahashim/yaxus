@@ -308,7 +308,8 @@ fn log_single(label: &str, usage: &Usage, done: &Finished) {
 mod tests {
     use super::*;
     use yaxus_model::{Event as EngineEvent, ReqId, Request, StartInfo};
-    use yaxus_tokenizer::{TAG_ID, TranslationRequest};
+    use yaxus_pfml::TranslationRequest;
+    use yaxus_tokenizer::TAG_ID;
 
     /// An engine whose every pass panics.
     #[derive(Default)]
@@ -370,7 +371,7 @@ mod tests {
         let (events, mut out) = mpsc::unbounded_channel();
         let req = TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let job = Job {
-            work: Work::Single { prompt: Prompt::new(&tok, &req).unwrap(), max_new_tokens: 4 },
+            work: Work::Single { prompt: Prompt::new(&tok, &req.validate().unwrap()), max_new_tokens: 4 },
             enqueued: Instant::now(),
             events,
             label: "test".into(),

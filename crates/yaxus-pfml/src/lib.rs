@@ -1,17 +1,12 @@
-//! PFML3 prompt construction, a direct port of `chat_template.jinja`.
+//! PFML3 prompts of PLaMo 3 Translate, a direct port of `chat_template.jinja`.
+//!
+//! A [`TranslationRequest`] is the unchecked input. [`TranslationRequest::validate`]
+//! turns it into a [`ValidRequest`], whose [`render`](ValidRequest::render) cannot fail.
 
-/// A previous source/translation pair, used for consistency across segments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranslationPair {
-    pub source: String,
-    pub target: String,
-}
+use yaxus_tokenizer::{SPECIAL_PREFIX, py_isspace};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GlossaryEntry {
-    pub source: String,
-    pub target: String,
-}
+/// Glossary entries and history pairs (source, translation) are the API's pairs.
+pub use yaxus_api::Pair;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranslationRequest {
@@ -21,29 +16,51 @@ pub struct TranslationRequest {
     /// `polite` or `plain`; only valid when `target_lang == "ja"`.
     pub form: Option<String>,
     pub context: Option<String>,
-    pub glossary: Vec<GlossaryEntry>,
-    pub history: Vec<TranslationPair>,
+    pub glossary: Vec<Pair>,
+    /// Earlier source/translation pairs, oldest first.
+    pub history: Vec<Pair>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct PromptError(pub String);
 
-const RESERVED: &str = "<|plamo:";
+/// The Japanese politeness a translation into `ja` may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Form {
+    Polite,
+    Plain,
+}
+
+impl Form {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Form::Polite => "polite",
+            Form::Plain => "plain",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "polite" => Some(Form::Polite),
+            "plain" => Some(Form::Plain),
+            _ => None,
+        }
+    }
+}
 
 /// Whether `s` is empty or only whitespace, as the prompt template sees it (Jinja's
 /// `trim` is Python's `str.strip()`, which also strips U+001C..U+001F).
 pub fn is_blank(s: &str) -> bool {
-    // Jinja `trim` uses Python `str.strip()`.
-    s.chars().all(crate::py_isspace)
+    s.chars().all(py_isspace)
 }
 
 fn check_text(value: &str, name: &str, allow_empty: bool) -> Result<(), PromptError> {
     if !allow_empty && is_blank(value) {
         return Err(PromptError(format!("{name} must not be empty.")));
     }
-    if value.contains(RESERVED) {
-        return Err(PromptError(format!("{name} must not contain reserved PFML tokens (<|plamo:...).")));
+    if value.contains(SPECIAL_PREFIX) {
+        return Err(PromptError(format!("{name} must not contain reserved PFML tokens ({SPECIAL_PREFIX}...).")));
     }
     Ok(())
 }
@@ -66,6 +83,7 @@ pub fn validate_lang(value: &str, name: &str) -> Result<(), PromptError> {
     Ok(())
 }
 
+/// The model card's spelling `ja(easy)` of `ja-easy`.
 fn alias(lang: &str) -> &str {
     if lang == "ja(easy)" { "ja-easy" } else { lang }
 }
@@ -75,66 +93,107 @@ pub fn validate_message(text: &str) -> Result<(), PromptError> {
     check_text(text, "message content", false)
 }
 
+/// What [`TranslationRequest::validate_options`] checks, in normalized form.
+struct Options {
+    target_lang: String,
+    source_lang: Option<String>,
+    form: Option<Form>,
+}
+
 impl TranslationRequest {
-    /// Checks everything [`to_prompt`](TranslationRequest::to_prompt) checks except the
-    /// text and the history: the languages, the form, the context and the glossary.
+    /// Checks everything [`validate`](Self::validate) checks except the text and the
+    /// history: the languages, the form, the context and the glossary.
     pub fn validate_options(&self) -> Result<(), PromptError> {
+        self.options().map(|_| ())
+    }
+
+    fn options(&self) -> Result<Options, PromptError> {
         let target_lang = alias(&self.target_lang);
         validate_lang(target_lang, "target_lang")?;
-        if let Some(s) = self.source_lang.as_deref().map(alias) {
+        let source_lang = self.source_lang.as_deref().map(alias);
+        if let Some(s) = source_lang {
             validate_lang(s, "source_lang")?;
         }
         if let Some(c) = &self.context {
             check_text(c, "context", true)?;
         }
-        if let Some(form) = &self.form
-            && (!matches!(form.as_str(), "polite" | "plain") || target_lang != "ja")
-        {
-            return Err(PromptError("form must be polite or plain and requires target_lang=\"ja\".".into()));
-        }
+        let form = match self.form.as_deref() {
+            None => None,
+            Some(f) => match Form::parse(f) {
+                Some(form) if target_lang == "ja" => Some(form),
+                _ => return Err(PromptError("form must be polite or plain and requires target_lang=\"ja\".".into())),
+            },
+        };
         for term in &self.glossary {
             check_text(&term.source, "glossary source", false)?;
             check_text(&term.target, "glossary target", false)?;
         }
-        Ok(())
+        Ok(Options { target_lang: target_lang.into(), source_lang: source_lang.map(String::from), form })
     }
 
-    /// Renders the PFML3 prompt, including the leading `<|plamo:bos|>`.
-    /// Tokenize the result with `add_bos = false`.
-    pub fn to_prompt(&self) -> Result<String, PromptError> {
+    /// Checks the whole request, normalizing the language aliases.
+    pub fn validate(self) -> Result<ValidRequest, PromptError> {
         for pair in &self.history {
             validate_message(&pair.source)?;
             validate_message(&pair.target)?;
         }
         validate_message(&self.text)?;
-        self.validate_options()?;
-        let target_lang = alias(&self.target_lang);
-        let source_lang = self.source_lang.as_deref().map(alias);
+        let Options { target_lang, source_lang, form } = self.options()?;
+        Ok(ValidRequest { req: TranslationRequest { target_lang, source_lang, ..self }, form })
+    }
+}
 
+/// A request that passed [`TranslationRequest::validate`], with its language aliases
+/// normalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidRequest {
+    req: TranslationRequest,
+    form: Option<Form>,
+}
+
+impl ValidRequest {
+    pub fn request(&self) -> &TranslationRequest {
+        &self.req
+    }
+
+    pub fn form(&self) -> Option<Form> {
+        self.form
+    }
+
+    /// The same request without history (still valid).
+    pub fn without_history(mut self) -> Self {
+        self.req.history.clear();
+        self
+    }
+
+    /// Renders the PFML3 prompt, including the leading `<|plamo:bos|>`.
+    /// Tokenize the result with `add_bos = false`.
+    pub fn render(&self) -> String {
+        let r = &self.req;
         let mut p = String::from("<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation");
-        if let Some(c) = self.context.as_deref().filter(|c| !c.is_empty()) {
+        if let Some(c) = r.context.as_deref().filter(|c| !c.is_empty()) {
             p += "<|plamo:tag|>context<|plamo:msg|>";
             p += c;
         }
         let input_header = |p: &mut String| {
             *p += "<|plamo:tag|>input";
-            if let Some(s) = source_lang {
+            if let Some(s) = &r.source_lang {
                 *p += "<|plamo:key|>lang<|plamo:val|>";
                 *p += s;
             }
         };
-        for pair in &self.history {
+        for pair in &r.history {
             input_header(&mut p);
             p += "<|plamo:msg|>";
             p += &pair.source;
             p += "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>";
-            p += target_lang;
+            p += &r.target_lang;
             p += "<|plamo:msg|>";
             p += &pair.target;
         }
-        if !self.glossary.is_empty() {
+        if !r.glossary.is_empty() {
             p += "<|plamo:tag|>glossary";
-            for term in &self.glossary {
+            for term in &r.glossary {
                 p += "<|plamo:index|>";
                 p += &term.source;
                 p += "<|plamo:item|>";
@@ -143,15 +202,15 @@ impl TranslationRequest {
         }
         input_header(&mut p);
         p += "<|plamo:msg|>";
-        p += &self.text;
+        p += &r.text;
         p += "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>";
-        p += target_lang;
-        if let Some(form) = &self.form {
+        p += &r.target_lang;
+        if let Some(form) = self.form {
             p += "<|plamo:key|>form<|plamo:val|>";
-            p += form;
+            p += form.as_str();
         }
         p += "<|plamo:msg|>";
-        Ok(p)
+        p
     }
 }
 
@@ -164,7 +223,11 @@ mod tests {
     }
 
     fn err(r: &TranslationRequest) -> String {
-        r.to_prompt().unwrap_err().0
+        r.clone().validate().unwrap_err().0
+    }
+
+    fn render(r: &TranslationRequest) -> String {
+        r.clone().validate().unwrap().render()
     }
 
     #[test]
@@ -186,14 +249,14 @@ mod tests {
             assert!(validate_lang(bad, "lang").unwrap_err().0.contains(why), "{bad}");
         }
         // The model card's alias.
-        assert!(req("x", "ja(easy)").to_prompt().unwrap().contains("<|plamo:val|>ja-easy<|plamo:msg|>"));
+        assert!(render(&req("x", "ja(easy)")).contains("<|plamo:val|>ja-easy<|plamo:msg|>"));
     }
 
     #[test]
     fn form_needs_japanese() {
         let mut r = req("x", "ja");
         r.form = Some("polite".into());
-        assert!(r.to_prompt().unwrap().ends_with("<|plamo:key|>form<|plamo:val|>polite<|plamo:msg|>"));
+        assert!(render(&r).ends_with("<|plamo:key|>form<|plamo:val|>polite<|plamo:msg|>"));
         for (target, form) in [("ja-easy", "polite"), ("en", "plain"), ("ja", "casual")] {
             let mut r = req("x", target);
             r.form = Some(form.into());
@@ -211,28 +274,43 @@ mod tests {
         cases.push(r);
         for (s, t) in [(reserved, "y"), ("y", reserved)] {
             let mut r = req("x", "en");
-            r.history = vec![TranslationPair { source: s.into(), target: t.into() }];
+            r.history = vec![Pair { source: s.into(), target: t.into() }];
             cases.push(r);
             let mut r = req("x", "en");
-            r.glossary = vec![GlossaryEntry { source: s.into(), target: t.into() }];
+            r.glossary = vec![Pair { source: s.into(), target: t.into() }];
             cases.push(r);
         }
         for r in &cases {
             assert!(err(r).contains("reserved PFML tokens"), "{r:?}");
         }
         // Only the full prefix is reserved.
-        assert!(req("<|plamo and plamo:|>", "en").to_prompt().is_ok());
+        assert!(req("<|plamo and plamo:|>", "en").validate().is_ok());
     }
 
     #[test]
     fn blank_fields() {
         assert!(err(&req(" \n\u{3000}", "en")).contains("message content must not be empty"));
         let mut r = req("x", "en");
-        r.glossary = vec![GlossaryEntry { source: "a".into(), target: " ".into() }];
+        r.glossary = vec![Pair { source: "a".into(), target: " ".into() }];
         assert!(err(&r).contains("glossary target must not be empty"));
         // An empty context is left out of the prompt.
         let mut r = req("x", "en");
         r.context = Some(String::new());
-        assert!(!r.to_prompt().unwrap().contains("context"));
+        assert!(!render(&r).contains("context"));
+    }
+
+    #[test]
+    fn validation_normalizes_and_parses() {
+        let mut r = req("x", "ja");
+        r.source_lang = Some("ja(easy)".into());
+        r.form = Some("plain".into());
+        r.history = vec![Pair { source: "a".into(), target: "b".into() }];
+        let v = r.validate().unwrap();
+        assert_eq!(v.request().source_lang.as_deref(), Some("ja-easy"));
+        assert_eq!(v.form(), Some(Form::Plain));
+        let bare = v.clone().without_history();
+        assert!(bare.request().history.is_empty());
+        assert!(v.render().len() > bare.render().len());
+        assert!(!bare.render().contains("<|plamo:msg|>a<|plamo:tag|>"));
     }
 }

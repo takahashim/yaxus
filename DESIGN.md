@@ -138,6 +138,7 @@ yaxus/
   crates/
     yaxus-api/             # サーバとクライアントが共有する JSON の型
     yaxus-tokenizer/       # PLaMo トークナイザ (pure Rust, 依存最小)
+    yaxus-pfml/            # PFML3 プロンプト (chat_template.jinja の移植) と翻訳リクエストの検証
     yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32, rayon)。正しさの基準とフォールバック
     yaxus-backend-wgpu/    # Vulkan 用 WGSL カーネル群

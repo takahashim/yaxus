@@ -31,7 +31,7 @@ pub fn run_request(
 ) -> Result<(String, RunStats)> {
     let mut memory = Memory::new(0);
     let mut session = Session::new(model, tok, &mut memory);
-    let prompt = Prompt::new(tok, &prompt_request(req))?;
+    let prompt = Prompt::new(tok, &prompt_request(req).validate()?);
     session.submit(prompt, req.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS), ());
     let (mut done, mut failed) = (None, None);
     while done.is_none() && failed.is_none() {

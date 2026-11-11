@@ -501,7 +501,7 @@ fn bench_streams(
     for line in set.lines().filter(|l| !l.trim().is_empty()) {
         let (lang, text) = line.split_once('\t').context("set lines are `lang<TAB>text`")?;
         let req = yaxus_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
-        prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req))?.into_ids());
+        prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req).validate()?).into_ids());
     }
     anyhow::ensure!(!prompts.is_empty(), "{} has no sentences", file.display());
     let reference: Option<Vec<String>> = match &compare {

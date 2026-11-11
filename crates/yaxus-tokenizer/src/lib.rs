@@ -20,12 +20,8 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
-mod pfml;
 mod stream;
 
-pub use pfml::{
-    GlossaryEntry, PromptError, TranslationPair, TranslationRequest, is_blank, validate_lang, validate_message,
-};
 pub use stream::StreamDecoder;
 
 const INVALID_SCORE: i64 = -20_000_000;
@@ -39,6 +35,9 @@ const NO_TOKEN: u32 = u32::MAX;
 const REPEATED_CHARS_THRESHOLD: usize = 4;
 /// `break_around_consecutive_spaces_threshold` from tokenizer_config.json.
 const CONSECUTIVE_SPACES_THRESHOLD: usize = 2;
+
+/// Prefix of every PLaMo special token (`<|plamo:bos|>`, `<|plamo:msg|>`, ...).
+pub const SPECIAL_PREFIX: &str = "<|plamo:";
 
 pub const BOS_ID: u32 = 1;
 pub const EOS_ID: u32 = 1; // tokenizer_config: eos_token = <|plamo:bos|>
@@ -328,8 +327,10 @@ fn parse_byte_token(tok: &str) -> Option<u8> {
     u8::from_str_radix(hex, 16).ok()
 }
 
-/// Python `str.isspace()`, which is what `\s` matches in a `str` regex.
-fn py_isspace(c: char) -> bool {
+/// Python `str.isspace()`, which is what `\s` matches in a `str` regex and what
+/// `str.strip()` removes. Exposed for code that must treat whitespace like the
+/// Python tokenizer and chat template do.
+pub fn py_isspace(c: char) -> bool {
     matches!(c,
         '\t'..='\r' | '\x1c'..='\x1f' | ' ' | '\u{85}' | '\u{a0}' | '\u{1680}'
         | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}')
@@ -343,7 +344,7 @@ fn preprocess(text: &str) -> Vec<char> {
 }
 
 fn mark_special_tokens(text: &str) -> Cow<'_, str> {
-    const PREFIX: &str = "<|plamo:";
+    const PREFIX: &str = SPECIAL_PREFIX;
     if !text.contains(PREFIX) {
         return Cow::Borrowed(text);
     }

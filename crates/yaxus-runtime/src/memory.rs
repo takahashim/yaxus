@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use yaxus_tokenizer::TranslationRequest;
+use yaxus_pfml::ValidRequest;
 
 /// Entries kept by default.
 pub const DEFAULT_ENTRIES: usize = 4096;
@@ -21,9 +21,10 @@ pub struct Memory {
 
 /// What a translation mostly depends on: the text, the languages and the form (not the
 /// history, context or glossary, which a hint may safely ignore).
-pub fn key(req: &TranslationRequest) -> u64 {
+pub fn key(req: &ValidRequest) -> u64 {
+    let r = req.request();
     let mut h = DefaultHasher::new();
-    (&req.text, &req.target_lang, &req.source_lang, &req.form).hash(&mut h);
+    (&r.text, &r.target_lang, &r.source_lang, req.form()).hash(&mut h);
     h.finish()
 }
 

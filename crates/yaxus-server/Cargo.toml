@@ -22,3 +22,6 @@ yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-runtime = { path = "../yaxus-runtime" }
+
+[dev-dependencies]
+yaxus-pfml = { path = "../yaxus-pfml" }
