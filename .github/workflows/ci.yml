@@ -50,6 +50,9 @@ jobs:
           fi
           echo "$TOKENIZER_SHA256  .model/tokenizer.jsonl" | sha256sum -c -
       - name: Tests
+        env:
+          # Fail instead of skipping if the tokenizer above is somehow missing.
+          YAXUS_REQUIRE_GOLDEN: "1"
         run: cargo test --workspace
 
   kernels:

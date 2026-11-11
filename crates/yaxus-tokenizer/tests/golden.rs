@@ -1,7 +1,9 @@
 //! Compares against `tests/golden/tokenizer.jsonl` produced by the Python tokenizer.
 //!
 //! Needs the model's `tokenizer.jsonl`; set `YAXUS_MODEL_DIR` or have
-//! pfnet/plamo-3-translate-2b in the Hugging Face cache. Skips otherwise.
+//! pfnet/plamo-3-translate-2b in the Hugging Face cache. Without it the tests are
+//! skipped with a warning, unless `YAXUS_REQUIRE_GOLDEN=1` is set (use that in CI and
+//! before releases), in which case a missing model is a failure.
 
 use std::path::{Path, PathBuf};
 
@@ -18,11 +20,21 @@ fn model_dir() -> Option<PathBuf> {
 }
 
 fn load() -> Option<(Tokenizer, Vec<Value>)> {
-    let Some(dir) = model_dir() else {
-        eprintln!("model directory not found; skipping golden tests");
+    let required = std::env::var_os("YAXUS_REQUIRE_GOLDEN").is_some_and(|v| !v.is_empty() && v != "0");
+    let path = model_dir().map(|d| d.join("tokenizer.jsonl")).filter(|p| p.is_file());
+    let Some(path) = path else {
+        assert!(
+            !required,
+            "YAXUS_REQUIRE_GOLDEN is set but no tokenizer.jsonl was found \
+             (set YAXUS_MODEL_DIR or download pfnet/plamo-3-translate-2b)"
+        );
+        eprintln!(
+            "warning: tokenizer.jsonl not found; SKIPPING golden tests \
+             (set YAXUS_MODEL_DIR, or YAXUS_REQUIRE_GOLDEN=1 to make this an error)"
+        );
         return None;
     };
-    let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl")).unwrap();
+    let tok = Tokenizer::from_file(path).unwrap();
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/tokenizer.jsonl");
     let cases = std::fs::read_to_string(golden).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     Some((tok, cases))
