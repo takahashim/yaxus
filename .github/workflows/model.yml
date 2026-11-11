@@ -48,7 +48,7 @@ env:
   GGUF_REPO: pfnet/plamo-3-translate-0.8b-GGUF
   GGUF_REV: 1cf96ae02133958a20074bfdfab76517bb737d00
   # Q4_K_M also holds Q6_K tensors; Q2_K (with Q3_K) is what `--draft auto` prefers.
-  GGUF_FILES: "*Q4_K_M.gguf *Q2_K.gguf"
+  GGUF_FILES: plamo-3-translate-0.8b-Q4_K_M.gguf plamo-3-translate-0.8b-Q2_K.gguf
   # Only needed if the repositories become gated; empty otherwise.
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
@@ -80,10 +80,11 @@ jobs:
         run: |
           if [ "${{ steps.hf-cache.outputs.cache-hit }}" = true ]; then export HF_HUB_OFFLINE=1; fi
           pipx install 'huggingface_hub[cli]'
-          model=$(hf download "$MODEL_REPO" --revision "$MODEL_REV" \
-            --include '*.json' '*.safetensors' '*.jsonl' '*.py' '*.jinja' --quiet)
-          set -f # GGUF_FILES holds patterns for hf, not for the shell
-          hf download "$GGUF_REPO" --revision "$GGUF_REV" --include $GGUF_FILES --quiet
+          # The whole checkpoint repository (its other files are small); explicit file
+          # names for the GGUF one (hf's --include takes a single pattern).
+          model=$(hf download "$MODEL_REPO" --revision "$MODEL_REV" --quiet)
+          # shellcheck disable=SC2086 # GGUF_FILES is a list of file names
+          hf download "$GGUF_REPO" $GGUF_FILES --revision "$GGUF_REV" --quiet
           echo "YAXUS_MODEL_DIR=$model" >> "$GITHUB_ENV"
           # The GGUF tests skip quietly without these, so make their absence an error.
           ls ~/.cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b/snapshots/*/model*.safetensors
