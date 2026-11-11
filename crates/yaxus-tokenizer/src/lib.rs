@@ -16,13 +16,13 @@
 //! dropped from the output.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
 mod stream;
+mod trie;
 
 pub use stream::StreamDecoder;
+use trie::Trie;
 
 const INVALID_SCORE: i64 = -20_000_000;
 const UNKNOWN_SCORE: i64 = -10_000_000;
@@ -69,44 +69,83 @@ pub enum TokenKind {
     Other,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Node {
-    /// (token id, integer score) when the path from the root spells a token.
-    token: Option<(u32, i64)>,
+impl TokenKind {
+    /// The kind column of `tokenizer.jsonl` (`NORMAL`, `BYTE`, ...).
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "NORMAL" => TokenKind::Normal,
+            "BYTE" => TokenKind::Byte,
+            "CONTROL" => TokenKind::Control,
+            "UNKNOWN" => TokenKind::Unknown,
+            _ => TokenKind::Other,
+        }
+    }
+
+    /// A llama.cpp token type (`tokenizer.ggml.token_type` of a GGUF file): 1 normal,
+    /// 2 unknown, 3 control, 6 byte (4 user-defined and 5 unused are `Other`).
+    pub fn from_ggml_type(t: i32) -> Self {
+        match t {
+            1 => TokenKind::Normal,
+            2 => TokenKind::Unknown,
+            3 => TokenKind::Control,
+            6 => TokenKind::Byte,
+            _ => TokenKind::Other,
+        }
+    }
 }
 
-/// Hasher for the trie's `(node << 32) | codepoint` keys. The default SipHash dominates
-/// the Viterbi inner loop; one 128-bit multiply mixes both halves into every bit.
-#[derive(Default)]
-struct EdgeHasher(u64);
+/// The byte tokens `<0x00>`..`<0xFF>`, in both directions.
+#[derive(Debug, Clone)]
+struct ByteTable {
+    /// Token id of each byte value.
+    ids: [u32; 256],
+    /// For each token id, the byte value if it is a byte token.
+    byte_of: Vec<Option<u8>>,
+}
 
-impl Hasher for EdgeHasher {
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("only u64 keys are hashed");
+impl ByteTable {
+    /// Collects the byte tokens; every byte value must have exactly one.
+    fn from_vocab(tokens: &[String], kinds: &[TokenKind]) -> Result<Self, Error> {
+        let mut t = ByteTable { ids: [0; 256], byte_of: vec![None; tokens.len()] };
+        let mut set = [false; 256];
+        for (id, tok) in tokens.iter().enumerate().filter(|&(id, _)| kinds[id] == TokenKind::Byte) {
+            let b = parse_byte_token(tok)
+                .ok_or_else(|| Error::Vocab(format!("token id {id}: malformed byte token {tok:?}")))?;
+            if std::mem::replace(&mut set[b as usize], true) {
+                return Err(Error::Vocab(format!("token id {id}: byte token <0x{b:02X}> is defined twice")));
+            }
+            t.ids[b as usize] = id as u32;
+            t.byte_of[id] = Some(b);
+        }
+        if let Some(b) = set.iter().position(|x| !x) {
+            return Err(Error::Vocab(format!("byte token <0x{b:02X}> is not set")));
+        }
+        Ok(t)
     }
 
-    fn write_u64(&mut self, x: u64) {
-        let p = (x as u128) * 0x9e37_79b9_7f4a_7c15;
-        self.0 = (p as u64) ^ ((p >> 64) as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
+    fn id(&self, b: u8) -> u32 {
+        self.ids[b as usize]
     }
 }
 
-type EdgeMap = HashMap<u64, u32, BuildHasherDefault<EdgeHasher>>;
+/// Checks that the ids in [`FIXED_TOKENS`] hold the expected tokens.
+fn check_fixed_tokens(tokens: &[String]) -> Result<(), Error> {
+    for (id, want) in FIXED_TOKENS {
+        let got = tokens.get(id as usize);
+        if got.map(String::as_str) != Some(want) {
+            return Err(Error::Vocab(format!("token id {id} must be {want:?}, found {got:?}")));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     tokens: Vec<String>,
     kinds: Vec<TokenKind>,
-    /// For byte tokens, the byte value they represent.
-    byte_of: Vec<Option<u8>>,
-    bytes: [u32; 256],
-    nodes: Vec<Node>,
-    /// Trie edges keyed by `(node << 32) | codepoint`.
-    edges: EdgeMap,
+    bytes: ByteTable,
+    /// Every token except the byte tokens, plus the boundary character.
+    trie: Trie,
 }
 
 /// Python's `round()` (round half to even) applied to `score * 1e4`.
@@ -137,13 +176,7 @@ impl Tokenizer {
             let row = row.as_array().ok_or_else(|| fmt("row is not an array"))?;
             let token = row.first().and_then(|v| v.as_str()).ok_or_else(|| fmt("token is not a string"))?;
             let score = row.get(1).and_then(|v| v.as_f64()).ok_or_else(|| fmt("score is not a number"))?;
-            let kind = match row.get(2).and_then(|v| v.as_str()) {
-                Some("NORMAL") => TokenKind::Normal,
-                Some("BYTE") => TokenKind::Byte,
-                Some("CONTROL") => TokenKind::Control,
-                Some("UNKNOWN") => TokenKind::Unknown,
-                _ => TokenKind::Other,
-            };
+            let kind = row.get(2).and_then(|v| v.as_str()).map_or(TokenKind::Other, TokenKind::from_label);
             tokens.push(token.to_string());
             kinds.push(kind);
             scores.push(score);
@@ -161,62 +194,10 @@ impl Tokenizer {
     }
 
     fn build(tokens: Vec<String>, kinds: Vec<TokenKind>, scores: Vec<f64>) -> Result<Self, Error> {
-        let mut t = Tokenizer {
-            byte_of: vec![None; tokens.len()],
-            tokens,
-            kinds,
-            bytes: [0; 256],
-            nodes: vec![Node { token: None }],
-            edges: EdgeMap::default(),
-        };
-        for (id, want) in FIXED_TOKENS {
-            let got = t.tokens.get(id as usize);
-            if got.map(String::as_str) != Some(want) {
-                return Err(Error::Vocab(format!("token id {id} must be {want:?}, found {got:?}")));
-            }
-        }
-        let mut byte_set = [false; 256];
-        for (id, &score) in scores.iter().enumerate() {
-            if t.kinds[id] == TokenKind::Byte {
-                let b = parse_byte_token(&t.tokens[id])
-                    .ok_or_else(|| Error::Vocab(format!("token id {id}: malformed byte token {:?}", t.tokens[id])))?;
-                if byte_set[b as usize] {
-                    return Err(Error::Vocab(format!("token id {id}: byte token <0x{b:02X}> is defined twice")));
-                }
-                t.bytes[b as usize] = id as u32;
-                t.byte_of[id] = Some(b);
-                byte_set[b as usize] = true;
-                continue;
-            }
-            let tok = t.tokens[id].clone();
-            t.insert(&tok, id as u32, int_score(score));
-        }
-        // The boundary character is added last, as in the Python implementation.
-        t.insert(&BOUNDARY_CHAR.to_string(), BOUNDARY_TOKEN_ID, 0);
-        if let Some(b) = byte_set.iter().position(|x| !x) {
-            return Err(Error::Vocab(format!("byte token <0x{b:02X}> is not set")));
-        }
-        Ok(t)
-    }
-
-    fn insert(&mut self, token: &str, id: u32, score: i64) {
-        let mut node = 0u32;
-        for c in token.chars() {
-            let key = ((node as u64) << 32) | c as u64;
-            node = match self.edges.get(&key) {
-                Some(&next) => next,
-                None => {
-                    let next = self.nodes.len() as u32;
-                    self.nodes.push(Node { token: None });
-                    self.edges.insert(key, next);
-                    next
-                }
-            };
-        }
-        if node != 0 && score > INVALID_SCORE {
-            // Later rows overwrite earlier ones, like the Python dicts.
-            self.nodes[node as usize].token = Some((id, score));
-        }
+        check_fixed_tokens(&tokens)?;
+        let bytes = ByteTable::from_vocab(&tokens, &kinds)?;
+        let trie = build_trie(&tokens, &kinds, &scores);
+        Ok(Tokenizer { tokens, kinds, bytes, trie })
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -254,21 +235,13 @@ impl Tokenizer {
         for i in (0..n).rev() {
             let mut best = i64::MAX;
             let mut best_path = (0u32, NO_TOKEN);
-            // Walk the trie forward. Lengths are visited in increasing order, so `<=`
-            // makes the longest token win among ties (Python: decreasing order, `<`).
-            let mut node = 0u32;
-            for (k, &c) in data[i..].iter().enumerate() {
-                match self.edges.get(&(((node as u64) << 32) | c as u64)) {
-                    Some(&next) => node = next,
-                    None => break,
-                }
-                if let Some((id, score)) = self.nodes[node as usize].token {
-                    let len = k + 1;
-                    let s = costs[i + len].saturating_sub(score);
-                    if s <= best {
-                        best = s;
-                        best_path = (len as u32, id);
-                    }
+            // Lengths come in increasing order, so `<=` makes the longest token win
+            // among ties (Python: decreasing order, `<`).
+            for (len, id, score) in self.trie.prefixes(&data[i..]) {
+                let s = costs[i + len].saturating_sub(score);
+                if s <= best {
+                    best = s;
+                    best_path = (len as u32, id);
                 }
             }
             // Unknown-character fallback (sentinel row), only if strictly better.
@@ -291,7 +264,7 @@ impl Tokenizer {
             } else {
                 let mut buf = [0u8; 4];
                 for &b in data[pos].encode_utf8(&mut buf).as_bytes() {
-                    out.push(self.bytes[b as usize]);
+                    out.push(self.bytes.id(b));
                 }
             }
             pos += len as usize;
@@ -301,7 +274,7 @@ impl Tokenizer {
     /// Returns the raw bytes a token stands for (special tokens yield their text).
     pub fn token_bytes(&self, id: u32) -> &[u8] {
         let i = id as usize;
-        match self.byte_of.get(i) {
+        match self.bytes.byte_of.get(i) {
             Some(Some(b)) => std::slice::from_ref(b),
             Some(None) => self.tokens[i].as_bytes(),
             None => &[],
@@ -316,6 +289,22 @@ impl Tokenizer {
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
+}
+
+/// The trie of every token but the byte tokens, then the boundary character. Later
+/// rows replace earlier ones with the same text, like the Python dicts; tokens with a
+/// score at or below `INVALID_SCORE` are left out.
+fn build_trie(tokens: &[String], kinds: &[TokenKind], scores: &[f64]) -> Trie {
+    let mut trie = Trie::new();
+    for (id, tok) in tokens.iter().enumerate() {
+        let score = int_score(scores[id]);
+        if kinds[id] != TokenKind::Byte && !tok.is_empty() && score > INVALID_SCORE {
+            trie.insert(tok, id as u32, score);
+        }
+    }
+    // The boundary character is added last, as in the Python implementation.
+    trie.insert(&BOUNDARY_CHAR.to_string(), BOUNDARY_TOKEN_ID, 0);
+    trie
 }
 
 /// Parses a byte token `<0xNN>` (exactly two hex digits).
@@ -591,7 +580,7 @@ mod tests {
     #[test]
     fn stream_decoder_matches_decode() {
         let tok = tokenizer(&[("あ", -1.0), ("ab", -1.0)]);
-        let byte = |b: u8| tok.bytes[b as usize];
+        let byte = |b: u8| tok.bytes.id(b);
         let normal = [tok.encode("あ", false)[0], tok.encode("ab", false)[0], BOS_ID];
         // Byte tokens biased towards UTF-8 lead/continuation bytes, so that split,
         // truncated and invalid sequences all occur, mixed with whole tokens.

@@ -223,17 +223,7 @@ pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
         return Ok(Tokenizer::from_file(model.join("tokenizer.jsonl"))?);
     }
     let v = yaxus_model::gguf::Gguf::open(model)?.vocab()?;
-    let kinds = v
-        .types
-        .iter()
-        .map(|t| match t {
-            1 => TokenKind::Normal,
-            2 => TokenKind::Unknown,
-            3 => TokenKind::Control,
-            6 => TokenKind::Byte,
-            _ => TokenKind::Other,
-        })
-        .collect();
+    let kinds = v.types.iter().map(|&t| TokenKind::from_ggml_type(t)).collect();
     Ok(Tokenizer::from_vocab(v.tokens, kinds, v.scores)?)
 }
 
