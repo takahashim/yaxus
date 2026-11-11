@@ -16,4 +16,5 @@ yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 yaxus-backend-wgpu = { path = "../yaxus-backend-wgpu" }
 
 [dev-dependencies]
+yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }
 serde_json.workspace = true

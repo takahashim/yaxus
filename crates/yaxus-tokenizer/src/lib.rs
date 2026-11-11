@@ -19,6 +19,8 @@ use std::borrow::Cow;
 use std::path::Path;
 
 mod stream;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 mod trie;
 
 pub use stream::StreamDecoder;
@@ -437,38 +439,7 @@ mod tests {
         assert_eq!(runs("ああああ  x    "), format!("{b}ああああ{b}{b}  {b}x{b}    {b}"));
     }
 
-    /// A minimal PLaMo-shaped vocabulary: control tokens at ids 0..=16 (bos at 1,
-    /// tag at 16), the 256 byte tokens, then `normal` with their scores.
-    fn vocab(normal: &[(&str, f64)]) -> (Vec<String>, Vec<TokenKind>, Vec<f64>) {
-        let mut tokens = Vec::new();
-        let mut kinds = Vec::new();
-        let mut scores = Vec::new();
-        for id in 0..=TAG_ID {
-            tokens.push(match id {
-                BOS_ID => "<|plamo:bos|>".to_string(),
-                TAG_ID => "<|plamo:tag|>".to_string(),
-                _ => format!("<|plamo:c{id}|>"),
-            });
-            kinds.push(TokenKind::Control);
-            scores.push(0.0);
-        }
-        for b in 0..=255u8 {
-            tokens.push(format!("<0x{b:02X}>"));
-            kinds.push(TokenKind::Byte);
-            scores.push(0.0);
-        }
-        for &(t, score) in normal {
-            tokens.push(t.to_string());
-            kinds.push(TokenKind::Normal);
-            scores.push(score);
-        }
-        (tokens, kinds, scores)
-    }
-
-    fn tokenizer(normal: &[(&str, f64)]) -> Tokenizer {
-        let (t, k, s) = vocab(normal);
-        Tokenizer::from_vocab(t, k, s).unwrap()
-    }
+    use testing::{plamo_like as tokenizer, vocab};
 
     /// Encodes and maps the ids back to token strings, for readable assertions.
     fn pieces(tok: &Tokenizer, text: &str) -> Vec<String> {

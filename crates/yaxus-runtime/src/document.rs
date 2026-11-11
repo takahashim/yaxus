@@ -337,7 +337,6 @@ pub fn run_document(
 mod tests {
     use yaxus_model::{Event, ReqId, Request};
     use yaxus_pfml::ValidRequest;
-    use yaxus_tokenizer::TAG_ID;
 
     use super::*;
 
@@ -458,22 +457,9 @@ mod tests {
 
     /// A tokenizer with the PLaMo special-token layout and a single "x" token.
     fn tokenizer() -> (Tokenizer, u32) {
-        use yaxus_tokenizer::{BOS_ID, TokenKind};
-        let mut tokens: Vec<String> = (0..=TAG_ID)
-            .map(|id| match id {
-                BOS_ID => "<|plamo:bos|>".into(),
-                TAG_ID => "<|plamo:tag|>".into(),
-                _ => format!("<|plamo:c{id}|>"),
-            })
-            .collect();
-        let mut kinds = vec![TokenKind::Control; tokens.len()];
-        tokens.extend((0..=255u8).map(|b| format!("<0x{b:02X}>")));
-        kinds.extend([TokenKind::Byte; 256]);
-        tokens.push("x".into());
-        kinds.push(TokenKind::Normal);
-        let x = tokens.len() as u32 - 1;
-        let scores = vec![0.0; tokens.len()];
-        (Tokenizer::from_vocab(tokens, kinds, scores).unwrap(), x)
+        let tok = yaxus_tokenizer::testing::plamo_like(&[("x", 0.0)]);
+        let x = tok.vocab_size() as u32 - 1;
+        (tok, x)
     }
 
     fn fake(len: usize) -> (Tokenizer, FakeEngine) {

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Pure Rust port of the PLaMo 3 tokenizer (tokenization_plamo.py)"
 
+[features]
+# `testing`: small PLaMo-shaped vocabularies for other crates' tests.
+test-util = []
+
 [dependencies]
 serde_json.workspace = true
 thiserror.workspace = true
