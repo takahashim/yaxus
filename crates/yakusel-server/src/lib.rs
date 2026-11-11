@@ -67,8 +67,9 @@ pub struct DraftOptions {
     pub quant: Quant,
 }
 
-/// Arithmetic of the GPU prompt processing (passes of more than 16 rows; decoding is
-/// always f32). The figures are for a 780M against `F32`: speed of the pass and how far
+/// Arithmetic of the GPU prompt processing: passes of more than 16 rows, or with
+/// [`Decode::Int16`] more than 48 (`Int16`, `F16`) or 24 (`Int8`), below which the decode
+/// kernels are faster. The figures are for a 780M against `F32`: speed of the pass and how far
 /// the logits of the first generated token move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefill {
@@ -96,6 +97,31 @@ impl std::str::FromStr for Prefill {
     }
 }
 
+/// Arithmetic of GPU passes of up to 16 rows (decode steps, speculative verification,
+/// short prompts; see [`Prefill`] for when longer passes take the same kernels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Decode {
+    /// Integer dot products, activations rounded to 15 bits per block of 32: logits move
+    /// by about 6e-3 against `F32`; a 7-row pass is 1.4x (2B) to 1.6x (8B) faster on a
+    /// 780M, single rows cost about 1% more. A row's logits do not depend on the other
+    /// rows of its pass.
+    #[default]
+    Int16,
+    /// f32 throughout: the reference.
+    F32,
+}
+
+impl std::str::FromStr for Decode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "int16" => Ok(Decode::Int16),
+            "f32" => Ok(Decode::F32),
+            _ => anyhow::bail!("unknown decode precision {s:?} (expected int16 or f32)"),
+        }
+    }
+}
+
 /// How to load and run the model.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -104,6 +130,7 @@ pub struct LoadOptions {
     pub draft: Option<DraftOptions>,
     /// Arithmetic of the GPU prompt processing.
     pub prefill: Prefill,
+    pub decode: Decode,
     /// Reuse the KV of finished requests for prompts sharing a prefix.
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
@@ -119,6 +146,7 @@ impl Default for LoadOptions {
             quant: Quant::Auto,
             draft: None,
             prefill: Prefill::default(),
+            decode: Decode::default(),
             prefix_cache: true,
             kv_tokens: yakusel_model::DEFAULT_KV_TOKENS,
             engine: yakusel_model::EngineConfig::default(),
@@ -192,7 +220,7 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
     if let Some(d) = draft {
         cfg.draft_k = d.k;
     }
-    let Some(gpu) = gpu else {
+    let Some(mut gpu) = gpu else {
         yakusel_backend_cpu::init_threads();
         let target = prepare(Model::load(dir, CpuBackend::new(), o.quant)?, o)?;
         let draft = match draft {
@@ -209,10 +237,28 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
         Prefill::F16 => GemmKind::Coop,
         Prefill::F32 => GemmKind::F32,
     });
-    let draft_gpu = gpu.share();
+    use yakusel_backend_wgpu::Gemv;
+    let mut draft_gpu = gpu.share();
+    match o.decode {
+        Decode::Int16 => {
+            gpu.set_gemv(Gemv::INT16);
+            // The draft only proposes tokens: its single rows take the f32 kernel, a
+            // little faster for the Q2_K draft (19-sentence set: 74.4 vs 74.0 tok/s).
+            draft_gpu.set_gemv(Gemv { planes: Some(2), single_f32: true });
+        }
+        Decode::F32 => {
+            gpu.set_gemv(Gemv::F32);
+            draft_gpu.set_gemv(Gemv::F32);
+        }
+    }
     let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
+    target.backend.precompile();
     let draft = match draft {
-        Some(d) => Some(prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?),
+        Some(d) => {
+            let m = prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?;
+            m.backend.precompile();
+            Some(m)
+        }
         None => None,
     };
     Ok(Box::new(Engine::new(target, draft, cfg)?))

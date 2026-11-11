@@ -69,8 +69,9 @@ pub enum Event {
 pub struct EngineConfig {
     /// Requests decoding or prefilling at once (the rest wait).
     pub max_streams: usize,
-    /// Most requests advanced by one decode pass (8 rows is the cheapest per row on a
-    /// Radeon 780M: 46 ms for 8 rows, 114 ms for 16).
+    /// Most requests advanced by one decode pass. With f32 kernels 8 rows are the
+    /// cheapest per row on a Radeon 780M (2B: 38 ms for 8 rows, 108 ms for 16); with the
+    /// integer kernels 16 are (26 and 38 ms), and the CLI then asks for 16.
     pub decode_rows: usize,
     /// Prompt rows per pass while other requests are decoding.
     pub busy_prefill_rows: usize,

@@ -2,7 +2,7 @@
 //! computed from the same quantized weights. Needs a Vulkan GPU:
 //! `cargo test --release -p yakusel-backend-wgpu --test kernels -- --ignored`
 
-use yakusel_backend_wgpu::{GemmKind, WgpuBackend};
+use yakusel_backend_wgpu::{GemmKind, Gemv, WgpuBackend};
 use yakusel_model::Quant;
 use yakusel_model::ggml::GgmlType;
 use yakusel_model::quant::{Q8_BLOCK, quantize_q4, quantize_q8};
@@ -76,6 +76,9 @@ fn gemm_kinds(gpu: &WgpuBackend) -> Vec<(GemmKind, f32)> {
     kinds
 }
 
+/// The kernels for up to 16 rows (`set_gemv`) and the error each may add.
+const GEMV_KINDS: [(Option<usize>, f32); 3] = [(None, 0.0), (Some(2), 3e-3), (Some(1), 3e-2)];
+
 #[test]
 #[ignore]
 fn matmul_kernels_match_host() {
@@ -90,26 +93,32 @@ fn matmul_kernels_match_host() {
             // tiles of 32, 64 and 128 tokens.
             for t in [1, 2, 3, 5, 8, 12, 16, 20, 24, 40, 70, 150, 200] {
                 for glu in [false, true] {
-                    if glu && t > 1 {
-                        continue; // glu is fused only for decode; other T use matmul + swiglu
-                    }
                     let x = values(t * k, 11 + t as u64);
                     let want = reference(&x, t, &wd, n, k, glu);
                     let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-                    for (kind, tol) in gemm_kinds(&gpu) {
-                        if t <= 16 && kind != GemmKind::F32 {
-                            continue;
-                        }
+                    // (GEMM kind, GEMV planes, tolerance): the pass uses one of the two.
+                    let mut cases: Vec<(GemmKind, Option<usize>, f32)> = if t <= 16 {
+                        GEMV_KINDS.iter().map(|&(v, tol)| (GemmKind::F32, v, tol)).collect()
+                    } else {
+                        gemm_kinds(&gpu).into_iter().map(|(g, tol)| (g, None, tol)).collect()
+                    };
+                    if t > 16 && t <= 48 {
+                        // Several integer GEMVs in place of the GEMM.
+                        cases.push((GemmKind::Int16, Some(2), 3e-3));
+                    }
+                    for (kind, gemv, tol) in cases {
                         gpu.set_gemm(kind);
+                        gpu.set_gemv(Gemv { planes: gemv, single_f32: false });
                         let got = gpu.debug_matmul(&x, t, &w, n, k, quant, glu);
                         assert_eq!(got.len(), want.len());
                         let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-                        // bf16 weights have no integer form: the f16 or f32 GEMM takes them.
+                        // bf16 weights have no integer form: the f16 or f32 kernels take them.
                         let tol = if t > 16 && quant == Quant::Bf16 && kind != GemmKind::F32 { 3e-3 } else { tol };
+                        let tol = if quant == Quant::Bf16 && t <= 16 { 0.0 } else { tol };
                         let tol = tol.max(1e-4);
                         assert!(
                             err <= tol * scale.max(1.0),
-                            "{quant:?} {kind:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
+                            "{quant:?} {kind:?} {gemv:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
                         );
                     }
                 }
@@ -156,29 +165,66 @@ fn ggml_matmul_kernels_match_host() {
         for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
             let bytes = ggml_blocks(dtype, n, k, 3);
             let wd = yakusel_model::ggml::dequantize(dtype, &bytes, n * k);
-            for t in [1, 2, 5, 8, 16, 20, 40, 70, 150] {
+            for t in [1, 2, 3, 5, 8, 16, 20, 40, 70, 150] {
                 for glu in [false, true] {
-                    if glu && t > 1 {
-                        continue;
-                    }
                     let x = values(t * k, 21 + t as u64);
                     let want = reference(&x, t, &wd, n, k, glu);
                     let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
-                    for (kind, tol) in gemm_kinds(&gpu) {
-                        if t <= 16 && kind != GemmKind::F32 {
-                            continue;
-                        }
+                    let mut cases: Vec<(GemmKind, Option<usize>, f32)> = if t <= 16 {
+                        GEMV_KINDS.iter().map(|&(v, tol)| (GemmKind::F32, v, tol)).collect()
+                    } else {
+                        gemm_kinds(&gpu).into_iter().map(|(g, tol)| (g, None, tol)).collect()
+                    };
+                    if t > 16 && t <= 48 {
+                        // Several integer GEMVs in place of the GEMM.
+                        cases.push((GemmKind::Int16, Some(2), 3e-3));
+                    }
+                    for (kind, gemv, tol) in cases {
                         gpu.set_gemm(kind);
+                        gpu.set_gemv(Gemv { planes: gemv, single_f32: false });
                         let got = gpu.debug_matmul_ggml(&x, t, dtype, &bytes, n, k, glu);
                         let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
                         // Q4_K/Q6_K scales are rounded to f16 on the GPU (~5e-4 relative).
                         let tol = tol.max(1e-3);
                         assert!(
                             err <= tol * scale.max(1.0),
-                            "{dtype:?} {kind:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
+                            "{dtype:?} {kind:?} {gemv:?} n={n} k={k} t={t} glu={glu}: err {err} (scale {scale})"
                         );
                     }
                 }
+            }
+        }
+    }
+}
+
+/// With the integer kernels, a row's result is the same bits whether it runs alone or
+/// among the rows of a larger pass (so concurrency and speculation cannot change it).
+#[test]
+#[ignore]
+fn integer_rows_do_not_depend_on_the_pass() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let (n, k, t) = (200, 1536, 7);
+    for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
+        let bytes = ggml_blocks(dtype, n, k, 5);
+        let x = values(t * k, 31);
+        for planes in [2, 1] {
+            gpu.set_gemv(Gemv { planes: Some(planes), single_f32: false });
+            for glu in [false, true] {
+                let cols = if glu { n / 2 } else { n };
+                let all = gpu.debug_matmul_ggml(&x, t, dtype, &bytes, n, k, glu);
+                // Alone, and as the second of three rows.
+                for j in 0..t {
+                    let one = gpu.debug_matmul_ggml(&x[j * k..(j + 1) * k], 1, dtype, &bytes, n, k, glu);
+                    assert!(
+                        one.iter().zip(&all[j * cols..(j + 1) * cols]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{dtype:?} planes={planes} glu={glu}: row {j} alone differs from the 7-row pass"
+                    );
+                }
+                let three = gpu.debug_matmul_ggml(&x[2 * k..5 * k], 3, dtype, &bytes, n, k, glu);
+                assert!(
+                    three.iter().zip(&all[2 * cols..5 * cols]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{dtype:?} planes={planes} glu={glu}: a 3-row pass differs from the 7-row pass"
+                );
             }
         }
     }

@@ -313,8 +313,9 @@ fn tiled_attention_matches_cpu() {
 fn decode_attention_matches_cpu() {
     let dir = model_dir();
     let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
-    let gpu = WgpuBackend::new().unwrap();
+    let mut gpu = WgpuBackend::new().unwrap();
     gpu.set_gemm(yakusel_backend_wgpu::GemmKind::F32);
+    gpu.set_gemv(yakusel_backend_wgpu::Gemv::F32);
     let mut gpu = Model::load(&dir, gpu, Quant::Q8).unwrap();
     for n in [20u32, 600, 2100] {
         let ids: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 50000).collect();
@@ -349,9 +350,11 @@ fn prefill_kinds_against_f32() {
     let quant = if yakusel_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
     let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
     gpu.prefix_cache = false;
+    // (prompts of up to 16 rows would take the decode kernels)
+    gpu.backend.set_gemv(yakusel_backend_wgpu::Gemv::F32);
     let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
     prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
-    let mut logits = |gpu: &mut Model<WgpuBackend>, kind| -> Vec<Vec<f32>> {
+    let logits = |gpu: &mut Model<WgpuBackend>, kind| -> Vec<Vec<f32>> {
         gpu.backend.set_gemm(kind);
         prompts
             .iter()
@@ -391,5 +394,61 @@ fn prefill_kinds_against_f32() {
             base.len()
         );
         assert!(worst < bound, "{kind:?}: {worst}");
+    }
+}
+
+/// How far the integer decode kernels move the logits from the f32 GEMV's: 8 teacher-forced
+/// decode steps after an f32 prefill of the golden prompts and of a 600-token one.
+/// `YAKUSEL_MODEL_DIR` may name a GGUF file.
+#[test]
+#[ignore]
+fn decode_kinds_against_f32() {
+    use yakusel_backend_wgpu::{GemmKind, Gemv};
+    let dir = model_dir();
+    let quant = if yakusel_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
+    gpu.prefix_cache = false;
+    gpu.backend.set_gemm(GemmKind::F32);
+    let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
+    prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
+    let logits = |gpu: &mut Model<WgpuBackend>, gemv: Gemv| -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        for ids in &prompts {
+            gpu.backend.set_gemv(Gemv::F32);
+            let s = gpu.new_seq().unwrap();
+            gpu.prefill(s, ids).unwrap();
+            gpu.backend.set_gemv(gemv);
+            for step in 0..8u32 {
+                let l = gpu.forward(&[(s, &[2000 + step * 37])], false).unwrap();
+                out.push(gpu.backend.to_host(&l));
+            }
+            gpu.free_seq(s);
+        }
+        out
+    };
+    let softmax = |l: &[f32]| -> Vec<f64> {
+        let m = l.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let e: Vec<f64> = l.iter().map(|&v| ((v - m) as f64).exp()).collect();
+        let z: f64 = e.iter().sum();
+        e.into_iter().map(|v| v / z).collect()
+    };
+    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let base = logits(&mut gpu, Gemv::F32);
+    for (gemv, bound) in [(Gemv::INT16, 5e-2), (Gemv { planes: Some(1), single_f32: false }, 3.0)] {
+        let got = logits(&mut gpu, gemv);
+        let (mut worst, mut kl_max, mut same) = (0f32, 0f64, 0);
+        for (a, b) in base.iter().zip(&got) {
+            worst = worst.max(a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max));
+            let (p, q) = (softmax(a), softmax(b));
+            let kl: f64 = p.iter().zip(&q).filter(|(p, _)| **p > 0.0).map(|(p, q)| p * (p / q.max(1e-300)).ln()).sum();
+            kl_max = kl_max.max(kl);
+            same += usize::from(argmax(a) == argmax(b));
+        }
+        eprintln!(
+            "{:?} planes: max |logit - f32| = {worst:.2e}, max KL = {kl_max:.2e}, same token {same}/{}",
+            gemv.planes,
+            base.len()
+        );
+        assert!(worst < bound, "{gemv:?}: {worst}");
     }
 }

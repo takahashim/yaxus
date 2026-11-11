@@ -29,11 +29,16 @@ pub struct ModelArgs {
     /// auto (Vulkan GPU if available, else CPU), vulkan or cpu.
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
-    /// Arithmetic of GPU prompt processing (decoding is always f32): int16 (integer dot
-    /// products, activations rounded to 15 bits), int8 (7 bits as llama.cpp does: 1.5x
-    /// faster than int16, logits move ~100x more), f16 (matrix cores) or f32 (reference).
+    /// Arithmetic of GPU prompt processing (long passes): int16 (integer dot products,
+    /// activations rounded to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than
+    /// int16, logits move ~100x more), f16 (matrix cores) or f32 (reference).
     #[arg(long, default_value = "int16")]
     prefill_precision: yakusel_server::Prefill,
+    /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
+    /// drafts, short prompts): int16 (integer dot products, activations rounded to
+    /// 15 bits; several rows cost little more than one) or f32 (reference).
+    #[arg(long, default_value = "int16")]
+    decode_precision: yakusel_server::Decode,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
     /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
@@ -56,9 +61,10 @@ pub struct ModelArgs {
     /// Requests processed at once (more wait in the queue).
     #[arg(long, default_value_t = 16)]
     max_streams: usize,
-    /// Most requests advanced by one decode pass.
-    #[arg(long, default_value_t = 8)]
-    decode_rows: usize,
+    /// Most requests advanced by one decode pass [default: 16 with --decode-precision
+    /// int16 (rows are cheap there), else 8].
+    #[arg(long)]
+    decode_rows: Option<usize>,
     /// Weight format of the draft model: auto4 (GGUF tensors of up to 4 bits as in the file,
     /// everything else q4), q4 or q8. Affects speed only, never the output.
     #[arg(long, default_value = "auto4")]
@@ -100,11 +106,15 @@ impl ModelArgs {
             quant: self.quant,
             draft: self.draft_options()?,
             prefill: self.prefill_precision,
+            decode: self.decode_precision,
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
             engine: yakusel_model::EngineConfig {
                 max_streams: self.max_streams,
-                decode_rows: self.decode_rows,
+                decode_rows: self.decode_rows.unwrap_or(match self.decode_precision {
+                    yakusel_server::Decode::Int16 => 16,
+                    yakusel_server::Decode::F32 => 8,
+                }),
                 response_cache: if self.no_kv_cache || self.no_response_cache {
                     0
                 } else {
