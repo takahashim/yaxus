@@ -128,9 +128,11 @@ pub fn resolve_model(model: &str) -> Result<ResolvedModel> {
 /// The draft model for target `target` and `spec`: `none`, `auto` (from the local cache:
 /// the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else pfnet/plamo-3-translate-0.8b,
 /// else its Q4_K_M file; nothing if none is there), or a model as for [`resolve_model`].
-/// `None` also when it is the target's own file or directory. A draft of the target's
-/// size is kept: at fewer bits it still pays (0.8B target with the 0.8B Q2_K draft:
-/// 87.2 -> 95.2 tok/s on the 19-sentence set).
+/// `None` also when it is the target's own file or directory, and for `auto` when the
+/// target has the draft's size and is a GGUF file: a draft pays only when it reads much
+/// less than the target. 19-sentence set, 0.8B target with the 0.8B Q2_K draft: the
+/// checkpoint (loaded at 8 bits) 87.0 -> 96.9 tok/s, but Q4_K_M 126.5 -> 105.6 and
+/// Q3_K_M 134.7 -> 105.9.
 pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
     let dir = match spec {
         "none" => return Ok(None),
@@ -150,7 +152,23 @@ pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
         (Ok(a), Ok(b)) => a == b,
         _ => dir == target,
     };
-    Ok(if same { None } else { Some(dir) })
+    if same {
+        return Ok(None);
+    }
+    if spec == "auto" && yaxus_model::gguf::is_gguf(target) && shape(&dir).is_some_and(|s| Some(s) == shape(target)) {
+        return Ok(None);
+    }
+    Ok(Some(dir))
+}
+
+/// (hidden size, layers) of a model directory or GGUF file.
+fn shape(path: &Path) -> Option<(usize, usize)> {
+    let cfg = if yaxus_model::gguf::is_gguf(path) {
+        yaxus_model::gguf::Gguf::open(path).ok()?.config().ok()?
+    } else {
+        yaxus_model::Config::from_file(path.join("config.json")).ok()?
+    };
+    Some((cfg.hidden_size, cfg.num_hidden_layers))
 }
 
 #[cfg(test)]

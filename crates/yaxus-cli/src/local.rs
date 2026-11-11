@@ -211,19 +211,25 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
     let mut io_err = None;
     let mut memory = yaxus_runtime::memory::Memory::new(yaxus_runtime::memory::DEFAULT_ENTRIES);
-    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| match ev {
-        DocEvent::Delta { segment, text } => {
-            first.get_or_insert(t1.elapsed());
-            if let Err(e) = out.delta(segment, text) {
-                io_err.get_or_insert(e);
+    // A failed write (e.g. the reader of a pipe has exited) stops the translation.
+    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| {
+        let written = match ev {
+            DocEvent::Delta { segment, text } => {
+                first.get_or_insert(t1.elapsed());
+                out.delta(segment, text)
             }
-        }
-        DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
-            prompt += prompt_tokens;
-            reused += r;
-            generated += g;
-            if let Err(e) = out.end(segment) {
-                io_err.get_or_insert(e);
+            DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
+                prompt += prompt_tokens;
+                reused += r;
+                generated += g;
+                out.end(segment)
+            }
+        };
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                io_err = Some(e);
+                false
             }
         }
     })?;
@@ -391,6 +397,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
 }
 
 fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
+    anyhow::ensure!(gen_tokens > 0, "--gen-tokens must be at least 1");
     m.no_kv_cache = true;
     let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
@@ -446,6 +453,7 @@ fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Op
         outs.push(escape_line(&out));
         stats.push(st);
     }
+    anyhow::ensure!(!stats.is_empty(), "{} has no sentences", file.display());
     let generated_total: usize = stats.iter().map(|s| s.generated).sum();
     let dec: f64 = stats.iter().map(|s| s.decode.as_secs_f64()).sum();
     let gen_after_first: usize = stats.iter().map(|s| s.generated.saturating_sub(1)).sum();
@@ -493,6 +501,7 @@ fn bench_streams(
         let req = yaxus_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
         prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req))?.into_ids());
     }
+    anyhow::ensure!(!prompts.is_empty(), "{} has no sentences", file.display());
     let reference: Option<Vec<String>> = match &compare {
         Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),
         None => None,
@@ -633,10 +642,10 @@ fn bench_doc(
     }
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
-    let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
     let opts = DocOptions { history_chars, chains, neighbor_context, ..DocOptions::new(&to) };
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
+        let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
         let mut job = DocJob::new(paras, opts.clone());
         job.validate()?;
         println!(
@@ -660,6 +669,7 @@ fn bench_doc(
                     );
                 }
             }
+            true
         })?;
         let wall = t0.elapsed().as_secs_f64();
         println!(

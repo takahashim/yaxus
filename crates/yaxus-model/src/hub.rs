@@ -35,7 +35,12 @@ pub fn snapshot(repo: &str) -> Result<PathBuf> {
 /// The most recently modified entry of `dir` (ties: the last by name).
 fn newest(dir: &std::path::Path) -> Option<PathBuf> {
     let mtime = |p: &PathBuf| p.metadata().and_then(|m| m.modified()).ok();
-    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).max_by(|a, b| (mtime(a), a).cmp(&(mtime(b), b)))
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max_by(|a, b| (mtime(a), a).cmp(&(mtime(b), b)))
 }
 
 /// Whether tests that need models in the cache must fail instead of skipping without

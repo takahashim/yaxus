@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
-use yaxus_model::Generator;
+use yaxus_model::{Finish, Generator};
 use yaxus_tokenizer::{PromptError, Tokenizer, TranslationRequest, is_blank, validate_message};
 
 use crate::memory::Memory;
@@ -244,12 +244,16 @@ pub enum DocEvent<'a> {
 
 /// Translates a document on `engine` (which must not have other requests in flight).
 /// Earlier translations in `memory` serve as hints; the new ones are added to it.
+///
+/// `on` returns `false` to stop (e.g. when the output it writes to has gone away): no
+/// further segments are started, the ones in flight are cancelled and drained from the
+/// engine, no more events are sent, and `job` is left unfinished.
 pub fn run_document(
     engine: &mut dyn Generator,
     tok: &Tokenizer,
     job: &mut DocJob,
     memory: &mut Memory,
-    on: &mut dyn FnMut(DocEvent),
+    on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<()> {
     let mut session = Session::new(engine, tok, memory);
     let submit = |session: &mut Session<usize>, job: &mut DocJob| -> Result<()> {
@@ -259,12 +263,22 @@ pub fn run_document(
         Ok(())
     };
     submit(&mut session, job)?;
-    while !job.is_done() {
+    let mut stopped = false;
+    // Once stopped, run only until the requests in flight have left the engine.
+    while !job.is_done() && !(stopped && session.is_idle()) {
         let (mut finished, mut failed) = (Vec::new(), None);
+        // The request whose own text was refused: its end still counts (as it ended).
+        let mut refused = None;
         let worked = session.step(&mut |u| {
             match u {
-                Update::Delta { tag, text } if !text.is_empty() => on(DocEvent::Delta { segment: *tag, text }),
-                Update::Delta { .. } => {}
+                // Returning `false` cancels the request.
+                Update::Delta { .. } if stopped => return false,
+                Update::Delta { tag, text } => {
+                    if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
+                        (stopped, refused) = (true, Some(*tag));
+                        return false;
+                    }
+                }
                 Update::Done { tag, done } => finished.push((tag, done)),
                 Update::Failed { tag, message } => failed = Some(format!("segment {tag}: {message}")),
             }
@@ -274,15 +288,23 @@ pub fn run_document(
             anyhow::bail!(e);
         }
         for (segment, done) in finished {
-            on(DocEvent::SegmentDone {
-                segment,
-                prompt_tokens: done.prompt_tokens,
-                reused: done.start.reused,
-                generated: done.generated,
-            });
+            // After a stop: cancelled requests and the others' ends are dropped.
+            if done.finish == Finish::Cancelled || (stopped && refused != Some(segment)) {
+                continue;
+            }
+            if !stopped {
+                stopped = !on(DocEvent::SegmentDone {
+                    segment,
+                    prompt_tokens: done.prompt_tokens,
+                    reused: done.start.reused,
+                    generated: done.generated,
+                });
+            }
             job.finished(segment, done.text);
         }
-        submit(&mut session, job)?;
+        if !stopped {
+            submit(&mut session, job)?;
+        }
         anyhow::ensure!(worked || job.is_done() || !session.is_idle(), "engine idle with segments left");
     }
     Ok(())
@@ -290,6 +312,9 @@ pub fn run_document(
 
 #[cfg(test)]
 mod tests {
+    use yaxus_model::{Event, ReqId, Request};
+    use yaxus_tokenizer::TAG_ID;
+
     use super::*;
 
     fn opts(chains: usize, history_chars: usize) -> DocOptions {
@@ -326,6 +351,151 @@ mod tests {
         assert!(e.0.starts_with("segment 1:"), "{}", e.0);
         // `form` needs target_lang = "ja".
         assert!(DocJob::from_request(req(&["a"], Some("polite")), 64).validate().is_err());
+    }
+
+    /// Emits one "x" token per step for every request it holds, and stops each request
+    /// after `len` tokens (or when the sink returns `false`).
+    #[derive(Default)]
+    struct FakeEngine {
+        next_id: ReqId,
+        len: usize,
+        token: u32,
+        running: Vec<(ReqId, usize)>,
+        submitted: usize,
+        cancelled: usize,
+    }
+
+    impl Generator for FakeEngine {
+        fn submit(&mut self, req: Request) {
+            self.submitted += 1;
+            self.running.push((req.id, 0));
+        }
+
+        fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+            if self.running.is_empty() {
+                return Ok(false);
+            }
+            let mut keep = Vec::new();
+            for (id, n) in std::mem::take(&mut self.running) {
+                let finish = if !emit(Event::Token { id, token: self.token }) {
+                    self.cancelled += 1;
+                    Some(Finish::Cancelled)
+                } else if n + 1 == self.len {
+                    Some(Finish::Stop)
+                } else {
+                    None
+                };
+                match finish {
+                    Some(finish) => {
+                        emit(Event::Done { id, finish, generated: n + 1, start: Default::default() });
+                    }
+                    None => keep.push((id, n + 1)),
+                }
+            }
+            self.running = keep;
+            Ok(true)
+        }
+
+        fn fresh_id(&mut self) -> ReqId {
+            self.next_id += 1;
+            self.next_id
+        }
+        fn waiting(&self) -> usize {
+            0
+        }
+        fn active(&self) -> usize {
+            self.running.len()
+        }
+        fn abort_all(&mut self) {
+            self.running.clear();
+        }
+        fn backend_name(&self) -> String {
+            "fake".into()
+        }
+        fn weight_bytes(&self) -> usize {
+            0
+        }
+        fn stats(&self) -> Option<String> {
+            None
+        }
+        fn last_start(&self) -> yaxus_model::StartInfo {
+            Default::default()
+        }
+    }
+
+    /// A tokenizer with the PLaMo special-token layout and a single "x" token.
+    fn tokenizer() -> (Tokenizer, u32) {
+        use yaxus_tokenizer::{BOS_ID, TokenKind};
+        let mut tokens: Vec<String> = (0..=TAG_ID)
+            .map(|id| match id {
+                BOS_ID => "<|plamo:bos|>".into(),
+                TAG_ID => "<|plamo:tag|>".into(),
+                _ => format!("<|plamo:c{id}|>"),
+            })
+            .collect();
+        let mut kinds = vec![TokenKind::Control; tokens.len()];
+        tokens.extend((0..=255u8).map(|b| format!("<0x{b:02X}>")));
+        kinds.extend([TokenKind::Byte; 256]);
+        tokens.push("x".into());
+        kinds.push(TokenKind::Normal);
+        let x = tokens.len() as u32 - 1;
+        let scores = vec![0.0; tokens.len()];
+        (Tokenizer::from_vocab(tokens, kinds, scores).unwrap(), x)
+    }
+
+    fn fake(len: usize) -> (Tokenizer, FakeEngine) {
+        let (tok, x) = tokenizer();
+        (tok, FakeEngine { len, token: x, ..Default::default() })
+    }
+
+    #[test]
+    fn run_document_translates_every_segment() {
+        let (tok, mut engine) = fake(3);
+        let segs: Vec<String> = (0..5).map(|i| format!("p{i}")).collect();
+        let mut job = DocJob::new(segs, opts(2, 1000));
+        let mut memory = Memory::new(8);
+        let mut done = Vec::new();
+        run_document(&mut engine, &tok, &mut job, &mut memory, &mut |ev| {
+            if let DocEvent::SegmentDone { segment, .. } = ev {
+                done.push(segment);
+            }
+            true
+        })
+        .unwrap();
+        assert!(job.is_done());
+        assert!(job.outputs.iter().all(|o| o.as_deref() == Some("xxx")));
+        done.sort();
+        assert_eq!(done, [0, 1, 2, 3, 4]);
+        assert_eq!((engine.submitted, engine.cancelled), (5, 0));
+    }
+
+    #[test]
+    fn run_document_stops_when_the_sink_says_so() {
+        // Stop at the first delta: the two chains' first segments are in flight.
+        let (tok, mut engine) = fake(3);
+        let segs: Vec<String> = (0..6).map(|i| format!("p{i}")).collect();
+        let mut job = DocJob::new(segs, opts(2, 1000));
+        let mut memory = Memory::new(8);
+        let mut events = 0;
+        run_document(&mut engine, &tok, &mut job, &mut memory, &mut |_| {
+            events += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(events, 1, "no events after the sink said stop");
+        assert!(!job.is_done());
+        assert!(engine.running.is_empty(), "requests in flight are drained from the engine");
+        assert_eq!((engine.submitted, engine.cancelled), (2, 2), "nothing new is started");
+
+        // Stop at the end of the first segment: it is kept, nothing else is started.
+        let (tok, mut engine) = fake(2);
+        let segs: Vec<String> = (0..4).map(|i| format!("p{i}")).collect();
+        let mut job = DocJob::new(segs, opts(1, 1000));
+        run_document(&mut engine, &tok, &mut job, &mut memory, &mut |ev| !matches!(ev, DocEvent::SegmentDone { .. }))
+            .unwrap();
+        assert_eq!(job.outputs[0].as_deref(), Some("xx"));
+        assert!(job.outputs[1..].iter().all(Option::is_none));
+        assert_eq!((engine.submitted, engine.cancelled), (1, 0));
     }
 
     #[test]
