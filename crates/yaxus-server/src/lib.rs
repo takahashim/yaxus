@@ -296,22 +296,16 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
-pub fn default_config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join("yaxus");
-    }
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(".config/yaxus")
-}
-
 /// Loads the stored token or creates a new random one. Returns (token, newly_created).
 fn load_or_create_token(dir: &Path) -> Result<(String, bool)> {
     let path = dir.join("token");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Ok((t, false));
-        }
+    match std::fs::read_to_string(&path) {
+        Ok(t) if !t.trim().is_empty() => return Ok((t.trim().to_string(), false)),
+        // Missing or empty: create one below.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Replacing an unreadable token would lock every client out without saying why.
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     }
     std::fs::create_dir_all(dir)?;
     let mut buf = [0u8; 24];
@@ -325,13 +319,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The token of an `Authorization: Bearer <token>` header (the scheme is case-insensitive).
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+}
+
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| constant_time_eq(t.trim().as_bytes(), st.token.as_bytes()));
+        .and_then(bearer_token)
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), st.token.as_bytes()));
     if !ok {
         let mut r = error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -344,10 +344,15 @@ async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Html(INDEX_HTML))
 }
 
-async fn healthz(State(st): State<Shared>) -> Json<Health> {
+async fn healthz(State(st): State<Shared>) -> Response {
     let mut h = st.health.clone();
     h.queue = st.queued.load(Ordering::SeqCst);
-    Json(h)
+    // The inference thread has stopped (after a panic): report it instead of "ok".
+    if st.jobs.is_closed() {
+        h.status = "stopped".into();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(h)).into_response();
+    }
+    Json(h).into_response()
 }
 
 async fn languages() -> Json<Vec<Language>> {
@@ -475,7 +480,8 @@ async fn translate_document(
         return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
     }
     // Validate languages, options and every segment up front (blank segments are allowed
-    // and come back empty).
+    // and come back empty). A segment whose prompt alone exceeds the context is rejected
+    // here instead of failing the document half-way.
     for (i, seg) in req.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
         let one = TranslateRequest {
             text: seg.clone(),
@@ -486,8 +492,8 @@ async fn translate_document(
             glossary: req.glossary.clone(),
             ..Default::default()
         };
-        if let Err(e) = to_prompt_request(&one).to_prompt() {
-            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {}", e.0));
+        if let Err(e) = document::encode_within(&st.tok, &mut to_prompt_request(&one), st.max_context, 0) {
+            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {e}"));
         }
     }
     let opts = document::DocOptions {
@@ -501,15 +507,16 @@ async fn translate_document(
         neighbor_context: req.neighbor_context,
         max_new_tokens: req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context / 2),
     };
-    let doc = document::DocJob::new(req.segments.clone(), opts);
     let label =
         format!("{}->{}", req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), req.target_lang);
+    let (n, stream) = (req.segments.len(), req.stream);
+    let doc = document::DocJob::new(req.segments, opts);
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
     if let Err(r) = enqueue(&st, job) {
         return r;
     }
-    if req.stream {
+    if stream {
         let stream = UnboundedReceiverStream::new(rx).map(|ev| {
             sse_json_doc(&match ev {
                 Event::SegmentDelta(segment, delta) => DocumentEvent::Delta { segment, delta },
@@ -524,7 +531,7 @@ async fn translate_document(
         return r;
     }
     let mut rx = rx;
-    let mut out = vec![String::new(); req.segments.len()];
+    let mut out = vec![String::new(); n];
     while let Some(ev) = rx.recv().await {
         match ev {
             Event::SegmentDelta(i, d) => out[i].push_str(&d),
@@ -559,11 +566,19 @@ fn router(st: Shared) -> Router {
 pub fn serve(opts: ServeOptions) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (token, created) = match opts.token.clone() {
-        Some(t) => (t, false),
+    let (token, created) = match opts.token.as_deref() {
+        // Clients' tokens are trimmed before the comparison, so trim this one too.
+        Some(t) => (t.trim().to_string(), false),
         None => load_or_create_token(&opts.config_dir)?,
     };
     anyhow::ensure!(token.len() >= 16, "token must be at least 16 characters");
+    // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass the
+    // checks here and then fail in the engine.
+    anyhow::ensure!(
+        (1..=yaxus_model::DEFAULT_MAX_POS).contains(&opts.max_context),
+        "max context must be 1..={} tokens",
+        yaxus_model::DEFAULT_MAX_POS
+    );
 
     let tls = match (&opts.cert, &opts.key) {
         (Some(c), Some(k)) => tls::TlsFiles { cert: c.clone(), key: k.clone(), ca: None, sans: vec![] },
@@ -597,7 +612,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         let (tok, queued) = (tok.clone(), queued.clone());
         std::thread::Builder::new()
             .name("inference".into())
-            .spawn(move || worker::run(model, tok, rx, queued, queue_limit))?;
+            .spawn(move || worker::run(model, tok, rx, queued, queue_limit, opts.max_context))?;
     }
 
     let st = Arc::new(AppState { tok, jobs, queued, token: token.clone(), health, max_context: opts.max_context });
@@ -680,6 +695,33 @@ mod tests {
             }
         }
         assert!(n > 1000);
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+    }
+
+    #[test]
+    fn token_file_is_created_reused_and_never_silently_replaced() {
+        let dir = std::env::temp_dir().join(format!("yaxus-token-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (t, created) = load_or_create_token(&dir).unwrap();
+        assert!(created && t.len() == 48);
+        assert_eq!(load_or_create_token(&dir).unwrap(), (t.clone(), false));
+        // An empty file gets a new token.
+        std::fs::write(dir.join("token"), "\n").unwrap();
+        let (t2, created) = load_or_create_token(&dir).unwrap();
+        assert!(created && t2 != t);
+        // A file that cannot be read is an error, not a new token.
+        std::fs::write(dir.join("token"), [0xff, 0xfe]).unwrap();
+        assert!(load_or_create_token(&dir).is_err());
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), [0xff, 0xfe]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

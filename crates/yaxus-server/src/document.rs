@@ -171,6 +171,28 @@ pub enum DocEvent<'a> {
     SegmentDone { segment: usize, prompt_tokens: usize, reused: usize, generated: usize },
 }
 
+/// Encodes the prompt of `req` so that it and `max_new` generated tokens fit in
+/// `max_context`: when they do not, the history is dropped first, and the generation budget
+/// is then cut to what is left. Returns (prompt ids, max new tokens), or an error when even
+/// the prompt without history does not fit.
+pub fn encode_within(
+    tok: &Tokenizer,
+    req: &mut TranslationRequest,
+    max_context: usize,
+    max_new: usize,
+) -> std::result::Result<(Vec<u32>, usize), String> {
+    let mut ids = tok.encode(&req.to_prompt().map_err(|e| e.0)?, false);
+    if ids.len() + max_new > max_context && !req.history.is_empty() {
+        req.history.clear();
+        ids = tok.encode(&req.to_prompt().map_err(|e| e.0)?, false);
+    }
+    if ids.len() >= max_context {
+        return Err(format!("prompt is {} tokens; the limit is {max_context}", ids.len()));
+    }
+    let max_new = max_new.min(max_context - ids.len()).max(1);
+    Ok((ids, max_new))
+}
+
 /// Translates a document on `engine` (which must not have other requests in flight).
 /// Earlier translations in `memory` serve as hints; the new ones are added to it.
 ///
@@ -382,6 +404,34 @@ mod tests {
     fn fake(len: usize) -> (Tokenizer, FakeEngine) {
         let (tok, x) = tokenizer();
         (tok, FakeEngine { len, token: x, ..Default::default() })
+    }
+
+    #[test]
+    fn encode_within_drops_history_then_cuts_the_budget() {
+        let (tok, _) = tokenizer();
+        let base = TranslationRequest { text: "hello".into(), target_lang: "en".into(), ..Default::default() };
+        let with_history = TranslationRequest {
+            history: vec![TranslationPair { source: "a".repeat(300), target: "b".repeat(300) }],
+            ..base.clone()
+        };
+        let bare = tok.encode(&base.to_prompt().unwrap(), false).len();
+        let full = tok.encode(&with_history.to_prompt().unwrap(), false).len();
+        assert!(full > bare + 500);
+
+        // Everything fits: unchanged.
+        let mut r = with_history.clone();
+        let (ids, n) = encode_within(&tok, &mut r, full + 10, 10).unwrap();
+        assert_eq!((ids.len(), n, r.history.len()), (full, 10, 1));
+        // History plus budget too long: the history goes, the budget stays.
+        let mut r = with_history.clone();
+        let (ids, n) = encode_within(&tok, &mut r, full, 10).unwrap();
+        assert_eq!((ids.len(), n, r.history.len()), (bare, 10, 0));
+        // Without history the budget is cut to what is left (at least 1).
+        let mut r = base.clone();
+        assert_eq!(encode_within(&tok, &mut r, bare + 3, 10).unwrap().1, 3);
+        // The prompt alone does not fit.
+        let mut r = base.clone();
+        assert!(encode_within(&tok, &mut r, bare, 0).unwrap_err().contains("the limit is"));
     }
 
     #[test]
