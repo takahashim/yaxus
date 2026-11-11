@@ -236,3 +236,46 @@ fn integer_rows_do_not_depend_on_the_pass() {
         }
     }
 }
+
+/// Argmax over a whole pass of rows (more than one workgroup's worth of partials), with
+/// the CPU's choice on degenerate rows.
+#[test]
+#[ignore]
+fn argmax_handles_a_whole_pass() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let cols = 1000;
+    for rows in [1, 64, 65, 300, 512] {
+        let mut x = values(rows * cols, rows as u64);
+        let want: Vec<u32> = (0..rows).map(|r| ((r * 37) % cols) as u32).collect();
+        for (r, &w) in want.iter().enumerate() {
+            x[r * cols + w as usize] = 5.0;
+        }
+        assert_eq!(gpu.debug_argmax(&x, rows), want, "{rows} rows");
+    }
+    // A row of only -inf (or NaN) gives token 0, like the CPU, not an id beyond it.
+    let mut x = vec![f32::NEG_INFINITY; 2 * cols];
+    x[cols..].fill(f32::NAN);
+    assert_eq!(gpu.debug_argmax(&x, 2), [0, 0]);
+}
+
+/// A model whose layers are all full attention (or all sliding) gets a KV cache too.
+#[test]
+#[ignore]
+fn kv_cache_for_a_single_kind_of_layer() {
+    use yaxus_model::{Backend, Config, LayerMeta, Rope};
+    let mut gpu = WgpuBackend::new().unwrap();
+    let cfg: Config = serde_json::from_str(
+        r#"{"hidden_size": 256, "num_hidden_layers": 2, "num_attention_heads": 2,
+            "num_key_value_heads": 1, "head_dim": 128, "intermediate_size": 256,
+            "vocab_size": 300, "rms_norm_eps": 1e-6, "window_size": 64,
+            "sliding_window_pattern": 1, "rope_theta": 10000.0, "rope_local_theta": 10000.0}"#,
+    )
+    .unwrap();
+    let rope = Rope { inv_freq: vec![0.5; 64], concentration: 1.0 };
+    for full in [true, false] {
+        let metas: Vec<LayerMeta> = (0..2)
+            .map(|index| LayerMeta { index, full_attn: full, window: (!full).then_some(64), rope: rope.clone() })
+            .collect();
+        assert!(gpu.new_kv(&cfg, &metas, 2, 512).is_ok(), "full_attn = {full}");
+    }
+}

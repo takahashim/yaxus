@@ -174,8 +174,11 @@ pub struct Gpu {
     gemv: Gemv,
     /// Bytes uploaded since the staging memory was last released.
     unflushed_upload: usize,
-    /// Tiled attention for passes of more than 8 rows: keys are split into chunks until
-    /// about this many workgroups run (0: the per-row kernel instead).
+    /// An uploaded buffer larger than a storage binding may be (see `checked`).
+    oversized: Option<(String, usize)>,
+    /// Tiled attention for passes of more than 16 rows: keys are split into chunks until
+    /// about this many workgroups run (0: the per-row kernel instead). `YAXUS_TILE_WGS`
+    /// sets it; it is 0 on devices without the kernel's workgroup memory.
     tile_wgs: usize,
     kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
@@ -369,6 +372,10 @@ const ATTN_TILE_ROWS: usize = 32;
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 const ARGMAX_SLICES: usize = 64;
+/// Rows of logits one argmax handles: a whole pass (the model's prefill chunk).
+const ARGMAX_ROWS: usize = 512;
+/// Workgroup memory of `attn_tile` (`qs`, `kv`, `ss` and the per-row arrays).
+const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
 
 /// Passes with at most this many rows use the split-key attention (a workgroup per row
 /// and chunk of keys). Decode passes are rows of different requests, which the tiled
@@ -532,7 +539,7 @@ impl Gpu {
         });
         let argmax_out = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("argmax"),
-            size: 512,
+            size: (ARGMAX_ROWS * 8) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -563,7 +570,7 @@ impl Gpu {
         });
         let argmax_part = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("argmax-part"),
-            size: (64 * ARGMAX_SLICES * 16) as u64,
+            size: (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -592,8 +599,9 @@ impl Gpu {
             coop,
             gemm: GemmKind::from_env(),
             gemv: Gemv::from_env(),
-            tile_wgs: 384,
+            tile_wgs: std::env::var("YAXUS_TILE_WGS").ok().and_then(|v| v.parse().ok()).unwrap_or(384),
             unflushed_upload: 0,
+            oversized: None,
             profile: std::env::var_os("YAXUS_PROFILE").map(|_| Profile::default()),
         };
         b.build_kernels();
@@ -784,8 +792,12 @@ impl Gpu {
             }
         }
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
-        if self.subgroups {
+        // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
+        // without it, prefill attention takes the per-row kernel.
+        if self.subgroups && self.device.limits().max_compute_workgroup_storage_size >= ATTN_TILE_SHARED_BYTES {
             self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+        } else {
+            self.tile_wgs = 0;
         }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
@@ -953,6 +965,10 @@ impl Gpu {
 
     fn upload(&mut self, label: &str, bytes: &[u8]) -> wgpu::Buffer {
         self.weight_bytes += bytes.len();
+        // Binding it would fail at the first dispatch, long after loading.
+        if bytes.len() as u64 > self.device.limits().max_storage_buffer_binding_size {
+            self.oversized.get_or_insert((label.to_string(), bytes.len()));
+        }
         let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
             contents: bytes,
@@ -1013,7 +1029,7 @@ impl Gpu {
         use yaxus_model::ggml::GgmlType;
         let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
         if (quant == Quant::Auto || (quant == Quant::Auto4 && low_bit))
-            && let Some(w) = self.load_gguf_matrix(t, n, k)
+            && let Some(w) = self.load_gguf_matrix(t, n, k)?
         {
             return Ok(w);
         }
@@ -1056,8 +1072,10 @@ impl Gpu {
         };
         let k = metas.iter().map(|_| mk("k")).collect();
         let v = metas.iter().map(|_| mk("v")).collect();
-        let sliding = metas.iter().find(|m| !m.full_attn).context("no sliding layer")?;
-        let full = metas.iter().find(|m| m.full_attn).unwrap_or(sliding);
+        // A model may have only one kind of layer: the other table is then unused.
+        let any = metas.first().context("a model without layers")?;
+        let sliding = metas.iter().find(|m| !m.full_attn).unwrap_or(any);
+        let full = metas.iter().find(|m| m.full_attn).unwrap_or(any);
         let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kv-page-scratch"),
             size: (PAGE * kv_dim * 4) as u64,
@@ -1323,7 +1341,7 @@ impl Gpu {
             // Split the keys into chunks while there are few workgroups (short passes
             // over long contexts), merging the chunks with `attn_combine`.
             let wgs = self.pass_tiles * hq;
-            let target: usize = std::env::var("YAXUS_TILE_WGS").ok().and_then(|v| v.parse().ok()).unwrap_or(384);
+            let target = self.tile_wgs;
             // Keys a tile can span: its first row's window up to its last row.
             let span = match layer.window {
                 Some(w) => (self.pass_max_pos + 1).min(w + ATTN_TILE_ROWS - 1),
@@ -1627,7 +1645,7 @@ impl Gpu {
 impl Gpu {
     /// Greedy token and its softmax probability for every row (two-stage reduction).
     fn argmax_prob_rows(&mut self, logits: &Tensor) -> Vec<(u32, f32)> {
-        assert!(logits.rows <= 64, "argmax_rows supports up to 64 rows");
+        assert!(logits.rows <= ARGMAX_ROWS, "argmax_rows supports up to {ARGMAX_ROWS} rows (a pass)");
         let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
         let slice = logits.cols.div_ceil(ARGMAX_SLICES);
         self.dispatch(
@@ -1639,11 +1657,35 @@ impl Gpu {
         self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
         let b = self.read(&out, 0, logits.rows as u64 * 8);
         let v: &[u32] = bytemuck::cast_slice(&b);
-        v.as_chunks::<2>().0.iter().map(|&[i, x]| (i, f32::from_bits(x))).collect()
+        // A row of only -inf or NaN keeps the kernel's "none" index; the CPU picks the
+        // first element then, and an id beyond the vocabulary must not escape.
+        let cols = logits.cols as u32;
+        v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
     }
 }
 
 impl Gpu {
+    /// Runs `f` with the device's out-of-memory and validation errors captured, so that
+    /// a weight or KV arena that does not fit comes back as `Err` instead of panicking
+    /// in wgpu's default error handler.
+    fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let invalid = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let r = f(self);
+        let invalid = pollster::block_on(invalid.pop());
+        let oom = pollster::block_on(oom.pop());
+        if let Some(e) = oom.or(invalid) {
+            anyhow::bail!("{what}: {e}");
+        }
+        if let Some((label, bytes)) = self.oversized.take() {
+            anyhow::bail!(
+                "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",
+                self.device.limits().max_storage_buffer_binding_size
+            );
+        }
+        r
+    }
+
     fn load_matrix(&mut self, bf16: &[u16], n: usize, k: usize, quant: Quant) -> Result<Weight> {
         anyhow::ensure!(k.is_multiple_of(32), "K={k} must be a multiple of 32");
         Ok(match quant {
@@ -1655,8 +1697,21 @@ impl Gpu {
 
     /// A GGUF matrix in a layout the kernels read directly, without changing its values
     /// (up to f16 rounding of Q6_K's combined scales); `None` for other types.
-    fn load_gguf_matrix(&mut self, t: &TensorRef, n: usize, k: usize) -> Option<Weight> {
-        self.load_ggml(t.dtype, t.bytes(), n, k)
+    fn load_gguf_matrix(&mut self, t: &TensorRef, n: usize, k: usize) -> Result<Option<Weight>> {
+        use yaxus_model::ggml::GgmlType;
+        // The repacked layouts and the kernels take whole blocks per row: a file with
+        // rows that straddle blocks would load without complaint and compute garbage.
+        let row_block = match t.dtype {
+            GgmlType::Q8_0 | GgmlType::Q4_0 => 32,
+            GgmlType::Q2K | GgmlType::Q3K | GgmlType::Q4K | GgmlType::Q6K => 256,
+            _ => return Ok(None),
+        };
+        anyhow::ensure!(
+            k.is_multiple_of(row_block),
+            "{:?} matrix [{n}, {k}]: rows must be a multiple of {row_block} values",
+            t.dtype
+        );
+        Ok(self.load_ggml(t.dtype, t.bytes(), n, k))
     }
 
     fn load_ggml(&mut self, dtype: yaxus_model::ggml::GgmlType, b: &[u8], n: usize, k: usize) -> Option<Weight> {
@@ -1760,6 +1815,13 @@ impl Gpu {
         let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
         self.to_host(&y)
     }
+
+    #[doc(hidden)]
+    pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
+        let x = self.tensor(rows, logits.len() / rows);
+        self.queue.write_buffer(x.buf(), 0, bytemuck::cast_slice(logits));
+        self.argmax_rows(&x)
+    }
 }
 
 /// A handle to a shared [`Gpu`] context. Every model loaded through a handle shares the
@@ -1812,7 +1874,7 @@ impl WgpuBackend {
         self.gemv = gemv;
     }
 
-    /// For tests: the attention of passes with more than 8 rows uses the tiled kernel,
+    /// For tests: the attention of passes with more than 16 rows uses the tiled kernel,
     /// splitting keys until about `target_wgs` workgroups run (default 384), or the
     /// per-row kernel when `target_wgs` is 0.
     pub fn set_tiled_attention(&self, target_wgs: usize) {
@@ -1874,6 +1936,11 @@ impl WgpuBackend {
         g.debug_matmul(x, t, w, n, k, quant, glu)
     }
 
+    #[doc(hidden)]
+    pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
+        self.g().debug_argmax(logits, rows)
+    }
+
     fn track(&mut self, before: usize) {
         let after = self.g().weight_bytes;
         self.weight_bytes += after - before;
@@ -1893,7 +1960,7 @@ impl Backend for WgpuBackend {
     }
     fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
         let before = self.g().weight_bytes;
-        let w = self.g().load_weight(t, quant);
+        let w = self.g().checked("loading a weight", |g| g.load_weight(t, quant));
         self.track(before);
         let format = match &w {
             Ok(Weight::Q8 { .. }) => Some("q8"),
@@ -1913,7 +1980,7 @@ impl Backend for WgpuBackend {
     }
     fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
         let before = self.g().weight_bytes;
-        let w = self.g().load_embedding(t);
+        let w = self.g().checked("loading the embedding table", |g| g.load_embedding(t));
         self.track(before);
         w
     }
@@ -1921,7 +1988,7 @@ impl Backend for WgpuBackend {
         self.g().reserve_activations(cfg, rows)
     }
     fn new_kv(&mut self, cfg: &Config, metas: &[LayerMeta], pages: usize, max_pos: usize) -> Result<Kv> {
-        self.g().new_kv(cfg, metas, pages, max_pos)
+        self.g().checked("allocating the KV cache", |g| g.new_kv(cfg, metas, pages, max_pos))
     }
     fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
         self.g().copy_page(kv, src, dst)
