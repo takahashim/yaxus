@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_backend_wgpu::WgpuBackend;
-use yaxus_model::{Engine, Generator, Model, Quant};
+use yaxus_backend_wgpu::{GemmKind, Gemv, WgpuBackend};
+use yaxus_model::{Backend, Engine, EngineConfig, Generator, Model, Quant};
 use yaxus_tokenizer::Tokenizer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,18 @@ pub enum Prefill {
     F32,
 }
 
+impl Prefill {
+    /// The GPU kernels for it.
+    fn gemm_kind(self) -> GemmKind {
+        match self {
+            Prefill::Int16 => GemmKind::Int16,
+            Prefill::Int8 => GemmKind::Int8,
+            Prefill::F16 => GemmKind::Coop,
+            Prefill::F32 => GemmKind::F32,
+        }
+    }
+}
+
 impl std::str::FromStr for Prefill {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
@@ -83,6 +95,13 @@ pub enum Decode {
     F32,
 }
 
+/// Which model of a speculative pair a backend serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Target,
+    Draft,
+}
+
 impl Decode {
     /// Requests one decode pass advances by default: 16 with `Int16`, where extra rows are
     /// cheap, 8 with `F32`, where 8 rows is the cheapest per row.
@@ -90,6 +109,17 @@ impl Decode {
         match self {
             Decode::Int16 => 16,
             Decode::F32 => 8,
+        }
+    }
+
+    /// The GPU kernels for it, for the target or the draft model.
+    fn gemv(self, role: Role) -> Gemv {
+        match (self, role) {
+            (Decode::Int16, Role::Target) => Gemv::INT16,
+            // The draft only proposes tokens: its single rows take the f32 kernel, a
+            // little faster for the Q2_K draft (19-sentence set: 74.4 vs 74.0 tok/s).
+            (Decode::Int16, Role::Draft) => Gemv { planes: Some(2), single_f32: true },
+            (Decode::F32, _) => Gemv::F32,
         }
     }
 }
@@ -105,6 +135,25 @@ impl std::str::FromStr for Decode {
     }
 }
 
+/// How the engine takes requests. The rest of its configuration follows from the
+/// other [`LoadOptions`] or keeps the engine's defaults.
+#[derive(Debug, Clone)]
+pub struct Scheduling {
+    /// Requests decoding or prefilling at once (the rest wait).
+    pub max_streams: usize,
+    /// Most requests one decode pass advances; `None`: [`Decode::default_rows`].
+    pub decode_rows: Option<usize>,
+    /// Finished requests kept in the response cache (0: none).
+    pub response_cache: usize,
+}
+
+impl Default for Scheduling {
+    fn default() -> Self {
+        let e = EngineConfig::default();
+        Scheduling { max_streams: e.max_streams, decode_rows: None, response_cache: e.response_cache }
+    }
+}
+
 /// How to load and run the model.
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -114,15 +163,11 @@ pub struct LoadOptions {
     /// Arithmetic of the GPU prompt processing.
     pub prefill: Prefill,
     pub decode: Decode,
-    /// Most requests one decode pass advances; `None`: [`Decode::default_rows`].
-    pub decode_rows: Option<usize>,
     /// Reuse the KV of finished requests for prompts sharing a prefix.
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
     pub kv_tokens: usize,
-    /// Scheduling. Its `draft_k` is taken from `draft` and its `decode_rows` from
-    /// `decode_rows`.
-    pub engine: yaxus_model::EngineConfig,
+    pub scheduling: Scheduling,
 }
 
 impl Default for LoadOptions {
@@ -133,18 +178,28 @@ impl Default for LoadOptions {
             draft: None,
             prefill: Prefill::default(),
             decode: Decode::default(),
-            decode_rows: None,
             prefix_cache: true,
             kv_tokens: yaxus_model::DEFAULT_KV_TOKENS,
-            engine: yaxus_model::EngineConfig::default(),
+            scheduling: Scheduling::default(),
         }
     }
 }
 
-fn prepare<B: yaxus_model::Backend>(mut m: Model<B>, o: &LoadOptions) -> Result<Model<B>> {
-    m.prefix_cache = o.prefix_cache;
-    m.init_kv(o.kv_tokens, yaxus_model::DEFAULT_MAX_POS)?;
-    Ok(m)
+impl LoadOptions {
+    /// The engine's configuration, with or without the draft model.
+    fn engine_config(&self, draft: Option<&DraftOptions>) -> EngineConfig {
+        let s = &self.scheduling;
+        let mut cfg = EngineConfig {
+            max_streams: s.max_streams,
+            decode_rows: s.decode_rows.unwrap_or(self.decode.default_rows()),
+            response_cache: s.response_cache,
+            ..EngineConfig::default()
+        };
+        if let Some(d) = draft {
+            cfg.draft_k = d.k;
+        }
+        cfg
+    }
 }
 
 /// How the weights of `model` are stored, for display: the quantization, or for a GGUF
@@ -184,7 +239,31 @@ pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
 
 /// Loads the model (and optional draft model) on the requested backend.
 pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>> {
-    let gpu = match o.backend {
+    match gpu(o.backend)? {
+        Some(mut gpu) => {
+            // One device for the target and the draft model, with their own kernels.
+            gpu.set_gemm(o.prefill.gemm_kind());
+            let mut draft_gpu = gpu.share();
+            gpu.set_gemv(o.decode.gemv(Role::Target));
+            draft_gpu.set_gemv(o.decode.gemv(Role::Draft));
+            let draft = o.draft.as_ref().map(|d| (d, draft_gpu));
+            load_engine(dir, o, gpu, draft, |b: &WgpuBackend| b.precompile())
+        }
+        None => {
+            if o.draft.is_some() {
+                // The CPU matmul gains nothing from verifying several rows at once, so
+                // drafting only adds work (measured 18.5 -> 14.6 tok/s on the 2B).
+                tracing::info!("speculative decoding is disabled on the CPU backend (it is slower there)");
+            }
+            yaxus_backend_cpu::init_threads();
+            load_engine(dir, o, CpuBackend::new(), None, |_: &CpuBackend| {})
+        }
+    }
+}
+
+/// The GPU backend `kind` asks for; `None` for the CPU.
+fn gpu(kind: BackendKind) -> Result<Option<WgpuBackend>> {
+    Ok(match kind {
         BackendKind::Cpu => None,
         BackendKind::Vulkan => Some(WgpuBackend::new()?),
         BackendKind::Auto => match WgpuBackend::new() {
@@ -194,59 +273,34 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
                 None
             }
         },
+    })
+}
+
+/// The target model at `dir` on `target`, and the draft model on its own backend, in
+/// one engine. `warm` runs on each backend once its model is loaded.
+fn load_engine<B>(
+    dir: &Path,
+    o: &LoadOptions,
+    target: B,
+    draft: Option<(&DraftOptions, B)>,
+    warm: impl Fn(&B),
+) -> Result<Box<dyn Generator>>
+where
+    B: Backend + Send + 'static,
+    B::Weight: Send,
+    B::Kv: Send,
+{
+    let load = |dir: &Path, backend: B, quant: Quant| -> Result<Model<B>> {
+        let mut m = Model::load(dir, backend, quant)?;
+        m.prefix_cache = o.prefix_cache;
+        m.init_kv(o.kv_tokens, yaxus_model::DEFAULT_MAX_POS)?;
+        warm(&m.backend);
+        Ok(m)
     };
-    let draft = if gpu.is_none() && o.draft.is_some() {
-        // The CPU matmul gains nothing from verifying several rows at once, so drafting
-        // only adds work (measured 18.5 -> 14.6 tok/s on the 2B).
-        tracing::info!("speculative decoding is disabled on the CPU backend (it is slower there)");
-        None
-    } else {
-        o.draft.as_ref()
-    };
-    let mut cfg = o.engine.clone();
-    cfg.decode_rows = o.decode_rows.unwrap_or(o.decode.default_rows());
-    if let Some(d) = draft {
-        cfg.draft_k = d.k;
-    }
-    let Some(mut gpu) = gpu else {
-        yaxus_backend_cpu::init_threads();
-        let target = prepare(Model::load(dir, CpuBackend::new(), o.quant)?, o)?;
-        let draft = match draft {
-            Some(d) => Some(prepare(Model::load(&d.dir, CpuBackend::new(), d.quant)?, o)?),
-            None => None,
-        };
-        return Ok(Box::new(Engine::new(target, draft, cfg)?));
-    };
-    // One device for the target and the draft model.
-    use yaxus_backend_wgpu::GemmKind;
-    gpu.set_gemm(match o.prefill {
-        Prefill::Int16 => GemmKind::Int16,
-        Prefill::Int8 => GemmKind::Int8,
-        Prefill::F16 => GemmKind::Coop,
-        Prefill::F32 => GemmKind::F32,
-    });
-    use yaxus_backend_wgpu::Gemv;
-    let mut draft_gpu = gpu.share();
-    match o.decode {
-        Decode::Int16 => {
-            gpu.set_gemv(Gemv::INT16);
-            // The draft only proposes tokens: its single rows take the f32 kernel, a
-            // little faster for the Q2_K draft (19-sentence set: 74.4 vs 74.0 tok/s).
-            draft_gpu.set_gemv(Gemv { planes: Some(2), single_f32: true });
-        }
-        Decode::F32 => {
-            gpu.set_gemv(Gemv::F32);
-            draft_gpu.set_gemv(Gemv::F32);
-        }
-    }
-    let target = prepare(Model::load(dir, gpu, o.quant)?, o)?;
-    target.backend.precompile();
+    let cfg = o.engine_config(draft.as_ref().map(|(d, _)| *d));
+    let target = load(dir, target, o.quant)?;
     let draft = match draft {
-        Some(d) => {
-            let m = prepare(Model::load(&d.dir, draft_gpu, d.quant)?, o)?;
-            m.backend.precompile();
-            Some(m)
-        }
+        Some((d, backend)) => Some(load(&d.dir, backend, d.quant)?),
         None => None,
     };
     Ok(Box::new(Engine::new(target, draft, cfg)?))

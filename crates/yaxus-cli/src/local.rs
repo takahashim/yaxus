@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Args;
 use yaxus_model::Quant;
-use yaxus_runtime::{BackendKind, load_tokenizer, quant_label, run_request};
+use yaxus_runtime::{BackendKind, ResolvedModel, Scheduling, load_tokenizer, quant_label, run_request};
 use yaxus_tokenizer::{EOS_ID, TAG_ID};
 
 use crate::LangArgs;
@@ -80,8 +80,7 @@ impl ModelArgs {
         }))
     }
 
-    /// Returns (directory, display name).
-    fn resolve(&self) -> Result<(PathBuf, String)> {
+    fn resolve(&self) -> Result<ResolvedModel> {
         yaxus_runtime::resolve_model(&self.model)
     }
 
@@ -92,17 +91,16 @@ impl ModelArgs {
             draft: self.draft_options(target)?,
             prefill: self.prefill_precision,
             decode: self.decode_precision,
-            decode_rows: self.decode_rows,
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
-            engine: yaxus_model::EngineConfig {
+            scheduling: Scheduling {
                 max_streams: self.max_streams,
+                decode_rows: self.decode_rows,
                 response_cache: if self.no_kv_cache || self.no_response_cache {
                     0
                 } else {
-                    yaxus_model::EngineConfig::default().response_cache
+                    Scheduling::default().response_cache
                 },
-                ..Default::default()
             },
         })
     }
@@ -157,7 +155,7 @@ fn init_logging(level: &str) {
 #[cfg(feature = "server")]
 pub fn serve(a: ServeArgs) -> Result<()> {
     init_logging("info");
-    let (model_dir, model_name) = a.model.resolve()?;
+    let ResolvedModel { path: model_dir, name: model_name } = a.model.resolve()?;
     yaxus_server::serve(yaxus_server::ServeOptions {
         load: a.model.load_options(&model_dir)?,
         model_dir,
@@ -178,7 +176,7 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     // Warnings only (a GPU that cannot be used, drafting turned off), not the output.
     init_logging("warn");
     let req = lang.document(true)?;
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let t0 = Instant::now();
     let mut model = m.load(&dir)?;
@@ -192,7 +190,7 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
         );
     }
     let n = req.segments.len();
-    let mut job = DocJob::from_request(req);
+    let mut job = DocJob::from_request(req, usize::MAX);
     let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
     let t1 = Instant::now();
     let mut first: Option<Duration> = None;
@@ -358,7 +356,7 @@ pub fn bench(a: BenchArgs) -> Result<()> {
 fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
     // Each prompt is a prefix of the next one: the prefix cache would hide the work.
     m.no_kv_cache = true;
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
@@ -380,7 +378,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
 
 fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
     m.no_kv_cache = true;
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
@@ -416,7 +414,7 @@ fn escape_line(s: &str) -> String {
 
 fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Option<PathBuf>) -> Result<()> {
     m.no_response_cache = true;
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
@@ -470,7 +468,7 @@ fn bench_streams(
 ) -> Result<()> {
     // The same prompts run for every N.
     m.no_response_cache = true;
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
@@ -608,7 +606,7 @@ fn bench_doc(
 ) -> Result<()> {
     use yaxus_runtime::document::{DocEvent, DocJob, DocOptions, run_document};
     use yaxus_runtime::memory::{DEFAULT_ENTRIES, Memory};
-    let (dir, name) = m.resolve()?;
+    let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let paras: Vec<String> = match &file {
         Some(f) => yaxus_api::split_paragraphs(&std::fs::read_to_string(f)?),
@@ -622,23 +620,13 @@ fn bench_doc(
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
     let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
-    let opts = DocOptions {
-        target_lang: to.clone(),
-        source_lang: None,
-        form: None,
-        context: None,
-        glossary: vec![],
-        history_chars,
-        chains,
-        neighbor_context,
-        max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS,
-    };
+    let opts = DocOptions { history_chars, chains, neighbor_context, ..DocOptions::new(&to) };
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
         let mut job = DocJob::new(paras, opts.clone());
         println!(
             "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
-            job.segments.len(),
+            job.len(),
             job.chains(),
             if neighbor_context { ", neighbours as context" } else { "" }
         );
@@ -676,7 +664,7 @@ fn bench_doc(
         job = run(paras, &mut memory)?;
     }
     if let Some(p) = save {
-        let lines: Vec<String> = job.outputs.iter().map(|o| escape_line(o.as_deref().unwrap_or(""))).collect();
+        let lines: Vec<String> = job.outputs().iter().map(|o| escape_line(o.as_deref().unwrap_or(""))).collect();
         std::fs::write(&p, lines.join("\n") + "\n")?;
         println!("saved to {}", p.display());
     }

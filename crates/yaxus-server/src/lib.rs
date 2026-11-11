@@ -25,9 +25,7 @@ use yaxus_api::{
     DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, ErrorResponse, Health, LANGUAGES,
     Language, StreamEvent, TranslateRequest, TranslateResponse,
 };
-use yaxus_runtime::{
-    LoadOptions, document, load_generator, load_tokenizer, memory, non_empty, prompt_request, quant_label,
-};
+use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, prompt_request, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
 pub use tls::default_sans;
@@ -118,8 +116,8 @@ async fn languages() -> Json<Vec<Language>> {
 }
 
 /// `source->target` for the log line.
-fn label(source_lang: &Option<String>, target_lang: &str) -> String {
-    format!("{}->{}", non_empty(source_lang).unwrap_or("auto"), target_lang)
+fn label(source_lang: Option<&str>, target_lang: &str) -> String {
+    format!("{}->{}", source_lang.unwrap_or("auto"), target_lang)
 }
 
 fn sse_json(ev: &StreamEvent) -> Result<SseEvent, Infallible> {
@@ -134,26 +132,24 @@ async fn translate(
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let pr = prompt_request(&req);
-    let prompt = match pr.to_prompt() {
+    let prompt = match Prompt::new(&st.tok, &prompt_request(&req)) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.0),
     };
-    let ids = st.tok.encode(&prompt, false);
-    if ids.len() >= st.max_context {
+    if prompt.len() >= st.max_context {
         return error(
             StatusCode::BAD_REQUEST,
-            format!("prompt is {} tokens; the limit is {}", ids.len(), st.max_context),
+            format!("prompt is {} tokens; the limit is {}", prompt.len(), st.max_context),
         );
     }
-    let max_new = req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context - ids.len());
+    let max_new = req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context - prompt.len());
 
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job {
-        work: Work::Single { prompt_ids: ids, max_new_tokens: max_new, memo: memory::key(&pr) },
+        work: Work::Single { prompt, max_new_tokens: max_new },
         enqueued: Instant::now(),
         events: tx,
-        label: label(&req.source_lang, &req.target_lang),
+        label: label(req.requested_source_lang(), &req.target_lang),
     };
     if let Err(r) = enqueue(&st, job) {
         return r;
@@ -237,9 +233,8 @@ async fn translate_document(
             return error(StatusCode::BAD_REQUEST, format!("segment {i}: {}", e.0));
         }
     }
-    let (n, stream, label) = (req.segments.len(), req.stream, label(&req.source_lang, &req.target_lang));
-    let mut doc = document::DocJob::from_request(req);
-    doc.opts.max_new_tokens = doc.opts.max_new_tokens.clamp(1, st.max_context / 2);
+    let (n, stream, label) = (req.segments.len(), req.stream, label(req.requested_source_lang(), &req.target_lang));
+    let doc = document::DocJob::from_request(req, st.max_context / 2);
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
     if let Err(r) = enqueue(&st, job) {

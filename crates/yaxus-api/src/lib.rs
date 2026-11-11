@@ -27,6 +27,24 @@ pub struct TranslateRequest {
     pub stream: bool,
 }
 
+/// An optional language or form field as the request means it: an empty string (as a
+/// form sends for "not chosen") is the same as leaving the field out.
+fn given(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|s| !s.is_empty())
+}
+
+impl TranslateRequest {
+    /// The source language the request names, if any (`""` names none).
+    pub fn requested_source_lang(&self) -> Option<&str> {
+        given(&self.source_lang)
+    }
+
+    /// The form the request asks for, if any (`""` asks for none).
+    pub fn requested_form(&self) -> Option<&str> {
+        given(&self.form)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pair {
@@ -95,6 +113,18 @@ pub struct DocumentRequest {
     pub max_new_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
+}
+
+impl DocumentRequest {
+    /// See [`TranslateRequest::requested_source_lang`].
+    pub fn requested_source_lang(&self) -> Option<&str> {
+        given(&self.source_lang)
+    }
+
+    /// See [`TranslateRequest::requested_form`].
+    pub fn requested_form(&self) -> Option<&str> {
+        given(&self.form)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -274,6 +304,16 @@ pub fn split_paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_language_and_form_mean_unset() {
+        let mut r =
+            TranslateRequest { source_lang: Some(String::new()), form: Some("polite".into()), ..Default::default() };
+        assert_eq!((r.requested_source_lang(), r.requested_form()), (None, Some("polite")));
+        r.source_lang = Some("en".into());
+        r.form = None;
+        assert_eq!((r.requested_source_lang(), r.requested_form()), (Some("en"), None));
+    }
 
     #[test]
     fn languages_match_model_card() {

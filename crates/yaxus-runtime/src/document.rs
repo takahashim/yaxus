@@ -2,15 +2,14 @@
 //! chain they are translated in order, each with the earlier ones of the chain as history
 //! (see [`HistoryWindow`]); the chains run in parallel on the engine.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
-use yaxus_model::{Event, Finish, Generator, ReqId, Request};
-use yaxus_tokenizer::{EOS_ID, GlossaryEntry, StreamDecoder, TAG_ID, Tokenizer, TranslationPair, TranslationRequest};
+use yaxus_model::Generator;
+use yaxus_tokenizer::{GlossaryEntry, Tokenizer, TranslationPair, TranslationRequest};
 
-use crate::memory::{self, Memory};
-use crate::request::non_empty;
+use crate::memory::Memory;
+use crate::prompt::Prompt;
+use crate::session::{Session, Update};
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
 pub fn auto_chains(segments: usize) -> usize {
@@ -33,6 +32,23 @@ pub struct DocOptions {
     pub max_new_tokens: usize,
 }
 
+impl DocOptions {
+    /// Options for a translation into `target_lang`, with the API defaults otherwise.
+    pub fn new(target_lang: impl Into<String>) -> Self {
+        DocOptions {
+            target_lang: target_lang.into(),
+            source_lang: None,
+            form: None,
+            context: None,
+            glossary: Vec::new(),
+            history_chars: yaxus_api::DEFAULT_HISTORY_CHARS,
+            chains: 0,
+            neighbor_context: false,
+            max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS,
+        }
+    }
+}
+
 struct Chain {
     /// Segment indices of the chain, in order.
     segs: Vec<usize>,
@@ -42,9 +58,9 @@ struct Chain {
 
 /// The state of one document.
 pub struct DocJob {
-    pub segments: Vec<String>,
-    pub opts: DocOptions,
-    pub outputs: Vec<Option<String>>,
+    segments: Vec<String>,
+    opts: DocOptions,
+    outputs: Vec<Option<String>>,
     /// Segments submitted and not finished yet.
     in_flight: Vec<bool>,
     chains: Vec<Chain>,
@@ -53,18 +69,22 @@ pub struct DocJob {
 }
 
 impl DocJob {
-    /// The job of a document request, with the API defaults for what it leaves out.
-    pub fn from_request(r: DocumentRequest) -> Self {
+    /// The job of a document request, with the API defaults for what it leaves out and
+    /// at most `max_new_tokens_limit` new tokens per segment.
+    pub fn from_request(r: DocumentRequest, max_new_tokens_limit: usize) -> Self {
         let opts = DocOptions {
-            source_lang: non_empty(&r.source_lang).map(String::from),
-            form: non_empty(&r.form).map(String::from),
-            target_lang: r.target_lang,
-            context: r.context,
-            glossary: r.glossary,
+            source_lang: r.requested_source_lang().map(String::from),
+            form: r.requested_form().map(String::from),
             history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
             chains: r.chains.unwrap_or(0),
             neighbor_context: r.neighbor_context,
-            max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS),
+            max_new_tokens: r
+                .max_new_tokens
+                .unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS)
+                .clamp(1, max_new_tokens_limit),
+            target_lang: r.target_lang,
+            context: r.context,
+            glossary: r.glossary,
         };
         DocJob::new(r.segments, opts)
     }
@@ -90,6 +110,25 @@ impl DocJob {
 
     pub fn chains(&self) -> usize {
         self.chains.len()
+    }
+
+    /// Number of segments.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// New tokens allowed per segment.
+    pub fn max_new_tokens(&self) -> usize {
+        self.opts.max_new_tokens
+    }
+
+    /// The translation of each segment, once it is done.
+    pub fn outputs(&self) -> &[Option<String>] {
+        &self.outputs
     }
 
     pub fn is_done(&self) -> bool {
@@ -197,75 +236,39 @@ pub fn run_document(
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent),
 ) -> Result<()> {
-    struct Live {
-        seg: usize,
-        dec: StreamDecoder,
-        text: String,
-        tokens: Vec<u32>,
-        prompt_tokens: usize,
-        memo: u64,
-    }
-    let mut live: HashMap<ReqId, Live> = HashMap::new();
-    let submit = |engine: &mut dyn Generator,
-                  job: &mut DocJob,
-                  live: &mut HashMap<ReqId, Live>,
-                  memory: &Memory|
-     -> Result<()> {
-        for (seg, req) in job.ready() {
-            let ids = tok.encode(&req.to_prompt()?, false);
-            let id = engine.fresh_id();
-            let memo = memory::key(&req);
-            let prompt_tokens = ids.len();
-            live.insert(
-                id,
-                Live { seg, dec: StreamDecoder::new(), text: String::new(), tokens: Vec::new(), prompt_tokens, memo },
-            );
-            let mut r = Request::new(id, ids, job.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
-            r.hint = memory.get(memo);
-            engine.submit(r);
+    let mut session = Session::new(engine, tok, memory);
+    let submit = |session: &mut Session<usize>, job: &mut DocJob| -> Result<()> {
+        for (segment, req) in job.ready() {
+            session.submit(Prompt::new(tok, &req)?, job.max_new_tokens(), segment);
         }
         Ok(())
     };
-    submit(engine, job, &mut live, memory)?;
+    submit(&mut session, job)?;
     while !job.is_done() {
-        let mut finished = Vec::new();
-        let mut error = None;
-        let worked = engine.step(&mut |ev| {
-            match ev {
-                Event::Token { id, token } => {
-                    if let Some(l) = live.get_mut(&id) {
-                        l.tokens.push(token);
-                        let start = l.text.len();
-                        l.dec.push_into(tok, token, &mut l.text);
-                        if l.text.len() > start {
-                            on(DocEvent::Delta { segment: l.seg, text: &l.text[start..] });
-                        }
-                    }
-                }
-                Event::Done { id, generated, start, finish } => finished.push((id, generated, start.reused, finish)),
-                Event::Error { message, .. } => error = Some(message),
+        let (mut finished, mut failed) = (Vec::new(), None);
+        let worked = session.step(&mut |u| {
+            match u {
+                Update::Delta { tag, text } if !text.is_empty() => on(DocEvent::Delta { segment: *tag, text }),
+                Update::Delta { .. } => {}
+                Update::Done { tag, done } => finished.push((tag, done)),
+                Update::Failed { tag, message } => failed = Some(format!("segment {tag}: {message}")),
             }
             true
         })?;
-        if let Some(e) = error {
+        if let Some(e) = failed {
             anyhow::bail!(e);
         }
-        for (id, generated, reused, finish) in finished {
-            if let Some(mut l) = live.remove(&id) {
-                if finish == Finish::Stop {
-                    memory.put(l.memo, std::mem::take(&mut l.tokens));
-                }
-                let tail = l.dec.finish();
-                if !tail.is_empty() {
-                    on(DocEvent::Delta { segment: l.seg, text: &tail });
-                    l.text += &tail;
-                }
-                on(DocEvent::SegmentDone { segment: l.seg, prompt_tokens: l.prompt_tokens, reused, generated });
-                job.finished(l.seg, l.text);
-            }
+        for (segment, done) in finished {
+            on(DocEvent::SegmentDone {
+                segment,
+                prompt_tokens: done.prompt_tokens,
+                reused: done.start.reused,
+                generated: done.generated,
+            });
+            job.finished(segment, done.text);
         }
-        submit(engine, job, &mut live, memory)?;
-        anyhow::ensure!(worked || job.is_done() || !live.is_empty(), "engine idle with segments left");
+        submit(&mut session, job)?;
+        anyhow::ensure!(worked || job.is_done() || !session.is_idle(), "engine idle with segments left");
     }
     Ok(())
 }
@@ -275,17 +278,22 @@ mod tests {
     use super::*;
 
     fn opts(chains: usize, history_chars: usize) -> DocOptions {
-        DocOptions {
+        DocOptions { history_chars, chains, ..DocOptions::new("en") }
+    }
+
+    #[test]
+    fn requests_take_api_defaults_and_the_limit() {
+        let r = DocumentRequest {
+            segments: vec!["a".into()],
             target_lang: "en".into(),
-            source_lang: None,
-            form: None,
-            context: None,
-            glossary: vec![],
-            history_chars,
-            chains,
-            neighbor_context: false,
-            max_new_tokens: 64,
-        }
+            source_lang: Some(String::new()),
+            max_new_tokens: Some(10_000),
+            ..Default::default()
+        };
+        let job = DocJob::from_request(r, 256);
+        assert_eq!(job.opts.source_lang, None);
+        assert_eq!(job.max_new_tokens(), 256);
+        assert_eq!(job.opts.history_chars, yaxus_api::DEFAULT_HISTORY_CHARS);
     }
 
     #[test]
@@ -313,7 +321,7 @@ mod tests {
         let next = job.ready();
         assert_eq!(next[0].0, 2);
         assert_eq!(next[0].1.history.len(), 1);
-        assert_eq!(job.outputs[1].as_deref(), Some(""));
+        assert_eq!(job.outputs()[1].as_deref(), Some(""));
         assert!(next[0].1.to_prompt().is_ok());
     }
 
