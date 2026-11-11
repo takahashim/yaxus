@@ -41,11 +41,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # Pin both to the revisions tests/golden/logits_0_8b.jsonl was generated with.
+  # The revisions tests/golden/logits_0_8b.jsonl was generated with (HF transformers
+  # 5.22.2, torch 2.15.0, float32 on the CPU). Regenerate it when moving these.
   MODEL_REPO: pfnet/plamo-3-translate-0.8b
-  MODEL_REV: main
+  MODEL_REV: 8b4d42855622093e610ba9b90c2d2b59f8d5c15d
   GGUF_REPO: pfnet/plamo-3-translate-0.8b-GGUF
-  GGUF_REV: main
+  GGUF_REV: 1cf96ae02133958a20074bfdfab76517bb737d00
   # Q4_K_M also holds Q6_K tensors; Q2_K (with Q3_K) is what `--draft auto` prefers.
   GGUF_FILES: "*Q4_K_M.gguf *Q2_K.gguf"
   # Only needed if the repositories become gated; empty otherwise.
