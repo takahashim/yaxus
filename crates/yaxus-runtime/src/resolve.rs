@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use yaxus_model::Quant;
 
 /// A model found on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +170,19 @@ fn shape(path: &Path) -> Option<(usize, usize)> {
         yaxus_model::Config::from_file(path.join("config.json")).ok()?
     };
     Some((cfg.hidden_size, cfg.num_hidden_layers))
+}
+
+/// How the weights of `model` are stored, for display: the quantization, or for a GGUF
+/// file loaded with `auto` its main tensor type (`gguf Q4_K`).
+pub fn quant_label(model: &Path, quant: Quant) -> String {
+    if matches!(quant, Quant::Auto | Quant::Auto4) {
+        if yaxus_model::gguf::is_gguf(model) {
+            let main = yaxus_model::gguf::Gguf::open(model).ok().and_then(|g| g.main_type());
+            return format!("gguf {}", main.map_or("?", |t| t.name()));
+        }
+        return if quant == Quant::Auto { "q8" } else { "q4" }.into();
+    }
+    format!("{quant:?}").to_lowercase()
 }
 
 #[cfg(test)]
