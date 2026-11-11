@@ -72,6 +72,7 @@ pub struct ModelArgs {
 impl ModelArgs {
     fn draft_options(&self) -> Result<Option<yaxus_server::DraftOptions>> {
         const AUTO_DRAFT: &str = "pfnet/plamo-3-translate-0.8b";
+        let auto = self.draft == "auto";
         let dir = match self.draft.as_str() {
             "none" => return Ok(None),
             // The 2-bit GGUF first: its steps are 1.27x faster than the checkpoint's at 4 bits
@@ -89,6 +90,11 @@ impl ModelArgs {
         let same = |a: &Path, b: &Path| a.canonicalize().ok() == b.canonicalize().ok();
         if same(&dir, &target) {
             return Ok(None); // the target is the draft model itself
+        }
+        // `auto` drafts with a 0.8B model: pointless (only slower) for a 0.8B target,
+        // whichever of its files that is.
+        if auto && model_shape(&dir).is_some_and(|s| Some(s) == model_shape(&target)) {
+            return Ok(None);
         }
         Ok(Some(yaxus_server::DraftOptions { dir, k: self.draft_k, quant: self.draft_quant }))
     }
@@ -128,6 +134,16 @@ impl ModelArgs {
     }
 }
 
+/// (hidden size, layers) of a model directory or GGUF file.
+fn model_shape(path: &Path) -> Option<(usize, usize)> {
+    let cfg = if yaxus_model::gguf::is_gguf(path) {
+        yaxus_model::gguf::Gguf::open(path).ok()?.config().ok()?
+    } else {
+        yaxus_model::Config::from_file(path.join("config.json")).ok()?
+    };
+    Some((cfg.hidden_size, cfg.num_hidden_layers))
+}
+
 /// Resolves a model directory or a Hugging Face repo id in the local cache.
 /// Returns (directory, display name).
 fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
@@ -153,11 +169,14 @@ fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
         };
         let dir = hf_snapshot(&repo)
             .with_context(|| format!("download it with `hf download {repo} --include '*{quant}.gguf'`"))?;
+        // The whole quant name, so that e.g. `K_M` does not pick `Q3_K_M`.
         let want = format!("{}.gguf", quant.to_ascii_lowercase());
+        let matches =
+            |n: &str| n == want || n.strip_suffix(want.as_str()).is_some_and(|stem| stem.ends_with(['-', '.']));
         let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)?
             .flatten()
             .map(|e| e.path())
-            .filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().ends_with(&want)))
+            .filter(|f| f.file_name().is_some_and(|n| matches(&n.to_string_lossy().to_ascii_lowercase())))
             .collect();
         found.sort();
         let file = found.into_iter().next().with_context(|| {
@@ -207,7 +226,15 @@ fn hf_snapshot(model: &str) -> Result<PathBuf> {
         .ok()
         .map(|r| repo.join("snapshots").join(r.trim()))
         .filter(|p| p.is_dir())
-        .or_else(|| std::fs::read_dir(repo.join("snapshots")).ok()?.flatten().map(|e| e.path()).next())
+        // Without refs/main, the most recently written snapshot (not read_dir order).
+        .or_else(|| {
+            std::fs::read_dir(repo.join("snapshots"))
+                .ok()?
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+                .map(|e| e.path())
+        })
         .with_context(|| {
             format!(
                 "{} is neither a directory nor a model in {}; download it with `hf download {}`",
@@ -539,6 +566,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
 }
 
 fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, runs: usize) -> Result<()> {
+    anyhow::ensure!(gen_tokens > 0, "--gen-tokens must be at least 1");
     m.no_kv_cache = true;
     let (dir, name) = m.resolve()?;
     let tok = yaxus_server::load_tokenizer(&dir)?;
@@ -594,6 +622,7 @@ fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Op
         outs.push(escape_line(&out));
         stats.push(st);
     }
+    anyhow::ensure!(!stats.is_empty(), "{} has no sentences", file.display());
     let generated_total: usize = stats.iter().map(|s| s.generated).sum();
     let dec: f64 = stats.iter().map(|s| s.decode.as_secs_f64()).sum();
     let gen_after_first: usize = stats.iter().map(|s| s.generated.saturating_sub(1)).sum();
@@ -641,6 +670,7 @@ fn bench_streams(
         let req = yaxus_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
         prompts.push(tok.encode(&to_prompt_request(&req).to_prompt()?, false));
     }
+    anyhow::ensure!(!prompts.is_empty(), "{} has no sentences", file.display());
     let reference: Option<Vec<String>> = match &compare {
         Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),
         None => None,
@@ -781,7 +811,6 @@ fn bench_doc(
     }
     let mut model = m.load(&dir)?;
     header(&name, &m, model.as_ref());
-    let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
     let opts = DocOptions {
         target_lang: to.clone(),
         source_lang: None,
@@ -795,6 +824,7 @@ fn bench_doc(
     };
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
+        let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
         let mut job = DocJob::new(paras, opts.clone());
         println!(
             "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
