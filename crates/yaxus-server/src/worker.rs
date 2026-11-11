@@ -308,7 +308,7 @@ fn log_single(label: &str, usage: &Usage, done: &Finished) {
 mod tests {
     use super::*;
     use yaxus_model::{Event as EngineEvent, ReqId, Request, StartInfo};
-    use yaxus_tokenizer::{TAG_ID, TranslationRequest};
+    use yaxus_pfml::TranslationRequest;
 
     /// An engine whose every pass panics.
     #[derive(Default)]
@@ -348,19 +348,7 @@ mod tests {
     }
 
     fn tokenizer() -> Tokenizer {
-        use yaxus_tokenizer::{BOS_ID, TokenKind};
-        let mut tokens: Vec<String> = (0..=TAG_ID)
-            .map(|id| match id {
-                BOS_ID => "<|plamo:bos|>".into(),
-                TAG_ID => "<|plamo:tag|>".into(),
-                _ => format!("<|plamo:c{id}|>"),
-            })
-            .collect();
-        let mut kinds = vec![TokenKind::Control; tokens.len()];
-        tokens.extend((0..=255u8).map(|b| format!("<0x{b:02X}>")));
-        kinds.extend([TokenKind::Byte; 256]);
-        let scores = vec![0.0; tokens.len()];
-        Tokenizer::from_vocab(tokens, kinds, scores).unwrap()
+        yaxus_tokenizer::testing::plamo_like(&[])
     }
 
     #[test]
@@ -370,7 +358,7 @@ mod tests {
         let (events, mut out) = mpsc::unbounded_channel();
         let req = TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let job = Job {
-            work: Work::Single { prompt: Prompt::new(&tok, &req).unwrap(), max_new_tokens: 4 },
+            work: Work::Single { prompt: Prompt::new(&tok, &req.validate().unwrap()), max_new_tokens: 4 },
             enqueued: Instant::now(),
             events,
             label: "test".into(),

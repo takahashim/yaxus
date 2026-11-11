@@ -10,9 +10,11 @@ anyhow.workspace = true
 tracing = "0.1"
 yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
+yaxus-pfml = { path = "../yaxus-pfml" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 yaxus-backend-wgpu = { path = "../yaxus-backend-wgpu" }
 
 [dev-dependencies]
+yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }
 serde_json.workspace = true

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use yaxus_tokenizer::{GlossaryEntry, Tokenizer, TranslationPair, TranslationRequest};
+use yaxus_tokenizer::Tokenizer;
 
 fn model_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {
@@ -44,29 +44,6 @@ fn ids(v: &Value) -> Vec<u32> {
     v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect()
 }
 
-fn s(v: &Value, k: &str) -> Option<String> {
-    v.get(k).and_then(|x| x.as_str()).map(str::to_string)
-}
-
-fn pairs(v: &Value, k: &str) -> Vec<(String, String)> {
-    v.get(k)
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().map(|e| (s(e, "source").unwrap(), s(e, "target").unwrap())).collect())
-        .unwrap_or_default()
-}
-
-fn request(v: &Value) -> TranslationRequest {
-    TranslationRequest {
-        text: s(v, "text").unwrap(),
-        target_lang: s(v, "target_lang").unwrap(),
-        source_lang: s(v, "source_lang"),
-        form: s(v, "form"),
-        context: s(v, "context"),
-        glossary: pairs(v, "glossary").into_iter().map(|(source, target)| GlossaryEntry { source, target }).collect(),
-        history: pairs(v, "history").into_iter().map(|(source, target)| TranslationPair { source, target }).collect(),
-    }
-}
-
 #[test]
 fn golden_encode_decode() {
     let Some((tok, cases)) = load() else { return };
@@ -90,24 +67,14 @@ fn golden_encode_decode() {
     assert!(n > 100);
 }
 
+/// The prompts themselves are checked by `yaxus-pfml`; here only their encoding.
 #[test]
-fn golden_prompts() {
+fn golden_prompt_ids() {
     let Some((tok, cases)) = load() else { return };
     let mut n = 0;
-    for c in &cases {
-        match c["kind"].as_str().unwrap() {
-            "prompt" => {
-                let req = request(&c["request"]);
-                let prompt = req.to_prompt().unwrap();
-                assert_eq!(prompt, c["prompt"].as_str().unwrap());
-                assert_eq!(tok.encode(&prompt, false), ids(&c["ids"]), "{prompt}");
-            }
-            "prompt_error" => {
-                let req = request(&c["request"]);
-                assert!(req.to_prompt().is_err(), "expected error for {req:?}");
-            }
-            _ => continue,
-        }
+    for c in cases.iter().filter(|c| c["kind"] == "prompt") {
+        let prompt = c["prompt"].as_str().unwrap();
+        assert_eq!(tok.encode(prompt, false), ids(&c["ids"]), "{prompt}");
         n += 1;
     }
     assert!(n > 5);

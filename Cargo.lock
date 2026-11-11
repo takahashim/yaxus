@@ -2758,6 +2758,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yaxus-pfml"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+ "yaxus-api",
+ "yaxus-tokenizer",
+]
+
+[[package]]
 name = "yaxus-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2768,6 +2778,7 @@ dependencies = [
  "yaxus-backend-cpu",
  "yaxus-backend-wgpu",
  "yaxus-model",
+ "yaxus-pfml",
  "yaxus-tokenizer",
 ]
 
@@ -2789,6 +2800,7 @@ dependencies = [
  "tracing",
  "yaxus-api",
  "yaxus-model",
+ "yaxus-pfml",
  "yaxus-runtime",
  "yaxus-tokenizer",
 ]

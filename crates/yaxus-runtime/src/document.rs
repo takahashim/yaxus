@@ -5,10 +5,11 @@
 use anyhow::Result;
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
 use yaxus_model::{DEFAULT_MAX_POS, Finish, Generator};
-use yaxus_tokenizer::{PromptError, Tokenizer, TranslationRequest, is_blank, validate_message};
+use yaxus_pfml::{PromptError, TranslationRequest, is_blank, validate_message};
+use yaxus_tokenizer::Tokenizer;
 
 use crate::memory::Memory;
-use crate::prompt::{self, Prompt};
+use crate::prompt::Prompt;
 use crate::session::{Session, Update};
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
@@ -126,7 +127,9 @@ impl DocJob {
     pub fn validate(&self, tok: &Tokenizer) -> Result<(), PromptError> {
         self.options_request().validate_options()?;
         for i in (0..self.segments.len()).filter(|&i| !is_blank(&self.segments[i])) {
-            Prompt::fit(tok, self.bare_request(i), self.max_context, 0)
+            self.bare_request(i)
+                .validate()
+                .and_then(|r| Prompt::fit(tok, r, self.max_context, 0))
                 .map_err(|e| PromptError(format!("segment {i}: {}", e.0)))?;
         }
         Ok(())
@@ -135,7 +138,7 @@ impl DocJob {
     /// The prompt of a request from [`ready`](Self::ready) and its generation budget, both
     /// within the context: a history that leaves too little room is dropped.
     pub fn prompt(&self, tok: &Tokenizer, req: TranslationRequest) -> Result<(Prompt, usize), PromptError> {
-        Prompt::fit(tok, req, self.max_context, self.opts.max_new_tokens)
+        Prompt::fit(tok, req.validate()?, self.max_context, self.opts.max_new_tokens)
     }
 
     /// The options of every segment's prompt (empty text and history).
@@ -146,7 +149,7 @@ impl DocJob {
             source_lang: self.opts.source_lang.clone(),
             form: self.opts.form.clone(),
             context: self.opts.context.clone(),
-            glossary: prompt::glossary(&self.opts.glossary),
+            glossary: self.opts.glossary.clone(),
             history: Vec::new(),
         }
     }
@@ -191,7 +194,7 @@ impl DocJob {
             // translation with reserved tokens (a control token the model emitted).
             .filter(|p| validate_message(&p.source).is_ok() && validate_message(&p.target).is_ok())
             .collect();
-        let history = prompt::history(chain.window.select(&done));
+        let history = chain.window.select(&done).to_vec();
         TranslationRequest { history, ..self.bare_request(i) }
     }
 
@@ -333,7 +336,7 @@ pub fn run_document(
 #[cfg(test)]
 mod tests {
     use yaxus_model::{Event, ReqId, Request};
-    use yaxus_tokenizer::{TAG_ID, TranslationPair};
+    use yaxus_pfml::ValidRequest;
 
     use super::*;
 
@@ -375,11 +378,8 @@ mod tests {
         // `form` needs target_lang = "ja".
         assert!(DocJob::from_request(req(&["a"], Some("polite")), n).validate(&tok).is_err());
         // Each segment's prompt must fit the context: blank ones need not.
-        let fits =
-            Prompt::new(&tok, &TranslationRequest { text: "b".into(), target_lang: "en".into(), ..Default::default() })
-                .unwrap()
-                .len()
-                + 1;
+        let b = TranslationRequest { text: "b".into(), target_lang: "en".into(), ..Default::default() };
+        let fits = Prompt::new(&tok, &b.validate().unwrap()).len() + 1;
         assert!(DocJob::from_request(req(&["b", " "], None), fits).validate(&tok).is_ok());
         let e = DocJob::from_request(req(&["b", "bb"], None), fits).validate(&tok).unwrap_err();
         assert!(e.0.starts_with("segment 1:") && e.0.contains("the limit is"), "{}", e.0);
@@ -457,22 +457,9 @@ mod tests {
 
     /// A tokenizer with the PLaMo special-token layout and a single "x" token.
     fn tokenizer() -> (Tokenizer, u32) {
-        use yaxus_tokenizer::{BOS_ID, TokenKind};
-        let mut tokens: Vec<String> = (0..=TAG_ID)
-            .map(|id| match id {
-                BOS_ID => "<|plamo:bos|>".into(),
-                TAG_ID => "<|plamo:tag|>".into(),
-                _ => format!("<|plamo:c{id}|>"),
-            })
-            .collect();
-        let mut kinds = vec![TokenKind::Control; tokens.len()];
-        tokens.extend((0..=255u8).map(|b| format!("<0x{b:02X}>")));
-        kinds.extend([TokenKind::Byte; 256]);
-        tokens.push("x".into());
-        kinds.push(TokenKind::Normal);
-        let x = tokens.len() as u32 - 1;
-        let scores = vec![0.0; tokens.len()];
-        (Tokenizer::from_vocab(tokens, kinds, scores).unwrap(), x)
+        let tok = yaxus_tokenizer::testing::plamo_like(&[("x", 0.0)]);
+        let x = tok.vocab_size() as u32 - 1;
+        (tok, x)
     }
 
     fn fake(len: usize) -> (Tokenizer, FakeEngine) {
@@ -485,15 +472,15 @@ mod tests {
         let (tok, _) = tokenizer();
         let base = TranslationRequest { text: "hello".into(), target_lang: "en".into(), ..Default::default() };
         let with_history = TranslationRequest {
-            history: vec![TranslationPair { source: "a".repeat(300), target: "b".repeat(300) }],
+            history: vec![Pair { source: "a".repeat(300), target: "b".repeat(300) }],
             ..base.clone()
         };
-        let bare = Prompt::new(&tok, &base).unwrap().len();
-        let full = Prompt::new(&tok, &with_history).unwrap().len();
+        let (base, with_history) = (base.validate().unwrap(), with_history.validate().unwrap());
+        let bare = Prompt::new(&tok, &base).len();
+        let full = Prompt::new(&tok, &with_history).len();
         assert!(full > bare + 500);
-        let fit = |r: &TranslationRequest, ctx, max_new| {
-            Prompt::fit(&tok, r.clone(), ctx, max_new).map(|(p, n)| (p.len(), n))
-        };
+        let fit =
+            |r: &ValidRequest, ctx, max_new| Prompt::fit(&tok, r.clone(), ctx, max_new).map(|(p, n)| (p.len(), n));
 
         // Everything fits: unchanged.
         assert_eq!(fit(&with_history, full + 10, 10).unwrap(), (full, 10));
@@ -586,7 +573,7 @@ mod tests {
         assert_eq!(next[0].0, 2);
         assert_eq!(next[0].1.history.len(), 1);
         assert_eq!(job.outputs()[1].as_deref(), Some(""));
-        assert!(next[0].1.to_prompt().is_ok());
+        assert!(next[0].1.clone().validate().is_ok());
     }
 
     #[test]
@@ -608,7 +595,7 @@ mod tests {
         job.finished(0, "A<|plamo:msg|>".into()); // a control token the model emitted
         let next = job.ready();
         assert!(next[0].1.history.is_empty());
-        assert!(next[0].1.to_prompt().is_ok());
+        assert!(next[0].1.clone().validate().is_ok());
         job.finished(1, "B".into());
         assert_eq!(job.ready()[0].1.history.len(), 1, "later pairs are kept");
     }

@@ -145,8 +145,8 @@ async fn translate(
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let prompt = match Prompt::new(&st.tok, &prompt_request(&req)) {
-        Ok(p) => p,
+    let prompt = match prompt_request(&req).validate() {
+        Ok(r) => Prompt::new(&st.tok, &r),
         Err(e) => return error(StatusCode::BAD_REQUEST, e.0),
     };
     if prompt.len() >= st.max_context {

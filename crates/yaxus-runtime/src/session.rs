@@ -187,8 +187,6 @@ impl<'a, T> Session<'a, T> {
 mod tests {
     use std::collections::VecDeque;
 
-    use yaxus_tokenizer::TokenKind;
-
     use super::*;
 
     /// Plays back scripted events, one list per step, and records what it was given.
@@ -247,24 +245,9 @@ mod tests {
         17 + b as u32
     }
 
-    /// Control tokens 0..=16 (bos at 1, tag at 16), the 256 byte tokens, `Hel` and `lo`.
+    /// The PLaMo special-token layout with the tokens `Hel` and `lo`.
     fn tokenizer() -> Tokenizer {
-        let mut tokens: Vec<String> = (0..=TAG_ID)
-            .map(|id| match id {
-                1 => "<|plamo:bos|>".to_string(),
-                TAG_ID => "<|plamo:tag|>".to_string(),
-                _ => format!("<|plamo:c{id}|>"),
-            })
-            .collect();
-        let mut kinds = vec![TokenKind::Control; tokens.len()];
-        for b in 0..=255u8 {
-            tokens.push(format!("<0x{b:02X}>"));
-            kinds.push(TokenKind::Byte);
-        }
-        tokens.extend(["Hel".to_string(), "lo".to_string()]);
-        kinds.extend([TokenKind::Normal, TokenKind::Normal]);
-        let scores = vec![0.0; tokens.len()];
-        Tokenizer::from_vocab(tokens, kinds, scores).unwrap()
+        yaxus_tokenizer::testing::plamo_like(&[("Hel", 0.0), ("lo", 0.0)])
     }
 
     fn token(id: ReqId, token: u32) -> Event {

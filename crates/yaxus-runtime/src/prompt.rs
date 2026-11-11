@@ -1,7 +1,8 @@
 //! Requests of the HTTP API as prompts.
 
-use yaxus_api::{Pair, TranslateRequest};
-use yaxus_tokenizer::{GlossaryEntry, PromptError, Tokenizer, TranslationPair, TranslationRequest};
+use yaxus_api::TranslateRequest;
+use yaxus_pfml::{PromptError, TranslationRequest, ValidRequest};
+use yaxus_tokenizer::Tokenizer;
 
 use crate::memory;
 
@@ -13,19 +14,9 @@ pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
         source_lang: r.requested_source_lang().map(String::from),
         form: r.requested_form().map(String::from),
         context: r.context.clone(),
-        glossary: glossary(&r.glossary),
-        history: history(&r.history),
+        glossary: r.glossary.clone(),
+        history: r.history.clone(),
     }
-}
-
-/// The API's glossary pairs as prompt entries.
-pub(crate) fn glossary(pairs: &[Pair]) -> Vec<GlossaryEntry> {
-    pairs.iter().map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() }).collect()
-}
-
-/// The API's history pairs (source, translation) as prompt entries.
-pub(crate) fn history(pairs: &[Pair]) -> Vec<TranslationPair> {
-    pairs.iter().map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() }).collect()
 }
 
 /// A translation request as the engine takes it: the prompt's token ids, and the key
@@ -41,8 +32,8 @@ pub struct Prompt {
 const MIN_BUDGET: usize = 512;
 
 impl Prompt {
-    pub fn new(tok: &Tokenizer, req: &TranslationRequest) -> Result<Self, PromptError> {
-        Ok(Prompt { ids: tok.encode(&req.to_prompt()?, false), memo: memory::key(req) })
+    pub fn new(tok: &Tokenizer, req: &ValidRequest) -> Self {
+        Prompt { ids: tok.encode(&req.render(), false), memo: memory::key(req) }
     }
 
     /// The prompt of `req` such that it and the generation budget fit in `max_context`
@@ -52,14 +43,13 @@ impl Prompt {
     /// without history does not fit.
     pub fn fit(
         tok: &Tokenizer,
-        mut req: TranslationRequest,
+        req: ValidRequest,
         max_context: usize,
         max_new: usize,
     ) -> Result<(Self, usize), PromptError> {
-        let mut prompt = Prompt::new(tok, &req)?;
-        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.history.is_empty() {
-            req.history.clear();
-            prompt = Prompt::new(tok, &req)?;
+        let mut prompt = Prompt::new(tok, &req);
+        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.request().history.is_empty() {
+            prompt = Prompt::new(tok, &req.without_history());
         }
         if prompt.len() >= max_context {
             return Err(PromptError(format!("prompt is {} tokens; the limit is {max_context}", prompt.len())));
