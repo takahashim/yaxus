@@ -1,0 +1,100 @@
+name: Model
+
+# End-to-end tests against the real 0.8B model on the CPU backend: logits and greedy
+# output against HF transformers (tests/golden/logits_0_8b.jsonl), Q8 quality, and the
+# GGUF files against the safetensors checkpoint. The model is ~1.6 GB, so this runs on
+# changes to the code it covers, weekly, and on demand rather than on every PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/yaxus-model/**
+      - crates/yaxus-backend-cpu/**
+      - crates/yaxus-tokenizer/**
+      - crates/yaxus-server/src/lib.rs
+      - tests/golden/logits_0_8b.jsonl
+      - tests/golden/tokenizer.jsonl
+      - Cargo.lock
+      - .github/workflows/model.yml
+  pull_request:
+    paths:
+      - crates/yaxus-model/**
+      - crates/yaxus-backend-cpu/**
+      - crates/yaxus-tokenizer/**
+      - crates/yaxus-server/src/lib.rs
+      - tests/golden/logits_0_8b.jsonl
+      - tests/golden/tokenizer.jsonl
+      - Cargo.lock
+      - .github/workflows/model.yml
+  schedule:
+    - cron: "17 18 * * 0" # Mondays 03:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The revisions tests/golden/logits_0_8b.jsonl was generated with (HF transformers
+  # 5.22.2, torch 2.15.0, float32 on the CPU). Regenerate it when moving these.
+  MODEL_REPO: pfnet/plamo-3-translate-0.8b
+  MODEL_REV: 8b4d42855622093e610ba9b90c2d2b59f8d5c15d
+  GGUF_REPO: pfnet/plamo-3-translate-0.8b-GGUF
+  GGUF_REV: 1cf96ae02133958a20074bfdfab76517bb737d00
+  # Q4_K_M also holds Q6_K tensors; Q2_K (with Q3_K) is what `--draft auto` prefers.
+  GGUF_FILES: plamo-3-translate-0.8b-Q4_K_M.gguf plamo-3-translate-0.8b-Q2_K.gguf
+  # Only needed if the repositories become gated; empty otherwise.
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+jobs:
+  model:
+    name: 0.8B on the CPU
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Golden data
+        run: |
+          test -f tests/golden/logits_0_8b.jsonl || {
+            echo "::error::tests/golden/logits_0_8b.jsonl is missing; generate it with tests/golden/gen_logits.py"
+            exit 1
+          }
+      - name: Model cache
+        id: hf-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          # Change the suffix together with GGUF_FILES.
+          key: hf-0.8b-${{ env.MODEL_REV }}-${{ env.GGUF_REV }}-q4km-q2k
+      - name: Download the model
+        run: |
+          if [ "${{ steps.hf-cache.outputs.cache-hit }}" = true ]; then export HF_HUB_OFFLINE=1; fi
+          pipx install 'huggingface_hub[cli]'
+          # The whole checkpoint repository (its other files are small); explicit file
+          # names for the GGUF one (hf's --include takes a single pattern).
+          model=$(hf download "$MODEL_REPO" --revision "$MODEL_REV" --quiet)
+          # shellcheck disable=SC2086 # GGUF_FILES is a list of file names
+          hf download "$GGUF_REPO" $GGUF_FILES --revision "$GGUF_REV" --quiet
+          echo "YAXUS_MODEL_DIR=$model" >> "$GITHUB_ENV"
+          # The GGUF tests skip quietly without these, so make their absence an error.
+          ls ~/.cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b/snapshots/*/model*.safetensors
+          ls ~/.cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b-GGUF/snapshots/*/*.gguf
+          du -sh ~/.cache/huggingface/hub
+      - name: Logits and greedy output (bf16, Q8)
+        env:
+          YAXUS_GOLDEN: ${{ github.workspace }}/tests/golden/logits_0_8b.jsonl
+        run: cargo test --release -p yaxus-backend-cpu --test golden -- --ignored --nocapture
+      - name: GGUF tensors and vocabulary
+        run: |
+          cargo test --release -p yaxus-model --test gguf -- --ignored --nocapture
+          cargo test --release -p yaxus-server --lib gguf_tokenizer_matches_jsonl -- --ignored --nocapture
