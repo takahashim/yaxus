@@ -15,7 +15,7 @@ use yaxus_api::{DocumentUsage, Usage};
 use yaxus_model::{Event as EngineEvent, Finish, Generator, ReqId, Request};
 use yaxus_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, Tokenizer};
 
-use crate::document::DocJob;
+use crate::document::{DocJob, encode_within};
 use crate::memory::{self, Memory};
 
 pub enum Work {
@@ -83,6 +83,8 @@ struct State {
     /// Documents whose chains may continue after this step.
     resubmit: Vec<u64>,
     memory: Memory,
+    /// Most prompt + generated tokens per request.
+    max_context: usize,
 }
 
 pub fn run(
@@ -91,6 +93,8 @@ pub fn run(
     mut rx: mpsc::Receiver<Job>,
     queued: Arc<AtomicUsize>,
     queue_limit: usize,
+    max_context: usize,
+    failed: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut st = State {
         active: HashMap::new(),
@@ -98,6 +102,7 @@ pub fn run(
         next_id: 0,
         resubmit: Vec::new(),
         memory: Memory::new(memory::DEFAULT_ENTRIES),
+        max_context,
     };
     loop {
         // Block only when there is nothing to run.
@@ -119,6 +124,7 @@ pub fn run(
             continue;
         }
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| engine.step(&mut |ev| handle(ev, &tok, &mut st))));
+        let panicked = result.is_err();
         let failure = match result {
             Ok(Ok(_)) => None,
             Ok(Err(e)) => Some(format!("{e:#}")),
@@ -133,6 +139,14 @@ pub fn run(
             }
             for (_, d) in st.docs.drain() {
                 let _ = d.events.send(Event::Error(msg.clone()));
+            }
+            if panicked {
+                // The engine may be half-way through a pass (KV pages, stream state): do
+                // not serve from it again. The server shuts down so that it can be
+                // restarted; until then new requests get 503 and /healthz says so.
+                tracing::error!("stopping the inference thread after a panic");
+                let _ = failed.send(());
+                return;
             }
             continue;
         }
@@ -194,21 +208,21 @@ fn add(job: Job, st: &mut State, engine: &mut dyn Generator, tok: &Tokenizer, qu
 fn submit_ready(key: u64, st: &mut State, engine: &mut dyn Generator, tok: &Tokenizer) {
     let Some(d) = st.docs.get_mut(&key) else { return };
     if !d.stopped {
-        for (segment, req) in d.doc.ready() {
-            let prompt = match req.to_prompt() {
-                Ok(p) => p,
+        for (segment, mut req) in d.doc.ready() {
+            // A long history may not fit with the segment: it is dropped then.
+            let (ids, max_new) = match encode_within(tok, &mut req, st.max_context, d.doc.opts.max_new_tokens) {
+                Ok(x) => x,
                 Err(e) => {
-                    let _ = d.events.send(Event::Error(format!("segment {segment}: {}", e.0)));
+                    let _ = d.events.send(Event::Error(format!("segment {segment}: {e}")));
                     d.stopped = true;
                     break;
                 }
             };
-            let ids = tok.encode(&prompt, false);
             st.next_id += 1;
             d.usage.prompt_tokens += ids.len();
             d.live += 1;
             let memo = memory::key(&req);
-            let mut r = Request::new(st.next_id, ids, d.doc.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
+            let mut r = Request::new(st.next_id, ids, max_new, vec![EOS_ID, TAG_ID]);
             r.hint = st.memory.get(memo);
             engine.submit(r);
             st.active.insert(
@@ -355,5 +369,85 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
             }
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yaxus_model::StartInfo;
+
+    /// An engine whose every pass panics.
+    struct Panicking;
+
+    impl Generator for Panicking {
+        fn submit(&mut self, _: Request) {}
+        fn step(&mut self, _: &mut dyn FnMut(EngineEvent) -> bool) -> anyhow::Result<bool> {
+            panic!("boom");
+        }
+        fn fresh_id(&mut self) -> ReqId {
+            0
+        }
+        fn waiting(&self) -> usize {
+            0
+        }
+        fn active(&self) -> usize {
+            1
+        }
+        fn backend_name(&self) -> String {
+            "panicking".into()
+        }
+        fn weight_bytes(&self) -> usize {
+            0
+        }
+        fn stats(&self) -> Option<String> {
+            None
+        }
+        fn last_start(&self) -> StartInfo {
+            StartInfo::default()
+        }
+    }
+
+    fn tokenizer() -> Tokenizer {
+        use yaxus_tokenizer::{BOS_ID, TokenKind};
+        let mut tokens: Vec<String> = (0..=TAG_ID)
+            .map(|id| match id {
+                BOS_ID => "<|plamo:bos|>".into(),
+                TAG_ID => "<|plamo:tag|>".into(),
+                _ => format!("<|plamo:c{id}|>"),
+            })
+            .collect();
+        let mut kinds = vec![TokenKind::Control; tokens.len()];
+        tokens.extend((0..=255u8).map(|b| format!("<0x{b:02X}>")));
+        kinds.extend([TokenKind::Byte; 256]);
+        let scores = vec![0.0; tokens.len()];
+        Tokenizer::from_vocab(tokens, kinds, scores).unwrap()
+    }
+
+    #[test]
+    fn a_panic_fails_the_requests_and_stops_the_worker() {
+        let (jobs, rx) = mpsc::channel(4);
+        let (events, mut out) = mpsc::unbounded_channel();
+        let job = Job {
+            work: Work::Single { prompt_ids: vec![1, 2, 3], max_new_tokens: 4, memo: 0 },
+            enqueued: Instant::now(),
+            events,
+            label: "test".into(),
+        };
+        let queued = Arc::new(AtomicUsize::new(1));
+        jobs.try_send(job).unwrap();
+        let tok = Arc::new(tokenizer());
+        let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            run(Box::new(Panicking), tok, rx, queued, 4, 8192, failed_tx);
+            let _ = done_tx.send(());
+        });
+        // The worker returns instead of serving from the broken engine (a timeout rather
+        // than join(), so that a regression fails instead of hanging the test run).
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the worker kept running");
+        assert!(matches!(out.try_recv(), Ok(Event::Error(m)) if m.contains("internal error")));
+        assert!(jobs.is_closed());
+        assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
     }
 }

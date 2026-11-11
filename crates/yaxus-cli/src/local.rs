@@ -265,7 +265,8 @@ pub struct ServeArgs {
     /// Extra host name or IP for the generated certificate (repeatable).
     #[arg(long)]
     san: Vec<String>,
-    /// Requests that may wait while one is being translated; more get HTTP 429.
+    /// Requests that may wait in the server's queue; more get HTTP 429. (The engine also
+    /// holds up to this many beyond the ones it is running, so about twice this can wait.)
     #[arg(long, default_value_t = 16)]
     queue: usize,
     /// Maximum prompt + generated tokens per request.

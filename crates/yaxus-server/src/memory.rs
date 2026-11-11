@@ -40,13 +40,33 @@ impl Memory {
         if self.cap == 0 || tokens.is_empty() {
             return;
         }
-        self.map.insert(key, tokens);
-        self.order.retain(|&k| k != key);
+        // Only a key already present needs its old place in the order removed.
+        if self.map.insert(key, tokens).is_some() {
+            self.order.retain(|&k| k != key);
+        }
         self.order.push_back(key);
         while self.map.len() > self.cap
             && let Some(old) = self.order.pop_front()
         {
             self.map.remove(&old);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn least_recently_put_goes_first() {
+        let mut m = Memory::new(2);
+        m.put(1, vec![1]);
+        m.put(2, vec![2]);
+        m.put(1, vec![10]); // 1 is now the newest
+        m.put(3, vec![3]);
+        assert_eq!((m.get(1), m.get(2), m.get(3)), (vec![10], vec![], vec![3]));
+        assert_eq!(m.order.len(), 2);
+        m.put(4, vec![]); // empty outputs are not kept
+        assert_eq!(m.get(4), Vec::<u32>::new());
     }
 }
