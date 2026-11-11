@@ -411,16 +411,18 @@ fn grid(groups: u32) -> (u32, u32) {
 }
 
 impl Gpu {
-    /// Opens the first non-CPU Vulkan adapter.
+    /// Opens the first non-CPU Vulkan adapter. `YAXUS_SOFTWARE_VULKAN=1` accepts a software
+    /// one too (lavapipe), so the kernel tests can run on machines without a GPU (CI).
     pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
+        let software = std::env::var_os("YAXUS_SOFTWARE_VULKAN").is_some_and(|v| v == "1");
         let adapter = adapters
             .into_iter()
-            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .find(|a| software || a.get_info().device_type != wgpu::DeviceType::Cpu)
             .context(
                 "no Vulkan GPU found (only a software renderer, if any). Check that the user is in \
                  the `render` group and that the session has it (re-login, or run under `sg render`)",
@@ -720,7 +722,10 @@ impl Gpu {
         self.add_kernel("qk_rope", QK_ROPE, &[false, false, false, true, true, true, true, true]);
         self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
         self.add_kernel("embed", EMBED, &[false, true, true]);
-        for g in [1usize, 2, 4, 6, 8, 12, 16] {
+        // (the split attention reduces with subgroup shuffles; without them the per-row
+        // kernel takes every pass)
+        let sg = self.subgroups;
+        for g in [1usize, 2, 4, 6, 8, 12, 16].into_iter().filter(|_| sg) {
             for ch in SPLIT_CHUNKS {
                 let name: &'static str = Box::leak(format!("attn_split{g}_{ch}").into_boxed_str());
                 let src = ATTN_SPLIT
@@ -1760,6 +1765,13 @@ impl WgpuBackend {
     #[doc(hidden)]
     pub fn has_matrix_cores(&self) -> bool {
         self.g().coop
+    }
+
+    /// Whether the device has 32-lane subgroups, which the decode kernels (integer and
+    /// multi-row GEMVs, split attention) need; without them the plain f32 kernels run.
+    #[doc(hidden)]
+    pub fn has_subgroups(&self) -> bool {
+        self.g().subgroups
     }
 
     /// Test hook, see [`Gpu::debug_matmul_ggml`].
