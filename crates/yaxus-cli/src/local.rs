@@ -386,19 +386,25 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
     let mut io_err = None;
     let mut memory = yaxus_server::memory::Memory::new(yaxus_server::memory::DEFAULT_ENTRIES);
-    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| match ev {
-        DocEvent::Delta { segment, text } => {
-            first.get_or_insert(t1.elapsed());
-            if let Err(e) = out.delta(segment, text) {
-                io_err.get_or_insert(e);
+    // A failed write (e.g. the reader of a pipe has exited) stops the translation.
+    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| {
+        let written = match ev {
+            DocEvent::Delta { segment, text } => {
+                first.get_or_insert(t1.elapsed());
+                out.delta(segment, text)
             }
-        }
-        DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
-            prompt += prompt_tokens;
-            reused += r;
-            generated += g;
-            if let Err(e) = out.end(segment) {
-                io_err.get_or_insert(e);
+            DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
+                prompt += prompt_tokens;
+                reused += r;
+                generated += g;
+                out.end(segment)
+            }
+        };
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                io_err = Some(e);
+                false
             }
         }
     })?;
@@ -847,6 +853,7 @@ fn bench_doc(
                     );
                 }
             }
+            true
         })?;
         let wall = t0.elapsed().as_secs_f64();
         println!(
