@@ -664,7 +664,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
 /// `ADD_NORM` with subgroup sums (two barriers per sum instead of nine), all loads issued
 /// first and the row kept in registers. A single row is pure latency (memory round trips
-/// in a chain), so that is what this shortens. Needs subgroups and at most 4096 columns.
+/// in a chain), so that is what this shortens. Needs subgroups and at most 4096 columns
+/// (`ADD_NORM_SG_MAX_COLS`; wider rows are dispatched to `ADD_NORM`).
 pub const ADD_NORM_SG: &str = r#"
 struct P { cols: u32, o1: f32, o2: f32, eps: f32 }
 var<immediate> p: P;

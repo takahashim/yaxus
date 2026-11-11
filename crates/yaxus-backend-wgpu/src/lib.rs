@@ -375,6 +375,9 @@ const ARGMAX_SLICES: usize = 64;
 /// attention of prompt passes handles badly: 16 requests in one pass took 74 ms with it
 /// against 38 ms (2B), so this covers every pass the decode kernels take in one dispatch.
 const SPLIT_ATTN_MAX_ROWS: usize = 16;
+/// Columns `add_norm_sg` keeps in registers (16 per lane of its 256); wider rows take the
+/// plain `add_norm`.
+const ADD_NORM_SG_MAX_COLS: usize = 16 * 256;
 /// Workgroups the split attention aims for at most when it splits heads (see `attention`).
 const ATTN_SPLIT_WGS: usize = 64;
 
@@ -765,7 +768,10 @@ impl Gpu {
         self.add_kernel("gemv1_bf16", &gemv1(W_BF16_16), &bf);
         self.add_kernel("gemv8_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(GEMV_MAX_T)), &bf);
         self.add_kernel("rmsnorm", RMSNORM, &[false, true, true]);
-        self.add_kernel("add_norm", if sg { ADD_NORM_SG } else { ADD_NORM }, &[false, false, true, true, true]);
+        self.add_kernel("add_norm", ADD_NORM, &[false, false, true, true, true]);
+        if sg {
+            self.add_kernel("add_norm_sg", ADD_NORM_SG, &[false, false, true, true, true]);
+        }
         self.add_kernel("glu_q8", &format!("{MM_PARAMS}{W_Q8_16}{GEMV_GLU}"), &q8);
         self.add_kernel("glu_bf16", &format!("{MM_PARAMS}{W_BF16_16}{GEMV_GLU}"), &bf);
         self.add_kernel("argmax1", ARGMAX1, &[false, true]);
@@ -1394,8 +1400,10 @@ impl Gpu {
         assert_eq!((x.rows, x.cols), (delta.rows, delta.cols));
         let h = self.tensor(x.rows, x.cols);
         let xb = x.buf().clone();
+        // (the subgroup kernel holds a row in registers, which bounds its width)
+        let name = if self.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS { "add_norm_sg" } else { "add_norm" };
         self.dispatch(
-            "add_norm",
+            name,
             &[h.buf(), &xb, delta.buf(), w1, w2],
             &[x.cols as u32, post_offset.to_bits(), pre_offset.to_bits(), eps.to_bits()],
             (x.rows as u32, 1),
@@ -1777,6 +1785,30 @@ impl Gpu {
         let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
         self.to_host(&y)
     }
+
+    /// Test hook: `add_norm` of `x` and `delta` (`[rows, cols]` each) with the norm weights
+    /// `w1` (post, offset `o1`) and `w2` (pre, offset `o2`). Returns `(x, h)` afterwards.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_add_norm(
+        &mut self,
+        x: &[f32],
+        delta: &[f32],
+        rows: usize,
+        cols: usize,
+        (w1, o1): (&[f32], f32),
+        (w2, o2): (&[f32], f32),
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut xt = self.tensor(rows, cols);
+        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
+        let dt = self.tensor(rows, cols);
+        self.queue.write_buffer(dt.buf(), 0, bytemuck::cast_slice(delta));
+        let w1 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w1)));
+        let w2 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w2)));
+        let h = self.add_norm(&mut xt, &dt, &w1, o1, &w2, o2, eps);
+        (self.to_host(&xt), self.to_host(&h))
+    }
 }
 
 /// A handle to a shared [`Gpu`] context. Every model loaded through a handle shares the
@@ -1889,6 +1921,22 @@ impl WgpuBackend {
         let mut g = self.g();
         g.gemv = self.gemv;
         g.debug_matmul(x, t, w, n, k, quant, glu)
+    }
+
+    /// Test hook, see [`Gpu::debug_add_norm`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_add_norm(
+        &mut self,
+        x: &[f32],
+        delta: &[f32],
+        rows: usize,
+        cols: usize,
+        w1: (&[f32], f32),
+        w2: (&[f32], f32),
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.g().debug_add_norm(x, delta, rows, cols, w1, w2, eps)
     }
 
     fn track(&mut self, before: usize) {
