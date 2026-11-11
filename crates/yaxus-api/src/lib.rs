@@ -214,8 +214,7 @@ pub const DEFAULT_HISTORY_CHARS: usize = 4000;
 /// Chooses the history sent with each segment of a document.
 ///
 /// The kept history starts at a fixed pair and only moves forward when it exceeds the
-/// budget; it then keeps just the newest pairs fitting in a quarter of the budget (at
-/// least the newest one, unless that alone exceeds the whole budget).
+/// budget; it then keeps just the newest pairs fitting in a quarter of the budget.
 /// Consecutive prompts therefore share a long prefix, which the server reuses instead of
 /// recomputing (a sliding window of the last N pairs would change the prefix on every
 /// segment). Each move costs one recomputation of the kept quarter, so moving rarely and
@@ -232,26 +231,18 @@ impl HistoryWindow {
         HistoryWindow { start: 0, budget_chars }
     }
 
-    /// The pairs of `all` (every earlier segment, oldest first) to send now. `all` is
-    /// expected to grow between calls; a shorter one starts a new sequence.
+    /// The pairs of `all` (every earlier segment, oldest first) to send now.
     pub fn select<'a>(&mut self, all: &'a [Pair]) -> &'a [Pair] {
         if self.budget_chars == 0 {
             return &[];
         }
         let chars = |p: &Pair| p.source.chars().count() + p.target.chars().count();
-        if self.start > all.len() {
-            self.start = 0;
-        }
+        self.start = self.start.min(all.len());
         let total: usize = all[self.start..].iter().map(chars).sum();
         if total > self.budget_chars {
+            // Keep the newest pairs within a quarter of the budget (at least one).
             let mut start = all.len() - 1;
             let mut kept = chars(&all[start]);
-            if kept > self.budget_chars {
-                // Not even the newest pair fits: send none rather than exceed the budget.
-                self.start = all.len();
-                return &[];
-            }
-            // Keep the newest pairs within a quarter of the budget (at least one).
             while start > self.start && kept + chars(&all[start - 1]) <= self.budget_chars / 4 {
                 start -= 1;
                 kept += chars(&all[start]);
@@ -304,29 +295,6 @@ mod tests {
         // The start stays put while the window fits.
         assert_eq!(w.select(&all[..10]).len(), 3);
         assert_eq!(HistoryWindow::new(0).select(&all).len(), 0);
-    }
-
-    #[test]
-    fn history_window_never_exceeds_the_budget_with_one_pair() {
-        let pair = |n: usize| Pair { source: "x".repeat(n), target: String::new() };
-        let all = [pair(100), pair(100), pair(900), pair(100)];
-        let mut w = HistoryWindow::new(800);
-        assert_eq!(w.select(&all[..2]).len(), 2);
-        // The 900-character pair alone is over the budget: no history.
-        assert!(w.select(&all[..3]).is_empty());
-        // Later pairs start a new window after it.
-        assert_eq!(w.select(&all[..4]), &all[3..]);
-    }
-
-    #[test]
-    fn history_window_restarts_on_a_shorter_list() {
-        let pair = |n: usize| Pair { source: "x".repeat(n), target: String::new() };
-        let long: Vec<Pair> = (0..10).map(|_| pair(100)).collect();
-        let mut w = HistoryWindow::new(800);
-        w.select(&long[..9]);
-        w.select(&long);
-        // A new, shorter sequence gets its whole history again.
-        assert_eq!(w.select(&long[..3]).len(), 3);
     }
 
     #[test]
