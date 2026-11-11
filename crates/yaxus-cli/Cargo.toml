@@ -12,10 +12,10 @@ path = "src/main.rs"
 [features]
 default = ["server"]
 # `translate` and `bench`: the model runs in this process.
-local = ["dep:yaxus-runtime", "dep:yaxus-model", "dep:yaxus-tokenizer"]
+local = ["dep:yaxus-runtime", "dep:yaxus-model", "dep:yaxus-tokenizer", "dep:tracing-subscriber"]
 # `serve` as well. Build with --no-default-features for a client-only binary, or with
 # --no-default-features --features local for local translation without the server.
-server = ["local", "dep:yaxus-server", "dep:tracing-subscriber"]
+server = ["local", "dep:yaxus-server"]
 
 [dependencies]
 anyhow.workspace = true

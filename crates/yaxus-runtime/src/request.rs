@@ -3,19 +3,23 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use yaxus_api::{DocumentRequest, TranslateRequest};
+use yaxus_api::TranslateRequest;
 use yaxus_model::Generator;
 use yaxus_tokenizer::{EOS_ID, GlossaryEntry, StreamDecoder, TAG_ID, Tokenizer, TranslationPair, TranslationRequest};
 
-use crate::document::DocOptions;
+/// An optional request field (`source_lang`, `form`) as given: an empty string means
+/// unset, as if the field were left out.
+pub fn non_empty(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|s| !s.is_empty())
+}
 
-/// The prompt fields of an API request. Empty `source_lang` and `form` mean unset.
+/// The prompt fields of an API request.
 pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
     TranslationRequest {
         text: r.text.clone(),
         target_lang: r.target_lang.clone(),
-        source_lang: r.source_lang.clone().filter(|s| !s.is_empty()),
-        form: r.form.clone().filter(|s| !s.is_empty()),
+        source_lang: non_empty(&r.source_lang).map(String::from),
+        form: non_empty(&r.form).map(String::from),
         context: r.context.clone(),
         glossary: r
             .glossary
@@ -27,23 +31,6 @@ pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
             .iter()
             .map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() })
             .collect(),
-    }
-}
-
-impl DocOptions {
-    /// The options of a document request, with the API defaults for what it leaves out.
-    pub fn from_request(r: &DocumentRequest) -> Self {
-        DocOptions {
-            target_lang: r.target_lang.clone(),
-            source_lang: r.source_lang.clone().filter(|s| !s.is_empty()),
-            form: r.form.clone().filter(|s| !s.is_empty()),
-            context: r.context.clone(),
-            glossary: r.glossary.clone(),
-            history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
-            chains: r.chains.unwrap_or(0),
-            neighbor_context: r.neighbor_context,
-            max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS),
-        }
     }
 }
 

@@ -74,7 +74,7 @@ pub fn resolve_model(model: &str) -> Result<(PathBuf, String)> {
 }
 
 /// The snapshot directory of repo `model` in the local Hugging Face cache.
-pub fn hf_snapshot(model: &str) -> Result<PathBuf> {
+pub(crate) fn hf_snapshot(model: &str) -> Result<PathBuf> {
     let cache = std::env::var_os("HF_HUB_CACHE")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
@@ -96,10 +96,12 @@ pub fn hf_snapshot(model: &str) -> Result<PathBuf> {
     Ok(snapshot)
 }
 
-/// The draft model for `spec`: `none`, `auto` (from the local cache: the Q2_K file of
-/// pfnet/plamo-3-translate-0.8b-GGUF, else pfnet/plamo-3-translate-0.8b, else its Q4_K_M
-/// file; nothing if none is there), or a model as for [`resolve_model`]. `None` also when
-/// it is the target model itself.
+/// The draft model for target `target` and `spec`: `none`, `auto` (from the local cache:
+/// the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else pfnet/plamo-3-translate-0.8b,
+/// else its Q4_K_M file; nothing if none is there), or a model as for [`resolve_model`].
+/// `None` also when it is the target's own file or directory. A draft of the target's
+/// size is kept: at fewer bits it still pays (0.8B target with the 0.8B Q2_K draft:
+/// 87.2 -> 95.2 tok/s on the 19-sentence set).
 pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
     let dir = match spec {
         "none" => return Ok(None),
@@ -114,6 +116,10 @@ pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
         },
         other => resolve_model(other)?.0,
     };
-    let same = |a: &Path, b: &Path| a.canonicalize().ok() == b.canonicalize().ok();
-    Ok(if same(&dir, target) { None } else { Some(dir) })
+    // Paths that cannot be canonicalized (missing, broken links) compare as given.
+    let same = match (dir.canonicalize(), target.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => dir == target,
+    };
+    Ok(if same { None } else { Some(dir) })
 }

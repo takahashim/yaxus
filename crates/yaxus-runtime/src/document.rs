@@ -5,11 +5,12 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use yaxus_api::{HistoryWindow, Pair};
+use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
 use yaxus_model::{Event, Finish, Generator, ReqId, Request};
 use yaxus_tokenizer::{EOS_ID, GlossaryEntry, StreamDecoder, TAG_ID, Tokenizer, TranslationPair, TranslationRequest};
 
 use crate::memory::{self, Memory};
+use crate::request::non_empty;
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
 pub fn auto_chains(segments: usize) -> usize {
@@ -52,6 +53,22 @@ pub struct DocJob {
 }
 
 impl DocJob {
+    /// The job of a document request, with the API defaults for what it leaves out.
+    pub fn from_request(r: DocumentRequest) -> Self {
+        let opts = DocOptions {
+            source_lang: non_empty(&r.source_lang).map(String::from),
+            form: non_empty(&r.form).map(String::from),
+            target_lang: r.target_lang,
+            context: r.context,
+            glossary: r.glossary,
+            history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
+            chains: r.chains.unwrap_or(0),
+            neighbor_context: r.neighbor_context,
+            max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS),
+        };
+        DocJob::new(r.segments, opts)
+    }
+
     pub fn new(segments: Vec<String>, opts: DocOptions) -> Self {
         let n = segments.len();
         let k = if opts.chains == 0 { auto_chains(n) } else { opts.chains }.clamp(1, n.max(1));

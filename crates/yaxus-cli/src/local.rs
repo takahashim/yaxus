@@ -71,9 +71,9 @@ pub struct ModelArgs {
 }
 
 impl ModelArgs {
-    fn draft_options(&self) -> Result<Option<yaxus_runtime::DraftOptions>> {
-        let (target, _) = self.resolve()?;
-        Ok(yaxus_runtime::resolve_draft(&self.draft, &target)?.map(|dir| yaxus_runtime::DraftOptions {
+    /// The draft model for the target at `target` (from [`ModelArgs::resolve`]).
+    fn draft_options(&self, target: &Path) -> Result<Option<yaxus_runtime::DraftOptions>> {
+        Ok(yaxus_runtime::resolve_draft(&self.draft, target)?.map(|dir| yaxus_runtime::DraftOptions {
             dir,
             k: self.draft_k,
             quant: self.draft_quant,
@@ -85,18 +85,18 @@ impl ModelArgs {
         yaxus_runtime::resolve_model(&self.model)
     }
 
-    fn load_options(&self) -> Result<yaxus_runtime::LoadOptions> {
+    fn load_options(&self, target: &Path) -> Result<yaxus_runtime::LoadOptions> {
         Ok(yaxus_runtime::LoadOptions {
             backend: self.backend,
             quant: self.quant,
-            draft: self.draft_options()?,
+            draft: self.draft_options(target)?,
             prefill: self.prefill_precision,
             decode: self.decode_precision,
+            decode_rows: self.decode_rows,
             prefix_cache: !self.no_kv_cache,
             kv_tokens: self.kv_tokens,
             engine: yaxus_model::EngineConfig {
                 max_streams: self.max_streams,
-                decode_rows: self.decode_rows.unwrap_or(self.decode_precision.default_rows()),
                 response_cache: if self.no_kv_cache || self.no_response_cache {
                     0
                 } else {
@@ -107,8 +107,9 @@ impl ModelArgs {
         })
     }
 
+    /// Loads the model at `dir` (from [`ModelArgs::resolve`]).
     fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::Generator>> {
-        yaxus_runtime::load_generator(dir, &self.load_options()?)
+        yaxus_runtime::load_generator(dir, &self.load_options(dir)?)
     }
 }
 
@@ -143,15 +144,22 @@ pub struct ServeArgs {
     config_dir: Option<PathBuf>,
 }
 
+/// Log messages to stderr, at `level` unless `RUST_LOG` says otherwise.
+fn init_logging(level: &str) {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()))
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .init();
+}
+
 #[cfg(feature = "server")]
 pub fn serve(a: ServeArgs) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with_target(false)
-        .init();
+    init_logging("info");
     let (model_dir, model_name) = a.model.resolve()?;
     yaxus_server::serve(yaxus_server::ServeOptions {
-        load: a.model.load_options()?,
+        load: a.model.load_options(&model_dir)?,
         model_dir,
         model_name,
         listen: a.listen,
@@ -166,7 +174,9 @@ pub fn serve(a: ServeArgs) -> Result<()> {
 }
 
 pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
-    use yaxus_runtime::document::{DocEvent, DocJob, DocOptions, run_document};
+    use yaxus_runtime::document::{DocEvent, DocJob, run_document};
+    // Warnings only (a GPU that cannot be used, drafting turned off), not the output.
+    init_logging("warn");
     let req = lang.document(true)?;
     let (dir, name) = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
@@ -182,8 +192,7 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
         );
     }
     let n = req.segments.len();
-    let opts = DocOptions::from_request(&req);
-    let mut job = DocJob::new(req.segments, opts);
+    let mut job = DocJob::from_request(req);
     let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
     let t1 = Instant::now();
     let mut first: Option<Duration> = None;
@@ -318,12 +327,12 @@ enum BenchKind {
 
 const SYNTHETIC: &str = "The quick brown fox jumps over the lazy dog while the committee reviews every proposal. ";
 
-fn header(name: &str, model: &ModelArgs, g: &dyn yaxus_model::Generator) {
-    let quant = model.resolve().map(|(dir, _)| quant_label(&dir, model.quant)).unwrap_or_default();
-    println!("{name} {quant} on {}", g.backend_name());
+fn header(name: &str, dir: &Path, model: &ModelArgs, g: &dyn yaxus_model::Generator) {
+    println!("{name} {} on {}", quant_label(dir, model.quant), g.backend_name());
 }
 
 pub fn bench(a: BenchArgs) -> Result<()> {
+    init_logging("warn");
     match a.kind {
         BenchKind::Rows { model, rows, runs } => bench_rows(model, rows, runs),
         BenchKind::Decode { model, prompt_tokens, gen_tokens, runs } => {
@@ -352,7 +361,7 @@ fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {
     let (dir, name) = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
-    header(&name, &m, model.as_ref());
+    header(&name, &dir, &m, model.as_ref());
     let all = tok.encode(&SYNTHETIC.repeat(200), true);
     model.generate(&all[..16], 1, &[], &mut |_| true)?;
     println!("{:>6} {:>10} {:>10}", "rows", "ms/pass", "rows/s");
@@ -374,7 +383,7 @@ fn bench_decode(mut m: ModelArgs, prompt_tokens: Vec<usize>, gen_tokens: usize, 
     let (dir, name) = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
-    header(&name, &m, model.as_ref());
+    header(&name, &dir, &m, model.as_ref());
     let all = tok.encode(&SYNTHETIC.repeat(200), true);
     model.generate(&all[..16], 2, &[], &mut |_| true)?;
     println!("{:>8} {:>14} {:>14}", "prompt", "prefill tok/s", "decode tok/s");
@@ -410,7 +419,7 @@ fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Op
     let (dir, name) = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
-    header(&name, &m, model.as_ref());
+    header(&name, &dir, &m, model.as_ref());
     let set = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let reference: Option<Vec<String>> = match &compare {
         Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),
@@ -464,7 +473,7 @@ fn bench_streams(
     let (dir, name) = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
     let mut model = m.load(&dir)?;
-    header(&name, &m, model.as_ref());
+    header(&name, &dir, &m, model.as_ref());
     let set = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let mut prompts = Vec::new();
     for line in set.lines().filter(|l| !l.trim().is_empty()) {
@@ -611,7 +620,7 @@ fn bench_doc(
         anyhow::ensure!((1..=paras.len()).contains(&e), "--edit must be 1..={}", paras.len());
     }
     let mut model = m.load(&dir)?;
-    header(&name, &m, model.as_ref());
+    header(&name, &dir, &m, model.as_ref());
     let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
     let opts = DocOptions {
         target_lang: to.clone(),

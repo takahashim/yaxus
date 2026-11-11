@@ -11,5 +11,5 @@ mod request;
 mod resolve;
 
 pub use load::{BackendKind, Decode, DraftOptions, LoadOptions, Prefill, load_generator, load_tokenizer, quant_label};
-pub use request::{RunStats, prompt_request, run_request};
-pub use resolve::{hf_snapshot, resolve_draft, resolve_model};
+pub use request::{RunStats, non_empty, prompt_request, run_request};
+pub use resolve::{resolve_draft, resolve_model};

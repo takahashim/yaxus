@@ -114,11 +114,14 @@ pub struct LoadOptions {
     /// Arithmetic of the GPU prompt processing.
     pub prefill: Prefill,
     pub decode: Decode,
+    /// Most requests one decode pass advances; `None`: [`Decode::default_rows`].
+    pub decode_rows: Option<usize>,
     /// Reuse the KV of finished requests for prompts sharing a prefix.
     pub prefix_cache: bool,
     /// KV arena size in tokens (per model).
     pub kv_tokens: usize,
-    /// Scheduling (`draft_k` is taken from `draft`).
+    /// Scheduling. Its `draft_k` is taken from `draft` and its `decode_rows` from
+    /// `decode_rows`.
     pub engine: yaxus_model::EngineConfig,
 }
 
@@ -130,6 +133,7 @@ impl Default for LoadOptions {
             draft: None,
             prefill: Prefill::default(),
             decode: Decode::default(),
+            decode_rows: None,
             prefix_cache: true,
             kv_tokens: yaxus_model::DEFAULT_KV_TOKENS,
             engine: yaxus_model::EngineConfig::default(),
@@ -200,6 +204,7 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
         o.draft.as_ref()
     };
     let mut cfg = o.engine.clone();
+    cfg.decode_rows = o.decode_rows.unwrap_or(o.decode.default_rows());
     if let Some(d) = draft {
         cfg.draft_k = d.k;
     }
@@ -251,20 +256,18 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
 mod tests {
     use super::*;
 
-    fn snapshot(repo: &str) -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let snaps =
-            Path::new(&home).join(format!(".cache/huggingface/hub/models--{}/snapshots", repo.replace('/', "--")));
-        std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
-    }
-
     /// The vocabulary of a GGUF file gives the same tokenizer as `tokenizer.jsonl`.
+    /// Skipped without the models in the Hugging Face cache, unless `YAXUS_REQUIRE_GOLDEN`
+    /// is set (as in CI), where that is a failure.
     #[test]
     #[ignore]
     fn gguf_tokenizer_matches_jsonl() {
+        let snapshot = |repo: &str| crate::resolve::hf_snapshot(repo).ok();
         let (Some(hf), Some(gg)) =
             (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
         else {
+            let required = std::env::var_os("YAXUS_REQUIRE_GOLDEN").is_some_and(|v| !v.is_empty() && v != "0");
+            assert!(!required, "YAXUS_REQUIRE_GOLDEN is set but the 0.8B model or GGUF files are not in the cache");
             eprintln!("0.8B model or GGUF files not found; skipping");
             return;
         };

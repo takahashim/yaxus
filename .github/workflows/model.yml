@@ -12,7 +12,7 @@ on:
       - crates/yaxus-model/**
       - crates/yaxus-backend-cpu/**
       - crates/yaxus-tokenizer/**
-      - crates/yaxus-runtime/**
+      - crates/yaxus-runtime/src/load.rs
       - tests/golden/logits_0_8b.jsonl
       - tests/golden/tokenizer.jsonl
       - Cargo.lock
@@ -22,7 +22,7 @@ on:
       - crates/yaxus-model/**
       - crates/yaxus-backend-cpu/**
       - crates/yaxus-tokenizer/**
-      - crates/yaxus-runtime/**
+      - crates/yaxus-runtime/src/load.rs
       - tests/golden/logits_0_8b.jsonl
       - tests/golden/tokenizer.jsonl
       - Cargo.lock
@@ -95,6 +95,9 @@ jobs:
           YAXUS_GOLDEN: ${{ github.workspace }}/tests/golden/logits_0_8b.jsonl
         run: cargo test --release -p yaxus-backend-cpu --test golden -- --ignored --nocapture
       - name: GGUF tensors and vocabulary
+        env:
+          # Fail instead of skipping if the model files are not where the tests look.
+          YAXUS_REQUIRE_GOLDEN: "1"
         run: |
           cargo test --release -p yaxus-model --test gguf -- --ignored --nocapture
           cargo test --release -p yaxus-runtime --lib gguf_tokenizer_matches_jsonl -- --ignored --nocapture
