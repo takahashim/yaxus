@@ -394,10 +394,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
                     writeln!(w, "        let a{a}_{j}_{h}_{pl} = {};", terms.join(" + ")).unwrap();
                     sums.push(format!("a{a}_{j}_{h}_{pl}"));
                 }
-                let sum = if planes == 2 { format!("f32({} * 128 + {})", sums[0], sums[1]) } else { format!("f32({})", sums[0]) };
+                let sum = if planes == 2 {
+                    format!("f32({} * 128 + {})", sums[0], sums[1])
+                } else {
+                    format!("f32({})", sums[0])
+                };
                 if f.has_min {
-                    let xm = if ks == 1 { "w" } else if h == 0 { "y" } else { "z" };
-                    writeln!(w, "        r{a}_{j} += {sum} * (ws{a}_{h}.x * xv{j}.x) - ws{a}_{h}.y * xv{j}.{xm};").unwrap();
+                    let xm = if ks == 1 {
+                        "w"
+                    } else if h == 0 {
+                        "y"
+                    } else {
+                        "z"
+                    };
+                    writeln!(w, "        r{a}_{j} += {sum} * (ws{a}_{h}.x * xv{j}.x) - ws{a}_{h}.y * xv{j}.{xm};")
+                        .unwrap();
                 } else {
                     writeln!(w, "        r{a}_{j} += {sum} * (ws{a}_{h}.x * xv{j}.x);").unwrap();
                 }

@@ -494,7 +494,7 @@ impl<B: Backend> Model<B> {
         for &p in &pages {
             kv.pool.retain(p);
         }
-        if len % PAGE != 0 {
+        if !len.is_multiple_of(PAGE) {
             let p = match kv.pool.alloc() {
                 Some(p) => p,
                 None => {
@@ -525,9 +525,7 @@ impl<B: Backend> Model<B> {
             let kv = self.kv.as_ref().unwrap();
             let s = kv.seqs.get(&id).context("unknown sequence")?;
             let (first, last) = (s.len / PAGE, (s.len + n).div_ceil(PAGE));
-            (first..last)
-                .filter(|&pi| pi >= s.pages.len() || kv.pool.refs[s.pages[pi] as usize] > 1)
-                .count()
+            (first..last).filter(|&pi| pi >= s.pages.len() || kv.pool.refs[s.pages[pi] as usize] > 1).count()
         };
         self.ensure_free(need);
         let kv = self.kv.as_mut().unwrap();
@@ -595,7 +593,13 @@ impl<B: Backend> Model<B> {
             let a = b.attention(&qkv, &l.q_norm, &l.k_norm, &mut kv.kv, &self.cfg, &l.meta);
             let o = b.matmul(&a, &l.o_proj);
             let hm = b.add_norm(
-                &mut x, &o, &l.post_mixer_norm, POST_MIXER_NORM_OFFSET, &l.pre_mlp_norm, PRE_NORM_OFFSET, eps,
+                &mut x,
+                &o,
+                &l.post_mixer_norm,
+                POST_MIXER_NORM_OFFSET,
+                &l.pre_mlp_norm,
+                PRE_NORM_OFFSET,
+                eps,
             );
             let m = b.matmul_glu(&hm, &l.gate_up_proj);
             let m = b.matmul(&m, &l.down_proj);

@@ -12,8 +12,7 @@ fn model_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(d));
     }
     let home = std::env::var("HOME").ok()?;
-    let snaps = Path::new(&home)
-        .join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
+    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
     std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
 }
 
@@ -23,14 +22,10 @@ fn u32s(v: &Value) -> Vec<u32> {
 
 fn cases() -> Vec<Value> {
     // YAXUS_GOLDEN selects another model's file (e.g. logits_8b.jsonl with YAXUS_MODEL_DIR).
-    let golden = std::env::var("YAXUS_GOLDEN").map(PathBuf::from).unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl")
-    });
-    std::fs::read_to_string(golden)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
+    let golden = std::env::var("YAXUS_GOLDEN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl"));
+    std::fs::read_to_string(golden).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
 /// Q8 is lossy: require the same top-1 next token, report how far greedy output agrees.
@@ -48,11 +43,8 @@ fn q8_quality() {
         model.free_seq(s);
         let top_ids = u32s(&c["top_ids"]);
         let top_vals: Vec<f64> = c["top_logits"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
-        let max_err = top_ids
-            .iter()
-            .zip(&top_vals)
-            .map(|(&id, &v)| (logits[id as usize] as f64 - v).abs())
-            .fold(0.0, f64::max);
+        let max_err =
+            top_ids.iter().zip(&top_vals).map(|(&id, &v)| (logits[id as usize] as f64 - v).abs()).fold(0.0, f64::max);
         let want = u32s(&c["greedy"]);
         let got = model.generate(&ids, want.len(), &[], |_| true).unwrap();
         let agree = got.iter().zip(&want).take_while(|(a, b)| a == b).count();

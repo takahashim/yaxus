@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Replaces `target-cpu=native` from .cargo/config.toml (cached builds must run on any
+  # runner) and turns warnings, clippy's included, into errors.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    env:
+      # The tokenizer golden tests need the model's tokenizer.jsonl (public, 3.5 MB),
+      # pinned to the revision tests/golden was made with.
+      TOKENIZER_URL: https://huggingface.co/pfnet/plamo-3-translate-2b/resolve/cf66d22fbe6202c56b8e5d283691aa1da53d05af/tokenizer.jsonl
+      TOKENIZER_SHA256: bdce9e430e65931b28c56de2054f52b4cf8ed59b322db125e016d724d06dbb0e
+      YAXUS_MODEL_DIR: ${{ github.workspace }}/.model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Tokenizer for the golden tests
+        uses: actions/cache@v4
+        with:
+          path: .model
+          key: tokenizer-cf66d22f
+      - run: |
+          if [ ! -f .model/tokenizer.jsonl ]; then
+            mkdir -p .model
+            curl -fsSL "$TOKENIZER_URL" -o .model/tokenizer.jsonl
+          fi
+          echo "$TOKENIZER_SHA256  .model/tokenizer.jsonl" | sha256sum -c -
+      - name: Tests
+        run: cargo test --workspace
+
+  kernels:
+    # The GPU kernels against host references, on lavapipe (Mesa's software Vulkan).
+    # Its subgroups are narrower than 32 lanes, so this covers the prefill GEMMs (f32 and
+    # integer) and the f32 decode kernels, not the integer decode ones.
+    name: GPU kernels (lavapipe)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+      - name: Kernel tests
+        env:
+          YAXUS_SOFTWARE_VULKAN: "1"
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored

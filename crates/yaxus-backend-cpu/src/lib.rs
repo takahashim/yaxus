@@ -3,8 +3,8 @@
 //! Not optimized for speed; it is the ground truth the GPU kernels are checked against.
 
 use anyhow::Result;
-use rayon::prelude::*;
 use half::f16;
+use rayon::prelude::*;
 use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef, bf16_to_f32};
 
 use yaxus_model::quant::Q8_BLOCK;
@@ -108,10 +108,11 @@ pub fn physical_cores() -> Option<usize> {
     for e in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("cpu") && name[3..].chars().all(|c| c.is_ascii_digit()) {
-            if let Ok(s) = std::fs::read_to_string(e.path().join("topology/thread_siblings_list")) {
-                seen.insert(s.trim().to_string());
-            }
+        if name.starts_with("cpu")
+            && name[3..].chars().all(|c| c.is_ascii_digit())
+            && let Ok(s) = std::fs::read_to_string(e.path().join("topology/thread_siblings_list"))
+        {
+            seen.insert(s.trim().to_string());
         }
     }
     (!seen.is_empty()).then_some(seen.len())
@@ -421,15 +422,12 @@ impl Backend for CpuBackend {
     fn swiglu(&mut self, x: &Tensor) -> Tensor {
         let i = x.cols / 2;
         let mut out = Tensor::zeros(x.rows, i);
-        out.data
-            .par_chunks_mut(i)
-            .zip(x.data.par_chunks(x.cols))
-            .for_each(|(o, r)| {
-                for j in 0..i {
-                    let g = r[j];
-                    o[j] = g / (1.0 + (-g).exp()) * r[i + j];
-                }
-            });
+        out.data.par_chunks_mut(i).zip(x.data.par_chunks(x.cols)).for_each(|(o, r)| {
+            for j in 0..i {
+                let g = r[j];
+                o[j] = g / (1.0 + (-g).exp()) * r[i + j];
+            }
+        });
         out
     }
 

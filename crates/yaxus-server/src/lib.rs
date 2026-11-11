@@ -341,10 +341,7 @@ async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Response {
 }
 
 async fn index() -> impl IntoResponse {
-    (
-        [(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")],
-        Html(INDEX_HTML),
-    )
+    ([(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Html(INDEX_HTML))
 }
 
 async fn healthz(State(st): State<Shared>) -> Json<Health> {
@@ -354,12 +351,7 @@ async fn healthz(State(st): State<Shared>) -> Json<Health> {
 }
 
 async fn languages() -> Json<Vec<Language>> {
-    Json(
-        LANGUAGES
-            .iter()
-            .map(|(c, n)| Language { code: c.to_string(), name: n.to_string() })
-            .collect(),
-    )
+    Json(LANGUAGES.iter().map(|(c, n)| Language { code: c.to_string(), name: n.to_string() }).collect())
 }
 
 fn to_prompt_request(r: &TranslateRequest) -> TranslationRequest {
@@ -405,17 +397,11 @@ async fn translate(
             format!("prompt is {} tokens; the limit is {}", ids.len(), st.max_context),
         );
     }
-    let max_new = req
-        .max_new_tokens
-        .unwrap_or(DEFAULT_MAX_NEW_TOKENS)
-        .clamp(1, st.max_context - ids.len());
+    let max_new = req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context - ids.len());
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let label = format!(
-        "{}->{}",
-        req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"),
-        req.target_lang
-    );
+    let label =
+        format!("{}->{}", req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), req.target_lang);
     let job = Job {
         work: Work::Single { prompt_ids: ids, max_new_tokens: max_new, memo: memory::key(&to_prompt_request(&req)) },
         enqueued: Instant::now(),
@@ -454,6 +440,8 @@ async fn translate(
     error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
 }
 
+// (the error is the response to send; boxing it buys nothing on this path)
+#[allow(clippy::result_large_err)]
 fn enqueue(st: &AppState, job: Job) -> std::result::Result<(), Response> {
     st.queued.fetch_add(1, Ordering::SeqCst);
     match st.jobs.try_send(job) {
@@ -514,11 +502,8 @@ async fn translate_document(
         max_new_tokens: req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context / 2),
     };
     let doc = document::DocJob::new(req.segments.clone(), opts);
-    let label = format!(
-        "{}->{}",
-        req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"),
-        req.target_lang
-    );
+    let label =
+        format!("{}->{}", req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), req.target_lang);
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
     if let Err(r) = enqueue(&st, job) {
@@ -602,13 +587,8 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         model.backend_name(),
         t0.elapsed()
     );
-    let health = Health {
-        status: "ok".into(),
-        model: opts.model_name.clone(),
-        backend: model.backend_name(),
-        quant,
-        queue: 0,
-    };
+    let health =
+        Health { status: "ok".into(), model: opts.model_name.clone(), backend: model.backend_name(), quant, queue: 0 };
 
     let (jobs, rx) = mpsc::channel(opts.queue_limit.max(1));
     let queue_limit = opts.queue_limit.max(1);
@@ -667,7 +647,8 @@ mod tests {
 
     fn snapshot(repo: &str) -> Option<std::path::PathBuf> {
         let home = std::env::var("HOME").ok()?;
-        let snaps = Path::new(&home).join(format!(".cache/huggingface/hub/models--{}/snapshots", repo.replace('/', "--")));
+        let snaps =
+            Path::new(&home).join(format!(".cache/huggingface/hub/models--{}/snapshots", repo.replace('/', "--")));
         std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
     }
 
@@ -675,11 +656,18 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_tokenizer_matches_jsonl() {
-        let (Some(hf), Some(gg)) = (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF")) else {
+        let (Some(hf), Some(gg)) =
+            (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
+        else {
             eprintln!("0.8B model or GGUF files not found; skipping");
             return;
         };
-        let file = std::fs::read_dir(&gg).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "gguf")).unwrap();
+        let file = std::fs::read_dir(&gg)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+            .unwrap();
         let a = load_tokenizer(&hf).unwrap();
         let b = load_tokenizer(&file).unwrap();
         let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/tokenizer.jsonl");

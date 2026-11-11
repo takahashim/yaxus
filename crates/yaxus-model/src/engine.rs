@@ -303,9 +303,7 @@ const HINT_PATIENCE: usize = 4;
 fn hint_match(hint: &[u32], out: &[u32], pos: usize) -> Option<usize> {
     for n in (1..=out.len().min(3)).rev() {
         let tail = &out[out.len() - n..];
-        let best = (n..hint.len())
-            .filter(|&p| &hint[p - n..p] == tail)
-            .min_by_key(|&p| p.abs_diff(pos));
+        let best = (n..hint.len()).filter(|&p| &hint[p - n..p] == tail).min_by_key(|&p| p.abs_diff(pos));
         match best {
             // A single token matches too easily far from where the hint is aligned.
             Some(p) if n > 1 || p.abs_diff(pos) <= 4 => return Some(p),
@@ -415,7 +413,8 @@ impl<B: Backend> Engine<B> {
             _ => {
                 self.prefill_turn = true;
                 let speculate = |s: &Stream| self.draft.is_some() || !s.req.hint.is_empty();
-                if decoding.len() <= self.cfg.spec_max_streams && decoding.iter().all(|&i| speculate(&self.streams[i])) {
+                if decoding.len() <= self.cfg.spec_max_streams && decoding.iter().all(|&i| speculate(&self.streams[i]))
+                {
                     for &i in &decoding {
                         if let Err(e) = self.spec_round(i, emit) {
                             self.streams[i].error = Some(format!("{e:#}"));
@@ -505,15 +504,15 @@ impl<B: Backend> Engine<B> {
         }
         let items: Vec<(SeqId, &[u32])> =
             plan.iter().map(|&(i, a, b)| (self.streams[i].ts, &self.streams[i].req.prompt[a..b])).collect();
-        let result = self.target.forward(&items, false).and_then(|logits| {
+        let result = self.target.forward(&items, false).map(|logits| {
             // Only the streams whose prompt is complete need their last row's argmax.
             let complete: Vec<usize> =
                 (0..plan.len()).filter(|&j| plan[j].2 == self.streams[plan[j].0].req.prompt.len()).collect();
             if complete.is_empty() {
-                return Ok(Vec::new());
+                return Vec::new();
             }
             let toks = self.target.backend.argmax_rows(&logits);
-            Ok(complete.into_iter().map(|j| (j, toks[j])).collect())
+            complete.into_iter().map(|j| (j, toks[j])).collect()
         });
         match result {
             Ok(firsts) => {
@@ -576,9 +575,8 @@ impl<B: Backend> Engine<B> {
         let mut round_t0 = None;
         // After the output leaves the hint it often rejoins it a few tokens later; until
         // then single decode steps are cheaper than catching the draft model up.
-        let draft_lag = s.ds.map_or(usize::MAX, |d| {
-            self.target.seq_len(s.ts) - self.draft.as_ref().map_or(0, |m| m.seq_len(d))
-        });
+        let draft_lag =
+            s.ds.map_or(usize::MAX, |d| self.target.seq_len(s.ts) - self.draft.as_ref().map_or(0, |m| m.seq_len(d)));
         let (props, hint_at) = match from_hint {
             Some((p, props)) if !props.is_empty() => {
                 self.streams[i].hint_misses = 0;

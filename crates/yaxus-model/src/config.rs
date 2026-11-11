@@ -77,7 +77,7 @@ impl Config {
     }
 
     pub fn is_full_attn(&self, layer: usize) -> bool {
-        (layer + 1) % self.sliding_window_pattern == 0
+        (layer + 1).is_multiple_of(self.sliding_window_pattern)
     }
 
     pub fn q_dim(&self) -> usize {
@@ -119,12 +119,7 @@ impl Config {
     pub fn layer_meta(&self, layer: usize) -> Result<LayerMeta> {
         let full = self.is_full_attn(layer);
         let rope = Rope::new(self.head_dim, &self.rope_param(full))?;
-        Ok(LayerMeta {
-            index: layer,
-            full_attn: full,
-            window: if full { None } else { Some(self.window_size) },
-            rope,
-        })
+        Ok(LayerMeta { index: layer, full_attn: full, window: if full { None } else { Some(self.window_size) }, rope })
     }
 }
 
@@ -149,15 +144,9 @@ impl Rope {
     /// Mirrors `RotaryEmbedding._compute_buffers` (computed in f32 like torch).
     pub fn new(dim: usize, p: &RopeParam) -> Result<Self> {
         let base = p.rope_theta;
-        let freq: Vec<f32> = (0..dim)
-            .step_by(2)
-            .map(|i| (base as f32).powf(i as f32 / dim as f32))
-            .collect();
+        let freq: Vec<f32> = (0..dim).step_by(2).map(|i| (base as f32).powf(i as f32 / dim as f32)).collect();
         match p.rope_type.as_str() {
-            "default" => Ok(Rope {
-                inv_freq: freq.iter().map(|f| 1.0 / f).collect(),
-                concentration: 1.0,
-            }),
+            "default" => Ok(Rope { inv_freq: freq.iter().map(|f| 1.0 / f).collect(), concentration: 1.0 }),
             "yarn" => {
                 ensure!(!p.truncate, "yarn truncate=true is not supported");
                 let factor = p.factor.context("yarn factor")?;
@@ -180,10 +169,7 @@ impl Rope {
                         interp * (1.0 - mask) + extrap * mask
                     })
                     .collect();
-                Ok(Rope {
-                    inv_freq,
-                    concentration: (0.1 * factor.ln() + 1.0) as f32,
-                })
+                Ok(Rope { inv_freq, concentration: (0.1 * factor.ln() + 1.0) as f32 })
             }
             other => anyhow::bail!("unsupported rope_type {other}"),
         }

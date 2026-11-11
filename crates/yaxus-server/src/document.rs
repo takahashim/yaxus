@@ -199,7 +199,10 @@ pub fn run_document(
             let id = engine.fresh_id();
             let memo = memory::key(&req);
             let prompt_tokens = ids.len();
-            live.insert(id, Live { seg, dec: StreamDecoder::new(), text: String::new(), tokens: Vec::new(), prompt_tokens, memo });
+            live.insert(
+                id,
+                Live { seg, dec: StreamDecoder::new(), text: String::new(), tokens: Vec::new(), prompt_tokens, memo },
+            );
             let mut r = Request::new(id, ids, job.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
             r.hint = memory.get(memo);
             engine.submit(r);

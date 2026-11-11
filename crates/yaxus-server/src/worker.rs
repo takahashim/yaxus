@@ -20,7 +20,11 @@ use crate::memory::{self, Memory};
 
 pub enum Work {
     /// `memo`: the request's translation memory key.
-    Single { prompt_ids: Vec<u32>, max_new_tokens: usize, memo: u64 },
+    Single {
+        prompt_ids: Vec<u32>,
+        max_new_tokens: usize,
+        memo: u64,
+    },
     Document(Box<DocJob>),
 }
 
@@ -114,9 +118,7 @@ pub fn run(
         if st.active.is_empty() {
             continue;
         }
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            engine.step(&mut |ev| handle(ev, &tok, &mut st))
-        }));
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| engine.step(&mut |ev| handle(ev, &tok, &mut st))));
         let failure = match result {
             Ok(Ok(_)) => None,
             Ok(Err(e)) => Some(format!("{e:#}")),
@@ -257,12 +259,20 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
             a.text += &s;
             match &a.owner {
                 Owner::Single { events, .. } => {
-                    if s.is_empty() { !events.is_closed() } else { events.send(Event::Delta(s)).is_ok() }
+                    if s.is_empty() {
+                        !events.is_closed()
+                    } else {
+                        events.send(Event::Delta(s)).is_ok()
+                    }
                 }
                 Owner::Doc { key, segment } => {
                     let Some(d) = st.docs.get_mut(key) else { return false };
                     let ok = !d.stopped
-                        && if s.is_empty() { !d.events.is_closed() } else { d.events.send(Event::SegmentDelta(*segment, s)).is_ok() };
+                        && if s.is_empty() {
+                            !d.events.is_closed()
+                        } else {
+                            d.events.send(Event::SegmentDelta(*segment, s)).is_ok()
+                        };
                     if !ok {
                         d.stopped = true;
                     }
@@ -295,7 +305,11 @@ fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
                         "{label}: {} -> {} tokens in {elapsed:.2?} ({}, queued {} ms){}",
                         usage.prompt_tokens,
                         usage.completion_tokens,
-                        if start.cached { "from the response cache".to_string() } else { format!("reused {} prompt tokens", start.reused) },
+                        if start.cached {
+                            "from the response cache".to_string()
+                        } else {
+                            format!("reused {} prompt tokens", start.reused)
+                        },
                         usage.queue_ms,
                         if finish == Finish::Cancelled { ", cancelled by client" } else { "" }
                     );

@@ -79,7 +79,8 @@ pub const FORMATS: [IntFmt; 6] = [
     IntFmt {
         name: "q6",
         loader: W_Q6,
-        stage: "let g = wrow * (3u * p.k / 16u) + kb * 6u;
+        stage:
+            "let g = wrow * (3u * p.k / 16u) + kb * 6u;
         let lo = wq[g + c];
         let hi = wq[g + 4u + c / 2u] >> (16u * (c & 1u));
         let e0 = (((lo & 0x0f0f0f0fu) | (spread2e(hi) << 4u) | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
@@ -136,7 +137,13 @@ pub fn source(f: &IntFmt, tn: usize, planes: usize) -> String {
     let nt = 16 * tn; // tokens per workgroup
     let gv = tn.div_ceil(4); // vec4 of activations per lane and u32 of K
     // With 2 tokens per lane a lane uses half of a vec4 of 4 tokens.
-    let (xgroup, half) = if tn == 2 { ("st / 2u", true) } else if tn == 4 { ("st", false) } else { ("st * 2u", false) };
+    let (xgroup, half) = if tn == 2 {
+        ("st / 2u", true)
+    } else if tn == 4 {
+        ("st", false)
+    } else {
+        ("st * 2u", false)
+    };
     let pick = |e: String| if half { format!("select({e}.xy, {e}.zw, (st & 1u) == 1u)") } else { e };
     let ks = f.ks;
     let mut s = String::new();
@@ -260,8 +267,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
                 };
                 let (v, c) = (j / 4, j % 4);
                 if f.has_min {
-                    writeln!(w, "        r{i}_{j} += {sum} * (ws{h}_{i}.x * xu{v}[{c}]) - ws{h}_{i}.y * xm{h}_{v}[{c}];")
-                        .unwrap();
+                    writeln!(
+                        w,
+                        "        r{i}_{j} += {sum} * (ws{h}_{i}.x * xu{v}[{c}]) - ws{h}_{i}.y * xm{h}_{v}[{c}];"
+                    )
+                    .unwrap();
                 } else {
                     writeln!(w, "        r{i}_{j} += {sum} * (ws{h}_{i}.x * xu{v}[{c}]);").unwrap();
                 }

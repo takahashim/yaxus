@@ -41,9 +41,7 @@ fn check_text(value: &str, name: &str, allow_empty: bool) -> Result<(), PromptEr
         return Err(PromptError(format!("{name} must not be empty.")));
     }
     if value.contains(RESERVED) {
-        return Err(PromptError(format!(
-            "{name} must not contain reserved PFML tokens (<|plamo:...)."
-        )));
+        return Err(PromptError(format!("{name} must not contain reserved PFML tokens (<|plamo:...).")));
     }
     Ok(())
 }
@@ -61,9 +59,7 @@ pub fn validate_lang(value: &str, name: &str) -> Result<(), PromptError> {
         )));
     }
     if !value.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
-        return Err(PromptError(format!(
-            "{name} must use lowercase language codes without region subtags."
-        )));
+        return Err(PromptError(format!("{name} must use lowercase language codes without region subtags.")));
     }
     Ok(())
 }
@@ -94,9 +90,7 @@ impl TranslationRequest {
         if let Some(form) = &self.form
             && (!matches!(form.as_str(), "polite" | "plain") || target_lang != "ja")
         {
-            return Err(PromptError(
-                "form must be polite or plain and requires target_lang=\"ja\".".into(),
-            ));
+            return Err(PromptError("form must be polite or plain and requires target_lang=\"ja\".".into()));
         }
         for term in &self.glossary {
             check_text(&term.source, "glossary source", false)?;
