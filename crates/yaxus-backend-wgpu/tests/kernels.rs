@@ -244,7 +244,8 @@ fn integer_rows_do_not_depend_on_the_pass() {
 fn argmax_handles_a_whole_pass() {
     let mut gpu = WgpuBackend::new().unwrap();
     let cols = 1000;
-    for rows in [1, 64, 65, 300, 512] {
+    // 1100: more than one dispatch's 512 rows, done in batches.
+    for rows in [1, 64, 65, 300, 512, 1100] {
         let mut x = values(rows * cols, rows as u64);
         let want: Vec<u32> = (0..rows).map(|r| ((r * 37) % cols) as u32).collect();
         for (r, &w) in want.iter().enumerate() {
@@ -278,4 +279,16 @@ fn kv_cache_for_a_single_kind_of_layer() {
             .collect();
         assert!(gpu.new_kv(&cfg, &metas, 2, 512).is_ok(), "full_attn = {full}");
     }
+}
+
+/// A buffer the device cannot create is an error, not a panic in wgpu's handler.
+#[test]
+#[ignore]
+fn failed_allocations_are_errors() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let too_big = gpu.max_buffer_size() + 4;
+    assert!(gpu.debug_alloc(too_big).is_err());
+    // The device is still usable afterwards.
+    assert!(gpu.debug_alloc(1 << 20).is_ok());
+    assert_eq!(gpu.debug_argmax(&[0.0, 1.0, 0.5], 1), [1]);
 }

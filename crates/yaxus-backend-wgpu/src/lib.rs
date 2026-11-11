@@ -178,7 +178,8 @@ pub struct Gpu {
     oversized: Option<(String, usize)>,
     /// Tiled attention for passes of more than 16 rows: keys are split into chunks until
     /// about this many workgroups run (0: the per-row kernel instead). `YAXUS_TILE_WGS`
-    /// sets it; it is 0 on devices without the kernel's workgroup memory.
+    /// sets it (0 now selects the per-row kernel). Devices without the kernel's workgroup
+    /// memory take the per-row kernel whatever this says.
     tile_wgs: usize,
     kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
@@ -372,9 +373,11 @@ const ATTN_TILE_ROWS: usize = 32;
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 const ARGMAX_SLICES: usize = 64;
-/// Rows of logits one argmax handles: a whole pass (the model's prefill chunk).
+/// Rows of logits one argmax dispatch handles (one per stream of a pass, or the rows of
+/// a speculative verification); more are done in batches.
 const ARGMAX_ROWS: usize = 512;
-/// Workgroup memory of `attn_tile` (`qs`, `kv`, `ss` and the per-row arrays).
+/// Workgroup memory of `attn_tile`: the `var<workgroup>` arrays of `ATTN_TILE` in
+/// shaders.rs (`qs`, `kv`, `ss`, `rm`, `rl`, `rc`, `kslot`); keep the two in step.
 const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
 
 /// Passes with at most this many rows use the split-key attention (a workgroup per row
@@ -796,8 +799,6 @@ impl Gpu {
         // without it, prefill attention takes the per-row kernel.
         if self.subgroups && self.device.limits().max_compute_workgroup_storage_size >= ATTN_TILE_SHARED_BYTES {
             self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
-        } else {
-            self.tile_wgs = 0;
         }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
@@ -969,11 +970,23 @@ impl Gpu {
         if bytes.len() as u64 > self.device.limits().max_storage_buffer_binding_size {
             self.oversized.get_or_insert((label.to_string(), bytes.len()));
         }
-        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Not create_buffer_init: when the allocation fails (out of memory, above
+        // max_buffer_size) it panics mapping the invalid buffer, before an error scope
+        // can report it. A plain buffer and a queued write report the error instead.
+        let size = (bytes.len().max(4) as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        if bytes.len() as u64 == size {
+            self.queue.write_buffer(&buf, 0, bytes);
+        } else {
+            let mut padded = bytes.to_vec();
+            padded.resize(size as usize, 0);
+            self.queue.write_buffer(&buf, 0, &padded);
+        }
         // Initial contents go through staging memory that is only released after the
         // next submission; flush regularly so loading does not hold a second copy of
         // the weights (an 8B model in bf16 would exceed the GTT limit).
@@ -1336,7 +1349,7 @@ impl Gpu {
                 &[hq as u32, hkv as u32, nch as u32],
                 (hq as u32, t as u32),
             );
-        } else if t > SPLIT_ATTN_MAX_ROWS && self.subgroups && self.tile_wgs > 0 {
+        } else if t > SPLIT_ATTN_MAX_ROWS && self.tile_wgs > 0 && self.kernels.contains_key("attn_tile") {
             let tiles = self.meta_buf(MetaBuf::Tiles);
             // Split the keys into chunks while there are few workgroups (short passes
             // over long contexts), merging the chunks with `attn_combine`.
@@ -1645,7 +1658,16 @@ impl Gpu {
 impl Gpu {
     /// Greedy token and its softmax probability for every row (two-stage reduction).
     fn argmax_prob_rows(&mut self, logits: &Tensor) -> Vec<(u32, f32)> {
-        assert!(logits.rows <= ARGMAX_ROWS, "argmax_rows supports up to {ARGMAX_ROWS} rows (a pass)");
+        if logits.rows > ARGMAX_ROWS {
+            // More streams than one dispatch covers (--max-streams has no upper bound).
+            let mut out = Vec::with_capacity(logits.rows);
+            for start in (0..logits.rows).step_by(ARGMAX_ROWS) {
+                let rows: Vec<usize> = (start..(start + ARGMAX_ROWS).min(logits.rows)).collect();
+                let part = self.select_rows(logits, &rows);
+                out.extend(self.argmax_prob_rows(&part));
+            }
+            return out;
+        }
         let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
         let slice = logits.cols.div_ceil(ARGMAX_SLICES);
         self.dispatch(
@@ -1669,6 +1691,8 @@ impl Gpu {
     /// a weight or KV arena that does not fit comes back as `Err` instead of panicking
     /// in wgpu's default error handler.
     fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // Only report a buffer from this call (uploads outside `checked` also set it).
+        self.oversized = None;
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let invalid = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let r = f(self);
@@ -1817,6 +1841,19 @@ impl Gpu {
     }
 
     #[doc(hidden)]
+    pub fn debug_alloc(&mut self, size: u64) -> Result<()> {
+        self.checked("allocating a test buffer", |g| {
+            let _buf = g.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("test"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            Ok(())
+        })
+    }
+
+    #[doc(hidden)]
     pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
         let x = self.tensor(rows, logits.len() / rows);
         self.queue.write_buffer(x.buf(), 0, bytemuck::cast_slice(logits));
@@ -1939,6 +1976,16 @@ impl WgpuBackend {
     #[doc(hidden)]
     pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
         self.g().debug_argmax(logits, rows)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_alloc(&mut self, size: u64) -> Result<()> {
+        self.g().debug_alloc(size)
+    }
+
+    #[doc(hidden)]
+    pub fn max_buffer_size(&self) -> u64 {
+        self.g().device.limits().max_buffer_size
     }
 
     fn track(&mut self, before: usize) {
