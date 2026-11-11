@@ -80,6 +80,8 @@ impl Config {
             ("intermediate_size", self.intermediate_size),
             ("vocab_size", self.vocab_size),
             ("sliding_window_pattern", self.sliding_window_pattern),
+            // An empty window leaves sliding-window attention nothing to attend to (NaN).
+            ("window_size", self.window_size),
         ];
         for (name, v) in sizes {
             ensure!(v > 0, "{name} must be positive");

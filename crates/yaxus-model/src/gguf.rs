@@ -391,6 +391,23 @@ mod tests {
     }
 
     #[test]
+    fn first_rows_drops_the_trailing_rows() {
+        // A [3, 2] F32 matrix (dims innermost first).
+        let mut b = head(1, 0);
+        tensor(&mut b, &[2, 3], 0);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        for v in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            b.extend(v.to_le_bytes());
+        }
+        let f = write("rows", &b);
+        let g = Gguf::open(&f.0).unwrap();
+        let t = &g.tensors[0].1;
+        let top = t.first_rows(2).unwrap();
+        assert_eq!((top.shape.clone(), top.to_f32_vec()), (vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]));
+        assert!(t.first_rows(4).is_none());
+    }
+
+    #[test]
     fn a_small_valid_file_opens() {
         let mut b = head(1, 0);
         tensor(&mut b, &[2], 0);

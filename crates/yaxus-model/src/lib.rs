@@ -309,6 +309,17 @@ impl<B: Backend> Model<B> {
             lm_head_t.shape,
             cfg.vocab_size
         );
+        // Rows beyond the vocabulary (padding) would let argmax pick a token the embedding
+        // table does not have; only the first `vocab_size` rows are loaded.
+        let lm_head_rows;
+        let lm_head_t = if lm_head_t.shape[0] > cfg.vocab_size {
+            lm_head_rows = lm_head_t
+                .first_rows(cfg.vocab_size)
+                .with_context(|| format!("lm_head.weight: cannot drop its padding rows ({:?})", lm_head_t.dtype))?;
+            &lm_head_rows
+        } else {
+            lm_head_t
+        };
         let lm_head = backend.load_weight(lm_head_t, quant)?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
@@ -845,5 +856,8 @@ mod tests {
         assert!(cfg.validate().is_err());
         let cfg: Config = serde_json::from_str(&text(1)).unwrap();
         assert!(cfg.validate().is_ok());
+        let mut cfg: Config = serde_json::from_str(&text(1)).unwrap();
+        cfg.window_size = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("window_size"));
     }
 }
