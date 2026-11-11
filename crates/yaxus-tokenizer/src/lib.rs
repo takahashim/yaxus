@@ -40,12 +40,21 @@ pub const EOS_ID: u32 = 1; // tokenizer_config: eos_token = <|plamo:bos|>
 pub const PAD_ID: u32 = 3;
 pub const TAG_ID: u32 = 16;
 
+/// Token ids the rest of the crate (and its users) hard-code, checked at load time
+/// so that a vocabulary with a different layout fails loudly instead of breaking
+/// prompt construction or stop conditions.
+const FIXED_TOKENS: [(u32, &str); 2] = [(BOS_ID, "<|plamo:bos|>"), (TAG_ID, "<|plamo:tag|>")];
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to read {path}: {source}")]
     Io { path: String, source: std::io::Error },
+    /// A line of `tokenizer.jsonl` could not be parsed.
     #[error("tokenizer.jsonl line {line}: {msg}")]
     Format { line: usize, msg: String },
+    /// The vocabulary parsed, but is not a usable PLaMo vocabulary.
+    #[error("invalid vocabulary: {0}")]
+    Vocab(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +130,7 @@ impl Tokenizer {
     /// `tokenizer.ggml.*` metadata of a GGUF file).
     pub fn from_vocab(tokens: Vec<String>, kinds: Vec<TokenKind>, scores: Vec<f64>) -> Result<Self, Error> {
         if tokens.len() != kinds.len() || tokens.len() != scores.len() {
-            return Err(Error::Format { line: 0, msg: "vocabulary arrays differ in length".into() });
+            return Err(Error::Vocab("vocabulary arrays differ in length".into()));
         }
         Self::build(tokens, kinds, scores)
     }
@@ -135,14 +144,20 @@ impl Tokenizer {
             nodes: vec![Node { token: None }],
             edges: HashMap::new(),
         };
+        for (id, want) in FIXED_TOKENS {
+            let got = t.tokens.get(id as usize);
+            if got.map(String::as_str) != Some(want) {
+                return Err(Error::Vocab(format!("token id {id} must be {want:?}, found {got:?}")));
+            }
+        }
         let mut byte_set = [false; 256];
-        for (id, &score) in scores.iter().enumerate().take(t.tokens.len()) {
+        for (id, &score) in scores.iter().enumerate() {
             if t.kinds[id] == TokenKind::Byte {
-                let tok = &t.tokens[id];
-                let b = (tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>'))
-                    .then(|| u8::from_str_radix(&tok[3..5], 16).ok())
-                    .flatten()
-                    .ok_or_else(|| Error::Format { line: id + 1, msg: format!("malformed byte token {tok:?}") })?;
+                let b = parse_byte_token(&t.tokens[id])
+                    .ok_or_else(|| Error::Vocab(format!("token id {id}: malformed byte token {:?}", t.tokens[id])))?;
+                if byte_set[b as usize] {
+                    return Err(Error::Vocab(format!("token id {id}: byte token <0x{b:02X}> is defined twice")));
+                }
                 t.bytes[b as usize] = id as u32;
                 t.byte_of[id] = Some(b);
                 byte_set[b as usize] = true;
@@ -154,7 +169,7 @@ impl Tokenizer {
         // The boundary character is added last, as in the Python implementation.
         t.insert(&BOUNDARY_CHAR.to_string(), BOUNDARY_TOKEN_ID, 0);
         if let Some(b) = byte_set.iter().position(|x| !x) {
-            return Err(Error::Format { line: 0, msg: format!("byte token <0x{b:02X}> is not set") });
+            return Err(Error::Vocab(format!("byte token <0x{b:02X}> is not set")));
         }
         Ok(t)
     }
@@ -275,6 +290,15 @@ impl Tokenizer {
     }
 }
 
+/// Parses a byte token `<0xNN>` (exactly two hex digits).
+fn parse_byte_token(tok: &str) -> Option<u8> {
+    let hex = tok.strip_prefix("<0x")?.strip_suffix('>')?;
+    if hex.len() != 2 || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u8::from_str_radix(hex, 16).ok()
+}
+
 /// Python `str.isspace()`, which is what `\s` matches in a `str` regex.
 fn py_isspace(c: char) -> bool {
     matches!(c,
@@ -374,6 +398,152 @@ mod tests {
         assert_eq!(mark_runs("aaaab"), format!("{b}aaaa{b}b"));
         assert_eq!(mark_runs("a  b"), format!("a{b}  {b}b"));
         assert_eq!(mark_runs("\n\n\n\n"), "\n\n\n\n");
+    }
+
+    /// A minimal PLaMo-shaped vocabulary: control tokens at ids 0..=16 (bos at 1,
+    /// tag at 16), the 256 byte tokens, then `normal` with their scores.
+    fn vocab(normal: &[(&str, f64)]) -> (Vec<String>, Vec<TokenKind>, Vec<f64>) {
+        let mut tokens = Vec::new();
+        let mut kinds = Vec::new();
+        let mut scores = Vec::new();
+        for id in 0..=TAG_ID {
+            tokens.push(match id {
+                BOS_ID => "<|plamo:bos|>".to_string(),
+                TAG_ID => "<|plamo:tag|>".to_string(),
+                _ => format!("<|plamo:c{id}|>"),
+            });
+            kinds.push(TokenKind::Control);
+            scores.push(0.0);
+        }
+        for b in 0..=255u8 {
+            tokens.push(format!("<0x{b:02X}>"));
+            kinds.push(TokenKind::Byte);
+            scores.push(0.0);
+        }
+        for &(t, score) in normal {
+            tokens.push(t.to_string());
+            kinds.push(TokenKind::Normal);
+            scores.push(score);
+        }
+        (tokens, kinds, scores)
+    }
+
+    fn tokenizer(normal: &[(&str, f64)]) -> Tokenizer {
+        let (t, k, s) = vocab(normal);
+        Tokenizer::from_vocab(t, k, s).unwrap()
+    }
+
+    /// Encodes and maps the ids back to token strings, for readable assertions.
+    fn pieces(tok: &Tokenizer, text: &str) -> Vec<String> {
+        let ids = tok.encode(text, false);
+        assert_eq!(tok.decode(&ids), text.replace(BOUNDARY_CHAR, ""));
+        ids.iter().map(|&id| tok.id_to_token(id).unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn viterbi_picks_lowest_cost() {
+        let tok = tokenizer(&[("a", -1.0), ("b", -1.0), ("ab", -3.0), ("abc", -10.0), ("c", -1.0)]);
+        // a+b (2.0) beats ab (3.0); abc (10.0) loses to a+b+c (3.0).
+        assert_eq!(pieces(&tok, "ab"), ["a", "b"]);
+        assert_eq!(pieces(&tok, "abc"), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn viterbi_ties_prefer_longest_token() {
+        let tok = tokenizer(&[("a", -1.0), ("b", -1.0), ("ab", -2.0)]);
+        assert_eq!(pieces(&tok, "ab"), ["ab"]);
+        assert_eq!(pieces(&tok, "abab"), ["ab", "ab"]);
+    }
+
+    #[test]
+    fn unknown_characters_fall_back_to_utf8_bytes() {
+        let tok = tokenizer(&[("a", -1.0)]);
+        assert_eq!(pieces(&tok, "aé"), ["a", "<0xC3>", "<0xA9>"]);
+        assert_eq!(pieces(&tok, "😀"), ["<0xF0>", "<0x9F>", "<0x98>", "<0x80>"]);
+        assert!(tok.encode("", false).is_empty());
+        assert_eq!(tok.encode("", true), [BOS_ID]);
+    }
+
+    #[test]
+    fn fallback_wins_only_when_strictly_better() {
+        // Score -1000 gives exactly UNKNOWN_SCORE: the token wins the tie.
+        let tok = tokenizer(&[("x", -1000.0)]);
+        assert_eq!(pieces(&tok, "x"), ["x"]);
+        // Scores at or below INVALID_SCORE are never used.
+        let tok = tokenizer(&[("x", -2000.0)]);
+        assert_eq!(pieces(&tok, "x"), ["<0x78>"]);
+    }
+
+    #[test]
+    fn later_duplicate_rows_win() {
+        let tok = tokenizer(&[("ab", -9.0), ("a", -1.0), ("b", -1.0), ("ab", -1.0)]);
+        let ids = tok.encode("ab", false);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0] as usize, tok.vocab_size() - 1);
+    }
+
+    #[test]
+    fn boundaries_split_tokens_and_are_dropped() {
+        let b = BOUNDARY_CHAR;
+        let tok = tokenizer(&[("a", -1.0), ("b", -1.0), ("ab", -1.0), ("  ", -1.0), (" ", -1.0)]);
+        assert_eq!(pieces(&tok, &format!("a{b}b")), ["a", "b"]);
+        assert_eq!(pieces(&tok, &format!("{b}{b}")), Vec::<String>::new());
+        // Consecutive spaces are isolated from their neighbours.
+        let tok = tokenizer(&[("a", -1.0), ("a ", -1.0), (" ", -1.0), ("  ", -1.0)]);
+        assert_eq!(pieces(&tok, "a  a"), ["a", "  ", "a"]);
+        assert_eq!(pieces(&tok, "a a"), ["a ", "a"]);
+    }
+
+    #[test]
+    fn special_tokens_are_isolated() {
+        // Without the boundaries, "x<" + "|plamo:tag|>" (cost 0.1) would beat
+        // "x" + "<|plamo:tag|>" (cost 1.0).
+        let tok = tokenizer(&[("x", -1.0), ("x<", -0.1), ("|plamo:tag|>", 0.0)]);
+        assert_eq!(tok.encode("x<|plamo:tag|>x", false)[1], TAG_ID);
+        assert_eq!(pieces(&tok, "x<|plamo:tag|>x"), ["x", "<|plamo:tag|>", "x"]);
+    }
+
+    #[test]
+    fn rejects_bad_vocabularies() {
+        let err = |(t, k, s): (Vec<String>, Vec<TokenKind>, Vec<f64>)| {
+            Tokenizer::from_vocab(t, k, s).unwrap_err().to_string()
+        };
+        let base = vocab(&[]);
+        let byte = TAG_ID as usize + 1 + 0x41;
+
+        let mut v = base.clone();
+        v.0[TAG_ID as usize] = "<|plamo:msg|>".into();
+        assert!(err(v).contains("token id 16 must be \"<|plamo:tag|>\""));
+
+        let mut v = base.clone();
+        v.0.truncate(BOS_ID as usize);
+        v.1.truncate(BOS_ID as usize);
+        v.2.truncate(BOS_ID as usize);
+        assert!(err(v).contains("token id 1 must be"));
+
+        for bad in ["<0x+1>", "<0x4G>", "<0x041>", "<0xé>", "0x41"] {
+            let mut v = base.clone();
+            v.0[byte] = bad.into();
+            assert!(err(v).contains("malformed byte token"), "{bad}");
+        }
+
+        let mut v = base.clone();
+        v.0[byte] = "<0x42>".into();
+        assert!(err(v).contains("<0x42> is defined twice"));
+
+        let mut v = base.clone();
+        v.1[byte] = TokenKind::Normal;
+        assert!(err(v).contains("<0x41> is not set"));
+
+        let mut v = base.clone();
+        v.2.pop();
+        assert!(err(v).contains("differ in length"));
+    }
+
+    #[test]
+    fn jsonl_errors_report_the_line() {
+        let e = Tokenizer::from_jsonl("[\"a\", 0.0]\n\n[\"b\"]\n").unwrap_err();
+        assert_eq!(e.to_string(), "tokenizer.jsonl line 3: score is not a number");
     }
 
     #[test]
