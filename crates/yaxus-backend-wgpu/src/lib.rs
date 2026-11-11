@@ -1639,7 +1639,7 @@ impl Gpu {
         self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
         let b = self.read(&out, 0, logits.rows as u64 * 8);
         let v: &[u32] = bytemuck::cast_slice(&b);
-        v.chunks_exact(2).map(|c| (c[0], f32::from_bits(c[1]))).collect()
+        v.as_chunks::<2>().0.iter().map(|&[i, x]| (i, f32::from_bits(x))).collect()
     }
 }
 
