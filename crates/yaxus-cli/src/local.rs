@@ -309,9 +309,9 @@ pub fn run_request(
     let max_new = req.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS);
     let out = model.generate(&ids, max_new, &[EOS_ID, TAG_ID], &mut |id| {
         first.get_or_insert_with(Instant::now);
-        let s = dec.push(tok, id);
-        emit(&s);
-        text += &s;
+        let start = text.len();
+        dec.push_into(tok, id, &mut text);
+        emit(&text[start..]);
         true
     })?;
     let tail = dec.finish();

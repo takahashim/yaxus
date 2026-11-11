@@ -15,7 +15,9 @@
 //! the private-use boundary character U+EE00, which forces token boundaries and is
 //! dropped from the output.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 
 mod pfml;
@@ -28,6 +30,8 @@ const INVALID_SCORE: i64 = -20_000_000;
 const UNKNOWN_SCORE: i64 = -10_000_000;
 const BOUNDARY_CHAR: char = '\u{EE00}';
 const BOUNDARY_TOKEN_ID: u32 = 10_000_000;
+/// `path` entry for the unknown-character fallback (emitted as UTF-8 byte tokens).
+const NO_TOKEN: u32 = u32::MAX;
 
 /// `break_around_repeated_chars_threshold` from tokenizer_config.json.
 const REPEATED_CHARS_THRESHOLD: usize = 4;
@@ -72,6 +76,28 @@ struct Node {
     token: Option<(u32, i64)>,
 }
 
+/// Hasher for the trie's `(node << 32) | codepoint` keys. The default SipHash dominates
+/// the Viterbi inner loop; one 128-bit multiply mixes both halves into every bit.
+#[derive(Default)]
+struct EdgeHasher(u64);
+
+impl Hasher for EdgeHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys are hashed");
+    }
+
+    fn write_u64(&mut self, x: u64) {
+        let p = (x as u128) * 0x9e37_79b9_7f4a_7c15;
+        self.0 = (p as u64) ^ ((p >> 64) as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type EdgeMap = HashMap<u64, u32, BuildHasherDefault<EdgeHasher>>;
+
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     tokens: Vec<String>,
@@ -81,7 +107,7 @@ pub struct Tokenizer {
     bytes: [u32; 256],
     nodes: Vec<Node>,
     /// Trie edges keyed by `(node << 32) | codepoint`.
-    edges: HashMap<u64, u32>,
+    edges: EdgeMap,
 }
 
 /// Python's `round()` (round half to even) applied to `score * 1e4`.
@@ -142,7 +168,7 @@ impl Tokenizer {
             kinds,
             bytes: [0; 256],
             nodes: vec![Node { token: None }],
-            edges: HashMap::new(),
+            edges: EdgeMap::default(),
         };
         for (id, want) in FIXED_TOKENS {
             let got = t.tokens.get(id as usize);
@@ -207,8 +233,11 @@ impl Tokenizer {
     }
 
     /// Encodes text, optionally prefixing `<|plamo:bos|>` (the model expects it).
+    ///
+    /// As in the Python tokenizer, U+EE00 in `text` is taken as a token boundary and
+    /// produces no token, so `decode(encode(text))` drops it.
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
-        let chars: Vec<char> = preprocess(text).chars().collect();
+        let chars = preprocess(text);
         let mut out = Vec::with_capacity(chars.len() + 1);
         if add_bos {
             out.push(BOS_ID);
@@ -219,13 +248,13 @@ impl Tokenizer {
 
     fn viterbi(&self, data: &[char], out: &mut Vec<u32>) {
         let n = data.len();
-        // costs[i]: minimum cost to encode data[i..]; path[i]: (length, token id or -1).
+        // costs[i]: minimum cost to encode data[i..]; path[i]: (length, token id or NO_TOKEN).
         let mut costs = vec![i64::MAX; n + 1];
-        let mut path: Vec<(u32, i64)> = vec![(0, -1); n + 1];
+        let mut path: Vec<(u32, u32)> = vec![(0, NO_TOKEN); n + 1];
         costs[n] = 0;
         for i in (0..n).rev() {
             let mut best = i64::MAX;
-            let mut best_path = (0u32, -1i64);
+            let mut best_path = (0u32, NO_TOKEN);
             // Walk the trie forward. Lengths are visited in increasing order, so `<=`
             // makes the longest token win among ties (Python: decreasing order, `<`).
             let mut node = 0u32;
@@ -239,7 +268,7 @@ impl Tokenizer {
                     let s = costs[i + len].saturating_sub(score);
                     if s <= best {
                         best = s;
-                        best_path = (len as u32, id as i64);
+                        best_path = (len as u32, id);
                     }
                 }
             }
@@ -247,7 +276,7 @@ impl Tokenizer {
             let s = costs[i + 1].saturating_sub(UNKNOWN_SCORE);
             if s < best {
                 best = s;
-                best_path = (1, -1);
+                best_path = (1, NO_TOKEN);
             }
             costs[i] = best;
             path[i] = best_path;
@@ -256,9 +285,9 @@ impl Tokenizer {
         let mut pos = 0;
         while pos < n {
             let (len, id) = path[pos];
-            if id >= 0 {
-                if id as u32 != BOUNDARY_TOKEN_ID {
-                    out.push(id as u32);
+            if id != NO_TOKEN {
+                if id != BOUNDARY_TOKEN_ID {
+                    out.push(id);
                 }
             } else {
                 let mut buf = [0u8; 4];
@@ -309,31 +338,32 @@ fn py_isspace(c: char) -> bool {
 /// Applies the two regex substitutions of `AhoCorasick.encode`:
 /// 1. `(<\|plamo:[^|\s]{,64}\|>)` -> `\1`
 /// 2. `((.)\2{3,}| {2,})` -> `\1`
-fn preprocess(text: &str) -> String {
-    let step1 = mark_special_tokens(text);
-    mark_runs(&step1)
+fn preprocess(text: &str) -> Vec<char> {
+    mark_runs(&mark_special_tokens(text))
 }
 
-fn mark_special_tokens(text: &str) -> String {
+fn mark_special_tokens(text: &str) -> Cow<'_, str> {
     const PREFIX: &str = "<|plamo:";
     if !text.contains(PREFIX) {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + 16);
     let mut rest = text;
     while let Some(start) = rest.find(PREFIX) {
         let body = &rest[start + PREFIX.len()..];
-        let mut count = 0usize;
-        let mut end = 0usize; // byte offset within body after the class run
-        for (off, c) in body.char_indices() {
+        // Byte offset in `body` of the first character outside `[^|\s]`, if it comes
+        // within 64 characters; a 65th class character means no match.
+        let mut end = None;
+        for (n, (off, c)) in body.char_indices().enumerate() {
             if c == '|' || py_isspace(c) {
-                end = off;
+                end = Some(off);
                 break;
             }
-            count += 1;
-            end = off + c.len_utf8();
+            if n == 64 {
+                break;
+            }
         }
-        if count <= 64 && body[end..].starts_with("|>") {
+        if let Some(end) = end.filter(|&e| body[e..].starts_with("|>")) {
             let tok_end = start + PREFIX.len() + end + 2;
             out.push_str(&rest[..start]);
             out.push(BOUNDARY_CHAR);
@@ -347,20 +377,18 @@ fn mark_special_tokens(text: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
-fn mark_runs(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len() + 8);
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let mut j = i + 1;
-        while j < chars.len() && chars[j] == c {
-            j += 1;
+/// Marks the runs and returns the characters the Viterbi DP works on.
+fn mark_runs(text: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(text.len() + 8);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let mut run = 1;
+        while chars.next_if_eq(&c).is_some() {
+            run += 1;
         }
-        let run = j - i;
         // `.` does not match '\n'; a run that fails at its start also fails at every
         // later start, so matching whole runs is equivalent to the regex scan.
         let matched =
@@ -368,11 +396,10 @@ fn mark_runs(text: &str) -> String {
         if matched {
             out.push(BOUNDARY_CHAR);
         }
-        out.extend(&chars[i..j]);
+        out.extend(std::iter::repeat_n(c, run));
         if matched {
             out.push(BOUNDARY_CHAR);
         }
-        i = j;
     }
     out
 }
@@ -392,12 +419,32 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_special_tokens_length_limit() {
+        let b = BOUNDARY_CHAR;
+        let max = format!("<|plamo:{}|>", "x".repeat(64));
+        assert_eq!(mark_special_tokens(&max), format!("{b}{max}{b}"));
+        // Multi-byte characters count as one each.
+        let max = format!("<|plamo:{}|>", "あ".repeat(64));
+        assert_eq!(mark_special_tokens(&max), format!("{b}{max}{b}"));
+        let over = format!("<|plamo:{}|>", "あ".repeat(65));
+        assert_eq!(mark_special_tokens(&over), over);
+        // Unterminated, or ended by whitespace or a lone '|'.
+        for s in ["<|plamo:", "<|plamo:abc", "<|plamo:ab c|>", "<|plamo:ab|", "<|plamo:ab|x"] {
+            assert_eq!(mark_special_tokens(s), s);
+        }
+        assert!(matches!(mark_special_tokens("no special tokens"), Cow::Borrowed(_)));
+    }
+
+    #[test]
     fn preprocess_runs() {
         let b = BOUNDARY_CHAR;
-        assert_eq!(mark_runs("aaab"), "aaab");
-        assert_eq!(mark_runs("aaaab"), format!("{b}aaaa{b}b"));
-        assert_eq!(mark_runs("a  b"), format!("a{b}  {b}b"));
-        assert_eq!(mark_runs("\n\n\n\n"), "\n\n\n\n");
+        let runs = |s: &str| mark_runs(s).into_iter().collect::<String>();
+        assert_eq!(runs(""), "");
+        assert_eq!(runs("aaab"), "aaab");
+        assert_eq!(runs("aaaab"), format!("{b}aaaa{b}b"));
+        assert_eq!(runs("a  b"), format!("a{b}  {b}b"));
+        assert_eq!(runs("\n\n\n\n"), "\n\n\n\n");
+        assert_eq!(runs("ああああ  x    "), format!("{b}ああああ{b}{b}  {b}x{b}    {b}"));
     }
 
     /// A minimal PLaMo-shaped vocabulary: control tokens at ids 0..=16 (bos at 1,
@@ -538,6 +585,45 @@ mod tests {
         let mut v = base.clone();
         v.2.pop();
         assert!(err(v).contains("differ in length"));
+    }
+
+    #[test]
+    fn stream_decoder_matches_decode() {
+        let tok = tokenizer(&[("あ", -1.0), ("ab", -1.0)]);
+        let byte = |b: u8| tok.bytes[b as usize];
+        let normal = [tok.encode("あ", false)[0], tok.encode("ab", false)[0], BOS_ID];
+        // Byte tokens biased towards UTF-8 lead/continuation bytes, so that split,
+        // truncated and invalid sequences all occur, mixed with whole tokens.
+        let pool: Vec<u32> = [0x41, 0x80, 0x81, 0xBF, 0xC3, 0xA9, 0xE3, 0x81, 0x82, 0xF0, 0x9F, 0x98, 0xFF]
+            .iter()
+            .map(|&b| byte(b))
+            .chain(normal)
+            .collect();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for len in 0..200 {
+            let ids: Vec<u32> = (0..len % 24)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    pool[(state % pool.len() as u64) as usize]
+                })
+                .collect();
+            let (mut a, mut b) = (StreamDecoder::new(), StreamDecoder::new());
+            let (mut via_push, mut via_into) = (String::new(), String::new());
+            for &id in &ids {
+                let s = a.push(&tok, id);
+                let before = via_into.len();
+                b.push_into(&tok, id, &mut via_into);
+                // push_into appends exactly what push returns.
+                assert_eq!(&via_into[before..], s, "{ids:?}");
+                via_push += &s;
+            }
+            via_push += &a.finish();
+            via_into += &b.finish();
+            assert_eq!(via_push, tok.decode(&ids), "{ids:?}");
+            assert_eq!(via_into, via_push, "{ids:?}");
+        }
     }
 
     #[test]
