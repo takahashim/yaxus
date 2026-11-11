@@ -126,27 +126,50 @@ pub fn resolve_model(model: &str) -> Result<ResolvedModel> {
     ModelSpec::parse(model).locate(model)
 }
 
-/// The draft model for target `target` and `spec`: `none`, `auto` (from the local cache:
+/// Which draft model to use for speculative decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftSpec {
+    /// No draft model.
+    None,
+    /// The 0.8B model from the local cache, if it is there and pays (see [`resolve_draft`]).
+    Auto,
+    /// A model as for [`resolve_model`].
+    Model(String),
+}
+
+impl std::str::FromStr for DraftSpec {
+    type Err = anyhow::Error;
+    /// `none`, `auto`, or a model.
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "none" => DraftSpec::None,
+            "auto" => DraftSpec::Auto,
+            "" => anyhow::bail!("empty draft model (expected auto, none or a model)"),
+            model => DraftSpec::Model(model.to_string()),
+        })
+    }
+}
+
+/// The draft model for target `target`: for [`DraftSpec::Auto`] from the local cache,
 /// the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else pfnet/plamo-3-translate-0.8b,
-/// else its Q4_K_M file; nothing if none is there), or a model as for [`resolve_model`].
-/// `None` also when it is the target's own file or directory, and for `auto` when the
-/// target has the draft's size and is a GGUF file: a draft pays only when it reads much
-/// less than the target. 19-sentence set, 0.8B target with the 0.8B Q2_K draft: the
-/// checkpoint (loaded at 8 bits) 87.0 -> 96.9 tok/s, but Q4_K_M 126.5 -> 105.6 and
-/// Q3_K_M 134.7 -> 105.9.
-pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
+/// else its Q4_K_M file (nothing if none is there). `None` also when it is the target's own
+/// file or directory, and for `Auto` when the target has the draft's size and is a GGUF
+/// file: a draft pays only when it reads much less than the target. 19-sentence set, 0.8B
+/// target with the 0.8B Q2_K draft: the checkpoint (loaded at 8 bits) 87.0 -> 96.9 tok/s,
+/// but Q4_K_M 126.5 -> 105.6 and Q3_K_M 134.7 -> 105.9.
+pub fn resolve_draft(spec: &DraftSpec, target: &Path) -> Result<Option<PathBuf>> {
     let dir = match spec {
-        "none" => return Ok(None),
+        DraftSpec::None => return Ok(None),
         // The 2-bit GGUF first: its steps are 1.27x faster than the checkpoint's at 4 bits
         // and about as many of its tokens are accepted (DESIGN.md 11.32).
-        "auto" => match resolve_model("0.8b:Q2_K")
+        DraftSpec::Auto => match resolve_model("0.8b:Q2_K")
             .or_else(|_| resolve_model("pfnet/plamo-3-translate-0.8b"))
             .or_else(|_| resolve_model("0.8b:Q4_K_M"))
         {
             Ok(m) => m.path,
             Err(_) => return Ok(None),
         },
-        other => resolve_model(other)?.path,
+        DraftSpec::Model(model) => resolve_model(model)?.path,
     };
     // Paths that cannot be canonicalized (missing, broken links) compare as given.
     let same = match (dir.canonicalize(), target.canonicalize()) {
@@ -156,7 +179,8 @@ pub fn resolve_draft(spec: &str, target: &Path) -> Result<Option<PathBuf>> {
     if same {
         return Ok(None);
     }
-    if spec == "auto" && yaxus_model::gguf::is_gguf(target) && shape(&dir).is_some_and(|s| Some(s) == shape(target)) {
+    let auto = matches!(spec, DraftSpec::Auto);
+    if auto && yaxus_model::gguf::is_gguf(target) && shape(&dir).is_some_and(|s| Some(s) == shape(target)) {
         return Ok(None);
     }
     Ok(Some(dir))
@@ -209,6 +233,15 @@ mod tests {
         assert_eq!(q("x-IQ2_K.gguf").as_deref(), Some("IQ2_K"));
         assert_eq!(q("x-UD-Q2_K_XL.gguf").as_deref(), Some("Q2_K_XL"));
         assert_eq!(q("README.md"), None);
+    }
+
+    #[test]
+    fn draft_specs_parse() {
+        assert_eq!("none".parse::<DraftSpec>().unwrap(), DraftSpec::None);
+        assert_eq!("auto".parse::<DraftSpec>().unwrap(), DraftSpec::Auto);
+        assert_eq!("0.8b:Q2_K".parse::<DraftSpec>().unwrap(), DraftSpec::Model("0.8b:Q2_K".into()));
+        assert!("".parse::<DraftSpec>().is_err());
+        assert_eq!(resolve_draft(&DraftSpec::None, Path::new(".")).unwrap(), None);
     }
 
     #[test]

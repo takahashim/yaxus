@@ -44,7 +44,7 @@ pub struct ModelArgs {
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
     /// The output is identical with or without it; only the speed differs.
     #[arg(long, default_value = "auto")]
-    draft: String,
+    draft: yaxus_runtime::DraftSpec,
     /// Most tokens the draft model proposes per round (the length adapts to how often
     /// they are accepted).
     #[arg(long, default_value_t = 7)]
