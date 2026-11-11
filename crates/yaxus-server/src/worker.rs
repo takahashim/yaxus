@@ -2,8 +2,9 @@
 //! thread feeds them to the engine, which runs many of them in the same passes.
 //! A document job becomes one engine request per segment; when a segment finishes, the
 //! next segment of its chain is submitted. What each request goes through (hints from
-//! the translation memory, decoding, recording its output) is the runtime's [`Session`];
-//! this module only routes its updates to the clients.
+//! the translation memory, decoding, recording its output) is the runtime's [`Session`],
+//! and how a document advances is its [`DocRun`]; this module only routes their updates
+//! to the clients.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -15,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use yaxus_api::{DocumentUsage, Usage};
 use yaxus_model::{Finish, Generator};
-use yaxus_runtime::document::DocJob;
+use yaxus_runtime::document::{DocJob, DocRun};
 use yaxus_runtime::memory::{self, Memory};
 use yaxus_runtime::{Finished, Prompt, Session, Update};
 use yaxus_tokenizer::Tokenizer;
@@ -51,16 +52,11 @@ enum Owner {
 }
 
 struct Doc {
-    doc: DocJob,
+    run: DocRun,
     events: mpsc::UnboundedSender<Event>,
     label: String,
     enqueued: Instant,
     start: Instant,
-    usage: DocumentUsage,
-    /// Segments submitted and not finished.
-    live: usize,
-    /// The client left or a segment failed: no more segments are submitted.
-    stopped: bool,
 }
 
 /// The documents in progress.
@@ -154,16 +150,12 @@ fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs, queued: &AtomicU
         Work::Document(doc) => {
             docs.next_key += 1;
             let key = docs.next_key;
-            let usage = DocumentUsage { segments: doc.len(), chains: doc.chains(), ..Default::default() };
             let d = Doc {
-                doc: *doc,
+                run: DocRun::new(*doc),
                 events: job.events,
                 label: job.label,
                 enqueued: job.enqueued,
                 start: Instant::now(),
-                usage,
-                live: 0,
-                stopped: false,
             };
             docs.docs.insert(key, d);
             submit_ready(key, session, docs);
@@ -175,43 +167,33 @@ fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs, queued: &AtomicU
 /// when nothing is left.
 fn submit_ready(key: u64, session: &mut Session<Owner>, docs: &mut Docs) {
     let Some(d) = docs.docs.get_mut(&key) else { return };
-    if !d.stopped {
-        for (segment, req) in d.doc.ready() {
-            // A history that leaves too little room is dropped.
-            let (prompt, max_new) = match d.doc.prompt(session.tokenizer(), req) {
-                Ok(x) => x,
-                Err(e) => {
-                    let _ = d.events.send(Event::Error(format!("segment {segment}: {}", e.0)));
-                    d.stopped = true;
-                    break;
-                }
-            };
-            d.usage.prompt_tokens += prompt.len();
-            d.live += 1;
-            session.submit(prompt, max_new, Owner::Doc { key, segment });
-        }
-        // Segments without text complete without the engine.
-        if d.doc.is_done() {
-            d.usage.elapsed_ms = d.start.elapsed().as_millis() as u64;
-            d.usage.queue_ms = (d.start - d.enqueued).as_millis() as u64;
-            tracing::info!(
-                "{}: document of {} segments in {} chains, {} -> {} tokens ({} reused) in {} ms",
-                d.label,
-                d.usage.segments,
-                d.usage.chains,
-                d.usage.prompt_tokens,
-                d.usage.completion_tokens,
-                d.usage.reused_tokens,
-                d.usage.elapsed_ms
-            );
-            let _ = d.events.send(Event::DocumentDone(d.usage.clone()));
-            docs.docs.remove(&key);
-            return;
-        }
+    // A history that leaves too little room is dropped.
+    if let Err(e) = d.run.submit_ready(session, |segment| Owner::Doc { key, segment }) {
+        let _ = d.events.send(Event::Error(e.0));
     }
-    if d.stopped && d.live == 0 {
-        docs.docs.remove(&key);
+    if !d.run.is_over() {
+        return;
     }
+    // Segments without text complete without the engine.
+    if d.run.is_complete() {
+        let usage = DocumentUsage {
+            elapsed_ms: d.start.elapsed().as_millis() as u64,
+            queue_ms: (d.start - d.enqueued).as_millis() as u64,
+            ..d.run.usage().clone()
+        };
+        tracing::info!(
+            "{}: document of {} segments in {} chains, {} -> {} tokens ({} reused) in {} ms",
+            d.label,
+            usage.segments,
+            usage.chains,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.reused_tokens,
+            usage.elapsed_ms
+        );
+        let _ = d.events.send(Event::DocumentDone(usage));
+    }
+    docs.docs.remove(&key);
 }
 
 /// Delivers one update to its client; returns `false` to cancel a request whose client
@@ -227,14 +209,14 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         }
         Update::Delta { tag: Owner::Doc { key, segment }, text } => {
             let Some(d) = docs.docs.get_mut(key) else { return false };
-            let ok = !d.stopped
+            let ok = d.run.accepts()
                 && if text.is_empty() {
                     !d.events.is_closed()
                 } else {
                     d.events.send(Event::SegmentDelta(*segment, text.to_string())).is_ok()
                 };
             if !ok {
-                d.stopped = true;
+                d.run.stop();
             }
             ok
         }
@@ -246,12 +228,8 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         }
         Update::Done { tag: Owner::Doc { key, segment }, done } => {
             if let Some(d) = docs.docs.get_mut(&key) {
-                d.live -= 1;
-                if !d.stopped {
-                    d.usage.completion_tokens += done.generated;
-                    d.usage.reused_tokens += done.start.reused;
-                    d.doc.finished(segment, done.text);
-                    let _ = d.events.send(Event::SegmentEnd(segment));
+                if d.run.on_done(segment, done).is_some() && d.events.send(Event::SegmentEnd(segment)).is_err() {
+                    d.run.stop();
                 }
                 docs.resubmit.push(key);
             }
@@ -265,11 +243,9 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         Update::Failed { tag: Owner::Doc { key, segment }, message } => {
             if let Some(d) = docs.docs.get_mut(&key) {
                 tracing::warn!("{}: segment {segment} failed: {message}", d.label);
-                d.live -= 1;
-                if !d.stopped {
-                    let _ = d.events.send(Event::Error(format!("segment {segment}: {message}")));
+                if let Some(e) = d.run.on_failed(segment, &message) {
+                    let _ = d.events.send(Event::Error(e));
                 }
-                d.stopped = true;
                 docs.resubmit.push(key);
             }
             true
