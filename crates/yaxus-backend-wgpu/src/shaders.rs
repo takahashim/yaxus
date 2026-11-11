@@ -662,6 +662,68 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// `ADD_NORM` with subgroup sums (two barriers per sum instead of nine), all loads issued
+/// first and the row kept in registers. A single row is pure latency (memory round trips
+/// in a chain), so that is what this shortens. Needs subgroups and at most 4096 columns.
+pub const ADD_NORM_SG: &str = r#"
+struct P { cols: u32, o1: f32, o2: f32, eps: f32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> h: array<f32>;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<storage, read> d: array<f32>;
+@group(0) @binding(3) var<storage, read> w1: array<f32>;
+@group(0) @binding(4) var<storage, read> w2: array<f32>;
+var<workgroup> red: array<f32, 16>;
+
+// Shuffles within 32 lanes, as the GEMVs: correct for 32- and 64-lane subgroups alike
+// (`subgroupAdd` would sum 64 lanes on a wave64 dispatch).
+fn sum256(li: u32, v: f32, slot: u32) -> f32 {
+    var s = v;
+    for (var o = 16u; o > 0u; o >>= 1u) { s += subgroupShuffleXor(s, o); }
+    if (li % 32u == 0u) { red[slot * 8u + li / 32u] = s; }
+    workgroupBarrier();
+    return ((red[slot * 8u] + red[slot * 8u + 1u]) + (red[slot * 8u + 2u] + red[slot * 8u + 3u]))
+         + ((red[slot * 8u + 4u] + red[slot * 8u + 5u]) + (red[slot * 8u + 6u] + red[slot * 8u + 7u]));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let base = wg.x * p.cols;
+    var dv: array<f32, 16>;
+    var xv: array<f32, 16>;
+    var a1: array<f32, 16>;
+    var a2: array<f32, 16>;
+    var s = 0.0;
+    // All loads first: one memory round trip instead of three.
+    for (var e = 0u; e < 16u; e++) {
+        let i = li + 256u * e;
+        if (i < p.cols) {
+            dv[e] = d[base + i];
+            xv[e] = x[base + i];
+            a1[e] = p.o1 + w1[i];
+            a2[e] = p.o2 + w2[i];
+        }
+    }
+    for (var e = 0u; e < 16u; e++) { s += dv[e] * dv[e]; }
+    let r1 = 1.0 / sqrt(sum256(li, s, 0u) / f32(p.cols) + p.eps);
+    var s2 = 0.0;
+    for (var e = 0u; e < 16u; e++) {
+        let i = li + 256u * e;
+        if (i < p.cols) {
+            let v = xv[e] + a1[e] * (dv[e] * r1);
+            xv[e] = v;
+            x[base + i] = v;
+            s2 += v * v;
+        }
+    }
+    let r2 = 1.0 / sqrt(sum256(li, s2, 1u) / f32(p.cols) + p.eps);
+    for (var e = 0u; e < 16u; e++) {
+        let i = li + 256u * e;
+        if (i < p.cols) { h[base + i] = a2[e] * (xv[e] * r2); }
+    }
+}
+"#;
+
 /// Decode-time (T=1) gate/up projection fused with SwiGLU. A workgroup computes 4 outputs:
 /// lane groups 0-3 the gate rows `u`, groups 4-7 the matching up rows `n + u`
 /// (`p.n` is the intermediate size), then `y[u] = silu(gate) * up`.
@@ -1236,7 +1298,9 @@ var<immediate> p: P;
 @group(0) @binding(5) var<storage, read> rmeta: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> pages: array<u32>;
 
-const G: u32 = {G}u;
+const G: u32 = {G}u;            // query heads per workgroup
+const GF: u32 = {GF}u;          // query heads per KV head (a multiple of G)
+const SPLIT: u32 = GF / G;      // workgroups per KV head and chunk
 const CH: u32 = {CH}u;          // keys per chunk
 const LPK: u32 = 128u / CH;     // lanes per key (scores)
 const DV4: u32 = 32u / LPK;     // vec4 of the key per lane
@@ -1249,8 +1313,10 @@ var<workgroup> hm: array<f32, 16>;
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let g = G;
-    let kh = wg.x % p.hkv;
-    let c = wg.x / p.hkv;
+    let v = wg.x % (p.hkv * SPLIT);
+    let kh = v / SPLIT;
+    let hg = v % SPLIT;
+    let c = wg.x / (p.hkv * SPLIT);
     let t = wg.y;
     let kvd = p.hkv * 128u;
     let m4 = rmeta[t];
@@ -1259,14 +1325,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var lo = 0u;
     if (p.window > 0u && pos + 1u > p.window) { lo = pos + 1u - p.window; }
     let start = lo + c * CH;
-    let base = (((t * p.hkv + kh) * p.nch) + c) * g;
+    let base = (((t * p.hkv + kh) * p.nch) + c) * GF + hg * G;
     // Uniform per workgroup: chunks past this row's context only mark themselves empty.
     if (start > pos) {
         if (li < g) { ml[base + li] = vec2<f32>(-1e30, 0.0); }
         return;
     }
     for (var i = li; i < g * 32u; i += 128u) {
-        qs[i] = q[(t * p.hq + kh * g) * 32u + i];
+        qs[i] = q[(t * p.hq + kh * GF + hg * G) * 32u + i];
     }
     workgroupBarrier();
     let j = li / LPK;

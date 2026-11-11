@@ -375,6 +375,8 @@ const ARGMAX_SLICES: usize = 64;
 /// attention of prompt passes handles badly: 16 requests in one pass took 74 ms with it
 /// against 38 ms (2B), so this covers every pass the decode kernels take in one dispatch.
 const SPLIT_ATTN_MAX_ROWS: usize = 16;
+/// Workgroups the split attention aims for at most when it splits heads (see `attention`).
+const ATTN_SPLIT_WGS: usize = 64;
 
 /// Keys per chunk of the split attention kernels.
 const SPLIT_CHUNKS: [usize; 2] = [16, 32];
@@ -693,6 +695,7 @@ impl Gpu {
 
     fn build_kernels(&mut self) {
         use shaders::*;
+        let t0 = std::time::Instant::now();
         let sg = self.subgroups;
         // Decode GEMV: the subgroup kernel where available.
         let gemv1 = move |w16: &str| -> String {
@@ -762,7 +765,7 @@ impl Gpu {
         self.add_kernel("gemv1_bf16", &gemv1(W_BF16_16), &bf);
         self.add_kernel("gemv8_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(GEMV_MAX_T)), &bf);
         self.add_kernel("rmsnorm", RMSNORM, &[false, true, true]);
-        self.add_kernel("add_norm", ADD_NORM, &[false, false, true, true, true]);
+        self.add_kernel("add_norm", if sg { ADD_NORM_SG } else { ADD_NORM }, &[false, false, true, true, true]);
         self.add_kernel("glu_q8", &format!("{MM_PARAMS}{W_Q8_16}{GEMV_GLU}"), &q8);
         self.add_kernel("glu_bf16", &format!("{MM_PARAMS}{W_BF16_16}{GEMV_GLU}"), &bf);
         self.add_kernel("argmax1", ARGMAX1, &[false, true]);
@@ -775,12 +778,15 @@ impl Gpu {
         let sg = self.subgroups;
         for g in [1usize, 2, 4, 6, 8, 12, 16].into_iter().filter(|_| sg) {
             for ch in SPLIT_CHUNKS {
-                let name: &'static str = Box::leak(format!("attn_split{g}_{ch}").into_boxed_str());
-                let src = ATTN_SPLIT
-                    .replace("{G}", &g.to_string())
-                    .replace("{CH}", &ch.to_string())
-                    .replace("{GCH}", &(16 * ch).to_string());
-                self.add_kernel(name, &src, &[false, false, true, true, true, true, true]);
+                for hg in [1usize, 2, 3, 4, 6, 8, 12, 16].into_iter().filter(|h| g % h == 0) {
+                    let name: &'static str = Box::leak(format!("attn_split{g}_{ch}_{hg}").into_boxed_str());
+                    let src = ATTN_SPLIT
+                        .replace("{GF}", &g.to_string())
+                        .replace("{G}", &hg.to_string())
+                        .replace("{CH}", &ch.to_string())
+                        .replace("{GCH}", &(16 * ch).to_string());
+                    self.add_kernel(name, &src, &[false, false, true, true, true, true, true]);
+                }
             }
         }
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
@@ -789,6 +795,9 @@ impl Gpu {
         }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
+        if std::env::var_os("YAXUS_COMPILE_LOG").is_some() {
+            eprintln!("[compile] {} base kernels, {:.0} ms", self.kernels.len(), t0.elapsed().as_secs_f64() * 1e3);
+        }
     }
 
     fn tensor(&mut self, rows: usize, cols: usize) -> Tensor {
@@ -1300,17 +1309,25 @@ impl Gpu {
         // KV head) gains 11% at 256 keys over the per-head kernel.
         let ch = if ctx <= 64 { 16 } else { 32 };
         let nch = ctx.div_ceil(ch);
+        // Query heads per workgroup: few workgroups (short contexts, one KV head) leave
+        // the GPU idle, so the heads of a KV head are split over up to 64 workgroups in
+        // all. More would reread the keys for little gain (measured on a 780M: 0.8B at 64
+        // keys 26 -> 8.6 us per layer; 2B and 8B at 1024 keys slower when split).
+        let hg = [1usize, 2, 3, 4, 6, 8, 12, 16]
+            .into_iter()
+            .find(|&h| g % h == 0 && t * hkv * (g / h) * nch <= ATTN_SPLIT_WGS)
+            .unwrap_or(g);
         let split = t <= SPLIT_ATTN_MAX_ROWS
             && self.subgroups
-            && self.kernels.contains_key(format!("attn_split{g}_{ch}").as_str());
+            && self.kernels.contains_key(format!("attn_split{g}_{ch}_{hg}").as_str());
         if split {
             let part = self.tensor(t * hkv * nch * g, 128);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
-                &format!("attn_split{g}_{ch}"),
+                &format!("attn_split{g}_{ch}_{hg}"),
                 &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
                 &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
-                ((hkv * nch) as u32, t as u32),
+                ((hkv * (g / hg) * nch) as u32, t as u32),
             );
             self.dispatch(
                 "attn_combine",
