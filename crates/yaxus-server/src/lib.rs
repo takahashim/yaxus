@@ -479,23 +479,6 @@ async fn translate_document(
     if req.segments.is_empty() || req.segments.len() > MAX_SEGMENTS {
         return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
     }
-    // Validate languages, options and every segment up front (blank segments are allowed
-    // and come back empty). A segment whose prompt alone exceeds the context is rejected
-    // here instead of failing the document half-way.
-    for (i, seg) in req.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
-        let one = TranslateRequest {
-            text: seg.clone(),
-            target_lang: req.target_lang.clone(),
-            source_lang: req.source_lang.clone(),
-            form: req.form.clone(),
-            context: req.context.clone(),
-            glossary: req.glossary.clone(),
-            ..Default::default()
-        };
-        if let Err(e) = document::encode_within(&st.tok, &mut to_prompt_request(&one), st.max_context, 0) {
-            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {e}"));
-        }
-    }
     let opts = document::DocOptions {
         target_lang: req.target_lang.clone(),
         source_lang: req.source_lang.clone().filter(|s| !s.is_empty()),
@@ -507,10 +490,19 @@ async fn translate_document(
         neighbor_context: req.neighbor_context,
         max_new_tokens: req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context / 2),
     };
-    let label =
-        format!("{}->{}", req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), req.target_lang);
     let (n, stream) = (req.segments.len(), req.stream);
     let doc = document::DocJob::new(req.segments, opts);
+    // Validate languages, options and every segment up front (blank segments are allowed
+    // and come back empty): each segment's prompt without history, as the worker builds
+    // it (neighbouring segments included), must fit the context; history that does not
+    // fit is dropped when the segment is submitted.
+    for i in (0..n).filter(|&i| !doc.segments[i].trim().is_empty()) {
+        if let Err(e) = document::encode_within(&st.tok, &mut doc.bare_request(i), st.max_context, 0) {
+            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {e}"));
+        }
+    }
+    let label =
+        format!("{}->{}", req.source_lang.as_deref().filter(|s| !s.is_empty()).unwrap_or("auto"), req.target_lang);
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
     if let Err(r) = enqueue(&st, job) {
@@ -575,8 +567,9 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass the
     // checks here and then fail in the engine.
     anyhow::ensure!(
-        (1..=yaxus_model::DEFAULT_MAX_POS).contains(&opts.max_context),
-        "max context must be 1..={} tokens",
+        // (at least 2: documents give each segment up to half of it to generate)
+        (2..=yaxus_model::DEFAULT_MAX_POS).contains(&opts.max_context),
+        "max context must be 2..={} tokens",
         yaxus_model::DEFAULT_MAX_POS
     );
 
@@ -608,12 +601,17 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let (jobs, rx) = mpsc::channel(opts.queue_limit.max(1));
     let queue_limit = opts.queue_limit.max(1);
     let queued = Arc::new(AtomicUsize::new(0));
+    // The inference thread reports a fatal failure here; the server then shuts down and
+    // `serve` returns an error, so a supervisor can restart the process.
+    let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
     {
         let (tok, queued) = (tok.clone(), queued.clone());
+        let max_context = opts.max_context;
         std::thread::Builder::new()
             .name("inference".into())
-            .spawn(move || worker::run(model, tok, rx, queued, queue_limit, opts.max_context))?;
+            .spawn(move || worker::run(model, tok, rx, queued, queue_limit, max_context, failed_tx))?;
     }
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let st = Arc::new(AppState { tok, jobs, queued, token: token.clone(), health, max_context: opts.max_context });
     let app = router(st);
@@ -629,6 +627,15 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");
             h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+        let (h, f) = (handle.clone(), failed.clone());
+        tokio::spawn(async move {
+            // (an Err means the thread ended normally and dropped the sender)
+            if failed_rx.await.is_ok() {
+                tracing::error!("the inference thread stopped after an internal error; shutting down");
+                f.store(true, Ordering::SeqCst);
+                h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            }
         });
 
         let port = opts.listen.port();
@@ -652,7 +659,9 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
             .handle(handle)
             .serve(app.into_make_service())
             .await
-            .context("server error")
+            .context("server error")?;
+        anyhow::ensure!(!failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
+        Ok(())
     })
 }
 

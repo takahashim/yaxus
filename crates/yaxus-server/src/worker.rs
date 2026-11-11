@@ -94,6 +94,7 @@ pub fn run(
     queued: Arc<AtomicUsize>,
     queue_limit: usize,
     max_context: usize,
+    failed: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut st = State {
         active: HashMap::new(),
@@ -141,8 +142,10 @@ pub fn run(
             }
             if panicked {
                 // The engine may be half-way through a pass (KV pages, stream state): do
-                // not serve from it again. New requests get 503 and /healthz says so.
-                tracing::error!("stopping the inference thread after a panic; restart the server");
+                // not serve from it again. The server shuts down so that it can be
+                // restarted; until then new requests get 503 and /healthz says so.
+                tracing::error!("stopping the inference thread after a panic");
+                let _ = failed.send(());
                 return;
             }
             continue;
@@ -434,11 +437,17 @@ mod tests {
         let queued = Arc::new(AtomicUsize::new(1));
         jobs.try_send(job).unwrap();
         let tok = Arc::new(tokenizer());
-        let worker = std::thread::spawn(move || run(Box::new(Panicking), tok, rx, queued, 4, 8192));
-        // Without the fix the thread would keep serving from the broken engine; here it
-        // returns, so join() finishes and the channel to it is closed.
-        worker.join().unwrap();
+        let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            run(Box::new(Panicking), tok, rx, queued, 4, 8192, failed_tx);
+            let _ = done_tx.send(());
+        });
+        // The worker returns instead of serving from the broken engine (a timeout rather
+        // than join(), so that a regression fails instead of hanging the test run).
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the worker kept running");
         assert!(matches!(out.try_recv(), Ok(Event::Error(m)) if m.contains("internal error")));
         assert!(jobs.is_closed());
+        assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
     }
 }
