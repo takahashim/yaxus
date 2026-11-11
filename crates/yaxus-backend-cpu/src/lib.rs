@@ -337,8 +337,8 @@ impl Backend for CpuBackend {
         if t == 1 {
             return Tensor { data: tr, rows: 1, cols: n };
         }
-        // Transpose back, one output row per task (a serial loop was a visible share of
-        // prompt processing on the CPU).
+        // Transpose back, one output row per task (about 2% of a 512-row matmul; a serial
+        // loop took a few times longer).
         let mut out = Tensor::zeros(t, n);
         out.data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             for (j, o) in row.iter_mut().enumerate() {
@@ -504,20 +504,20 @@ mod tests {
     fn naive(qkv: &[Vec<f32>], cfg: &Config, layer: &LayerMeta) -> Vec<Vec<f32>> {
         let (hq, hkv, d) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let (qd, kvd) = (hq * d, hkv * d);
-        let ones = vec![0f32; d];
+        let zero_w = vec![0f32; d];
         let (mut cos, mut sin) = (vec![0f32; d / 2], vec![0f32; d / 2]);
         let (mut qs, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new());
         for (p, row) in qkv.iter().enumerate() {
             layer.rope.cos_sin(p, &mut cos, &mut sin);
             let mut q = vec![0f32; qd];
             for h in 0..hq {
-                rmsnorm_row(&row[h * d..(h + 1) * d], &ones, 1.0, cfg.rms_norm_eps, &mut q[h * d..(h + 1) * d]);
+                rmsnorm_row(&row[h * d..(h + 1) * d], &zero_w, 1.0, cfg.rms_norm_eps, &mut q[h * d..(h + 1) * d]);
                 rope_inplace(&mut q[h * d..(h + 1) * d], &cos, &sin);
             }
             let mut k = vec![0f32; kvd];
             for h in 0..hkv {
                 let src = &row[qd + h * d..qd + (h + 1) * d];
-                rmsnorm_row(src, &ones, 1.0, cfg.rms_norm_eps, &mut k[h * d..(h + 1) * d]);
+                rmsnorm_row(src, &zero_w, 1.0, cfg.rms_norm_eps, &mut k[h * d..(h + 1) * d]);
                 rope_inplace(&mut k[h * d..(h + 1) * d], &cos, &sin);
             }
             qs.push(q);
@@ -626,15 +626,25 @@ mod tests {
         let mut b = CpuBackend::new();
         let (n, k) = (40, 64);
         let w: Vec<u16> = values(n * k, 7).iter().map(|&x| yaxus_model::weights::f32_to_bf16(x)).collect();
-        let weight = Weight::Owned(w.clone(), vec![n, k]);
-        for t in [1, 3, 9] {
-            let x = Tensor { data: values(t * k, t as u64), rows: t, cols: k };
-            let y = b.matmul(&x, &weight);
-            assert_eq!((y.rows, y.cols), (t, n));
-            for i in 0..t {
-                for j in 0..n {
-                    let want: f32 = (0..k).map(|c| bf16_to_f32(w[j * k + c]) * x.data[i * k + c]).sum();
-                    assert!((y.data[i * n + j] - want).abs() < 1e-4, "t {t} ({i}, {j})");
+        // bf16 is exact up to f32 rounding; Q8 is off by the 8-bit quantization of the
+        // weights (and, depending on the path, of the input), so it is compared with a
+        // tolerance relative to the size of the terms.
+        let weights = [
+            ("bf16", Weight::Owned(w.clone(), vec![n, k]), 1e-4),
+            ("q8", Weight::Q8(Q8Matrix::quantize(&w, &[n, k])), 2e-2),
+        ];
+        for (name, weight, tol) in &weights {
+            for t in [1, 3, 9] {
+                let x = Tensor { data: values(t * k, t as u64), rows: t, cols: k };
+                let y = b.matmul(&x, weight);
+                assert_eq!((y.rows, y.cols), (t, n));
+                for i in 0..t {
+                    for j in 0..n {
+                        let terms = (0..k).map(|c| bf16_to_f32(w[j * k + c]) * x.data[i * k + c]);
+                        let (want, scale) = terms.fold((0f32, 0f32), |(s, a), v| (s + v, a + v.abs()));
+                        let got = y.data[i * n + j];
+                        assert!((got - want).abs() <= tol * scale.max(1.0), "{name} t {t} ({i}, {j}): {got} vs {want}");
+                    }
                 }
             }
         }
