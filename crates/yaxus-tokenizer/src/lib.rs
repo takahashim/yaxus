@@ -612,10 +612,12 @@ mod tests {
             let (mut a, mut b) = (StreamDecoder::new(), StreamDecoder::new());
             let (mut via_push, mut via_into) = (String::new(), String::new());
             for &id in &ids {
-                via_push += &a.push(&tok, id);
+                let s = a.push(&tok, id);
                 let before = via_into.len();
                 b.push_into(&tok, id, &mut via_into);
-                assert!(via_into.is_char_boundary(before));
+                // push_into appends exactly what push returns.
+                assert_eq!(&via_into[before..], s, "{ids:?}");
+                via_push += &s;
             }
             via_push += &a.finish();
             via_into += &b.finish();
