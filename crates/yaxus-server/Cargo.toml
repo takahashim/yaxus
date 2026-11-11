@@ -21,5 +21,4 @@ tracing = "0.1"
 yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-model = { path = "../yaxus-model" }
-yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
-yaxus-backend-wgpu = { path = "../yaxus-backend-wgpu" }
+yaxus-runtime = { path = "../yaxus-runtime" }

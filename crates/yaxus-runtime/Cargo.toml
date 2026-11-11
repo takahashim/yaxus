@@ -1,0 +1,18 @@
+[package]
+name = "yaxus-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model resolution, loading and translation jobs for yaxus (shared by the server and local mode)"
+
+[dependencies]
+anyhow.workspace = true
+tracing = "0.1"
+yaxus-api = { path = "../yaxus-api" }
+yaxus-tokenizer = { path = "../yaxus-tokenizer" }
+yaxus-model = { path = "../yaxus-model" }
+yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
+yaxus-backend-wgpu = { path = "../yaxus-backend-wgpu" }
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -136,17 +136,21 @@ yaxus/
   Cargo.toml                 # workspace
   DESIGN.md
   crates/
+    yaxus-api/             # サーバとクライアントが共有する JSON の型
     yaxus-tokenizer/       # PLaMo トークナイザ (pure Rust, 依存最小)
-    yaxus-model/           # 設定・safetensors ロード・plamo3 の計算グラフ・Backend トレイト
+    yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32, rayon)。正しさの基準とフォールバック
     yaxus-backend-wgpu/    # Vulkan 用 WGSL カーネル群
-    yaxus-server/          # axum + rustls、API、Web UI の埋め込み
-    yaxus-cli/             # バイナリ `yaxus` (serve / translate / client / quantize / download)
+    yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・API 要求からプロンプト・文書のチェーン・翻訳メモリ
+    yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
+    yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
   web/                       # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
   tests/golden/              # Python 側で生成した tokenizer / logits のゴールデンデータ
 ```
 
-クライアント用途だけなら GPU 依存を外せるよう、`yaxus-cli` は feature で `server` と `client` を分ける。
+`yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
+
+サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (2026-11-11 に `yaxus-server` と CLI から切り出した)。
 
 ---
 
@@ -681,7 +685,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.18 P5 の結果 (文書 API と履歴の扱いの評価)
 
-- `yaxus-server::document`: `DocJob` が文書を連続する段落の **チェーン** に分ける (既定はチェーン数 = 段落数 / 4、最大 8)。チェーン内は前の段落を履歴にして順に訳し (`HistoryWindow`、4000 文字)、チェーン同士はエンジン上で並列に流す。空の段落は空の訳で完了し、履歴にも入れない。`run_document` (ローカル用ドライバ) とサーバのワーカー (段落リクエストが終わるたびに同じチェーンの次の段落を投入) が同じ `DocJob` を使う。
+- `yaxus-runtime::document` (当初は `yaxus-server::document`): `DocJob` が文書を連続する段落の **チェーン** に分ける (既定はチェーン数 = 段落数 / 4、最大 8)。チェーン内は前の段落を履歴にして順に訳し (`HistoryWindow`、4000 文字)、チェーン同士はエンジン上で並列に流す。空の段落は空の訳で完了し、履歴にも入れない。`run_document` (ローカル用ドライバ) とサーバのワーカー (段落リクエストが終わるたびに同じチェーンの次の段落を投入) が同じ `DocJob` を使う。
 - API: `POST /v1/translate/document` (`segments`、共通オプション、`chains`、`history_chars`、`neighbor_context`、`stream`)。SSE は `{"segment": i, "delta": ..}`、`{"segment": i, "end": true}`、最後に `{"done": true, "usage": {...}}`。各段落は受付時にテンプレートで検証し、不正なら 400。
 - CLI: `translate` と `client` は入力の段落数によらず文書経路を使い (`--chains`、`--history-chars`、`--neighbor-context`)、並列に届く段落を順番どおりに表示する (先頭の未完了段落だけ逐次表示し、後続はバッファ)。クライアントの出力はローカルで同じチェーン数を指定した場合と一致。Web UI も文書 API に切り替え、複数の段落が同時に埋まっていく。
 - **履歴の扱いの評価** (逐次 (a) との比較、技術文 = モデルカード 14 段落 / 『羅生門』29 段落):
@@ -714,7 +718,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 - **応答キャッシュ** (`Engine`): 終わったリクエストの出力を、プロンプトと停止トークンをキーに LRU で 256 件保持する。同じリクエストはパスを一切回さずに即答する。`max_new_tokens` で途中まで切った出力は、より大きい上限の要求には使わない。`--no-kv-cache` または `--no-response-cache` で無効になる。
 - **ヒント** (`Request.hint`): 「出力に現れそうなトークン列」を受け取る。直近の出力の末尾 3, 2, 1 トークンが一致するヒント上の位置 (1 トークン一致は想定位置の近くに限る) から、続く最大 7 トークンを下書きと同じように 1 パスで検証する。下書きモデルは動かさない。ヒントの末尾には、直前に止まったリクエストの停止トークンを足す。こうすると出力の終わりもヒントで検証でき、下書きモデルの追いつき (プロンプト全体のプリフィル、約 200 ms) が要らない。出力がヒントから外れたら、4 回までは 1 行のデコードでヒントへの再合流を待ち、それでも合流しなければ下書きモデルに切り替える (この切り替えで 8.50 → 8.01 s)。下書きモデルがなくてもヒントは使える。
-- **翻訳メモリ** (`yaxus-server::memory`): 原文・対象言語・原文の言語・文体をキーに、前回の出力トークンを 4096 件保持する (履歴、context、用語集はキーに含めない)。サーバのワーカーと `run_document` が、各リクエストのヒントとして渡す。前の段落を直すと後続段落のプロンプト (履歴) が変わって応答キャッシュには当たらないが、翻訳メモリのヒントがほぼそのまま当たる。
+- **翻訳メモリ** (`yaxus-runtime::memory`、当初は `yaxus-server::memory`): 原文・対象言語・原文の言語・文体をキーに、前回の出力トークンを 4096 件保持する (履歴、context、用語集はキーに含めない)。サーバのワーカーと `run_document` が、各リクエストのヒントとして渡す。前の段落を直すと後続段落のプロンプト (履歴) が変わって応答キャッシュには当たらないが、翻訳メモリのヒントがほぼそのまま当たる。
 - `bench doc --edit N`: 同じエンジンで文書を訳したあと、段落 N の最後の文を削って再び訳す。
 
 | 再翻訳の例 | 1 回目 | 2 回目 | 内訳 |

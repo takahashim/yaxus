@@ -15,8 +15,8 @@ use yaxus_api::{DocumentUsage, Usage};
 use yaxus_model::{Event as EngineEvent, Finish, Generator, ReqId, Request};
 use yaxus_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, Tokenizer};
 
-use crate::document::DocJob;
-use crate::memory::{self, Memory};
+use yaxus_runtime::document::DocJob;
+use yaxus_runtime::memory::{self, Memory};
 
 pub enum Work {
     /// `memo`: the request's translation memory key.
