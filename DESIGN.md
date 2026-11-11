@@ -338,8 +338,11 @@ CPU 実装の 2B 実測 (32 トークンの英文 → 日本語、18 トーク�
 ```
 python tests/golden/gen_tokenizer.py $MODEL_DIR > tests/golden/tokenizer.jsonl
 python tests/golden/gen_logits.py   $MODEL_DIR > tests/golden/logits_2b.jsonl
+python tests/golden/gen_logits.py   $MODEL_0_8B_DIR > tests/golden/logits_0_8b.jsonl   # CI (.github/workflows/model.yml)
 YAXUS_REQUIRE_GOLDEN=1 cargo test --release   # トークナイザ (モデルが無ければ失敗させる)
 cargo test --release -p yaxus-backend-cpu -- --ignored   # モデル (2B ロードあり)
+YAXUS_MODEL_DIR=$MODEL_0_8B_DIR YAXUS_GOLDEN=$PWD/tests/golden/logits_0_8b.jsonl \
+  cargo test --release -p yaxus-backend-cpu --test golden -- --ignored   # CI と同じ 0.8B
 ```
 
 ### 8.2 M3 の実装メモ

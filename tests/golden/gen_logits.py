@@ -1,7 +1,8 @@
 """Generate model golden data (last-token logits and greedy outputs) with HF transformers.
 
 Usage:
-    python gen_logits.py MODEL_DIR > logits_2b.jsonl
+    python gen_logits.py MODEL_DIR > logits_2b.jsonl      # pfnet/plamo-3-translate-2b
+    python gen_logits.py MODEL_DIR > logits_0_8b.jsonl    # 0.8B, used by CI (model.yml)
 
 Runs the model in float32 on CPU (needs ~4x the bf16 size in RAM). Each line:
     {"name", "ids", "top_ids", "top_logits", "logits_sum", "logits_sq_sum", "greedy"}
