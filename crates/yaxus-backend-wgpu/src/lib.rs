@@ -1744,6 +1744,30 @@ impl Gpu {
         self.gemm != GemmKind::F32
     }
 
+    /// Test hook: `add_norm` of `x` and `delta` (`[rows, cols]` each) with the norm weights
+    /// `w1` (post, offset `o1`) and `w2` (pre, offset `o2`). Returns `(x, h)` afterwards.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_add_norm(
+        &mut self,
+        x: &[f32],
+        delta: &[f32],
+        rows: usize,
+        cols: usize,
+        (w1, o1): (&[f32], f32),
+        (w2, o2): (&[f32], f32),
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut xt = self.tensor(rows, cols);
+        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
+        let dt = self.tensor(rows, cols);
+        self.queue.write_buffer(dt.buf(), 0, bytemuck::cast_slice(delta));
+        let w1 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w1)));
+        let w2 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w2)));
+        let h = self.add_norm(&mut xt, &dt, &w1, o1, &w2, o2, eps);
+        (self.to_host(&xt), self.to_host(&h))
+    }
+
     /// Test hook: like `debug_matmul` for a matrix given as raw GGML blocks, kept in its
     /// GPU layout (Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q6_K).
     #[doc(hidden)]
@@ -1784,30 +1808,6 @@ impl Gpu {
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
         let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
         self.to_host(&y)
-    }
-
-    /// Test hook: `add_norm` of `x` and `delta` (`[rows, cols]` each) with the norm weights
-    /// `w1` (post, offset `o1`) and `w2` (pre, offset `o2`). Returns `(x, h)` afterwards.
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn debug_add_norm(
-        &mut self,
-        x: &[f32],
-        delta: &[f32],
-        rows: usize,
-        cols: usize,
-        (w1, o1): (&[f32], f32),
-        (w2, o2): (&[f32], f32),
-        eps: f32,
-    ) -> (Vec<f32>, Vec<f32>) {
-        let mut xt = self.tensor(rows, cols);
-        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
-        let dt = self.tensor(rows, cols);
-        self.queue.write_buffer(dt.buf(), 0, bytemuck::cast_slice(delta));
-        let w1 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w1)));
-        let w2 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w2)));
-        let h = self.add_norm(&mut xt, &dt, &w1, o1, &w2, o2, eps);
-        (self.to_host(&xt), self.to_host(&h))
     }
 }
 
@@ -1887,6 +1887,22 @@ impl WgpuBackend {
         self.g().subgroups
     }
 
+    /// Test hook, see [`Gpu::debug_add_norm`].
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_add_norm(
+        &mut self,
+        x: &[f32],
+        delta: &[f32],
+        rows: usize,
+        cols: usize,
+        w1: (&[f32], f32),
+        w2: (&[f32], f32),
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        self.g().debug_add_norm(x, delta, rows, cols, w1, w2, eps)
+    }
+
     /// Test hook, see [`Gpu::debug_matmul_ggml`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -1921,22 +1937,6 @@ impl WgpuBackend {
         let mut g = self.g();
         g.gemv = self.gemv;
         g.debug_matmul(x, t, w, n, k, quant, glu)
-    }
-
-    /// Test hook, see [`Gpu::debug_add_norm`].
-    #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn debug_add_norm(
-        &mut self,
-        x: &[f32],
-        delta: &[f32],
-        rows: usize,
-        cols: usize,
-        w1: (&[f32], f32),
-        w2: (&[f32], f32),
-        eps: f32,
-    ) -> (Vec<f32>, Vec<f32>) {
-        self.g().debug_add_norm(x, delta, rows, cols, w1, w2, eps)
     }
 
     fn track(&mut self, before: usize) {

@@ -130,6 +130,37 @@ fn matmul_kernels_match_host() {
     }
 }
 
+/// `add_norm` against the host: `x += norm(delta) * (o1 + w1)`, then
+/// `h = norm(x) * (o2 + w2)`. Widths up to 4096 take the subgroup kernel where there is
+/// one, wider rows (and every width without subgroups) the plain one.
+#[test]
+#[ignore]
+fn add_norm_matches_host() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let (o1, o2, eps) = (1.0f32, 1.0f32, 1e-6f32);
+    let norm = |v: &[f32]| 1.0 / (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32 + eps).sqrt();
+    for cols in [64, 1000, 2560, 4096, 4352, 6000] {
+        for rows in [1, 3] {
+            let x = values(rows * cols, cols as u64);
+            let d = values(rows * cols, cols as u64 + 1);
+            let (w1, w2) = (values(cols, 3), values(cols, 4));
+            let (gx, gh) = gpu.debug_add_norm(&x, &d, rows, cols, (&w1, o1), (&w2, o2), eps);
+            for r in 0..rows {
+                let row = r * cols..(r + 1) * cols;
+                let r1 = norm(&d[row.clone()]);
+                let wx: Vec<f32> = (0..cols).map(|i| x[r * cols + i] + (o1 + w1[i]) * (d[r * cols + i] * r1)).collect();
+                let r2 = norm(&wx);
+                for i in 0..cols {
+                    let wh = (o2 + w2[i]) * (wx[i] * r2);
+                    let (ex, eh) = ((gx[r * cols + i] - wx[i]).abs(), (gh[r * cols + i] - wh).abs());
+                    assert!(ex <= 1e-4 * wx[i].abs().max(1.0), "x cols={cols} row {r} [{i}]");
+                    assert!(eh <= 1e-4 * wh.abs().max(1.0), "h cols={cols} row {r} [{i}]");
+                }
+            }
+        }
+    }
+}
+
 /// Random but valid GGML blocks for an `[n, k]` matrix of type `t` (scales kept small so
 /// the products stay in a sane range).
 fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
@@ -232,37 +263,6 @@ fn integer_rows_do_not_depend_on_the_pass() {
                     three.iter().zip(&all[2 * cols..5 * cols]).all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{dtype:?} planes={planes} glu={glu}: a 3-row pass differs from the 7-row pass"
                 );
-            }
-        }
-    }
-}
-
-/// `add_norm` against the host: `x += norm(delta) * (o1 + w1)`, then
-/// `h = norm(x) * (o2 + w2)`. Widths up to 4096 take the subgroup kernel where there is
-/// one, wider rows (and every width without subgroups) the plain one.
-#[test]
-#[ignore]
-fn add_norm_matches_host() {
-    let mut gpu = WgpuBackend::new().unwrap();
-    let (o1, o2, eps) = (1.0f32, 1.0f32, 1e-6f32);
-    let norm = |v: &[f32]| 1.0 / (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32 + eps).sqrt();
-    for cols in [64, 1000, 2560, 4096, 4352, 6000] {
-        for rows in [1, 3] {
-            let x = values(rows * cols, cols as u64);
-            let d = values(rows * cols, cols as u64 + 1);
-            let (w1, w2) = (values(cols, 3), values(cols, 4));
-            let (gx, gh) = gpu.debug_add_norm(&x, &d, rows, cols, (&w1, o1), (&w2, o2), eps);
-            for r in 0..rows {
-                let row = r * cols..(r + 1) * cols;
-                let r1 = norm(&d[row.clone()]);
-                let wx: Vec<f32> = (0..cols).map(|i| x[r * cols + i] + (o1 + w1[i]) * (d[r * cols + i] * r1)).collect();
-                let r2 = norm(&wx);
-                for i in 0..cols {
-                    let wh = (o2 + w2[i]) * (wx[i] * r2);
-                    let (ex, eh) = ((gx[r * cols + i] - wx[i]).abs(), (gh[r * cols + i] - wh).abs());
-                    assert!(ex <= 1e-4 * wx[i].abs().max(1.0), "x cols={cols} row {r} [{i}]");
-                    assert!(eh <= 1e-4 * wh.abs().max(1.0), "h cols={cols} row {r} [{i}]");
-                }
             }
         }
     }
