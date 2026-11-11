@@ -165,7 +165,7 @@ fn dot_q8(qs: &[i8], scales: &[f16], x: &[f32]) -> f32 {
 }
 
 fn dequant_q8_row(qs: &[i8], scales: &[f16], out: &mut [f32]) {
-    for ((o, q), sc) in out.chunks_exact_mut(Q8_BLOCK).zip(qs.chunks_exact(Q8_BLOCK)).zip(scales) {
+    for ((o, q), sc) in out.as_chunks_mut::<Q8_BLOCK>().0.iter_mut().zip(qs.as_chunks::<Q8_BLOCK>().0).zip(scales) {
         let d = sc.to_f32();
         for (a, &b) in o.iter_mut().zip(q) {
             *a = b as f32 * d;
