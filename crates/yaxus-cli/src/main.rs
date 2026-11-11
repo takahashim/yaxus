@@ -92,8 +92,9 @@ enum Cmd {
 }
 
 pub fn config_dir() -> PathBuf {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(x).join("yaxus");
+    // The XDG spec: an empty or relative XDG_CONFIG_HOME is ignored.
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return x.join("yaxus");
     }
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".config/yaxus")
@@ -201,12 +202,16 @@ fn run_client(
             .map(|t| t.trim().to_string())
             .context("no token: pass --token or set YAXUS_TOKEN")?,
     };
+    if token.trim().is_empty() {
+        bail!("the access token is empty: pass --token or set YAXUS_TOKEN");
+    }
     let mut builder = reqwest::blocking::Client::builder().timeout(None).use_rustls_tls();
     if let Some(ca) = &ca {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
         builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
     }
     if insecure {
+        eprintln!("warning: --insecure: the server certificate is not verified, but the token is still sent");
         builder = builder.danger_accept_invalid_certs(true);
     }
     let http = builder.build()?;
