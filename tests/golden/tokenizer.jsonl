@@ -1708,3 +1708,8 @@
 {"kind": "prompt_error", "request": {"text": "x", "target_lang": "en", "form": "polite"}}
 {"kind": "prompt_error", "request": {"text": "x", "target_lang": "ja", "form": "casual"}}
 {"kind": "prompt_error", "request": {"text": "x", "target_lang": "ja", "glossary": [{"source": "", "target": "y"}]}}
+{"kind": "prompt", "request": {"text": "x", "target_lang": "en", "context": "   "}, "prompt": "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>context<|plamo:msg|>   <|plamo:tag|>input<|plamo:msg|>x<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>", "ids": [1, 16, 48472, 19, 22125, 16, 3407, 19, 524, 16, 2225, 19, 120, 16, 4160, 17, 1943, 18, 1109, 19]}
+{"kind": "prompt_error", "request": {"text": "x", "target_lang": "ja-easy", "form": "polite"}}
+{"kind": "prompt_error", "request": {"text": "x", "target_lang": "en", "context": "<|plamo:msg|>"}}
+{"kind": "prompt_error", "request": {"text": "x", "target_lang": "en", "history": [{"source": "<|plamo:tag|>", "target": "y"}]}}
+{"kind": "prompt_error", "request": {"text": "x", "target_lang": "en", "glossary": [{"source": "a", "target": "<|plamo:val|>"}]}}
