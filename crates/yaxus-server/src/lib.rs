@@ -178,7 +178,18 @@ pub fn quant_label(model: &Path, quant: Quant) -> String {
 pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
     use yaxus_tokenizer::TokenKind;
     if !yaxus_model::gguf::is_gguf(model) {
-        return Ok(Tokenizer::from_file(model.join("tokenizer.jsonl"))?);
+        let tok = Tokenizer::from_file(model.join("tokenizer.jsonl"))?;
+        // A token beyond the model's embedding table would fail inside a forward pass
+        // (e.g. a tokenizer.jsonl from another revision); a GGUF file's vocabulary is the
+        // model's own.
+        let cfg = yaxus_model::Config::from_file(model.join("config.json"))?;
+        anyhow::ensure!(
+            tok.vocab_size() <= cfg.vocab_size,
+            "tokenizer.jsonl has {} tokens but the model only {}",
+            tok.vocab_size(),
+            cfg.vocab_size
+        );
+        return Ok(tok);
     }
     let v = yaxus_model::gguf::Gguf::open(model)?.vocab()?;
     let kinds = v
@@ -687,5 +698,34 @@ mod tests {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn a_tokenizer_larger_than_the_model_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("yaxus-vocab-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The PLaMo layout: 17 control tokens (bos at 1, tag at 16), then 256 bytes.
+        let mut lines: Vec<String> = (0..17)
+            .map(|i| match i {
+                1 => r#"["<|plamo:bos|>", 0.0, "CONTROL"]"#.to_string(),
+                16 => r#"["<|plamo:tag|>", 0.0, "CONTROL"]"#.to_string(),
+                _ => format!(r#"["<|plamo:c{i}|>", 0.0, "CONTROL"]"#),
+            })
+            .collect();
+        lines.extend((0..=255u8).map(|b| format!(r#"["<0x{b:02X}>", 0.0, "BYTE"]"#)));
+        std::fs::write(dir.join("tokenizer.jsonl"), lines.join("\n")).unwrap();
+        let config = |vocab: usize| {
+            format!(
+                r#"{{"hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 1,
+                    "num_key_value_heads": 1, "head_dim": 2, "intermediate_size": 8,
+                    "vocab_size": {vocab}, "rms_norm_eps": 1e-6, "window_size": 4,
+                    "sliding_window_pattern": 1, "rope_theta": 1.0, "rope_local_theta": 1.0}}"#
+            )
+        };
+        std::fs::write(dir.join("config.json"), config(273)).unwrap();
+        assert_eq!(load_tokenizer(&dir).unwrap().vocab_size(), 273);
+        std::fs::write(dir.join("config.json"), config(200)).unwrap();
+        assert!(format!("{:#}", load_tokenizer(&dir).unwrap_err()).contains("273 tokens but the model only 200"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

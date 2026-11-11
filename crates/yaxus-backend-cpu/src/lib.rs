@@ -125,6 +125,9 @@ pub fn init_threads() {
         return;
     }
     if let Some(n) = physical_cores() {
+        // The host's cores are not all ours under a cgroup CPU quota (containers) or an
+        // affinity mask (taskset); available_parallelism accounts for both.
+        let n = std::thread::available_parallelism().map_or(n, |a| n.min(a.get()));
         let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
     }
 }
@@ -225,6 +228,10 @@ impl Backend for CpuBackend {
     fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
         let w = match (quant, t.as_bf16()) {
             (Quant::Q4, _) => anyhow::bail!("q4 weights are only supported on the Vulkan backend"),
+            (Quant::Q8 | Quant::Auto | Quant::Auto4, _) if !matches!(t.shape[..], [_, k] if k.is_multiple_of(Q8_BLOCK)) =>
+            {
+                anyhow::bail!("q8 needs a matrix whose rows are a multiple of {Q8_BLOCK} (shape {:?})", t.shape)
+            }
             (Quant::Q8 | Quant::Auto | Quant::Auto4, Some(b)) => Weight::Q8(Q8Matrix::quantize(b, &t.shape)),
             (Quant::Q8 | Quant::Auto | Quant::Auto4, None) => {
                 Weight::Q8(Q8Matrix::quantize(&t.to_bf16_vec(), &t.shape))
@@ -330,12 +337,14 @@ impl Backend for CpuBackend {
         if t == 1 {
             return Tensor { data: tr, rows: 1, cols: n };
         }
+        // Transpose back, one output row per task (a serial loop was a visible share of
+        // prompt processing on the CPU).
         let mut out = Tensor::zeros(t, n);
-        for j in 0..n {
-            for i in 0..t {
-                out.data[i * n + j] = tr[j * t + i];
+        out.data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+            for (j, o) in row.iter_mut().enumerate() {
+                *o = tr[j * t + i];
             }
-        }
+        });
         out
     }
 
@@ -458,5 +467,176 @@ impl Backend for CpuBackend {
 
     fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         x.data.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use yaxus_model::Rope;
+
+    use super::*;
+
+    /// Small deterministic values in [-1, 1).
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    fn config(hq: usize, hkv: usize, d: usize) -> Config {
+        serde_json::from_str(&format!(
+            r#"{{"hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": {hq},
+                "num_key_value_heads": {hkv}, "head_dim": {d}, "intermediate_size": 8,
+                "vocab_size": 16, "rms_norm_eps": 1e-6, "window_size": 16,
+                "sliding_window_pattern": 1, "rope_theta": 10000.0, "rope_local_theta": 10000.0}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Dense attention of one sequence's rows (positions 0..n), as the paged kernel
+    /// should compute it.
+    fn naive(qkv: &[Vec<f32>], cfg: &Config, layer: &LayerMeta) -> Vec<Vec<f32>> {
+        let (hq, hkv, d) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let (qd, kvd) = (hq * d, hkv * d);
+        let ones = vec![0f32; d];
+        let (mut cos, mut sin) = (vec![0f32; d / 2], vec![0f32; d / 2]);
+        let (mut qs, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new());
+        for (p, row) in qkv.iter().enumerate() {
+            layer.rope.cos_sin(p, &mut cos, &mut sin);
+            let mut q = vec![0f32; qd];
+            for h in 0..hq {
+                rmsnorm_row(&row[h * d..(h + 1) * d], &ones, 1.0, cfg.rms_norm_eps, &mut q[h * d..(h + 1) * d]);
+                rope_inplace(&mut q[h * d..(h + 1) * d], &cos, &sin);
+            }
+            let mut k = vec![0f32; kvd];
+            for h in 0..hkv {
+                let src = &row[qd + h * d..qd + (h + 1) * d];
+                rmsnorm_row(src, &ones, 1.0, cfg.rms_norm_eps, &mut k[h * d..(h + 1) * d]);
+                rope_inplace(&mut k[h * d..(h + 1) * d], &cos, &sin);
+            }
+            qs.push(q);
+            ks.push(k);
+            vs.push(row[qd + kvd..].to_vec());
+        }
+        let scale = 1.0 / (d as f32).sqrt();
+        (0..qkv.len())
+            .map(|p| {
+                let lo = layer.window.map_or(0, |w| (p + 1).saturating_sub(w));
+                let mut out = vec![0f32; qd];
+                for h in 0..hq {
+                    let kh = h / (hq / hkv);
+                    let sc: Vec<f32> = (lo..=p)
+                        .map(|s| dot(&qs[p][h * d..(h + 1) * d], &ks[s][kh * d..(kh + 1) * d]) * scale)
+                        .collect();
+                    let m = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let w: Vec<f32> = sc.iter().map(|x| (x - m).exp()).collect();
+                    let z: f32 = w.iter().sum();
+                    for (s, wi) in (lo..=p).zip(&w) {
+                        for j in 0..d {
+                            out[h * d + j] += wi / z * vs[s][kh * d + j];
+                        }
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// Runs the paged attention for some rows of several sequences in one pass.
+    /// `rows[i] = (sequence, position)`; `pages[sequence]` is its page table.
+    fn pass(
+        b: &mut CpuBackend,
+        kv: &mut Kv,
+        cfg: &Config,
+        layer: &LayerMeta,
+        qkv: &[Vec<Vec<f32>>],
+        pages: &[Vec<u32>],
+        rows: &[(usize, usize)],
+    ) -> Vec<Vec<f32>> {
+        let mut meta = PassMeta::default();
+        let mut off = vec![None; pages.len()];
+        for &(sq, p) in rows {
+            let o = *off[sq].get_or_insert_with(|| {
+                let o = meta.pages.len() as u32;
+                meta.pages.extend(&pages[sq]);
+                o
+            });
+            meta.ids.push(0);
+            meta.pos.push(p as u32);
+            meta.kv_slot.push(pages[sq][p / PAGE] * PAGE as u32 + (p % PAGE) as u32);
+            meta.pt_off.push(o);
+        }
+        b.begin_pass(&meta);
+        let cols = qkv[0][0].len();
+        let data = rows.iter().flat_map(|&(sq, p)| qkv[sq][p].iter().copied()).collect();
+        let x = Tensor { data, rows: rows.len(), cols };
+        let norm = Weight::Owned(vec![0; cfg.head_dim], vec![cfg.head_dim]);
+        let out = b.attention(&x, &norm, &norm, kv, cfg, layer);
+        (0..out.rows).map(|r| out.row(r).to_vec()).collect()
+    }
+
+    #[test]
+    fn paged_attention_matches_dense_attention() {
+        let (hq, hkv, d) = (4, 2, 8);
+        let cfg = config(hq, hkv, d);
+        let cols = (hq + 2 * hkv) * d;
+        let rope = Rope { inv_freq: vec![1.0, 0.3, 0.05, 0.01], concentration: 1.1 };
+        for window in [None, Some(16)] {
+            let layer = LayerMeta { index: 0, full_attn: window.is_none(), window, rope: rope.clone() };
+            let mut b = CpuBackend::new();
+            let mut kv = b.new_kv(&cfg, std::slice::from_ref(&layer), 4, 1024).unwrap();
+            // Sequence 0 spans two non-adjacent pages; sequence 1 has one.
+            let pages = vec![vec![3, 1], vec![0]];
+            let lens = [140, 9];
+            let qkv: Vec<Vec<Vec<f32>>> = lens
+                .iter()
+                .enumerate()
+                .map(|(s, &n)| (0..n).map(|p| values(cols, (s * 1000 + p) as u64)).collect())
+                .collect();
+            let want: Vec<Vec<Vec<f32>>> = qkv.iter().map(|q| naive(q, &cfg, &layer)).collect();
+
+            // First pass: 100 rows of sequence 0 and 4 of sequence 1; second pass: the
+            // rest, so the second reads keys written by the first, across the page boundary.
+            let mut got: Vec<Vec<Vec<f32>>> = lens.iter().map(|&n| vec![Vec::new(); n]).collect();
+            let first: Vec<(usize, usize)> = (0..100).map(|p| (0, p)).chain((0..4).map(|p| (1, p))).collect();
+            let second: Vec<(usize, usize)> = (100..140).map(|p| (0, p)).chain((4..9).map(|p| (1, p))).collect();
+            for rows in [first, second] {
+                for (row, &(s, p)) in pass(&mut b, &mut kv, &cfg, &layer, &qkv, &pages, &rows).into_iter().zip(&rows) {
+                    got[s][p] = row;
+                }
+            }
+            for s in 0..2 {
+                for p in 0..lens[s] {
+                    for (a, w) in got[s][p].iter().zip(&want[s][p]) {
+                        assert!((a - w).abs() < 1e-5, "window {window:?}, seq {s}, pos {p}: {a} vs {w}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_matches_a_plain_loop() {
+        let mut b = CpuBackend::new();
+        let (n, k) = (40, 64);
+        let w: Vec<u16> = values(n * k, 7).iter().map(|&x| yaxus_model::weights::f32_to_bf16(x)).collect();
+        let weight = Weight::Owned(w.clone(), vec![n, k]);
+        for t in [1, 3, 9] {
+            let x = Tensor { data: values(t * k, t as u64), rows: t, cols: k };
+            let y = b.matmul(&x, &weight);
+            assert_eq!((y.rows, y.cols), (t, n));
+            for i in 0..t {
+                for j in 0..n {
+                    let want: f32 = (0..k).map(|c| bf16_to_f32(w[j * k + c]) * x.data[i * k + c]).sum();
+                    assert!((y.data[i * n + j] - want).abs() < 1e-4, "t {t} ({i}, {j})");
+                }
+            }
+        }
     }
 }
