@@ -7,3 +7,6 @@ description = "HTTP API types shared by the yaxus server and client"
 
 [dependencies]
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

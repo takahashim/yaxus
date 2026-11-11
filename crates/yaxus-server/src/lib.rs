@@ -68,11 +68,13 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 /// Loads the stored token or creates a new random one. Returns (token, newly_created).
 fn load_or_create_token(dir: &Path) -> Result<(String, bool)> {
     let path = dir.join("token");
-    if let Ok(t) = std::fs::read_to_string(&path) {
-        let t = t.trim().to_string();
-        if !t.is_empty() {
-            return Ok((t, false));
-        }
+    match std::fs::read_to_string(&path) {
+        Ok(t) if !t.trim().is_empty() => return Ok((t.trim().to_string(), false)),
+        // Missing or empty: create one below.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Replacing an unreadable token would lock every client out without saying why.
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     }
     std::fs::create_dir_all(dir)?;
     let mut buf = [0u8; 24];
@@ -86,13 +88,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// The token of an `Authorization: Bearer <token>` header (the scheme is case-insensitive).
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+}
+
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| constant_time_eq(t.trim().as_bytes(), st.token.as_bytes()));
+        .and_then(bearer_token)
+        .is_some_and(|t| constant_time_eq(t.as_bytes(), st.token.as_bytes()));
     if !ok {
         let mut r = error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
@@ -105,10 +113,15 @@ async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Html(INDEX_HTML))
 }
 
-async fn healthz(State(st): State<Shared>) -> Json<Health> {
+async fn healthz(State(st): State<Shared>) -> Response {
     let mut h = st.health.clone();
     h.queue = st.queued.load(Ordering::SeqCst);
-    Json(h)
+    // The inference thread has stopped (after a panic): report it instead of "ok".
+    if st.jobs.is_closed() {
+        h.status = "stopped".into();
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(h)).into_response();
+    }
+    Json(h).into_response()
 }
 
 async fn languages() -> Json<Vec<Language>> {
@@ -218,9 +231,11 @@ async fn translate_document(
         return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
     }
     let (n, stream, label) = (req.segments.len(), req.stream, label(req.requested_source_lang(), &req.target_lang));
-    let doc = document::DocJob::from_request(req, st.max_context / 2);
-    // Options and every segment are checked up front (blank segments come back empty).
-    if let Err(e) = doc.validate() {
+    let doc = document::DocJob::from_request(req, st.max_context);
+    // Options and every segment's prompt without history are checked up front, against the
+    // context too (blank segments come back empty); history that does not fit is dropped
+    // when the segment is submitted.
+    if let Err(e) = doc.validate(&st.tok) {
         return error(StatusCode::BAD_REQUEST, e.0);
     }
     let (tx, rx) = mpsc::unbounded_channel();
@@ -278,11 +293,20 @@ fn router(st: Shared) -> Router {
 pub fn serve(opts: ServeOptions) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (token, created) = match opts.token.clone() {
-        Some(t) => (t, false),
+    let (token, created) = match opts.token.as_deref() {
+        // Clients' tokens are trimmed before the comparison, so trim this one too.
+        Some(t) => (t.trim().to_string(), false),
         None => load_or_create_token(&opts.config_dir)?,
     };
     anyhow::ensure!(token.len() >= 16, "token must be at least 16 characters");
+    // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass the
+    // checks here and then fail in the engine.
+    anyhow::ensure!(
+        // (at least 2: documents give each segment up to half of it to generate)
+        (2..=yaxus_model::DEFAULT_MAX_POS).contains(&opts.max_context),
+        "max context must be 2..={} tokens",
+        yaxus_model::DEFAULT_MAX_POS
+    );
 
     let tls = match (&opts.cert, &opts.key) {
         (Some(c), Some(k)) => tls::TlsFiles { cert: c.clone(), key: k.clone(), ca: None, sans: vec![] },
@@ -312,12 +336,16 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let (jobs, rx) = mpsc::channel(opts.queue_limit.max(1));
     let queue_limit = opts.queue_limit.max(1);
     let queued = Arc::new(AtomicUsize::new(0));
+    // The inference thread reports a fatal failure here; the server then shuts down and
+    // `serve` returns an error, so a supervisor can restart the process.
+    let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
     {
         let (tok, queued) = (tok.clone(), queued.clone());
         std::thread::Builder::new()
             .name("inference".into())
-            .spawn(move || worker::run(model, tok, rx, queued, queue_limit))?;
+            .spawn(move || worker::run(model, tok, rx, queued, queue_limit, failed_tx))?;
     }
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let st = Arc::new(AppState { tok, jobs, queued, token: token.clone(), health, max_context: opts.max_context });
     let app = router(st);
@@ -333,6 +361,15 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutting down");
             h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+        let (h, f) = (handle.clone(), failed.clone());
+        tokio::spawn(async move {
+            // (an Err means the thread ended normally and dropped the sender)
+            if failed_rx.await.is_ok() {
+                tracing::error!("the inference thread stopped after an internal error; shutting down");
+                f.store(true, Ordering::SeqCst);
+                h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            }
         });
 
         let port = opts.listen.port();
@@ -356,13 +393,42 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
             .handle(handle)
             .serve(app.into_make_service())
             .await
-            .context("server error")
+            .context("server error")?;
+        anyhow::ensure!(!failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
+        Ok(())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
+    }
+
+    #[test]
+    fn token_file_is_created_reused_and_never_silently_replaced() {
+        let dir = std::env::temp_dir().join(format!("yaxus-token-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (t, created) = load_or_create_token(&dir).unwrap();
+        assert!(created && t.len() == 48);
+        assert_eq!(load_or_create_token(&dir).unwrap(), (t.clone(), false));
+        // An empty file gets a new token.
+        std::fs::write(dir.join("token"), "\n").unwrap();
+        let (t2, created) = load_or_create_token(&dir).unwrap();
+        assert!(created && t2 != t);
+        // A file that cannot be read is an error, not a new token.
+        std::fs::write(dir.join("token"), [0xff, 0xfe]).unwrap();
+        assert!(load_or_create_token(&dir).is_err());
+        assert_eq!(std::fs::read(dir.join("token")).unwrap(), [0xff, 0xfe]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn token_compare() {

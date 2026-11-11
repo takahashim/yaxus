@@ -350,7 +350,11 @@ impl<B: Backend> Engine<B> {
             );
             anyhow::ensure!((1..=16).contains(&cfg.draft_k), "draft length must be 1..=16");
         }
-        anyhow::ensure!(cfg.decode_rows >= 1 && cfg.max_streams >= 1);
+        // A zero row budget would make every prompt pass empty and the engine spin.
+        anyhow::ensure!(
+            cfg.decode_rows >= 1 && cfg.max_streams >= 1 && cfg.busy_prefill_rows >= 1,
+            "decode_rows, max_streams and busy_prefill_rows must be at least 1"
+        );
         Ok(Engine {
             target,
             draft,
@@ -907,6 +911,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_row_budgets_are_rejected() {
+        let cfg = EngineConfig { busy_prefill_rows: 0, ..Default::default() };
+        assert!(Engine::new(crate::testing::model(2), None, cfg).is_err());
+        assert!(Engine::new(crate::testing::model(2), None, EngineConfig::default()).is_ok());
+    }
 
     #[test]
     fn hint_follows_the_output() {

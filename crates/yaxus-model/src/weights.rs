@@ -34,6 +34,16 @@ impl TensorRef {
         self.shape.iter().product()
     }
 
+    /// The first `rows` rows of a matrix, without copying (rows are contiguous). `None`
+    /// when this is not a matrix of at least `rows` rows whose rows are whole blocks.
+    pub fn first_rows(&self, rows: usize) -> Option<TensorRef> {
+        let &[n, k] = &self.shape[..] else { return None };
+        if rows > n || !k.is_multiple_of(self.dtype.block().0) {
+            return None;
+        }
+        Some(TensorRef { len: rows * self.dtype.bytes_for(k), shape: vec![rows, k], ..self.clone() })
+    }
+
     /// Borrows the data as raw bf16 `u16`s when it is bf16 and suitably aligned.
     pub fn as_bf16(&self) -> Option<&[u16]> {
         let b = self.bytes();

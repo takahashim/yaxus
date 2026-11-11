@@ -71,8 +71,31 @@ impl Config {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(!self.scale_embedding, "scale_embedding=true is not supported");
         ensure!(!self.tie_word_embeddings, "tied embeddings are not supported");
-        ensure!(self.num_attention_heads % self.num_key_value_heads == 0);
-        ensure!(self.head_dim % 2 == 0);
+        let sizes = [
+            ("hidden_size", self.hidden_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("num_attention_heads", self.num_attention_heads),
+            ("num_key_value_heads", self.num_key_value_heads),
+            ("head_dim", self.head_dim),
+            ("intermediate_size", self.intermediate_size),
+            ("vocab_size", self.vocab_size),
+            ("sliding_window_pattern", self.sliding_window_pattern),
+        ];
+        for (name, v) in sizes {
+            ensure!(v > 0, "{name} must be positive");
+        }
+        // With sliding layers, an empty window leaves them nothing to attend to (NaN).
+        ensure!(
+            self.sliding_window_pattern == 1 || self.window_size > 0,
+            "window_size must be positive when there are sliding-window layers"
+        );
+        ensure!(
+            self.num_attention_heads.is_multiple_of(self.num_key_value_heads),
+            "num_attention_heads ({}) is not a multiple of num_key_value_heads ({})",
+            self.num_attention_heads,
+            self.num_key_value_heads
+        );
+        ensure!(self.head_dim.is_multiple_of(2), "head_dim ({}) must be even", self.head_dim);
         Ok(())
     }
 

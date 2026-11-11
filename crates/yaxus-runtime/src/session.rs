@@ -174,6 +174,13 @@ impl<'a, T> Session<'a, T> {
         self.engine.abort_all();
         self.live.drain().map(|(_, l)| l.tag).collect()
     }
+
+    /// Gives up on the engine (after a panic in [`step`](Session::step), when its state
+    /// cannot be trusted and it must not be called again): returns the tags of the
+    /// requests in flight without telling the engine.
+    pub fn abandon(self) -> Vec<T> {
+        self.live.into_values().map(|l| l.tag).collect()
+    }
 }
 
 #[cfg(test)]
@@ -367,5 +374,16 @@ mod tests {
         assert!(session.is_idle());
         drop(session);
         assert!(engine.aborted, "the engine drops its requests too");
+    }
+
+    #[test]
+    fn abandon_leaves_the_engine_alone() {
+        let tok = tokenizer();
+        let mut memory = Memory::new(8);
+        let mut engine = Script::default();
+        let mut session = Session::new(&mut engine, &tok, &mut memory);
+        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
+        assert_eq!(session.abandon(), ["a"]);
+        assert!(!engine.aborted);
     }
 }

@@ -138,6 +138,12 @@ PROMPTS = [
     {"text": "x", "target_lang": "en", "form": "polite"},
     {"text": "x", "target_lang": "ja", "form": "casual"},
     {"text": "x", "target_lang": "ja", "glossary": [{"source": "", "target": "y"}]},
+    # Added later (appended so that the earlier lines stay as they were).
+    {"text": "x", "target_lang": "en", "context": "   "},
+    {"text": "x", "target_lang": "ja-easy", "form": "polite"},
+    {"text": "x", "target_lang": "en", "context": "<|plamo:msg|>"},
+    {"text": "x", "target_lang": "en", "history": [{"source": "<|plamo:tag|>", "target": "y"}]},
+    {"text": "x", "target_lang": "en", "glossary": [{"source": "a", "target": "<|plamo:val|>"}]},
 ]
 
 for req in PROMPTS:

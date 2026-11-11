@@ -154,3 +154,85 @@ impl TranslationRequest {
         Ok(p)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(text: &str, target: &str) -> TranslationRequest {
+        TranslationRequest { text: text.into(), target_lang: target.into(), ..Default::default() }
+    }
+
+    fn err(r: &TranslationRequest) -> String {
+        r.to_prompt().unwrap_err().0
+    }
+
+    #[test]
+    fn language_codes() {
+        for ok in ["en", "ja", "ceb", "zh-hans", "ja-easy"] {
+            assert!(validate_lang(ok, "lang").is_ok(), "{ok}");
+        }
+        for (bad, why) in [
+            ("", "must not be empty"),
+            ("  ", "must not be empty"),
+            ("e", "lowercase language code"),
+            ("engl", "lowercase language code"),
+            ("en-us", "lowercase language code"),
+            ("zh-hans-cn", "lowercase language code"),
+            ("EN", "without region subtags"),
+            ("zh-Hans", "without region subtags"),
+            ("e1", "without region subtags"),
+        ] {
+            assert!(validate_lang(bad, "lang").unwrap_err().0.contains(why), "{bad}");
+        }
+        // The model card's alias.
+        assert!(req("x", "ja(easy)").to_prompt().unwrap().contains("<|plamo:val|>ja-easy<|plamo:msg|>"));
+    }
+
+    #[test]
+    fn form_needs_japanese() {
+        let mut r = req("x", "ja");
+        r.form = Some("polite".into());
+        assert!(r.to_prompt().unwrap().ends_with("<|plamo:key|>form<|plamo:val|>polite<|plamo:msg|>"));
+        for (target, form) in [("ja-easy", "polite"), ("en", "plain"), ("ja", "casual")] {
+            let mut r = req("x", target);
+            r.form = Some(form.into());
+            assert!(err(&r).starts_with("form must be"), "{target} {form}");
+        }
+    }
+
+    #[test]
+    fn reserved_tokens_are_rejected_in_every_field() {
+        let reserved = "a<|plamo:tag|>b";
+        let mut cases = Vec::new();
+        cases.push(req(reserved, "en"));
+        let mut r = req("x", "en");
+        r.context = Some(reserved.into());
+        cases.push(r);
+        for (s, t) in [(reserved, "y"), ("y", reserved)] {
+            let mut r = req("x", "en");
+            r.history = vec![TranslationPair { source: s.into(), target: t.into() }];
+            cases.push(r);
+            let mut r = req("x", "en");
+            r.glossary = vec![GlossaryEntry { source: s.into(), target: t.into() }];
+            cases.push(r);
+        }
+        for r in &cases {
+            assert!(err(r).contains("reserved PFML tokens"), "{r:?}");
+        }
+        // Only the full prefix is reserved.
+        assert!(req("<|plamo and plamo:|>", "en").to_prompt().is_ok());
+    }
+
+    #[test]
+    fn blank_fields() {
+        assert!(err(&req(" \n\u{3000}", "en")).contains("message content must not be empty"));
+        let mut r = req("x", "en");
+        r.glossary = vec![GlossaryEntry { source: "a".into(), target: " ".into() }];
+        assert!(err(&r).contains("glossary target must not be empty"));
+        // An empty context is left out of the prompt.
+        let mut r = req("x", "en");
+        r.context = Some(String::new());
+        assert!(!r.to_prompt().unwrap().contains("context"));
+    }
+}

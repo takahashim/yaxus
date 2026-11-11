@@ -36,9 +36,36 @@ pub struct Prompt {
     memo: u64,
 }
 
+/// Generation budget a request keeps its history for in [`Prompt::fit`]: `max_new` is a
+/// cap that outputs rarely approach, so a prompt with history that leaves this much is kept.
+const MIN_BUDGET: usize = 512;
+
 impl Prompt {
     pub fn new(tok: &Tokenizer, req: &TranslationRequest) -> Result<Self, PromptError> {
         Ok(Prompt { ids: tok.encode(&req.to_prompt()?, false), memo: memory::key(req) })
+    }
+
+    /// The prompt of `req` such that it and the generation budget fit in `max_context`
+    /// tokens: the budget is cut to what the prompt leaves, and the history is dropped
+    /// only when that would leave less than `MIN_BUDGET` (or `max_new`, if smaller).
+    /// Returns the prompt and the budget (at least 1), or an error when even the prompt
+    /// without history does not fit.
+    pub fn fit(
+        tok: &Tokenizer,
+        mut req: TranslationRequest,
+        max_context: usize,
+        max_new: usize,
+    ) -> Result<(Self, usize), PromptError> {
+        let mut prompt = Prompt::new(tok, &req)?;
+        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.history.is_empty() {
+            req.history.clear();
+            prompt = Prompt::new(tok, &req)?;
+        }
+        if prompt.len() >= max_context {
+            return Err(PromptError(format!("prompt is {} tokens; the limit is {max_context}", prompt.len())));
+        }
+        let max_new = max_new.min(max_context - prompt.len()).max(1);
+        Ok((prompt, max_new))
     }
 
     /// The token ids, for callers that build engine requests themselves (benchmarks).

@@ -132,7 +132,8 @@ pub struct ServeArgs {
     /// Extra host name or IP for the generated certificate (repeatable).
     #[arg(long)]
     san: Vec<String>,
-    /// Requests that may wait while one is being translated; more get HTTP 429.
+    /// Requests that may wait in the server's queue; more get HTTP 429. (The engine also
+    /// holds up to this many beyond the ones it is running, so about twice this can wait.)
     #[arg(long, default_value_t = 16)]
     queue: usize,
     /// Maximum prompt + generated tokens per request.
@@ -202,9 +203,10 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
         );
     }
     let n = req.segments.len();
-    let mut job = DocJob::from_request(req, usize::MAX);
+    // The model's positions are the context (the server makes it --max-context).
+    let mut job = DocJob::from_request(req, yaxus_model::DEFAULT_MAX_POS);
     // Bad input fails before any output, as the server answers it with 400.
-    job.validate()?;
+    job.validate(&tok)?;
     let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
     let t1 = Instant::now();
     let mut first: Option<Duration> = None;
@@ -647,7 +649,7 @@ fn bench_doc(
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
         let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
         let mut job = DocJob::new(paras, opts.clone());
-        job.validate()?;
+        job.validate(&tok)?;
         println!(
             "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
             job.len(),
