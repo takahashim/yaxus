@@ -39,6 +39,11 @@ impl Prompt {
         Ok(Prompt { ids: tok.encode(&req.to_prompt()?, false), memo: memory::key(req) })
     }
 
+    /// The token ids.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
     /// Prompt length in tokens.
     pub fn len(&self) -> usize {
         self.ids.len()
@@ -46,6 +51,11 @@ impl Prompt {
 
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(ids: Vec<u32>, memo: u64) -> Self {
+        Prompt { ids, memo }
     }
 
     pub(crate) fn into_parts(self) -> (Vec<u32>, u64) {

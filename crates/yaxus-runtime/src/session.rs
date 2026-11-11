@@ -174,3 +174,191 @@ impl<'a, T> Session<'a, T> {
         self.live.drain().map(|(_, l)| l.tag).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use yaxus_tokenizer::TokenKind;
+
+    use super::*;
+
+    /// Plays back scripted events, one list per step, and records what it was given.
+    #[derive(Default)]
+    struct Script {
+        steps: VecDeque<Vec<Event>>,
+        submitted: Vec<Request>,
+        /// What the session answered to each event.
+        answers: Vec<bool>,
+        next_id: ReqId,
+    }
+
+    impl Generator for Script {
+        fn submit(&mut self, req: Request) {
+            self.submitted.push(req);
+        }
+        fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+            let Some(events) = self.steps.pop_front() else { return Ok(false) };
+            for ev in events {
+                self.answers.push(emit(ev));
+            }
+            Ok(true)
+        }
+        fn fresh_id(&mut self) -> ReqId {
+            self.next_id += 1;
+            self.next_id
+        }
+        fn waiting(&self) -> usize {
+            0
+        }
+        fn active(&self) -> usize {
+            0
+        }
+        fn backend_name(&self) -> String {
+            "script".into()
+        }
+        fn weight_bytes(&self) -> usize {
+            0
+        }
+        fn stats(&self) -> Option<String> {
+            None
+        }
+        fn last_start(&self) -> StartInfo {
+            StartInfo::default()
+        }
+    }
+
+    const HEL: u32 = 17 + 256;
+    const LO: u32 = HEL + 1;
+    /// The byte token of `b`.
+    fn byte(b: u8) -> u32 {
+        17 + b as u32
+    }
+
+    /// Control tokens 0..=16 (bos at 1, tag at 16), the 256 byte tokens, `Hel` and `lo`.
+    fn tokenizer() -> Tokenizer {
+        let mut tokens: Vec<String> = (0..=TAG_ID)
+            .map(|id| match id {
+                1 => "<|plamo:bos|>".to_string(),
+                TAG_ID => "<|plamo:tag|>".to_string(),
+                _ => format!("<|plamo:c{id}|>"),
+            })
+            .collect();
+        let mut kinds = vec![TokenKind::Control; tokens.len()];
+        for b in 0..=255u8 {
+            tokens.push(format!("<0x{b:02X}>"));
+            kinds.push(TokenKind::Byte);
+        }
+        tokens.extend(["Hel".to_string(), "lo".to_string()]);
+        kinds.extend([TokenKind::Normal, TokenKind::Normal]);
+        let scores = vec![0.0; tokens.len()];
+        Tokenizer::from_vocab(tokens, kinds, scores).unwrap()
+    }
+
+    fn token(id: ReqId, token: u32) -> Event {
+        Event::Token { id, token }
+    }
+
+    fn done(id: ReqId, finish: Finish, generated: usize) -> Event {
+        Event::Done { id, finish, generated, start: StartInfo::default() }
+    }
+
+    /// The updates of one step, as text: `tag:delta`, `tag:done:text` or `tag:failed`.
+    fn run_step(session: &mut Session<'_, &'static str>, cancel_on: Option<&str>) -> Vec<String> {
+        let mut seen = Vec::new();
+        session
+            .step(&mut |u| match u {
+                Update::Delta { tag, text } => {
+                    seen.push(format!("{tag}:{text}"));
+                    cancel_on != Some(text)
+                }
+                Update::Done { tag, done } => {
+                    seen.push(format!("{tag}:done:{}", done.text));
+                    true
+                }
+                Update::Failed { tag, .. } => {
+                    seen.push(format!("{tag}:failed"));
+                    true
+                }
+            })
+            .unwrap();
+        seen
+    }
+
+    #[test]
+    fn tokens_become_text_and_a_stop_goes_into_memory() {
+        let tok = tokenizer();
+        let mut memory = Memory::new(8);
+        memory.put(42, vec![HEL]);
+        let mut engine = Script::default();
+        // "é" is two byte tokens: the first completes no character yet.
+        engine.steps.push_back(vec![token(1, HEL), token(1, LO), token(1, byte(0xC3))]);
+        engine.steps.push_back(vec![token(1, byte(0xA9)), done(1, Finish::Stop, 4)]);
+        let mut session = Session::new(&mut engine, &tok, &mut memory);
+        session.submit(Prompt::from_parts(vec![5, 6], 42), 32, "a");
+        assert_eq!(run_step(&mut session, None), ["a:Hel", "a:lo", "a:"]);
+        assert_eq!(run_step(&mut session, None), ["a:é", "a:done:Helloé"]);
+        assert!(session.is_idle());
+        drop(session);
+        let req = &engine.submitted[0];
+        assert_eq!((req.prompt.as_slice(), req.max_new_tokens), (&[5, 6][..], 32));
+        assert_eq!(req.stop, [EOS_ID, TAG_ID]);
+        assert_eq!(req.hint, [HEL], "the memory's tokens are the hint");
+        assert_eq!(memory.get(42), [HEL, LO, byte(0xC3), byte(0xA9)]);
+    }
+
+    #[test]
+    fn the_tail_comes_before_done_and_only_stops_are_remembered() {
+        let tok = tokenizer();
+        let mut memory = Memory::new(8);
+        let mut engine = Script::default();
+        // Ends inside a character: the decoder's tail comes out as a last Delta.
+        engine.steps.push_back(vec![token(1, HEL), token(1, byte(0xC3)), done(1, Finish::Length, 2)]);
+        let mut session = Session::new(&mut engine, &tok, &mut memory);
+        session.submit(Prompt::from_parts(vec![5], 7), 2, "a");
+        let seen = run_step(&mut session, None);
+        assert_eq!(seen[..2], ["a:Hel", "a:"]);
+        assert!(seen[2].starts_with("a:") && seen[2].len() > 2, "tail delta: {seen:?}");
+        assert!(seen[3].starts_with("a:done:Hel"), "{seen:?}");
+        drop(session);
+        assert!(memory.get(7).is_empty(), "a length cut is not remembered");
+    }
+
+    #[test]
+    fn a_false_answer_cancels_and_unknown_requests_are_refused() {
+        let tok = tokenizer();
+        let mut memory = Memory::new(8);
+        let mut engine = Script::default();
+        engine.steps.push_back(vec![
+            token(1, HEL),
+            token(2, LO),
+            token(9, LO),
+            Event::Error { id: 9, message: "x".into() },
+        ]);
+        engine.steps.push_back(vec![done(1, Finish::Cancelled, 1), Event::Error { id: 2, message: "boom".into() }]);
+        let mut session = Session::new(&mut engine, &tok, &mut memory);
+        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
+        session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
+        assert_eq!(run_step(&mut session, Some("Hel")), ["a:Hel", "b:lo"]);
+        assert_eq!(run_step(&mut session, None), ["a:done:Hel", "b:failed"]);
+        assert!(session.is_idle());
+        drop(session);
+        // Hel cancelled (false); lo kept; unknown request 9 refused; its error ignored.
+        assert_eq!(engine.answers, [false, true, false, true, true, true]);
+        assert!(memory.get(1).is_empty(), "a cancelled request is not remembered");
+    }
+
+    #[test]
+    fn abort_returns_the_tags_in_flight() {
+        let tok = tokenizer();
+        let mut memory = Memory::new(8);
+        let mut engine = Script::default();
+        let mut session = Session::new(&mut engine, &tok, &mut memory);
+        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
+        session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
+        let mut tags = session.abort_all();
+        tags.sort();
+        assert_eq!(tags, ["a", "b"]);
+        assert!(session.is_idle());
+    }
+}

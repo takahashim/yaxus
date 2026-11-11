@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Args;
 use yaxus_model::Quant;
-use yaxus_runtime::{BackendKind, ResolvedModel, Scheduling, load_tokenizer, quant_label, run_request};
+use yaxus_runtime::{BackendKind, Prompt, ResolvedModel, Scheduling, load_tokenizer, quant_label, run_request};
 use yaxus_tokenizer::{EOS_ID, TAG_ID};
 
 use crate::LangArgs;
@@ -173,7 +173,7 @@ pub fn serve(a: ServeArgs) -> Result<()> {
 
 pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     use yaxus_runtime::document::{DocEvent, DocJob, run_document};
-    // Warnings only (a GPU that cannot be used, drafting turned off), not the output.
+    // Warnings only (the GPU cannot be used, so speculative decoding is off), not the output.
     init_logging("warn");
     let req = lang.document(true)?;
     let ResolvedModel { path: dir, name } = m.resolve()?;
@@ -477,7 +477,7 @@ fn bench_streams(
     for line in set.lines().filter(|l| !l.trim().is_empty()) {
         let (lang, text) = line.split_once('\t').context("set lines are `lang<TAB>text`")?;
         let req = yaxus_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
-        prompts.push(tok.encode(&yaxus_runtime::prompt_request(&req).to_prompt()?, false));
+        prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req))?.ids().to_vec());
     }
     let reference: Option<Vec<String>> = match &compare {
         Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),

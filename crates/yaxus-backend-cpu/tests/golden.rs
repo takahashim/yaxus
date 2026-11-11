@@ -11,9 +11,7 @@ fn model_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {
         return Some(PathBuf::from(d));
     }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
-    std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
+    yaxus_model::hub::snapshot("pfnet/plamo-3-translate-2b").ok()
 }
 
 fn u32s(v: &Value) -> Vec<u32> {

@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod ggml;
 pub mod gguf;
+pub mod hub;
 pub mod quant;
 pub mod weights;
 

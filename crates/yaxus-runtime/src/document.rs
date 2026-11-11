@@ -5,7 +5,7 @@
 use anyhow::Result;
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
 use yaxus_model::Generator;
-use yaxus_tokenizer::{GlossaryEntry, Tokenizer, TranslationPair, TranslationRequest};
+use yaxus_tokenizer::{GlossaryEntry, PromptError, Tokenizer, TranslationPair, TranslationRequest, validate_message};
 
 use crate::memory::Memory;
 use crate::prompt::Prompt;
@@ -70,7 +70,7 @@ pub struct DocJob {
 
 impl DocJob {
     /// The job of a document request, with the API defaults for what it leaves out and
-    /// at most `max_new_tokens_limit` new tokens per segment.
+    /// at most `max_new_tokens_limit` new tokens per segment (at least 1).
     pub fn from_request(r: DocumentRequest, max_new_tokens_limit: usize) -> Self {
         let opts = DocOptions {
             source_lang: r.requested_source_lang().map(String::from),
@@ -81,7 +81,8 @@ impl DocJob {
             max_new_tokens: r
                 .max_new_tokens
                 .unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS)
-                .clamp(1, max_new_tokens_limit),
+                .min(max_new_tokens_limit)
+                .max(1),
             target_lang: r.target_lang,
             context: r.context,
             glossary: r.glossary,
@@ -106,6 +107,35 @@ impl DocJob {
             chains.push(Chain { segs, next: 0, window: HistoryWindow::new(opts.history_chars) });
         }
         DocJob { outputs: vec![None; n], in_flight: vec![false; n], segments, opts, chains, chain_of }
+    }
+
+    /// Checks what the segments' prompts are made of before any is sent: the options once
+    /// and each segment's text (blank segments are allowed; they come back empty). The
+    /// history added later is earlier output, and the neighbour context earlier text.
+    pub fn validate(&self) -> Result<(), PromptError> {
+        self.options_request().validate_options()?;
+        for (i, seg) in self.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
+            validate_message(seg).map_err(|e| PromptError(format!("segment {i}: {}", e.0)))?;
+        }
+        Ok(())
+    }
+
+    /// The options of every segment's prompt (empty text and history).
+    fn options_request(&self) -> TranslationRequest {
+        TranslationRequest {
+            text: String::new(),
+            target_lang: self.opts.target_lang.clone(),
+            source_lang: self.opts.source_lang.clone(),
+            form: self.opts.form.clone(),
+            context: self.opts.context.clone(),
+            glossary: self
+                .opts
+                .glossary
+                .iter()
+                .map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() })
+                .collect(),
+            history: Vec::new(),
+        }
     }
 
     pub fn chains(&self) -> usize {
@@ -165,20 +195,12 @@ impl DocJob {
         }
         TranslationRequest {
             text: self.segments[i].clone(),
-            target_lang: self.opts.target_lang.clone(),
-            source_lang: self.opts.source_lang.clone(),
-            form: self.opts.form.clone(),
             context,
-            glossary: self
-                .opts
-                .glossary
-                .iter()
-                .map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() })
-                .collect(),
             history: history
                 .iter()
                 .map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() })
                 .collect(),
+            ..self.options_request()
         }
     }
 
@@ -290,10 +312,27 @@ mod tests {
             max_new_tokens: Some(10_000),
             ..Default::default()
         };
-        let job = DocJob::from_request(r, 256);
+        let job = DocJob::from_request(r.clone(), 256);
         assert_eq!(job.opts.source_lang, None);
         assert_eq!(job.max_new_tokens(), 256);
         assert_eq!(job.opts.history_chars, yaxus_api::DEFAULT_HISTORY_CHARS);
+        // A limit of 0 (from a tiny --max-context) still allows one token, without panicking.
+        assert_eq!(DocJob::from_request(r, 0).max_new_tokens(), 1);
+    }
+
+    #[test]
+    fn validation_checks_options_once_and_every_segment() {
+        let req = |segments: &[&str], form: Option<&str>| DocumentRequest {
+            segments: segments.iter().map(|s| s.to_string()).collect(),
+            target_lang: "en".into(),
+            form: form.map(String::from),
+            ..Default::default()
+        };
+        assert!(DocJob::from_request(req(&["a", "  ", "b"], None), 64).validate().is_ok());
+        let e = DocJob::from_request(req(&["a", "x<|plamo:msg|>"], None), 64).validate().unwrap_err();
+        assert!(e.0.starts_with("segment 1:"), "{}", e.0);
+        // `form` needs target_lang = "ja".
+        assert!(DocJob::from_request(req(&["a"], Some("polite")), 64).validate().is_err());
     }
 
     #[test]

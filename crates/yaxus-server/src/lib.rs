@@ -217,24 +217,12 @@ async fn translate_document(
     if req.segments.is_empty() || req.segments.len() > MAX_SEGMENTS {
         return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
     }
-    // Validate languages, options and every segment up front (blank segments are allowed
-    // and come back empty).
-    for (i, seg) in req.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
-        let one = TranslateRequest {
-            text: seg.clone(),
-            target_lang: req.target_lang.clone(),
-            source_lang: req.source_lang.clone(),
-            form: req.form.clone(),
-            context: req.context.clone(),
-            glossary: req.glossary.clone(),
-            ..Default::default()
-        };
-        if let Err(e) = prompt_request(&one).to_prompt() {
-            return error(StatusCode::BAD_REQUEST, format!("segment {i}: {}", e.0));
-        }
-    }
     let (n, stream, label) = (req.segments.len(), req.stream, label(req.requested_source_lang(), &req.target_lang));
     let doc = document::DocJob::from_request(req, st.max_context / 2);
+    // Options and every segment are checked up front (blank segments come back empty).
+    if let Err(e) = doc.validate() {
+        return error(StatusCode::BAD_REQUEST, e.0);
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
     if let Err(r) = enqueue(&st, job) {

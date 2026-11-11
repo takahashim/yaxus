@@ -50,12 +50,13 @@ impl ModelSpec {
         }
     }
 
-    /// Finds it on disk.
-    fn locate(self) -> Result<ResolvedModel> {
+    /// Finds it on disk. `arg` is what the user wrote, the display name when the path
+    /// gives none (`.`).
+    fn locate(self, arg: &str) -> Result<ResolvedModel> {
         match self {
             ModelSpec::File(p) => {
                 anyhow::ensure!(yaxus_model::gguf::is_gguf(&p), "{} is not a GGUF file", p.display());
-                let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| arg.to_string());
                 Ok(ResolvedModel { path: p, name })
             }
             ModelSpec::Dir(p) => {
@@ -65,12 +66,12 @@ impl ModelSpec {
                     .filter_map(|a| a.file_name()?.to_str())
                     .find_map(|n| n.strip_prefix("models--").map(|r| r.rsplit("--").next().unwrap_or(r).to_string()))
                     .or_else(|| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| arg.to_string());
                 Ok(ResolvedModel { path: p, name })
             }
             ModelSpec::GgufFile { repo, quant } => {
                 let hint = format!("download it with `hf download {repo} --include '*{quant}.gguf'`");
-                let dir = hf_snapshot(&repo).context(hint.clone())?;
+                let dir = yaxus_model::hub::snapshot(&repo).context(hint.clone())?;
                 let want = format!("{}.gguf", quant.to_ascii_lowercase());
                 let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)?
                     .flatten()
@@ -84,10 +85,10 @@ impl ModelSpec {
                     .into_iter()
                     .next()
                     .with_context(|| format!("no *{quant}.gguf in {}; {hint}", dir.display()))?;
-                ModelSpec::File(file).locate()
+                ModelSpec::File(file).locate(arg)
             }
             ModelSpec::Repo(repo) => {
-                let snapshot = hf_snapshot(&repo)?;
+                let snapshot = yaxus_model::hub::snapshot(&repo)?;
                 if !snapshot.join("config.json").exists() {
                     let mut quants: Vec<String> = std::fs::read_dir(&snapshot)?
                         .flatten()
@@ -113,30 +114,7 @@ impl ModelSpec {
 /// a size (`2b` for pfnet/plamo-3-translate-2b), or `REPO:QUANT` / `SIZE:QUANT` for one
 /// file of a GGUF repository (`2b:Q4_K_M`).
 pub fn resolve_model(model: &str) -> Result<ResolvedModel> {
-    ModelSpec::parse(model).locate()
-}
-
-/// The snapshot directory of repo `model` in the local Hugging Face cache.
-pub(crate) fn hf_snapshot(model: &str) -> Result<PathBuf> {
-    let cache = std::env::var_os("HF_HUB_CACHE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface/hub"));
-    let repo = cache.join(format!("models--{}", model.replace('/', "--")));
-    let snapshot = std::fs::read_to_string(repo.join("refs/main"))
-        .ok()
-        .map(|r| repo.join("snapshots").join(r.trim()))
-        .filter(|p| p.is_dir())
-        .or_else(|| std::fs::read_dir(repo.join("snapshots")).ok()?.flatten().map(|e| e.path()).next())
-        .with_context(|| {
-            format!(
-                "{} is neither a directory nor a model in {}; download it with `hf download {}`",
-                model,
-                cache.display(),
-                model
-            )
-        })?;
-    Ok(snapshot)
+    ModelSpec::parse(model).locate(model)
 }
 
 /// The draft model for target `target` and `spec`: `none`, `auto` (from the local cache:
@@ -182,5 +160,11 @@ mod tests {
         assert_eq!(ModelSpec::parse("someone/model-GGUF:Q8_0"), gguf("someone/model-GGUF", "Q8_0"));
         let dir = std::env::temp_dir();
         assert_eq!(ModelSpec::parse(dir.to_str().unwrap()), ModelSpec::Dir(dir));
+    }
+
+    #[test]
+    fn a_path_without_a_name_shows_as_written() {
+        let m = ModelSpec::Dir(".".into()).locate(".").unwrap();
+        assert_eq!(m.name, ".");
     }
 }

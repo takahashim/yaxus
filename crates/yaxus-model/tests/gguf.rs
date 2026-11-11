@@ -3,16 +3,14 @@
 //! quantization error). Needs the 0.8B model and its GGUF files in the HF cache.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use yaxus_model::Weights;
 use yaxus_model::ggml::GgmlType;
 use yaxus_model::gguf::Gguf;
 
 fn snapshot(repo: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let snaps = Path::new(&home).join(format!(".cache/huggingface/hub/models--{}/snapshots", repo.replace('/', "--")));
-    std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
+    yaxus_model::hub::snapshot(repo).ok()
 }
 
 /// Relative L2 error allowed per type (measured errors are well below these).
@@ -34,6 +32,8 @@ fn gguf_tensors_match_checkpoint() {
     let (Some(hf), Some(gg)) =
         (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
     else {
+        let required = std::env::var_os("YAXUS_REQUIRE_GOLDEN").is_some_and(|v| !v.is_empty() && v != "0");
+        assert!(!required, "YAXUS_REQUIRE_GOLDEN is set but the 0.8B checkpoint or GGUF files are not in the cache");
         eprintln!("0.8B checkpoint or GGUF files not found; skipping");
         return;
     };

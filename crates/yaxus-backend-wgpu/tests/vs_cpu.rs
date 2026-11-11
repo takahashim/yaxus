@@ -14,9 +14,7 @@ fn model_dir() -> PathBuf {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {
         return PathBuf::from(d);
     }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
-    std::fs::read_dir(snaps).unwrap().flatten().map(|e| e.path()).next().unwrap()
+    yaxus_model::hub::snapshot("pfnet/plamo-3-translate-2b").unwrap()
 }
 
 fn cases() -> Vec<Value> {
@@ -117,9 +115,7 @@ fn gpu_matches_cpu_bf16() {
 }
 
 fn draft_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap();
-    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-0.8b/snapshots");
-    std::fs::read_dir(snaps).ok()?.next()?.ok().map(|e| e.path())
+    yaxus_model::hub::snapshot("pfnet/plamo-3-translate-0.8b").ok()
 }
 
 /// Speculative decoding must reproduce the target model's plain greedy output exactly.

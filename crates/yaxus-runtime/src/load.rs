@@ -253,7 +253,7 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
             if o.draft.is_some() {
                 // The CPU matmul gains nothing from verifying several rows at once, so
                 // drafting only adds work (measured 18.5 -> 14.6 tok/s on the 2B).
-                tracing::info!("speculative decoding is disabled on the CPU backend (it is slower there)");
+                tracing::warn!("speculative decoding is disabled on the CPU backend (it is slower there)");
             }
             yaxus_backend_cpu::init_threads();
             load_engine(dir, o, CpuBackend::new(), None, |_: &CpuBackend| {})
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     #[ignore]
     fn gguf_tokenizer_matches_jsonl() {
-        let snapshot = |repo: &str| crate::resolve::hf_snapshot(repo).ok();
+        let snapshot = |repo: &str| yaxus_model::hub::snapshot(repo).ok();
         let (Some(hf), Some(gg)) =
             (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
         else {

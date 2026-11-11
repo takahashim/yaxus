@@ -13,6 +13,7 @@ on:
       - crates/yaxus-backend-cpu/**
       - crates/yaxus-tokenizer/**
       - crates/yaxus-runtime/src/load.rs
+      - crates/yaxus-runtime/src/resolve.rs
       - tests/golden/logits_0_8b.jsonl
       - tests/golden/tokenizer.jsonl
       - Cargo.lock
@@ -23,6 +24,7 @@ on:
       - crates/yaxus-backend-cpu/**
       - crates/yaxus-tokenizer/**
       - crates/yaxus-runtime/src/load.rs
+      - crates/yaxus-runtime/src/resolve.rs
       - tests/golden/logits_0_8b.jsonl
       - tests/golden/tokenizer.jsonl
       - Cargo.lock
