@@ -72,9 +72,10 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8]> {
-        ensure!(self.at + n <= self.b.len(), "GGUF header is truncated");
-        let s = &self.b[self.at..self.at + n];
-        self.at += n;
+        // Lengths come from the file: checked so that a corrupt one cannot overflow.
+        let end = self.at.checked_add(n).filter(|&e| e <= self.b.len()).context("GGUF header is truncated")?;
+        let s = &self.b[self.at..end];
+        self.at = end;
         Ok(s)
     }
     fn u32(&mut self) -> Result<u32> {
@@ -84,7 +85,7 @@ impl Reader<'_> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
     fn string(&mut self) -> Result<String> {
-        let n = self.u64()? as usize;
+        let n = usize::try_from(self.u64()?).context("GGUF string is too long")?;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
     fn value(&mut self, t: u32) -> Result<Value> {
@@ -133,11 +134,13 @@ impl Gguf {
             let t = r.u32()?;
             meta.insert(k, r.value(t)?);
         }
-        let mut infos = Vec::with_capacity(n_tensors);
+        // Counts come from the file: reserve little up front and let a truncated file
+        // fail on its first missing byte.
+        let mut infos = Vec::with_capacity(n_tensors.min(1 << 16));
         for _ in 0..n_tensors {
             let name = r.string()?;
             let nd = r.u32()? as usize;
-            let mut dims = Vec::with_capacity(nd);
+            let mut dims = Vec::with_capacity(nd.min(8));
             for _ in 0..nd {
                 dims.push(r.u64()? as usize);
             }
@@ -146,15 +149,22 @@ impl Gguf {
             infos.push((name, dims, t, off));
         }
         let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
+        ensure!(align.is_power_of_two(), "GGUF alignment {align} is not a power of two");
         let data = r.at.div_ceil(align) * align;
-        let mut tensors = Vec::with_capacity(n_tensors);
+        let mut tensors = Vec::with_capacity(n_tensors.min(1 << 16));
         for (name, dims, t, off) in infos {
             // GGUF lists dimensions innermost first.
             let shape: Vec<usize> = dims.into_iter().rev().collect();
-            let n: usize = shape.iter().product();
+            let n = shape
+                .iter()
+                .try_fold(1usize, |a, &d| a.checked_mul(d))
+                .with_context(|| format!("{name}: too many elements"))?;
             ensure!(n.is_multiple_of(t.block().0), "{name}: {n} elements do not fill {t:?} blocks");
-            let (start, len) = (data + off, t.bytes_for(n));
-            ensure!(start + len <= mmap.len(), "{name}: data beyond the end of the file");
+            let len =
+                (n / t.block().0).checked_mul(t.block().1).with_context(|| format!("{name}: too many elements"))?;
+            let end = data.checked_add(off).and_then(|s| s.checked_add(len));
+            ensure!(end.is_some_and(|e| e <= mmap.len()), "{name}: data beyond the end of the file");
+            let start = data + off;
             tensors.push((name, TensorRef { mmap: mmap.clone(), start, len, shape, dtype: t, minus: 0.0 }));
         }
         Ok(Gguf { meta, tensors })
@@ -299,5 +309,97 @@ impl Gguf {
             }
         }
         count.into_iter().max_by_key(|&(_, n)| n).map(|(t, _)| t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct File(std::path::PathBuf);
+    impl Drop for File {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write(name: &str, bytes: &[u8]) -> File {
+        let p = std::env::temp_dir().join(format!("yaxus-gguf-{}-{name}.gguf", std::process::id()));
+        std::fs::write(&p, bytes).unwrap();
+        File(p)
+    }
+
+    /// Header: magic, version 3, tensor and key/value counts.
+    fn head(n_tensors: u64, n_kv: u64) -> Vec<u8> {
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(n_tensors.to_le_bytes());
+        b.extend(n_kv.to_le_bytes());
+        b
+    }
+
+    fn string(b: &mut Vec<u8>, s: &str) {
+        b.extend((s.len() as u64).to_le_bytes());
+        b.extend(s.as_bytes());
+    }
+
+    /// One tensor entry: name, dims (innermost first), F32, offset.
+    fn tensor(b: &mut Vec<u8>, dims: &[u64], off: u64) {
+        string(b, "t");
+        b.extend((dims.len() as u32).to_le_bytes());
+        for d in dims {
+            b.extend(d.to_le_bytes());
+        }
+        b.extend(0u32.to_le_bytes());
+        b.extend(off.to_le_bytes());
+    }
+
+    fn open_err(name: &str, bytes: &[u8]) -> String {
+        let f = write(name, bytes);
+        match Gguf::open(&f.0) {
+            Ok(_) => panic!("{name}: opened"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_files_are_errors_not_panics() {
+        // A string length near u64::MAX.
+        let mut b = head(0, 1);
+        b.extend(u64::MAX.to_le_bytes());
+        assert!(open_err("strlen", &b).contains("truncated"));
+
+        // Alignment 0.
+        let mut b = head(0, 1);
+        string(&mut b, "general.alignment");
+        b.extend(4u32.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        assert!(open_err("align", &b).contains("power of two"));
+
+        // A tensor offset that overflows.
+        let mut b = head(1, 0);
+        tensor(&mut b, &[4], u64::MAX - 1);
+        assert!(open_err("offset", &b).contains("beyond the end"));
+
+        // Dimensions whose product overflows.
+        let mut b = head(1, 0);
+        tensor(&mut b, &[u64::MAX / 2, 4], 0);
+        assert!(open_err("dims", &b).contains("too many elements"));
+
+        // A huge tensor count in a short file.
+        assert!(open_err("count", &head(u64::MAX, 0)).contains("truncated"));
+    }
+
+    #[test]
+    fn a_small_valid_file_opens() {
+        let mut b = head(1, 0);
+        tensor(&mut b, &[2], 0);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b.extend(1.5f32.to_le_bytes());
+        b.extend((-2.0f32).to_le_bytes());
+        let f = write("valid", &b);
+        let g = Gguf::open(&f.0).unwrap();
+        assert_eq!(g.tensors.len(), 1);
+        assert_eq!(g.tensors[0].1.to_f32_vec(), [1.5, -2.0]);
     }
 }

@@ -303,7 +303,12 @@ impl<B: Backend> Model<B> {
         }
         let norm = ld("model.norm.weight", &[h])?;
         let lm_head_t = w.get("lm_head.weight")?;
-        anyhow::ensure!(lm_head_t.shape[1] == h && lm_head_t.shape[0] >= cfg.vocab_size);
+        anyhow::ensure!(
+            matches!(lm_head_t.shape[..], [v, k] if k == h && v >= cfg.vocab_size),
+            "lm_head.weight: shape {:?}, expected [>= {}, {h}]",
+            lm_head_t.shape,
+            cfg.vocab_size
+        );
         let lm_head = backend.load_weight(lm_head_t, quant)?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
@@ -417,8 +422,18 @@ impl<B: Backend> Model<B> {
                 if let Some(e) = kv.cached.iter_mut().find(|(c, _)| *c == src) {
                     e.1 = now;
                 }
-                self.ensure_free(1);
-                (self.fork(src, keep)?, keep)
+                // Only a partly used last page is copied; whole pages are shared.
+                if !keep.is_multiple_of(PAGE) {
+                    self.ensure_free(1);
+                }
+                // With the arena full, making room can evict `src` itself (it is the
+                // newest, so it goes last), and the copy can still find no page: then
+                // the prompt is computed from scratch rather than failing.
+                let alive = self.kv.as_ref().unwrap().seqs.contains_key(&src);
+                match alive.then(|| self.fork(src, keep)) {
+                    Some(Ok(s)) => (s, keep),
+                    _ => (self.new_seq()?, 0),
+                }
             }
             _ => (self.new_seq()?, 0),
         };
@@ -524,14 +539,16 @@ impl<B: Backend> Model<B> {
         let need = {
             let kv = self.kv.as_ref().unwrap();
             let s = kv.seqs.get(&id).context("unknown sequence")?;
-            let (first, last) = (s.len / PAGE, (s.len + n).div_ceil(PAGE));
+            let end = s.len + n;
+            // Before evicting anything: a pass that cannot run should not flush the cache.
+            anyhow::ensure!(end <= kv.max_pos, "context length {end} exceeds the limit {}", kv.max_pos);
+            let (first, last) = (s.len / PAGE, end.div_ceil(PAGE));
             (first..last).filter(|&pi| pi >= s.pages.len() || kv.pool.refs[s.pages[pi] as usize] > 1).count()
         };
         self.ensure_free(need);
         let kv = self.kv.as_mut().unwrap();
         let s = kv.seqs.get_mut(&id).context("unknown sequence")?;
         let end = s.len + n;
-        anyhow::ensure!(end <= kv.max_pos, "context length {end} exceeds the limit {}", kv.max_pos);
         let first = s.len / PAGE;
         for pi in first..end.div_ceil(PAGE) {
             if pi < s.pages.len() {
@@ -651,5 +668,182 @@ impl<B: Backend> Model<B> {
             Err(_) => self.free_seq(id),
         }
         r
+    }
+}
+
+/// A model with a do-nothing backend, for tests of the KV and scheduling logic (tensors
+/// are just their row counts and every argmax is token 0).
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub struct NullBackend {
+        rows: usize,
+    }
+
+    impl Backend for NullBackend {
+        type Tensor = usize;
+        type Weight = ();
+        type Kv = ();
+
+        fn name(&self) -> String {
+            "null".into()
+        }
+        fn weight_bytes(&self) -> usize {
+            0
+        }
+        fn load_weight(&mut self, _: &TensorRef, _: Quant) -> Result<()> {
+            Ok(())
+        }
+        fn new_kv(&mut self, _: &Config, _: &[LayerMeta], _: usize, _: usize) -> Result<()> {
+            Ok(())
+        }
+        fn copy_page(&mut self, _: &mut (), _: u32, _: u32) {}
+        fn begin_pass(&mut self, pass: &PassMeta) {
+            self.rows = pass.ids.len();
+        }
+        fn embed(&mut self, _: &()) -> usize {
+            self.rows
+        }
+        fn rmsnorm(&mut self, x: &usize, _: &(), _: f32, _: f32) -> usize {
+            *x
+        }
+        fn matmul(&mut self, x: &usize, _: &()) -> usize {
+            *x
+        }
+        fn attention(&mut self, x: &usize, _: &(), _: &(), _: &mut (), _: &Config, _: &LayerMeta) -> usize {
+            *x
+        }
+        fn swiglu(&mut self, x: &usize) -> usize {
+            *x
+        }
+        fn add_assign(&mut self, _: &mut usize, _: &usize) {}
+        fn select_rows(&mut self, _: &usize, rows: &[usize]) -> usize {
+            rows.len()
+        }
+        fn argmax_rows(&mut self, x: &usize) -> Vec<u32> {
+            vec![0; *x]
+        }
+        fn to_host(&mut self, _: &usize) -> Vec<f32> {
+            Vec::new()
+        }
+    }
+
+    pub fn config() -> Config {
+        serde_json::from_str(
+            r#"{"hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 1,
+                "num_key_value_heads": 1, "head_dim": 2, "intermediate_size": 8,
+                "vocab_size": 16, "rms_norm_eps": 1e-6, "window_size": 4,
+                "sliding_window_pattern": 1, "rope_theta": 10000.0, "rope_local_theta": 10000.0}"#,
+        )
+        .unwrap()
+    }
+
+    /// A one-layer model whose KV arena holds `pages` pages.
+    pub fn model(pages: usize) -> Model<NullBackend> {
+        let cfg = config();
+        let layer = Layer {
+            meta: LayerMeta {
+                index: 0,
+                full_attn: true,
+                window: None,
+                rope: Rope { inv_freq: vec![], concentration: 1.0 },
+            },
+            pre_mixer_norm: (),
+            qkv_proj: (),
+            q_norm: (),
+            k_norm: (),
+            o_proj: (),
+            post_mixer_norm: (),
+            pre_mlp_norm: (),
+            gate_up_proj: (),
+            down_proj: (),
+            post_mlp_norm: (),
+        };
+        let mut m = Model {
+            cfg,
+            backend: NullBackend { rows: 0 },
+            embed: (),
+            layers: vec![layer],
+            norm: (),
+            lm_head: (),
+            chunk: 512,
+            kv: None,
+            prefix_cache: true,
+            last_start: StartInfo::default(),
+        };
+        m.init_kv(pages * PAGE, DEFAULT_MAX_POS).unwrap();
+        m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::model;
+    use super::*;
+
+    #[test]
+    fn reuse_falls_back_to_a_fresh_sequence_when_the_arena_is_full() {
+        // Two pages, both held by a finished (cached) sequence of 130 tokens.
+        let mut m = model(2);
+        let a: Vec<u32> = (0..130).collect();
+        let (id, _) = m.start(&a).unwrap();
+        m.finish(id);
+        assert_eq!(m.free_pages(), 0);
+        // A prompt sharing 129 tokens needs one page for the partly used last one: the
+        // only way to get it is to evict the source itself. Computing from scratch works.
+        let mut b = a[..129].to_vec();
+        b.extend([500, 501]);
+        let (id, reused) = m.begin(&b).unwrap();
+        assert_eq!(reused, 0);
+        m.prefill(id, &b).unwrap();
+        assert_eq!(m.seq_len(id), b.len());
+    }
+
+    #[test]
+    fn reuse_shares_whole_pages_without_a_free_page() {
+        let mut m = model(2);
+        let a: Vec<u32> = (0..200).collect();
+        let (id, _) = m.start(&a).unwrap();
+        m.finish(id);
+        // The common prefix is exactly one page: it is shared, nothing is copied.
+        let mut b = a[..PAGE].to_vec();
+        b.push(999);
+        let (_, reused) = m.begin(&b).unwrap();
+        assert_eq!(reused, PAGE);
+    }
+
+    #[test]
+    fn a_pass_beyond_max_pos_keeps_the_prefix_cache() {
+        // Two pages: the 300-row pass would need more than the free one, so without the
+        // early check making room would evict the cached sequence first.
+        let mut m = model(2);
+        m.init_kv(2 * PAGE, 200).unwrap();
+        let a: Vec<u32> = (0..100).collect();
+        let (id, _) = m.start(&a).unwrap();
+        m.finish(id);
+        let free = m.free_pages();
+        let (id, _) = m.begin(&[7; 20]).unwrap();
+        assert!(m.prefill(id, &[7; 300]).is_err());
+        // The cached sequence was not evicted for a pass that could not run.
+        assert_eq!(m.free_pages(), free);
+    }
+
+    #[test]
+    fn config_rejects_zero_sizes() {
+        let text = |kv: usize| {
+            format!(
+                r#"{{"hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 2,
+                    "num_key_value_heads": {kv}, "head_dim": 2, "intermediate_size": 8,
+                    "vocab_size": 16, "rms_norm_eps": 1e-6, "window_size": 4,
+                    "sliding_window_pattern": 1, "rope_theta": 1.0, "rope_local_theta": 1.0}}"#
+            )
+        };
+        let cfg: Config = serde_json::from_str(&text(0)).unwrap();
+        assert!(cfg.validate().unwrap_err().to_string().contains("num_key_value_heads"));
+        let cfg: Config = serde_json::from_str(&text(3)).unwrap();
+        assert!(cfg.validate().is_err());
+        let cfg: Config = serde_json::from_str(&text(1)).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }
