@@ -44,7 +44,7 @@ pub struct ModelArgs {
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
     /// The output is identical with or without it; only the speed differs.
     #[arg(long, default_value = "auto")]
-    draft: String,
+    draft: yaxus_runtime::DraftSpec,
     /// Most tokens the draft model proposes per round (the length adapts to how often
     /// they are accepted).
     #[arg(long, default_value_t = 7)]
@@ -204,7 +204,7 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     }
     let n = req.segments.len();
     // The model's positions are the context (the server makes it --max-context).
-    let mut job = DocJob::from_request(req, yaxus_model::DEFAULT_MAX_POS);
+    let job = DocJob::from_request(req, yaxus_model::DEFAULT_MAX_POS);
     // Bad input fails before any output, as the server answers it with 400.
     job.validate(&tok)?;
     let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
@@ -214,17 +214,17 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     let mut io_err = None;
     let mut memory = yaxus_runtime::memory::Memory::new(yaxus_runtime::memory::DEFAULT_ENTRIES);
     // A failed write (e.g. the reader of a pipe has exited) stops the translation.
-    run_document(model.as_mut(), &tok, &mut job, &mut memory, &mut |ev| {
+    let job = run_document(model.as_mut(), &tok, job, &mut memory, &mut |ev| {
         let written = match ev {
             DocEvent::Delta { segment, text } => {
                 first.get_or_insert(t1.elapsed());
                 out.delta(segment, text)
             }
-            DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } => {
-                prompt += prompt_tokens;
-                reused += r;
-                generated += g;
-                out.end(segment)
+            DocEvent::SegmentDone(end) => {
+                prompt += end.prompt_tokens;
+                reused += end.reused;
+                generated += end.generated;
+                out.end(end.segment)
             }
         };
         match written {
@@ -648,7 +648,7 @@ fn bench_doc(
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
         let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
-        let mut job = DocJob::new(paras, opts.clone());
+        let job = DocJob::new(paras, opts.clone());
         job.validate(&tok)?;
         println!(
             "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
@@ -658,15 +658,18 @@ fn bench_doc(
         );
         let t0 = Instant::now();
         let (mut prompt, mut reused, mut generated) = (0usize, 0usize, 0usize);
-        run_document(model.as_mut(), &tok, &mut job, memory, &mut |ev| {
-            if let DocEvent::SegmentDone { segment, prompt_tokens, reused: r, generated: g } = ev {
-                prompt += prompt_tokens;
-                reused += r;
-                generated += g;
+        let job = run_document(model.as_mut(), &tok, job, memory, &mut |ev| {
+            if let DocEvent::SegmentDone(end) = ev {
+                prompt += end.prompt_tokens;
+                reused += end.reused;
+                generated += end.generated;
                 if verbose {
                     println!(
-                        "  #{:<2} prompt {prompt_tokens:>4}, reused {r:>4}, generated {g:>3}, done at {:>6.2} s",
-                        segment + 1,
+                        "  #{:<2} prompt {:>4}, reused {:>4}, generated {:>3}, done at {:>6.2} s",
+                        end.segment + 1,
+                        end.prompt_tokens,
+                        end.reused,
+                        end.generated,
                         t0.elapsed().as_secs_f64()
                     );
                 }

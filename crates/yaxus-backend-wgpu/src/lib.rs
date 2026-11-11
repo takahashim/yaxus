@@ -311,6 +311,13 @@ impl Gemv {
     pub const F32: Gemv = Gemv { planes: None, single_f32: false };
     pub const INT16: Gemv = Gemv { planes: Some(2), single_f32: false };
 
+    /// The kernels of a draft model next to a target that uses these. The draft only
+    /// proposes tokens, so with the integer kernels its single rows take the f32 GEMV,
+    /// a little faster for the Q2_K draft (19-sentence set: 74.4 vs 74.0 tok/s).
+    pub fn for_draft(self) -> Gemv {
+        Gemv { single_f32: self.planes.is_some(), ..self }
+    }
+
     fn planes(self, t: usize) -> Option<usize> {
         if t == 1 && self.single_f32 { None } else { self.planes }
     }
@@ -1938,6 +1945,12 @@ impl WgpuBackend {
     /// Another handle to the same context (for a second model).
     pub fn share(&self) -> Self {
         WgpuBackend { gpu: self.gpu.clone(), weight_bytes: 0, gemv: self.gemv, formats: Vec::new() }
+    }
+
+    /// A handle on the same device for the draft model of a speculative pair, with the
+    /// draft's counterpart of this handle's kernels ([`Gemv::for_draft`]).
+    pub fn share_for_draft(&self) -> Self {
+        WgpuBackend { gemv: self.gemv.for_draft(), ..self.share() }
     }
 
     fn g(&self) -> std::sync::MutexGuard<'_, Gpu> {
