@@ -2686,26 +2686,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "yakusel-api"
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
+]
+
+[[package]]
+name = "yaxus-api"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
-name = "yakusel-backend-cpu"
+name = "yaxus-backend-cpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
  "rayon",
  "serde_json",
- "yakusel-model",
- "yakusel-tokenizer",
+ "yaxus-model",
+ "yaxus-tokenizer",
 ]
 
 [[package]]
-name = "yakusel-backend-wgpu"
+name = "yaxus-backend-wgpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2714,12 +2723,12 @@ dependencies = [
  "pollster",
  "serde_json",
  "wgpu",
- "yakusel-backend-cpu",
- "yakusel-model",
+ "yaxus-backend-cpu",
+ "yaxus-model",
 ]
 
 [[package]]
-name = "yakusel-cli"
+name = "yaxus-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2727,14 +2736,14 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tracing-subscriber",
- "yakusel-api",
- "yakusel-model",
- "yakusel-server",
- "yakusel-tokenizer",
+ "yaxus-api",
+ "yaxus-model",
+ "yaxus-server",
+ "yaxus-tokenizer",
 ]
 
 [[package]]
-name = "yakusel-model"
+name = "yaxus-model"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2747,7 +2756,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "yakusel-server"
+name = "yaxus-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -2762,29 +2771,20 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "yakusel-api",
- "yakusel-backend-cpu",
- "yakusel-backend-wgpu",
- "yakusel-model",
- "yakusel-tokenizer",
+ "yaxus-api",
+ "yaxus-backend-cpu",
+ "yaxus-backend-wgpu",
+ "yaxus-model",
+ "yaxus-tokenizer",
 ]
 
 [[package]]
-name = "yakusel-tokenizer"
+name = "yaxus-tokenizer"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "yasna"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
-dependencies = [
- "time",
 ]
 
 [[package]]

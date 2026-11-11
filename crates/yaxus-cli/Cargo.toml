@@ -1,0 +1,26 @@
+[package]
+name = "yaxus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "yaxus command-line interface"
+
+[[bin]]
+name = "yaxus"
+path = "src/main.rs"
+
+[features]
+default = ["server"]
+# `serve` and `translate` (local inference). Build with --no-default-features for a client-only binary.
+server = ["dep:yaxus-server", "dep:yaxus-model", "dep:yaxus-tokenizer", "dep:tracing-subscriber"]
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+yaxus-api = { path = "../yaxus-api" }
+yaxus-tokenizer = { path = "../yaxus-tokenizer", optional = true }
+yaxus-model = { path = "../yaxus-model", optional = true }
+yaxus-server = { path = "../yaxus-server", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

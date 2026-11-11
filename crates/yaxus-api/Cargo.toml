@@ -1,0 +1,9 @@
+[package]
+name = "yaxus-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP API types shared by the yaxus server and client"
+
+[dependencies]
+serde.workspace = true

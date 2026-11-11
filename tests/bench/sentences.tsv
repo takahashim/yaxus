@@ -1,0 +1,19 @@
+ja	Machine translation has improved dramatically over the past decade, driven largely by advances in neural network architectures and the availability of large parallel corpora. Early statistical systems relied on phrase tables and hand-tuned features, which made them brittle when faced with unfamiliar domains or long-distance reordering. Modern transformer-based models, by contrast, learn contextual representations that capture syntax and meaning across entire sentences, and in many language pairs they now produce output that professional translators consider fluent.
+en	吾輩は猫である。名前はまだ無い。どこで生れたかとんと見当がつかぬ。
+en	本日の会議資料を添付しましたので、事前にご確認いただけますと幸いです。
+en	このライブラリはスレッドセーフではないため、複数のスレッドから同時に呼び出さないでください。
+en	昨日の地震で一部の路線が運転を見合わせていますが、午後には再開する見込みです。
+en	新製品の発売日は来月の十五日に決定しました。
+en	量子化によりモデルのサイズは約半分になったが、翻訳の品質はほとんど変わらなかった。
+ja	The quick brown fox jumps over the lazy dog.
+ja	Please make sure to back up your data before installing the update.
+ja	The committee will announce its decision after reviewing all of the submitted proposals.
+ja	If the server does not respond within thirty seconds, the client retries the request automatically.
+ja	She has been working on this research project for more than five years.
+ja	Prices are subject to change without notice.
+zh-hans	The new policy will take effect on January 1st next year.
+zh-hans	明日は雨が降るので、傘を持って行ってください。
+ko	駅から徒歩五分のところに新しいカフェができました。
+fr	The museum is closed on Mondays and public holidays.
+de	Our office will be closed for the holidays from December 28 to January 3.
+es	Thank you for your patience while we investigate this issue.

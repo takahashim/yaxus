@@ -1,0 +1,18 @@
+[package]
+name = "yaxus-backend-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Vulkan (wgpu) backend for yaxus with hand-written WGSL kernels"
+
+[dependencies]
+anyhow.workspace = true
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+yaxus-model = { path = "../yaxus-model" }
+
+[dev-dependencies]
+yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
+serde_json.workspace = true

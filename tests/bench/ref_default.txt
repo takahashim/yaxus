@@ -1,0 +1,19 @@
+機械翻訳はこの10年で飛躍的に向上したが、その主因はニューラルネットワークアーキテクチャの進化と、大規模な対訳コーパスの整備にある。初期の統計的システムはフレーズテーブルや手作業で調整された特徴量に依存していたため、未知のドメインや長距離の語順入れ替えに直面すると脆弱であった。対照的に、現代のTransformerベースのモデルは、文全体にわたる構文と意味を捉えた文脈表現を学習しており、多くの言語対において、プロの翻訳者が流暢だと評価する出力を生成するようになっている。
+I am a cat. I have no name yet. I have no idea where I was born.
+I have attached today's meeting materials for your review in advance.
+This library is not thread-safe, so do not call it from multiple threads simultaneously.
+Some lines are suspended due to yesterday's earthquake, but service is expected to resume in the afternoon.
+The release date for the new product has been set for the 15th of next month.
+Quantization reduced the model size by about half, but translation quality remained largely unchanged.
+足の速い茶色のキツネが、のろまな犬を飛び越える。
+アップデートをインストールする前に、必ずデータのバックアップを取ってください。
+委員会は、提出されたすべての提案を検討した上で、決定を発表します。
+サーバーが30秒以内に応答しない場合、クライアントは自動的にリクエストを再試行します。
+彼女は5年以上にわたってこの研究プロジェクトに取り組んできた。
+価格は予告なく変更される場合があります。
+新政策将于明年1月1日生效。
+明天会下雨，请带上雨伞。
+역에서 도보 5분 거리에 새로운 카페가 생겼습니다.
+Le musée est fermé les lundis et les jours fériés.
+Unser Büro bleibt vom 28. Dezember bis zum 3. Januar wegen der Feiertage geschlossen.
+Gracias por su paciencia mientras investigamos este problema.
