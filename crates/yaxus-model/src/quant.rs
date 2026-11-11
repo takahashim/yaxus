@@ -20,11 +20,8 @@ pub fn quantize_q8(w: &[u16], k: usize) -> Q8Data {
     let nb = w.len() / Q8_BLOCK;
     let mut qs = vec![0i8; w.len()];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(Q8_BLOCK)
-        .zip(scales.par_iter_mut())
-        .zip(w.par_chunks(Q8_BLOCK))
-        .with_min_len(1024)
-        .for_each(|((q, sc), src)| {
+    qs.par_chunks_mut(Q8_BLOCK).zip(scales.par_iter_mut()).zip(w.par_chunks(Q8_BLOCK)).with_min_len(1024).for_each(
+        |((q, sc), src)| {
             let amax = src.iter().map(|&x| bf16_to_f32(x).abs()).fold(0f32, f32::max);
             let d = f16::from_f32(amax / 127.0);
             *sc = d;
@@ -33,7 +30,8 @@ pub fn quantize_q8(w: &[u16], k: usize) -> Q8Data {
             for (o, &x) in q.iter_mut().zip(src) {
                 *o = (bf16_to_f32(x) * id).round().clamp(-127.0, 127.0) as i8;
             }
-        });
+        },
+    );
     Q8Data { qs, scales }
 }
 
@@ -50,11 +48,8 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
     let nb = w.len() / Q8_BLOCK;
     let mut qs = vec![0u8; w.len() / 2];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(Q8_BLOCK / 2)
-        .zip(scales.par_iter_mut())
-        .zip(w.par_chunks(Q8_BLOCK))
-        .with_min_len(1024)
-        .for_each(|((q, sc), src)| {
+    qs.par_chunks_mut(Q8_BLOCK / 2).zip(scales.par_iter_mut()).zip(w.par_chunks(Q8_BLOCK)).with_min_len(1024).for_each(
+        |((q, sc), src)| {
             let amax = src.iter().map(|&x| bf16_to_f32(x).abs()).fold(0f32, f32::max);
             let d = f16::from_f32(amax / 7.0);
             *sc = d;
@@ -64,7 +59,8 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
             for (e, o) in q.iter_mut().enumerate() {
                 *o = nib(src[2 * e]) | (nib(src[2 * e + 1]) << 4);
             }
-        });
+        },
+    );
     Q4Data { qs, scales }
 }
 

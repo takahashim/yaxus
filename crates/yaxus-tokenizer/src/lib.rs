@@ -43,10 +43,7 @@ pub const TAG_ID: u32 = 16;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to read {path}: {source}")]
-    Io {
-        path: String,
-        source: std::io::Error,
-    },
+    Io { path: String, source: std::io::Error },
     #[error("tokenizer.jsonl line {line}: {msg}")]
     Format { line: usize, msg: String },
 }
@@ -87,10 +84,8 @@ impl Tokenizer {
     /// Loads `tokenizer.jsonl` from a file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let text =
+            std::fs::read_to_string(path).map_err(|source| Error::Io { path: path.display().to_string(), source })?;
         Self::from_jsonl(&text)
     }
 
@@ -103,21 +98,11 @@ impl Tokenizer {
             if line.is_empty() {
                 continue;
             }
-            let fmt = |msg: &str| Error::Format {
-                line: lineno + 1,
-                msg: msg.to_string(),
-            };
-            let row: serde_json::Value =
-                serde_json::from_str(line).map_err(|e| fmt(&e.to_string()))?;
+            let fmt = |msg: &str| Error::Format { line: lineno + 1, msg: msg.to_string() };
+            let row: serde_json::Value = serde_json::from_str(line).map_err(|e| fmt(&e.to_string()))?;
             let row = row.as_array().ok_or_else(|| fmt("row is not an array"))?;
-            let token = row
-                .first()
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| fmt("token is not a string"))?;
-            let score = row
-                .get(1)
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| fmt("score is not a number"))?;
+            let token = row.first().and_then(|v| v.as_str()).ok_or_else(|| fmt("token is not a string"))?;
+            let score = row.get(1).and_then(|v| v.as_f64()).ok_or_else(|| fmt("score is not a number"))?;
             let kind = match row.get(2).and_then(|v| v.as_str()) {
                 Some("NORMAL") => TokenKind::Normal,
                 Some("BYTE") => TokenKind::Byte,
@@ -151,32 +136,25 @@ impl Tokenizer {
             edges: HashMap::new(),
         };
         let mut byte_set = [false; 256];
-        let n = t.tokens.len();
-        for id in 0..n {
+        for (id, &score) in scores.iter().enumerate().take(t.tokens.len()) {
             if t.kinds[id] == TokenKind::Byte {
                 let tok = &t.tokens[id];
                 let b = (tok.len() == 6 && tok.starts_with("<0x") && tok.ends_with('>'))
                     .then(|| u8::from_str_radix(&tok[3..5], 16).ok())
                     .flatten()
-                    .ok_or_else(|| Error::Format {
-                        line: id + 1,
-                        msg: format!("malformed byte token {tok:?}"),
-                    })?;
+                    .ok_or_else(|| Error::Format { line: id + 1, msg: format!("malformed byte token {tok:?}") })?;
                 t.bytes[b as usize] = id as u32;
                 t.byte_of[id] = Some(b);
                 byte_set[b as usize] = true;
                 continue;
             }
             let tok = t.tokens[id].clone();
-            t.insert(&tok, id as u32, int_score(scores[id]));
+            t.insert(&tok, id as u32, int_score(score));
         }
         // The boundary character is added last, as in the Python implementation.
         t.insert(&BOUNDARY_CHAR.to_string(), BOUNDARY_TOKEN_ID, 0);
         if let Some(b) = byte_set.iter().position(|x| !x) {
-            return Err(Error::Format {
-                line: 0,
-                msg: format!("byte token <0x{b:02X}> is not set"),
-            });
+            return Err(Error::Format { line: 0, msg: format!("byte token <0x{b:02X}> is not set") });
         }
         Ok(t)
     }
@@ -361,8 +339,8 @@ fn mark_runs(text: &str) -> String {
         let run = j - i;
         // `.` does not match '\n'; a run that fails at its start also fails at every
         // later start, so matching whole runs is equivalent to the regex scan.
-        let matched = (c != '\n' && run >= REPEATED_CHARS_THRESHOLD)
-            || (c == ' ' && run >= CONSECUTIVE_SPACES_THRESHOLD);
+        let matched =
+            (c != '\n' && run >= REPEATED_CHARS_THRESHOLD) || (c == ' ' && run >= CONSECUTIVE_SPACES_THRESHOLD);
         if matched {
             out.push(BOUNDARY_CHAR);
         }
@@ -382,15 +360,9 @@ mod tests {
     #[test]
     fn preprocess_special_tokens() {
         let b = BOUNDARY_CHAR;
-        assert_eq!(
-            mark_special_tokens("a<|plamo:msg|>b"),
-            format!("a{b}<|plamo:msg|>{b}b")
-        );
+        assert_eq!(mark_special_tokens("a<|plamo:msg|>b"), format!("a{b}<|plamo:msg|>{b}b"));
         assert_eq!(mark_special_tokens("<|plamo:a b|>"), "<|plamo:a b|>");
-        assert_eq!(
-            mark_special_tokens("<|plamo:<|plamo:x|>"),
-            format!("<|plamo:{b}<|plamo:x|>{b}")
-        );
+        assert_eq!(mark_special_tokens("<|plamo:<|plamo:x|>"), format!("<|plamo:{b}<|plamo:x|>{b}"));
         let long = format!("<|plamo:{}|>", "x".repeat(65));
         assert_eq!(mark_special_tokens(&long), long);
     }

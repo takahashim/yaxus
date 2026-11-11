@@ -13,8 +13,7 @@ fn model_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(d));
     }
     let home = std::env::var("HOME").ok()?;
-    let snaps = Path::new(&home)
-        .join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
+    let snaps = Path::new(&home).join(".cache/huggingface/hub/models--pfnet--plamo-3-translate-2b/snapshots");
     std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
 }
 
@@ -25,11 +24,7 @@ fn load() -> Option<(Tokenizer, Vec<Value>)> {
     };
     let tok = Tokenizer::from_file(dir.join("tokenizer.jsonl")).unwrap();
     let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/tokenizer.jsonl");
-    let cases = std::fs::read_to_string(golden)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
+    let cases = std::fs::read_to_string(golden).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     Some((tok, cases))
 }
 
@@ -44,11 +39,7 @@ fn s(v: &Value, k: &str) -> Option<String> {
 fn pairs(v: &Value, k: &str) -> Vec<(String, String)> {
     v.get(k)
         .and_then(|x| x.as_array())
-        .map(|a| {
-            a.iter()
-                .map(|e| (s(e, "source").unwrap(), s(e, "target").unwrap()))
-                .collect()
-        })
+        .map(|a| a.iter().map(|e| (s(e, "source").unwrap(), s(e, "target").unwrap())).collect())
         .unwrap_or_default()
 }
 
@@ -59,14 +50,8 @@ fn request(v: &Value) -> TranslationRequest {
         source_lang: s(v, "source_lang"),
         form: s(v, "form"),
         context: s(v, "context"),
-        glossary: pairs(v, "glossary")
-            .into_iter()
-            .map(|(source, target)| GlossaryEntry { source, target })
-            .collect(),
-        history: pairs(v, "history")
-            .into_iter()
-            .map(|(source, target)| TranslationPair { source, target })
-            .collect(),
+        glossary: pairs(v, "glossary").into_iter().map(|(source, target)| GlossaryEntry { source, target }).collect(),
+        history: pairs(v, "history").into_iter().map(|(source, target)| TranslationPair { source, target }).collect(),
     }
 }
 

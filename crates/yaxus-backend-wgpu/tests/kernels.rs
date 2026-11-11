@@ -1,6 +1,9 @@
 //! Matmul kernels (every path: gemv1, gemvm2..8, gemm, glu) against a host reference
 //! computed from the same quantized weights. Needs a Vulkan GPU:
 //! `cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored`
+//! or a software one (lavapipe, as in CI; without 32-lane subgroups only the f32 decode
+//! kernels and the prefill GEMMs run): `YAXUS_SOFTWARE_VULKAN=1
+//! VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` in front.
 
 use yaxus_backend_wgpu::{GemmKind, Gemv, WgpuBackend};
 use yaxus_model::Quant;
@@ -203,6 +206,10 @@ fn ggml_matmul_kernels_match_host() {
 #[ignore]
 fn integer_rows_do_not_depend_on_the_pass() {
     let mut gpu = WgpuBackend::new().unwrap();
+    if !gpu.has_subgroups() {
+        eprintln!("no 32-lane subgroups (the integer decode kernels need them); skipping");
+        return;
+    }
     let (n, k, t) = (200, 1536, 7);
     for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
         let bytes = ggml_blocks(dtype, n, k, 5);

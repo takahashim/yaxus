@@ -52,7 +52,7 @@ impl TensorRef {
     /// The values as bf16 (`u16`), dequantized and rounded when stored otherwise.
     pub fn to_bf16_vec(&self) -> Vec<u16> {
         if self.dtype == GgmlType::Bf16 && self.minus == 0.0 {
-            return self.bytes().chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            return self.bytes().as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect();
         }
         self.to_f32_vec().into_iter().map(f32_to_bf16).collect()
     }

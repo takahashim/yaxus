@@ -31,20 +31,29 @@ fn bound(t: GgmlType) -> f64 {
 #[test]
 #[ignore]
 fn gguf_tensors_match_checkpoint() {
-    let (Some(hf), Some(gg)) = (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF")) else {
+    let (Some(hf), Some(gg)) =
+        (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
+    else {
         eprintln!("0.8B checkpoint or GGUF files not found; skipping");
         return;
     };
     let reference = Weights::open(&hf).unwrap();
     let hf_cfg = yaxus_model::Config::from_file(hf.join("config.json")).unwrap();
-    let mut files: Vec<PathBuf> =
-        std::fs::read_dir(&gg).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "gguf")).collect();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&gg)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "gguf"))
+        .collect();
     files.sort();
     assert!(!files.is_empty());
     for f in files {
         let g = Gguf::open(&f).unwrap();
         let cfg = g.config().unwrap();
-        assert_eq!((cfg.hidden_size, cfg.num_hidden_layers, cfg.intermediate_size), (hf_cfg.hidden_size, hf_cfg.num_hidden_layers, hf_cfg.intermediate_size));
+        assert_eq!(
+            (cfg.hidden_size, cfg.num_hidden_layers, cfg.intermediate_size),
+            (hf_cfg.hidden_size, hf_cfg.num_hidden_layers, hf_cfg.intermediate_size)
+        );
         let w = g.weights().unwrap();
         let mut worst: HashMap<GgmlType, (f64, String)> = HashMap::new();
         for name in w.names() {
@@ -63,6 +72,10 @@ fn gguf_tensors_match_checkpoint() {
         }
         let mut v: Vec<_> = worst.into_iter().collect();
         v.sort_by_key(|(t, _)| format!("{t:?}"));
-        eprintln!("{}: {:?}", f.file_name().unwrap().to_string_lossy(), v.iter().map(|(t, (e, _))| format!("{t:?} {e:.4}")).collect::<Vec<_>>());
+        eprintln!(
+            "{}: {:?}",
+            f.file_name().unwrap().to_string_lossy(),
+            v.iter().map(|(t, (e, _))| format!("{t:?} {e:.4}")).collect::<Vec<_>>()
+        );
     }
 }

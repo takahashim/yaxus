@@ -255,10 +255,7 @@ fn q6k_values(b: &[u8]) -> Vec<(i32, f32)> {
 pub fn dequantize(t: GgmlType, bytes: &[u8], n: usize) -> Vec<f32> {
     let (e, bsz) = t.block();
     let mut y = vec![0f32; n];
-    y.par_chunks_mut(e)
-        .zip(bytes.par_chunks(bsz))
-        .with_min_len(256)
-        .for_each(|(out, blk)| dequant_block(t, blk, out));
+    y.par_chunks_mut(e).zip(bytes.par_chunks(bsz)).with_min_len(256).for_each(|(out, blk)| dequant_block(t, blk, out));
     y
 }
 
@@ -516,7 +513,10 @@ mod tests {
             let d = h(m, 2 * (c / 256));
             let sc = m[2 * (k / 256) + c / 16] as i8 as f32;
             assert_eq!(d * sc * (q as f32 - 4.0), w, "q3 {e}");
-            assert!(((q as f32 - 4.0) * p.scales16[e / 16].to_f32() - w).abs() <= 2e-3 * w.abs().max(1e-2), "q3 s16 {e}");
+            assert!(
+                ((q as f32 - 4.0) * p.scales16[e / 16].to_f32() - w).abs() <= 2e-3 * w.abs().max(1e-2),
+                "q3 s16 {e}"
+            );
         }
     }
 

@@ -58,23 +58,63 @@ impl Drop for Tensor {
 }
 
 pub enum Weight {
-    Q8 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
-    Q4 { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
+    Q8 {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
+    Q4 {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
     /// GGUF Q4_K values: nibbles and the per-256 headers, decoded in the kernels.
-    Q4K { q: wgpu::Buffer, s: wgpu::Buffer, n: usize, k: usize },
+    Q4K {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
     /// 6-bit values (GGUF Q6_K): `s` holds Q6_K's scales for the decode kernels, `s16` an
     /// f16 scale per 16 for the prefill GEMMs.
-    Q6 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
+    Q6 {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        s16: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
     /// 3-bit values (GGUF Q3_K), scales as for `Q6`.
-    Q3 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
+    Q3 {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        s16: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
     /// 2-bit values (GGUF Q2_K): `s` holds Q2_K's scales and mins for the decode kernels,
     /// `s16` a pair of f16 per 16 for the prefill GEMMs.
-    Q2 { q: wgpu::Buffer, s: wgpu::Buffer, s16: wgpu::Buffer, n: usize, k: usize },
-    Bf16 { w: wgpu::Buffer, n: usize, k: usize },
+    Q2 {
+        q: wgpu::Buffer,
+        s: wgpu::Buffer,
+        s16: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
+    Bf16 {
+        w: wgpu::Buffer,
+        n: usize,
+        k: usize,
+    },
     /// 1-D weights (norms), converted to f32.
     Vector(wgpu::Buffer),
     /// Embedding table `[V, H]` in bf16 (two values per u32).
-    Embedding { table: wgpu::Buffer, h: usize },
+    Embedding {
+        table: wgpu::Buffer,
+        h: usize,
+    },
 }
 
 /// Paged KV storage of one model: slot `s` of a layer holds `kv_dim` floats at `s * kv_dim`.
@@ -177,8 +217,12 @@ impl Drop for Gpu {
             let total: f64 = v.iter().map(|x| x.1.0).sum();
             eprintln!("[wgpu kernels] total {:.1} ms", total / 1e6);
             for (name, (ns, n)) in v {
-                eprintln!("  {name:<26} {:>9.2} ms {:>5.1}%  {n:>6} calls  {:>8.1} us/call",
-                    ns / 1e6, 100.0 * ns / total, ns / 1e3 / *n as f64);
+                eprintln!(
+                    "  {name:<26} {:>9.2} ms {:>5.1}%  {n:>6} calls  {:>8.1} us/call",
+                    ns / 1e6,
+                    100.0 * ns / total,
+                    ns / 1e3 / *n as f64
+                );
             }
         }
         if let Some(p) = &self.profile
@@ -385,10 +429,8 @@ fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_only: &[boo
         source: wgpu::ShaderSource::Wgsl(src.into()),
     });
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
-    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(name),
-        entries: &entries,
-    });
+    let layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(name),
         bind_group_layouts: &[Some(&layout)],
@@ -411,17 +453,17 @@ fn grid(groups: u32) -> (u32, u32) {
 }
 
 impl Gpu {
-    /// Opens the first non-CPU Vulkan adapter.
+    /// Opens the first non-CPU Vulkan adapter. `YAXUS_SOFTWARE_VULKAN=1` accepts a software
+    /// one too (lavapipe), so the kernel tests can run on machines without a GPU (CI).
     pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-        let adapter = adapters
-            .into_iter()
-            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
-            .context(
+        let software = std::env::var_os("YAXUS_SOFTWARE_VULKAN").is_some_and(|v| v == "1");
+        let adapter =
+            adapters.into_iter().find(|a| software || a.get_info().device_type != wgpu::DeviceType::Cpu).context(
                 "no Vulkan GPU found (only a software renderer, if any). Check that the user is in \
                  the `render` group and that the session has it (re-login, or run under `sg render`)",
             )?;
@@ -576,7 +618,11 @@ impl Gpu {
         type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
         let mut jobs: Vec<Job> = Vec::new();
         if let Some(planes) = gemv.planes {
-            jobs.push((format!("xquantr{planes}"), vec![false, true, false], Box::new(move || gemv_int::xquant_source(planes))));
+            jobs.push((
+                format!("xquantr{planes}"),
+                vec![false, true, false],
+                Box::new(move || gemv_int::xquant_source(planes)),
+            ));
             for f in formats.iter().filter_map(|f| gemv_int::format(f)) {
                 for glu in [false, true] {
                     if !gemv.single_f32 {
@@ -599,7 +645,11 @@ impl Gpu {
             }
         }
         if let Some(planes) = self.gemm.planes() {
-            jobs.push((format!("xquant{planes}"), vec![false, true, false], Box::new(move || gemm_int::xquant_source(planes))));
+            jobs.push((
+                format!("xquant{planes}"),
+                vec![false, true, false],
+                Box::new(move || gemm_int::xquant_source(planes)),
+            ));
             for f in formats.iter().filter_map(|f| gemm_int::format(f)) {
                 for tn in [2, 4, 8] {
                     jobs.push((
@@ -720,7 +770,10 @@ impl Gpu {
         self.add_kernel("qk_rope", QK_ROPE, &[false, false, false, true, true, true, true, true]);
         self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
         self.add_kernel("embed", EMBED, &[false, true, true]);
-        for g in [1usize, 2, 4, 6, 8, 12, 16] {
+        // (the split attention reduces with subgroup shuffles; without them the per-row
+        // kernel takes every pass)
+        let sg = self.subgroups;
+        for g in [1usize, 2, 4, 6, 8, 12, 16].into_iter().filter(|_| sg) {
             for ch in SPLIT_CHUNKS {
                 let name: &'static str = Box::leak(format!("attn_split{g}_{ch}").into_boxed_str());
                 let src = ATTN_SPLIT
@@ -981,18 +1034,10 @@ impl Gpu {
         let qkv = cfg.q_dim() + 2 * cfg.kv_dim();
         let padded = rows.div_ceil(64) * 64;
         // (elements, simultaneously live tensors) of one forward pass.
-        let shapes = [
-            (rows * h, 4),
-            (rows * qkv, 1),
-            (rows * cfg.q_dim(), 2),
-            (padded * 2 * inter, 1),
-            (rows * inter, 1),
-        ];
-        let tensors: Vec<Tensor> = shapes
-            .iter()
-            .flat_map(|&(n, count)| (0..count).map(move |_| n))
-            .map(|n| self.tensor(1, n))
-            .collect();
+        let shapes =
+            [(rows * h, 4), (rows * qkv, 1), (rows * cfg.q_dim(), 2), (padded * 2 * inter, 1), (rows * inter, 1)];
+        let tensors: Vec<Tensor> =
+            shapes.iter().flat_map(|&(n, count)| (0..count).map(move |_| n)).map(|n| self.tensor(1, n)).collect();
         drop(tensors); // back to the pool
     }
 
@@ -1070,8 +1115,7 @@ impl Gpu {
 
     fn begin_pass(&mut self, pass: &PassMeta) {
         let rows = pass.ids.len();
-        let meta: Vec<[u32; 4]> =
-            (0..rows).map(|i| [pass.pos[i], pass.kv_slot[i], pass.pt_off[i], 0]).collect();
+        let meta: Vec<[u32; 4]> = (0..rows).map(|i| [pass.pos[i], pass.kv_slot[i], pass.pt_off[i], 0]).collect();
         self.upload_ordered(MetaBuf::Ids, bytemuck::cast_slice(&pass.ids));
         self.upload_ordered(MetaBuf::Rows, bytemuck::cast_slice(&meta));
         self.upload_ordered(MetaBuf::Pages, bytemuck::cast_slice(&pass.pages));
@@ -1172,7 +1216,12 @@ impl Gpu {
                     self.prof_detail = Some(format!("{n}x{k}"));
                 }
                 let groups = grid(n.div_ceil(8 * gemvm_rows(rows)) as u32);
-                self.dispatch(&format!("gemvm{rows}_{suffix}"), &refs, &[n as u32, k as u32, rows as u32, r0 as u32], groups);
+                self.dispatch(
+                    &format!("gemvm{rows}_{suffix}"),
+                    &refs,
+                    &[n as u32, k as u32, rows as u32, r0 as u32],
+                    groups,
+                );
             }
             self.pending_flops += 2.0 * (t * n * k) as f64;
             if self.pending_flops >= SUBMIT_FLOPS {
@@ -1313,6 +1362,7 @@ impl Gpu {
         o
     }
 
+    #[allow(clippy::too_many_arguments)] // (the `Backend` trait's signature)
     fn add_norm(
         &mut self,
         x: &mut Tensor,
@@ -1354,9 +1404,8 @@ impl Gpu {
         let tp = t.div_ceil(128) * 128;
         let xq = self.tensor(tp, planes * k / 4);
         let xs = self.tensor(tp, k / 8);
-        let xquant = self.int_kernel(format!("xquant{planes}"), &[false, true, false], || {
-            gemm_int::xquant_source(planes)
-        });
+        let xquant =
+            self.int_kernel(format!("xquant{planes}"), &[false, true, false], || gemm_int::xquant_source(planes));
         let lanes = (tp / 4) * (k / 32);
         self.dispatch(
             xquant,
@@ -1377,15 +1426,19 @@ impl Gpu {
             if tiles == 0 {
                 continue;
             }
-            let name = self.int_kernel(
-                format!("gemmint{planes}_{tn}_{}", f.name),
-                &[false, true, true, true, true],
-                || gemm_int::source(f, tn, planes),
-            );
+            let name =
+                self.int_kernel(format!("gemmint{planes}_{tn}_{}", f.name), &[false, true, true, true, true], || {
+                    gemm_int::source(f, tn, planes)
+                });
             if self.kernels_profile.is_some() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
-            self.dispatch(name, &refs, &[n as u32, k as u32, t as u32, r0 as u32], (n.div_ceil(64) as u32, tiles as u32));
+            self.dispatch(
+                name,
+                &refs,
+                &[n as u32, k as u32, t as u32, r0 as u32],
+                (n.div_ceil(64) as u32, tiles as u32),
+            );
         }
         self.pending_flops += 2.0 * (t * n * k) as f64;
         if self.pending_flops >= SUBMIT_FLOPS {
@@ -1411,11 +1464,10 @@ impl Gpu {
         if t == 1 {
             // A single row is rounded inside the kernel (no dispatch of its own).
             let rw = GEMVI_ROWS;
-            let name = self.int_kernel(
-                gemvi_name(planes, 1, rw, glu, true, f.name),
-                &[false, true, true, true],
-                || gemv_int::source(f, 1, planes, rw, glu, true),
-            );
+            let name =
+                self.int_kernel(gemvi_name(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
+                    gemv_int::source(f, 1, planes, rw, glu, true)
+                });
             if self.kernels_profile.is_some() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
@@ -1426,9 +1478,8 @@ impl Gpu {
         }
         let xq = self.tensor(t, planes * k / 4);
         let xs = self.tensor(t, k / 8);
-        let xquant = self.int_kernel(format!("xquantr{planes}"), &[false, true, false], || {
-            gemv_int::xquant_source(planes)
-        });
+        let xquant =
+            self.int_kernel(format!("xquantr{planes}"), &[false, true, false], || gemv_int::xquant_source(planes));
         let lanes = t * (k / 32);
         self.dispatch(
             xquant,
@@ -1564,6 +1615,8 @@ impl Gpu {
         self.argmax_prob_rows(logits).into_iter().map(|(i, _)| i).collect()
     }
 
+    // (`&mut`: reading back submits the recorded work)
+    #[allow(clippy::wrong_self_convention)]
     fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         let size = (x.rows * x.cols * 4) as u64;
         let b = self.read(&x.buf().clone(), 0, size);
@@ -1586,13 +1639,13 @@ impl Gpu {
         self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
         let b = self.read(&out, 0, logits.rows as u64 * 8);
         let v: &[u32] = bytemuck::cast_slice(&b);
-        v.chunks_exact(2).map(|c| (c[0], f32::from_bits(c[1]))).collect()
+        v.as_chunks::<2>().0.iter().map(|&[i, x]| (i, f32::from_bits(x))).collect()
     }
 }
 
 impl Gpu {
     fn load_matrix(&mut self, bf16: &[u16], n: usize, k: usize, quant: Quant) -> Result<Weight> {
-        anyhow::ensure!(k % 32 == 0, "K={k} must be a multiple of 32");
+        anyhow::ensure!(k.is_multiple_of(32), "K={k} must be a multiple of 32");
         Ok(match quant {
             Quant::Q8 | Quant::Auto => self.upload_q8(yaxus_model::quant::quantize_q8(bf16, k), n, k),
             Quant::Q4 | Quant::Auto4 => self.upload_q4(yaxus_model::quant::quantize_q4(bf16, k), n, k),
@@ -1690,7 +1743,17 @@ impl Gpu {
     /// Test hook: `x [t, k] · W^T` (or `swiglu` of it with `glu`) for a bf16 matrix `W [n, k]`
     /// stored as `quant`, through the same kernels the model uses.
     #[doc(hidden)]
-    pub fn debug_matmul(&mut self, x: &[f32], t: usize, w: &[u16], n: usize, k: usize, quant: Quant, glu: bool) -> Vec<f32> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn debug_matmul(
+        &mut self,
+        x: &[f32],
+        t: usize,
+        w: &[u16],
+        n: usize,
+        k: usize,
+        quant: Quant,
+        glu: bool,
+    ) -> Vec<f32> {
         let w = self.load_matrix(w, n, k, quant).unwrap();
         let xt = self.tensor(t, k);
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
@@ -1713,9 +1776,15 @@ pub struct WgpuBackend {
 }
 
 impl WgpuBackend {
-    /// Opens the first non-CPU Vulkan adapter.
+    /// Opens the first non-CPU Vulkan adapter. `YAXUS_SOFTWARE_VULKAN=1` accepts a software
+    /// one too (lavapipe), so the kernel tests can run on machines without a GPU (CI).
     pub fn new() -> Result<Self> {
-        Ok(WgpuBackend { gpu: Arc::new(Mutex::new(Gpu::new()?)), weight_bytes: 0, gemv: Gemv::from_env(), formats: Vec::new() })
+        Ok(WgpuBackend {
+            gpu: Arc::new(Mutex::new(Gpu::new()?)),
+            weight_bytes: 0,
+            gemv: Gemv::from_env(),
+            formats: Vec::new(),
+        })
     }
 
     /// Another handle to the same context (for a second model).
@@ -1762,6 +1831,13 @@ impl WgpuBackend {
         self.g().coop
     }
 
+    /// Whether the device has 32-lane subgroups, which the decode kernels (integer and
+    /// multi-row GEMVs, split attention) need; without them the plain f32 kernels run.
+    #[doc(hidden)]
+    pub fn has_subgroups(&self) -> bool {
+        self.g().subgroups
+    }
+
     /// Test hook, see [`Gpu::debug_matmul_ggml`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -1783,7 +1859,16 @@ impl WgpuBackend {
     /// Test hook, see [`Gpu::debug_matmul`].
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn debug_matmul(&mut self, x: &[f32], t: usize, w: &[u16], n: usize, k: usize, quant: Quant, glu: bool) -> Vec<f32> {
+    pub fn debug_matmul(
+        &mut self,
+        x: &[f32],
+        t: usize,
+        w: &[u16],
+        n: usize,
+        k: usize,
+        quant: Quant,
+        glu: bool,
+    ) -> Vec<f32> {
         let mut g = self.g();
         g.gemv = self.gemv;
         g.debug_matmul(x, t, w, n, k, quant, glu)

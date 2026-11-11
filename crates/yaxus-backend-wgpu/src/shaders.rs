@@ -985,7 +985,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
-
 /// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): 144-byte blocks of a
 /// header and nibbles as in Q4, bound twice (`wq` for the nibbles, `wsc` for headers).
 pub const W_Q4K: &str = r#"
@@ -1219,7 +1218,6 @@ fn wdot16(row: u32, j: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec
     return sm.x * d - sm.y * dot(x0 + x1 + x2 + x3, vec4<f32>(1.0));
 }
 "#;
-
 
 /// Split-key attention for passes with few rows (decode, verification), part 1 of 2.
 /// One workgroup of 128 per (row, KV head, chunk of 64 keys): it handles all

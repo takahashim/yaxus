@@ -114,13 +114,8 @@ fn parse_glossary(entries: &[String]) -> Result<Vec<Pair>> {
     entries
         .iter()
         .map(|e| {
-            let (s, t) = e
-                .split_once('=')
-                .with_context(|| format!("glossary entry {e:?} must be SRC=DST"))?;
-            Ok(Pair {
-                source: s.trim().to_string(),
-                target: t.trim().to_string(),
-            })
+            let (s, t) = e.split_once('=').with_context(|| format!("glossary entry {e:?} must be SRC=DST"))?;
+            Ok(Pair { source: s.trim().to_string(), target: t.trim().to_string() })
         })
         .collect()
 }
@@ -265,18 +260,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "server")]
         Cmd::Bench(args) => local::bench(args),
         #[cfg(feature = "server")]
-        Cmd::Translate {
-            model,
-            lang,
-            verbose,
-        } => local::translate(model, lang, verbose),
-        Cmd::Client {
-            server,
-            token,
-            ca,
-            insecure,
-            no_stream,
-            lang,
-        } => run_client(server, token, ca, insecure, no_stream, lang),
+        Cmd::Translate { model, lang, verbose } => local::translate(model, lang, verbose),
+        Cmd::Client { server, token, ca, insecure, no_stream, lang } => {
+            run_client(server, token, ca, insecure, no_stream, lang)
+        }
     }
 }

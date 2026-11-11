@@ -21,9 +21,9 @@ fn model_dir() -> PathBuf {
 
 fn cases() -> Vec<Value> {
     // YAXUS_GOLDEN selects another model's file (e.g. logits_8b.jsonl with YAXUS_MODEL_DIR).
-    let golden = std::env::var("YAXUS_GOLDEN").map(PathBuf::from).unwrap_or_else(|_| {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl")
-    });
+    let golden = std::env::var("YAXUS_GOLDEN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/logits_2b.jsonl"));
     std::fs::read_to_string(golden).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
@@ -132,7 +132,8 @@ fn speculative_matches_plain() {
         return;
     };
     let gpu = WgpuBackend::new().unwrap();
-    let mut plain = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), None, EngineConfig::default()).unwrap();
+    let mut plain =
+        Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), None, EngineConfig::default()).unwrap();
     let mut spec = Engine::new(
         Model::load(&dir, gpu.share(), Quant::Q8).unwrap(),
         Some(Model::load(&draft_dir, gpu.share(), Quant::Q4).unwrap()),
@@ -215,7 +216,8 @@ fn hints_and_response_cache_keep_output() {
     let gpu = WgpuBackend::new().unwrap();
     gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
     for with_draft in [false, true] {
-        let draft = if with_draft { draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap()) } else { None };
+        let draft =
+            if with_draft { draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap()) } else { None };
         if with_draft && draft.is_none() {
             continue;
         }
@@ -253,7 +255,9 @@ fn hints_and_response_cache_keep_output() {
             }
             let mut shifted = solo[3.min(solo.len())..].to_vec();
             shifted.extend_from_slice(&solo);
-            for (name, hint) in [("exact", solo.clone()), ("wrong", wrong), ("shifted", shifted), ("other", vec![5, 6, 7, 8])] {
+            for (name, hint) in
+                [("exact", solo.clone()), ("wrong", wrong), ("shifted", shifted), ("other", vec![5, 6, 7, 8])]
+            {
                 assert_eq!(run(&mut eng, &ids, 40, hint.clone()), solo, "{} hint {name} draft {with_draft}", c["name"]);
                 // A budget that ends inside a round.
                 assert_eq!(run(&mut eng, &ids, 6, hint), solo[..6.min(solo.len())], "{} hint {name} max 6", c["name"]);
@@ -303,8 +307,6 @@ fn tiled_attention_matches_cpu() {
         assert!(e < 2e-3, "{name}: {e}");
     }
 }
-
-
 
 /// Decode steps (the split attention, 16-key chunks for short and 32-key chunks for long
 /// contexts, and its merge) against the CPU with the f32 prefill GEMM, teacher-forced.
