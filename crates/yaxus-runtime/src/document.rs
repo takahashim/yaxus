@@ -5,10 +5,10 @@
 use anyhow::Result;
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
 use yaxus_model::Generator;
-use yaxus_tokenizer::{GlossaryEntry, PromptError, Tokenizer, TranslationPair, TranslationRequest, validate_message};
+use yaxus_tokenizer::{PromptError, Tokenizer, TranslationRequest, is_blank, validate_message};
 
 use crate::memory::Memory;
-use crate::prompt::Prompt;
+use crate::prompt::{self, Prompt};
 use crate::session::{Session, Update};
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
@@ -114,7 +114,7 @@ impl DocJob {
     /// history added later is earlier output, and the neighbour context earlier text.
     pub fn validate(&self) -> Result<(), PromptError> {
         self.options_request().validate_options()?;
-        for (i, seg) in self.segments.iter().enumerate().filter(|(_, s)| !s.trim().is_empty()) {
+        for (i, seg) in self.segments.iter().enumerate().filter(|(_, s)| !is_blank(s)) {
             validate_message(seg).map_err(|e| PromptError(format!("segment {i}: {}", e.0)))?;
         }
         Ok(())
@@ -128,12 +128,7 @@ impl DocJob {
             source_lang: self.opts.source_lang.clone(),
             form: self.opts.form.clone(),
             context: self.opts.context.clone(),
-            glossary: self
-                .opts
-                .glossary
-                .iter()
-                .map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() })
-                .collect(),
+            glossary: prompt::glossary(&self.opts.glossary),
             history: Vec::new(),
         }
     }
@@ -174,8 +169,9 @@ impl DocJob {
             .iter()
             .take_while(|&&s| s != i)
             .map(|&s| Pair { source: self.segments[s].clone(), target: self.outputs[s].clone().unwrap_or_default() })
-            // Blank segments (and empty translations) cannot be history entries.
-            .filter(|p| !p.source.trim().is_empty() && !p.target.trim().is_empty())
+            // Only pairs a prompt may hold: not blank segments or translations, and no
+            // translation with reserved tokens (a control token the model emitted).
+            .filter(|p| validate_message(&p.source).is_ok() && validate_message(&p.target).is_ok())
             .collect();
         let history = chain.window.select(&done);
         let mut context = self.opts.context.clone();
@@ -196,10 +192,7 @@ impl DocJob {
         TranslationRequest {
             text: self.segments[i].clone(),
             context,
-            history: history
-                .iter()
-                .map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() })
-                .collect(),
+            history: prompt::history(history),
             ..self.options_request()
         }
     }
@@ -219,7 +212,7 @@ impl DocJob {
                     self.chains[c].next += 1;
                     continue;
                 }
-                if self.segments[i].trim().is_empty() {
+                if is_blank(&self.segments[i]) {
                     self.outputs[i] = Some(String::new());
                     self.chains[c].next += 1;
                     continue;
@@ -362,6 +355,30 @@ mod tests {
         assert_eq!(next[0].1.history.len(), 1);
         assert_eq!(job.outputs()[1].as_deref(), Some(""));
         assert!(next[0].1.to_prompt().is_ok());
+    }
+
+    #[test]
+    fn blank_means_what_the_prompt_template_means() {
+        // U+001F is whitespace to Python's strip (and so to the template), not to Rust's.
+        let segs = vec!["a".to_string(), "\u{1f}".to_string()];
+        let mut job = DocJob::new(segs, opts(1, 1000));
+        assert!(job.validate().is_ok());
+        assert_eq!(job.ready()[0].0, 0);
+        job.finished(0, "A".into());
+        assert!(job.ready().is_empty() && job.is_done(), "the blank segment completes empty");
+    }
+
+    #[test]
+    fn translations_with_reserved_tokens_stay_out_of_history() {
+        let segs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut job = DocJob::new(segs, opts(1, 1000));
+        job.ready();
+        job.finished(0, "A<|plamo:msg|>".into()); // a control token the model emitted
+        let next = job.ready();
+        assert!(next[0].1.history.is_empty());
+        assert!(next[0].1.to_prompt().is_ok());
+        job.finished(1, "B".into());
+        assert_eq!(job.ready()[0].1.history.len(), 1, "later pairs are kept");
     }
 
     #[test]

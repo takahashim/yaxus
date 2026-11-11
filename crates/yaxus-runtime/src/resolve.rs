@@ -72,19 +72,23 @@ impl ModelSpec {
             ModelSpec::GgufFile { repo, quant } => {
                 let hint = format!("download it with `hf download {repo} --include '*{quant}.gguf'`");
                 let dir = yaxus_model::hub::snapshot(&repo).context(hint.clone())?;
-                let want = format!("{}.gguf", quant.to_ascii_lowercase());
+                // The quantization is the last `-` part of the file name (`...-2b-Q4_K_M.gguf`),
+                // so `Q2_K` does not pick `IQ2_K` or `Q2_K_L`.
                 let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)?
                     .flatten()
                     .map(|e| e.path())
-                    .filter(|f| {
-                        f.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().ends_with(&want))
-                    })
+                    .filter(|f| gguf_quant(f).is_some_and(|q| q.eq_ignore_ascii_case(&quant)))
                     .collect();
                 found.sort();
-                let file = found
-                    .into_iter()
-                    .next()
-                    .with_context(|| format!("no *{quant}.gguf in {}; {hint}", dir.display()))?;
+                let file = match found.len() {
+                    0 => anyhow::bail!("no *-{quant}.gguf in {}; {hint}", dir.display()),
+                    1 => found.remove(0),
+                    _ => anyhow::bail!(
+                        "several files in {} are {quant}: {}; give the path of one",
+                        dir.display(),
+                        found.iter().filter_map(|f| f.file_name()?.to_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                };
                 ModelSpec::File(file).locate(arg)
             }
             ModelSpec::Repo(repo) => {
@@ -92,11 +96,7 @@ impl ModelSpec {
                 if !snapshot.join("config.json").exists() {
                     let mut quants: Vec<String> = std::fs::read_dir(&snapshot)?
                         .flatten()
-                        .filter_map(|e| {
-                            let n = e.file_name().to_string_lossy().into_owned();
-                            let stem = n.strip_suffix(".gguf")?;
-                            Some(format!("{repo}:{}", stem.rsplit('-').next().unwrap_or(stem)))
-                        })
+                        .filter_map(|e| Some(format!("{repo}:{}", gguf_quant(&e.path())?)))
                         .collect();
                     quants.sort();
                     if !quants.is_empty() {
@@ -108,6 +108,14 @@ impl ModelSpec {
             }
         }
     }
+}
+
+/// The quantization of a GGUF file name: its last `-` part (`Q4_K_M` of
+/// `plamo-3-translate-2b-Q4_K_M.gguf`).
+fn gguf_quant(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf").or_else(|| name.strip_suffix(".GGUF"))?;
+    Some(stem.rsplit('-').next().unwrap_or(stem).to_string())
 }
 
 /// Finds a model: a directory, a GGUF file, a repository in the local Hugging Face cache,
@@ -160,6 +168,15 @@ mod tests {
         assert_eq!(ModelSpec::parse("someone/model-GGUF:Q8_0"), gguf("someone/model-GGUF", "Q8_0"));
         let dir = std::env::temp_dir();
         assert_eq!(ModelSpec::parse(dir.to_str().unwrap()), ModelSpec::Dir(dir));
+    }
+
+    #[test]
+    fn quantization_is_the_last_part_of_the_name() {
+        let q = |n: &str| gguf_quant(Path::new(n));
+        assert_eq!(q("plamo-3-translate-0.8b-Q2_K.gguf").as_deref(), Some("Q2_K"));
+        assert_eq!(q("x-IQ2_K.gguf").as_deref(), Some("IQ2_K"));
+        assert_eq!(q("x-UD-Q2_K_XL.gguf").as_deref(), Some("Q2_K_XL"));
+        assert_eq!(q("README.md"), None);
     }
 
     #[test]

@@ -31,7 +31,9 @@ pub struct PromptError(pub String);
 
 const RESERVED: &str = "<|plamo:";
 
-fn is_blank(s: &str) -> bool {
+/// Whether `s` is empty or only whitespace, as the prompt template sees it (Jinja's
+/// `trim` is Python's `str.strip()`, which also strips U+001C..U+001F).
+pub fn is_blank(s: &str) -> bool {
     // Jinja `trim` uses Python `str.strip()`.
     s.chars().all(crate::py_isspace)
 }

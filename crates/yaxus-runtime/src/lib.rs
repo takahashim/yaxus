@@ -19,4 +19,4 @@ pub use load::{
 pub use prompt::{Prompt, prompt_request};
 pub use resolve::{ResolvedModel, resolve_draft, resolve_model};
 pub use run::{RunStats, run_request};
-pub use session::{Finished, Session, Update};
+pub use session::{Finished, STOP_TOKENS, Session, Update};

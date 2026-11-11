@@ -203,6 +203,45 @@ fn concurrent_matches_solo() {
     eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec);
 }
 
+/// After `abort_all` (the server's recovery from a failed step) the engine holds nothing:
+/// no streams, no waiting requests, all KV pages free, and it answers as before.
+#[test]
+#[ignore]
+fn abort_all_leaves_a_clean_engine() {
+    let dir = model_dir();
+    let gpu = WgpuBackend::new().unwrap();
+    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap());
+    let cfg = EngineConfig { max_streams: 2, response_cache: 0, ..EngineConfig::default() };
+    let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
+    eng.target.prefix_cache = false;
+    if let Some(d) = eng.draft.as_mut() {
+        d.prefix_cache = false;
+    }
+    let prompt = u32s(&cases()[0]["ids"]);
+    let before = eng.generate(&prompt, 16, &[1, 16], &mut |_| true).unwrap();
+    // (the KV arena exists from the first request on)
+    let free = (eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages()));
+    // Two running (one decoding, one prefilling or decoding) and one waiting.
+    for i in 0..3 {
+        eng.submit(Request::new(i, prompt.clone(), 64, vec![1, 16]));
+    }
+    for _ in 0..3 {
+        eng.step(&mut |_| true).unwrap();
+    }
+    assert!(eng.active() > 0 && eng.waiting() > 0);
+    eng.abort_all();
+    assert!(eng.is_idle());
+    assert_eq!((eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages())), free);
+    let mut events = 0;
+    eng.step(&mut |_| {
+        events += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(events, 0, "aborted requests send no events");
+    assert_eq!(eng.generate(&prompt, 16, &[1, 16], &mut |_| true).unwrap(), before);
+}
+
 /// Hint tokens, right, partly wrong or unrelated, never change the output; with an exact
 /// hint the response cache answers a repeated request without running it.
 #[test]

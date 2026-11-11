@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Args;
 use yaxus_model::Quant;
-use yaxus_runtime::{BackendKind, Prompt, ResolvedModel, Scheduling, load_tokenizer, quant_label, run_request};
-use yaxus_tokenizer::{EOS_ID, TAG_ID};
+use yaxus_runtime::{
+    BackendKind, Prompt, ResolvedModel, STOP_TOKENS, Scheduling, load_tokenizer, quant_label, run_request,
+};
 
 use crate::LangArgs;
 
@@ -142,19 +143,30 @@ pub struct ServeArgs {
     config_dir: Option<PathBuf>,
 }
 
-/// Log messages to stderr, at `level` unless `RUST_LOG` says otherwise.
-fn init_logging(level: &str) {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()))
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .init();
+/// Log messages at `level` unless `RUST_LOG` says otherwise.
+fn init_logging(level: &str, to: LogTo) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into());
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    match to {
+        // The server's log is its output (`yaxus serve > server.log`), as it always was.
+        LogTo::Stdout => fmt.init(),
+        // Local commands print translations or tables on stdout; warnings go apart.
+        LogTo::Stderr => {
+            fmt.with_writer(std::io::stderr).with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())).init()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LogTo {
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    Stdout,
+    Stderr,
 }
 
 #[cfg(feature = "server")]
 pub fn serve(a: ServeArgs) -> Result<()> {
-    init_logging("info");
+    init_logging("info", LogTo::Stdout);
     let ResolvedModel { path: model_dir, name: model_name } = a.model.resolve()?;
     yaxus_server::serve(yaxus_server::ServeOptions {
         load: a.model.load_options(&model_dir)?,
@@ -174,7 +186,7 @@ pub fn serve(a: ServeArgs) -> Result<()> {
 pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     use yaxus_runtime::document::{DocEvent, DocJob, run_document};
     // Warnings only (the GPU cannot be used, so speculative decoding is off), not the output.
-    init_logging("warn");
+    init_logging("warn", LogTo::Stderr);
     let req = lang.document(true)?;
     let ResolvedModel { path: dir, name } = m.resolve()?;
     let tok = load_tokenizer(&dir)?;
@@ -191,6 +203,8 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     }
     let n = req.segments.len();
     let mut job = DocJob::from_request(req, usize::MAX);
+    // Bad input fails before any output, as the server answers it with 400.
+    job.validate()?;
     let mut out = crate::OrderedPrinter::new(std::io::stdout().lock(), n);
     let t1 = Instant::now();
     let mut first: Option<Duration> = None;
@@ -330,7 +344,7 @@ fn header(name: &str, dir: &Path, model: &ModelArgs, g: &dyn yaxus_model::Genera
 }
 
 pub fn bench(a: BenchArgs) -> Result<()> {
-    init_logging("warn");
+    init_logging("warn", LogTo::Stderr);
     match a.kind {
         BenchKind::Rows { model, rows, runs } => bench_rows(model, rows, runs),
         BenchKind::Decode { model, prompt_tokens, gen_tokens, runs } => {
@@ -477,14 +491,14 @@ fn bench_streams(
     for line in set.lines().filter(|l| !l.trim().is_empty()) {
         let (lang, text) = line.split_once('\t').context("set lines are `lang<TAB>text`")?;
         let req = yaxus_api::TranslateRequest { text: text.into(), target_lang: lang.into(), ..Default::default() };
-        prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req))?.ids().to_vec());
+        prompts.push(Prompt::new(&tok, &yaxus_runtime::prompt_request(&req))?.into_ids());
     }
     let reference: Option<Vec<String>> = match &compare {
         Some(p) => Some(std::fs::read_to_string(p)?.lines().map(String::from).collect()),
         None => None,
     };
     // Warm-up.
-    model.generate(&prompts[0], 4, &[EOS_ID, TAG_ID], &mut |_| true)?;
+    model.generate(&prompts[0], 4, &STOP_TOKENS, &mut |_| true)?;
     println!("{:>4} {:>8} {:>12} {:>14} {:>12}", "n", "tokens", "wall s", "total tok/s", "identical");
     for &n in &ns {
         let picked: Vec<usize> = (0..n).map(|i| i % prompts.len()).collect();
@@ -493,7 +507,7 @@ fn bench_streams(
                 r as u64,
                 prompts[i].clone(),
                 fixed_gen.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS),
-                if fixed_gen.is_some() { vec![] } else { vec![EOS_ID, TAG_ID] },
+                if fixed_gen.is_some() { vec![] } else { STOP_TOKENS.to_vec() },
             ));
         }
         let mut first_all: Option<Instant> = None;
@@ -624,6 +638,7 @@ fn bench_doc(
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
         let mut job = DocJob::new(paras, opts.clone());
+        job.validate()?;
         println!(
             "{} paragraphs, {chars} characters, to {to}, {} chains, history {history_chars} chars{}",
             job.len(),

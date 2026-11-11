@@ -16,7 +16,7 @@ use crate::memory::Memory;
 use crate::prompt::Prompt;
 
 /// Tokens that end a translation (not part of it).
-const STOP: [u32; 2] = [EOS_ID, TAG_ID];
+pub const STOP_TOKENS: [u32; 2] = [EOS_ID, TAG_ID];
 
 /// A request that has ended.
 #[derive(Debug, Clone)]
@@ -96,7 +96,7 @@ impl<'a, T> Session<'a, T> {
         let id = self.engine.fresh_id();
         let prompt_tokens = prompt.len();
         let (ids, memo) = prompt.into_parts();
-        let mut req = Request::new(id, ids, max_new_tokens, STOP.to_vec());
+        let mut req = Request::new(id, ids, max_new_tokens, STOP_TOKENS.to_vec());
         req.hint = self.memory.get(memo);
         self.engine.submit(req);
         let live = Live {
@@ -168,9 +168,10 @@ impl<'a, T> Session<'a, T> {
         self.engine.waiting()
     }
 
-    /// Forgets every request (after a failed [`step`](Session::step)) and returns their
-    /// tags, so that their owners can be told.
+    /// Drops every request, in the engine too (after a failed [`step`](Session::step)),
+    /// and returns their tags, so that their owners can be told.
     pub fn abort_all(&mut self) -> Vec<T> {
+        self.engine.abort_all();
         self.live.drain().map(|(_, l)| l.tag).collect()
     }
 }
@@ -191,6 +192,7 @@ mod tests {
         /// What the session answered to each event.
         answers: Vec<bool>,
         next_id: ReqId,
+        aborted: bool,
     }
 
     impl Generator for Script {
@@ -213,6 +215,9 @@ mod tests {
         }
         fn active(&self) -> usize {
             0
+        }
+        fn abort_all(&mut self) {
+            self.aborted = true;
         }
         fn backend_name(&self) -> String {
             "script".into()
@@ -302,7 +307,7 @@ mod tests {
         drop(session);
         let req = &engine.submitted[0];
         assert_eq!((req.prompt.as_slice(), req.max_new_tokens), (&[5, 6][..], 32));
-        assert_eq!(req.stop, [EOS_ID, TAG_ID]);
+        assert_eq!(req.stop, STOP_TOKENS);
         assert_eq!(req.hint, [HEL], "the memory's tokens are the hint");
         assert_eq!(memory.get(42), [HEL, LO, byte(0xC3), byte(0xA9)]);
     }
@@ -360,5 +365,7 @@ mod tests {
         tags.sort();
         assert_eq!(tags, ["a", "b"]);
         assert!(session.is_idle());
+        drop(session);
+        assert!(engine.aborted, "the engine drops its requests too");
     }
 }

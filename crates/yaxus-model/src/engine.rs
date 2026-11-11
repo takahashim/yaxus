@@ -394,6 +394,21 @@ impl<B: Backend> Engine<B> {
         self.waiting.is_empty() && self.streams.is_empty()
     }
 
+    /// Drops every request, waiting or running, without events, and frees their KV (for
+    /// recovery after a failed [`step`](Engine::step): the caller has given up on them).
+    pub fn abort_all(&mut self) {
+        self.waiting.clear();
+        for s in self.streams.drain(..) {
+            self.target.free_seq(s.ts);
+            if let (Some(d), Some(dm)) = (s.ds, self.draft.as_mut()) {
+                dm.free_seq(d);
+            }
+        }
+        self.rr = 0;
+        self.prefill_turn = false;
+        self.draft_in_sync = false;
+    }
+
     /// Runs one pass. `emit` receives tokens and completions; returning `false` for a
     /// token cancels that request. Returns `false` when there was nothing to do.
     pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
@@ -786,6 +801,8 @@ pub trait Generator: Send {
     fn fresh_id(&mut self) -> ReqId;
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
+    /// See [`Engine::abort_all`].
+    fn abort_all(&mut self);
     fn backend_name(&self) -> String;
     fn weight_bytes(&self) -> usize;
     /// Speculative decoding statistics, if any rounds ran.
@@ -851,6 +868,9 @@ where
     }
     fn active(&self) -> usize {
         Engine::active(self)
+    }
+    fn abort_all(&mut self) {
+        Engine::abort_all(self)
     }
     fn backend_name(&self) -> String {
         match &self.draft {

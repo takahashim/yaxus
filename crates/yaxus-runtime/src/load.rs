@@ -320,8 +320,10 @@ mod tests {
         let (Some(hf), Some(gg)) =
             (snapshot("pfnet/plamo-3-translate-0.8b"), snapshot("pfnet/plamo-3-translate-0.8b-GGUF"))
         else {
-            let required = std::env::var_os("YAXUS_REQUIRE_GOLDEN").is_some_and(|v| !v.is_empty() && v != "0");
-            assert!(!required, "YAXUS_REQUIRE_GOLDEN is set but the 0.8B model or GGUF files are not in the cache");
+            assert!(
+                !yaxus_model::hub::models_required(),
+                "YAXUS_REQUIRE_GOLDEN is set but the 0.8B model or GGUF files are not in the cache"
+            );
             eprintln!("0.8B model or GGUF files not found; skipping");
             return;
         };

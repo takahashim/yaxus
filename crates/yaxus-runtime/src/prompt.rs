@@ -1,6 +1,6 @@
 //! Requests of the HTTP API as prompts.
 
-use yaxus_api::TranslateRequest;
+use yaxus_api::{Pair, TranslateRequest};
 use yaxus_tokenizer::{GlossaryEntry, PromptError, Tokenizer, TranslationPair, TranslationRequest};
 
 use crate::memory;
@@ -13,17 +13,19 @@ pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
         source_lang: r.requested_source_lang().map(String::from),
         form: r.requested_form().map(String::from),
         context: r.context.clone(),
-        glossary: r
-            .glossary
-            .iter()
-            .map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() })
-            .collect(),
-        history: r
-            .history
-            .iter()
-            .map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() })
-            .collect(),
+        glossary: glossary(&r.glossary),
+        history: history(&r.history),
     }
+}
+
+/// The API's glossary pairs as prompt entries.
+pub(crate) fn glossary(pairs: &[Pair]) -> Vec<GlossaryEntry> {
+    pairs.iter().map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() }).collect()
+}
+
+/// The API's history pairs (source, translation) as prompt entries.
+pub(crate) fn history(pairs: &[Pair]) -> Vec<TranslationPair> {
+    pairs.iter().map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() }).collect()
 }
 
 /// A translation request as the engine takes it: the prompt's token ids, and the key
@@ -39,9 +41,9 @@ impl Prompt {
         Ok(Prompt { ids: tok.encode(&req.to_prompt()?, false), memo: memory::key(req) })
     }
 
-    /// The token ids.
-    pub fn ids(&self) -> &[u32] {
-        &self.ids
+    /// The token ids, for callers that build engine requests themselves (benchmarks).
+    pub fn into_ids(self) -> Vec<u32> {
+        self.ids
     }
 
     /// Prompt length in tokens.
