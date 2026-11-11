@@ -408,6 +408,30 @@ mod tests {
     }
 
     #[test]
+    fn first_rows_of_a_quantized_matrix() {
+        // Two rows of one Q8_0 block each (f16 scale, then 32 int8 values).
+        let mut b = head(1, 0);
+        string(&mut b, "t");
+        b.extend(2u32.to_le_bytes());
+        b.extend(32u64.to_le_bytes());
+        b.extend(2u64.to_le_bytes());
+        b.extend(8u32.to_le_bytes()); // Q8_0
+        b.extend(0u64.to_le_bytes());
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        for (scale, base) in [(0x3c00u16, 1i8), (0x4000u16, -1i8)] {
+            b.extend(scale.to_le_bytes()); // 1.0, then 2.0
+            b.extend((0..32).map(|i| (base * (i as i8 % 5)) as u8));
+        }
+        let f = write("q8rows", &b);
+        let g = Gguf::open(&f.0).unwrap();
+        let t = &g.tensors[0].1;
+        let all = t.to_f32_vec();
+        let top = t.first_rows(1).unwrap();
+        assert_eq!(top.shape, [1, 32]);
+        assert_eq!(top.to_f32_vec(), all[..32]);
+    }
+
+    #[test]
     fn a_small_valid_file_opens() {
         let mut b = head(1, 0);
         tensor(&mut b, &[2], 0);

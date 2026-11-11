@@ -426,22 +426,26 @@ impl<B: Backend> Model<B> {
         }
         let r = match best {
             Some((src, lcp)) if lcp.min(prompt.len() - 1) >= MIN_REUSE => {
-                let keep = lcp.min(prompt.len() - 1);
+                let mut keep = lcp.min(prompt.len() - 1);
                 let kv = self.kv.as_mut().unwrap();
                 kv.clock += 1;
                 let now = kv.clock;
-                if let Some(e) = kv.cached.iter_mut().find(|(c, _)| *c == src) {
-                    e.1 = now;
-                }
-                // Only a partly used last page is copied; whole pages are shared.
+                // Whole pages are shared; only a partly used last page is copied, which
+                // needs a free page. Make room without evicting `src` itself (with the
+                // arena full of live sequences it would go last otherwise), and when no
+                // page can be had, reuse just the whole pages.
+                let entry = kv.cached.iter().position(|(c, _)| *c == src).map(|i| kv.cached.remove(i));
                 if !keep.is_multiple_of(PAGE) {
                     self.ensure_free(1);
+                    if self.kv.as_ref().unwrap().pool.free.is_empty() {
+                        keep = keep / PAGE * PAGE;
+                    }
                 }
-                // With the arena full, making room can evict `src` itself (it is the
-                // newest, so it goes last), and the copy can still find no page: then
-                // the prompt is computed from scratch rather than failing.
-                let alive = self.kv.as_ref().unwrap().seqs.contains_key(&src);
-                match alive.then(|| self.fork(src, keep)) {
+                let kv = self.kv.as_mut().unwrap();
+                if let Some((c, _)) = entry {
+                    kv.cached.push((c, now));
+                }
+                match (keep >= MIN_REUSE).then(|| self.fork(src, keep)) {
                     Some(Ok(s)) => (s, keep),
                     _ => (self.new_seq()?, 0),
                 }
@@ -511,10 +515,11 @@ impl<B: Backend> Model<B> {
     /// A new sequence sharing the first `len` tokens of `id` (whole pages are shared; a
     /// partially used last page is copied).
     pub fn fork(&mut self, id: SeqId, len: usize) -> Result<SeqId> {
+        // Check before creating the new sequence, which an early return would leak.
+        let src = self.kv()?.seqs.get(&id).context("unknown sequence")?.clone();
+        anyhow::ensure!(len <= src.len, "fork beyond the end");
         let new = self.new_seq()?;
         let kv = self.kv.as_mut().unwrap();
-        let src = kv.seqs.get(&id).context("unknown sequence")?.clone();
-        anyhow::ensure!(len <= src.len, "fork beyond the end");
         let full = len / PAGE;
         let mut pages = src.pages[..full].to_vec();
         for &p in &pages {
@@ -806,9 +811,12 @@ mod tests {
         let mut b = a[..129].to_vec();
         b.extend([500, 501]);
         let (id, reused) = m.begin(&b).unwrap();
-        assert_eq!(reused, 0);
-        m.prefill(id, &b).unwrap();
+        // Copying the partly used page would need a page only evicting the source
+        // gives: the whole first page is shared instead, and the rest computed.
+        assert_eq!(reused, PAGE);
+        m.prefill(id, &b[reused..]).unwrap();
         assert_eq!(m.seq_len(id), b.len());
+        assert_eq!(m.seq_tokens(id), &b[..]);
     }
 
     #[test]
@@ -820,8 +828,11 @@ mod tests {
         // The common prefix is exactly one page: it is shared, nothing is copied.
         let mut b = a[..PAGE].to_vec();
         b.push(999);
-        let (_, reused) = m.begin(&b).unwrap();
+        let (id, reused) = m.begin(&b).unwrap();
         assert_eq!(reused, PAGE);
+        // Writing past the shared page takes the source's second page (evicting it).
+        m.prefill(id, &b[reused..]).unwrap();
+        assert_eq!(m.seq_tokens(id), &b[..]);
     }
 
     #[test]
@@ -857,7 +868,10 @@ mod tests {
         let cfg: Config = serde_json::from_str(&text(1)).unwrap();
         assert!(cfg.validate().is_ok());
         let mut cfg: Config = serde_json::from_str(&text(1)).unwrap();
+        // The window only matters with sliding layers (pattern > 1).
         cfg.window_size = 0;
+        assert!(cfg.validate().is_ok());
+        cfg.sliding_window_pattern = 2;
         assert!(cfg.validate().unwrap_err().to_string().contains("window_size"));
     }
 }

@@ -80,12 +80,15 @@ impl Config {
             ("intermediate_size", self.intermediate_size),
             ("vocab_size", self.vocab_size),
             ("sliding_window_pattern", self.sliding_window_pattern),
-            // An empty window leaves sliding-window attention nothing to attend to (NaN).
-            ("window_size", self.window_size),
         ];
         for (name, v) in sizes {
             ensure!(v > 0, "{name} must be positive");
         }
+        // With sliding layers, an empty window leaves them nothing to attend to (NaN).
+        ensure!(
+            self.sliding_window_pattern == 1 || self.window_size > 0,
+            "window_size must be positive when there are sliding-window layers"
+        );
         ensure!(
             self.num_attention_heads.is_multiple_of(self.num_key_value_heads),
             "num_attention_heads ({}) is not a multiple of num_key_value_heads ({})",
