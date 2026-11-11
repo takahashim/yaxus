@@ -1,16 +1,16 @@
-"""Compare yakusel and Ollama on the same prompts.
+"""Compare yaxus and Ollama on the same prompts.
 
     python compare.py BACKEND MODE [options]
 
 BACKEND: ollama:<model> (raw PFML3 prompts to /api/generate, built with the model's
-chat template) or yakusel (POST /v1/translate on YAKUSEL_URL with YAKUSEL_TOKEN).
+chat template) or yaxus (POST /v1/translate on YAXUS_URL with YAXUS_TOKEN).
 MODE: set FILE (sentences, `lang<TAB>text`), doc FILE (paragraphs, client-side chains
-with the same history window as yakusel), par FILE N (N concurrent sentences).
+with the same history window as yaxus), par FILE N (N concurrent sentences).
 Writes outputs to --out (one per line, newlines escaped).
 
 Environment: MODEL_DIR (the HF model directory, for the chat template), OLLAMA_URL
-(default http://127.0.0.1:11435), YAKUSEL_URL, YAKUSEL_TOKEN. Needs transformers for
-the Ollama backend. Start yakusel with --no-response-cache when repeating runs.
+(default http://127.0.0.1:11435), YAXUS_URL, YAXUS_TOKEN. Needs transformers for
+the Ollama backend. Start yaxus with --no-response-cache when repeating runs.
 """
 
 import argparse
@@ -23,8 +23,8 @@ import time
 import urllib.request
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11435")
-YAKUSEL = os.environ.get("YAKUSEL_URL", "https://127.0.0.1:18443")
-TOKEN = os.environ.get("YAKUSEL_TOKEN", "")
+YAXUS = os.environ.get("YAXUS_URL", "https://127.0.0.1:18443")
+TOKEN = os.environ.get("YAXUS_TOKEN", "")
 STOP = ["<|plamo:tag|>", "<|plamo:bos|>"]
 CTX = ssl._create_unverified_context()
 _tok = None
@@ -74,13 +74,13 @@ def translate(backend, text, lang, history=()):
             time.time() - t0,
         )
     body = {"text": text, "target_lang": lang, "history": [{"source": s, "target": t} for s, t in history]}
-    r = post(f"{YAKUSEL}/v1/translate", body, {"authorization": f"Bearer {TOKEN}"})
+    r = post(f"{YAXUS}/v1/translate", body, {"authorization": f"Bearer {TOKEN}"})
     u = r["usage"]
     return r["text"], u["prompt_tokens"], u["completion_tokens"], u["prefill_ms"] / 1e3, time.time() - t0
 
 
 class Window:
-    """yakusel_api::HistoryWindow."""
+    """yaxus_api::HistoryWindow."""
 
     def __init__(self, budget):
         self.start, self.budget = 0, budget

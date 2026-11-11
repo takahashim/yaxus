@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>yakusel</title>
+<title>yaxus</title>
 <link rel="icon" href="data:,">
 <style>
 :root {
@@ -61,7 +61,7 @@ label.field { display: block; margin-top: 8px; font-size: 13px; color: var(--mut
 </head>
 <body>
 <header>
-  <h1>yakusel</h1>
+  <h1>yaxus</h1>
   <span id="status">接続確認中…</span>
   <span class="spacer"></span>
   <label class="hint" for="token">トークン</label>
@@ -103,8 +103,8 @@ label.field { display: block; margin-top: 8px; font-size: 13px; color: var(--mut
 "use strict";
 const $ = (id) => document.getElementById(id);
 const store = {
-  get(k, d) { try { return localStorage.getItem("yakusel." + k) ?? d; } catch { return d; } },
-  set(k, v) { try { localStorage.setItem("yakusel." + k, v); } catch {} },
+  get(k, d) { try { return localStorage.getItem("yaxus." + k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("yaxus." + k, v); } catch {} },
 };
 let controller = null;
 

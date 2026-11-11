@@ -1,0 +1,16 @@
+[package]
+name = "yaxus-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference f32 CPU backend for yaxus"
+
+[dependencies]
+anyhow.workspace = true
+rayon = "1"
+half = "2"
+yaxus-model = { path = "../yaxus-model" }
+
+[dev-dependencies]
+yaxus-tokenizer = { path = "../yaxus-tokenizer" }
+serde_json.workspace = true

@@ -1,4 +1,4 @@
-# yakusel 設計書
+# yaxus 設計書
 
 PLaMo 3 Translate を Rust で直接推論する翻訳サーバ/CLI。
 llama.cpp や Python に依存せず、単一プロセスで動作し、HTTPS 経由で別マシンの CLI・ブラウザから利用する。
@@ -56,7 +56,7 @@ GPU 経路の結論は **Vulkan (wgpu + WGSL コンピュートシェーダ)**�
 - MLP: 融合 `gate_up_proj` を前半/後半に split し `silu(h0) * h1` → `down_proj`。
 - 最終 `model.norm` (offset 1.0) → `lm_head` (embedding とは非共有)。
 - 学習時の最大長は入出力合計 32,768 トークン。
-- 参照実装 (`modeling_plamo.py`) は KV キャッシュに RoPE 前の K を積み、毎ステップ「キャッシュ内の相対位置 0..kv_len」で q/k に RoPE をかけ直す (NICT inference path)。RoPE のスコアは位置差だけに依存し、YaRN の concentration も一様な倍率なので、**RoPE 済みの K を絶対位置でキャッシュする実装と数学的に等価**。yakusel は後者を採用 (M1 で HF と logits 誤差 3e-5、greedy 完全一致を確認)。
+- 参照実装 (`modeling_plamo.py`) は KV キャッシュに RoPE 前の K を積み、毎ステップ「キャッシュ内の相対位置 0..kv_len」で q/k に RoPE をかけ直す (NICT inference path)。RoPE のスコアは位置差だけに依存し、YaRN の concentration も一様な倍率なので、**RoPE 済みの K を絶対位置でキャッシュする実装と数学的に等価**。yaxus は後者を採用 (M1 で HF と logits 誤差 3e-5、greedy 完全一致を確認)。
 - sliding window の可視範囲はクエリ位置 `p` に対してキー `(p-2048, p]` (`swa_mask`)。
 - `scale_embedding: false` のため埋め込みのスケーリングは無い。
 
@@ -113,10 +113,10 @@ HF `tokenizers` 互換ではなく、PFN 独自実装 (`tokenization_plamo.py`, 
 ```
                  HTTPS (rustls, 自己署名 or 指定証明書)
 別マシン ──┬── ブラウザ ── GET /  (組み込み Web UI)
-          └── yakusel CLI ── POST /v1/translate (JSON / SSE ストリーミング)
+          └── yaxus CLI ── POST /v1/translate (JSON / SSE ストリーミング)
                                    │
                         ┌──────────▼──────────┐
-                        │ yakusel serve (1 プロセス) │
+                        │ yaxus serve (1 プロセス) │
                         │  axum ルータ + 認証      │
                         │  リクエストキュー (mpsc)  │
                         │  推論ワーカースレッド ×1   │
@@ -132,21 +132,21 @@ HF `tokenizers` 互換ではなく、PFN 独自実装 (`tokenization_plamo.py`, 
 ### 2.1 ワークスペース構成
 
 ```
-yakusel/
+yaxus/
   Cargo.toml                 # workspace
   DESIGN.md
   crates/
-    yakusel-tokenizer/       # PLaMo トークナイザ (pure Rust, 依存最小)
-    yakusel-model/           # 設定・safetensors ロード・plamo3 の計算グラフ・Backend トレイト
-    yakusel-backend-cpu/     # 参照実装 (f32, rayon)。正しさの基準とフォールバック
-    yakusel-backend-wgpu/    # Vulkan 用 WGSL カーネル群
-    yakusel-server/          # axum + rustls、API、Web UI の埋め込み
-    yakusel-cli/             # バイナリ `yakusel` (serve / translate / client / quantize / download)
+    yaxus-tokenizer/       # PLaMo トークナイザ (pure Rust, 依存最小)
+    yaxus-model/           # 設定・safetensors ロード・plamo3 の計算グラフ・Backend トレイト
+    yaxus-backend-cpu/     # 参照実装 (f32, rayon)。正しさの基準とフォールバック
+    yaxus-backend-wgpu/    # Vulkan 用 WGSL カーネル群
+    yaxus-server/          # axum + rustls、API、Web UI の埋め込み
+    yaxus-cli/             # バイナリ `yaxus` (serve / translate / client / quantize / download)
   web/                       # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
   tests/golden/              # Python 側で生成した tokenizer / logits のゴールデンデータ
 ```
 
-クライアント用途だけなら GPU 依存を外せるよう、`yakusel-cli` は feature で `server` と `client` を分ける。
+クライアント用途だけなら GPU 依存を外せるよう、`yaxus-cli` は feature で `server` と `client` を分ける。
 
 ---
 
@@ -169,14 +169,14 @@ pub trait Backend {
 }
 ```
 
-`yakusel-model` はこのトレイトだけに依存して plamo3 の forward を書く。CPU と wgpu で同じコードパスを通すことで、CPU 実装をゴールデンにして GPU 実装を検証できる。
+`yaxus-model` はこのトレイトだけに依存して plamo3 の forward を書く。CPU と wgpu で同じコードパスを通すことで、CPU 実装をゴールデンにして GPU 実装を検証できる。
 
 ### 3.2 重みの持ち方
 
 - safetensors (bf16) を mmap で読み、テンソル単位で GPU バッファにアップロードする。1 バッファ上限 2047 MiB に対し、2B/8B の最大テンソルは `lm_head`/`embed_tokens` の 880 MB (8B) なので分割不要。31B は要分割だが当面対象外。
 - WGSL に bf16 型は無いので、**bf16 を u32 に 2 個パックしたままバッファに置き、カーネル内で `bitcast<f32>(u << 16)` で f32 に展開**する。変換は無損失で、ロード時の型変換も不要。
 - 活性値は f32 (必要なら f16 に落とす)。KV キャッシュは f16。
-- 量子化 (後段フェーズ): ブロック 32 ごとに f16 スケールを持つ Q8 / Q4 を自前定義し、`yakusel quantize` で事前変換した独自フォーマット (`.ysq`、safetensors のメタデータ拡張) として保存。デコードはカーネル内で逆量子化する。8B を実用速度にするにはこれが必須。
+- 量子化 (後段フェーズ): ブロック 32 ごとに f16 スケールを持つ Q8 / Q4 を自前定義し、`yaxus quantize` で事前変換した独自フォーマット (`.ysq`、safetensors のメタデータ拡張) として保存。デコードはカーネル内で逆量子化する。8B を実用速度にするにはこれが必須。
 
 ### 3.3 必要なカーネル (WGSL)
 
@@ -216,7 +216,7 @@ pub trait Backend {
 ### 4.1 HTTPS
 
 - axum + `axum-server` (rustls)。
-- 証明書は `--cert/--key` 指定か、未指定なら初回起動時に `rcgen` で自己署名証明書を `~/.config/yakusel/` に生成して再利用する。CLI クライアントは `--ca` でその証明書をピン留めできる (`--insecure` も用意)。
+- 証明書は `--cert/--key` 指定か、未指定なら初回起動時に `rcgen` で自己署名証明書を `~/.config/yaxus/` に生成して再利用する。CLI クライアントは `--ca` でその証明書をピン留めできる (`--insecure` も用意)。
 - LAN 公開前提なので **Bearer トークン認証は必須** (`--token` または設定ファイル。未設定なら起動時に生成して表示)。Web UI はトークンを localStorage に保持。
 
 ### 4.2 API
@@ -259,12 +259,12 @@ GET  /v1/languages          対応言語コード一覧
 ## 5. CLI
 
 ```
-yakusel serve   --model ~/.cache/huggingface/hub/... [--backend vulkan|cpu] [--listen 0.0.0.0:8443] [--token ...]
-yakusel translate --to en [--from ja] [--form polite] "テキスト"   # サーバを立てずローカルで実行
-yakusel client  --server https://host:8443 --to en  < input.txt    # 標準入力を段落単位で送る
-yakusel quantize --model ... --scheme q8|q4 --out ...
-yakusel download --model pfnet/plamo-3-translate-2b              # hf-hub crate で取得
-yakusel bench   --model ...                                         # プリフィル/デコード速度計測
+yaxus serve   --model ~/.cache/huggingface/hub/... [--backend vulkan|cpu] [--listen 0.0.0.0:8443] [--token ...]
+yaxus translate --to en [--from ja] [--form polite] "テキスト"   # サーバを立てずローカルで実行
+yaxus client  --server https://host:8443 --to en  < input.txt    # 標準入力を段落単位で送る
+yaxus quantize --model ... --scheme q8|q4 --out ...
+yaxus download --model pfnet/plamo-3-translate-2b              # hf-hub crate で取得
+yaxus bench   --model ...                                         # プリフィル/デコード速度計測
 ```
 
 ---
@@ -275,7 +275,7 @@ yakusel bench   --model ...                                         # プリフ�
 2. **モデル (CPU)**: transformers (CPU, bf16→f32) で短いプロンプトの logits を保存し、CPU バックエンドの logits と最大絶対誤差で比較。greedy 出力列の一致も確認。
 3. **モデル (Vulkan)**: CPU バックエンドと同一入力で logits を比較。カーネル単体も CPU 実装と突き合わせる単体テストを持つ。
 4. **E2E**: README のサンプル文で期待訳が得られること。
-5. **性能**: `yakusel bench` でプリフィル tok/s とデコード tok/s を継続的に記録。
+5. **性能**: `yaxus bench` でプリフィル tok/s とデコード tok/s を継続的に記録。
 
 ---
 
@@ -310,12 +310,12 @@ yakusel bench   --model ...                                         # プリフ�
 
 | フェーズ | 状態 | メモ |
 |---|---|---|
-| M0 | 完了 | `yakusel-tokenizer`: ゴールデン 1,814 件 (2026-11-10 にモデルカード由来の行を除き、パブリックドメイン作品の抜粋 `tests/golden/corpus/` に置き換えて 1,696 件) の encode/decode、プロンプトテンプレート 14 件 (エラー系含む)、ストリーミングデコードが Python と完全一致。`(.)\2{3,}` の後方参照と Python の `\s` 定義は手書きで再現 |
-| M1 | 完了 | `yakusel-model` (Backend トレイト、forward、greedy 生成)、`yakusel-backend-cpu`。HF (f32) と最終 logits の最大誤差 3e-5、greedy 48 トークンが 3 ケースとも一致 |
+| M0 | 完了 | `yaxus-tokenizer`: ゴールデン 1,814 件 (2026-11-10 にモデルカード由来の行を除き、パブリックドメイン作品の抜粋 `tests/golden/corpus/` に置き換えて 1,696 件) の encode/decode、プロンプトテンプレート 14 件 (エラー系含む)、ストリーミングデコードが Python と完全一致。`(.)\2{3,}` の後方参照と Python の `\s` 定義は手書きで再現 |
+| M1 | 完了 | `yaxus-model` (Backend トレイト、forward、greedy 生成)、`yaxus-backend-cpu`。HF (f32) と最終 logits の最大誤差 3e-5、greedy 48 トークンが 3 ケースとも一致 |
 | 高速化 1 | 完了 | rayon を物理コア数 (8) で起動 (`RAYON_NUM_THREADS` で上書き可)、`.cargo/config.toml` で `target-cpu=native`、T<4 では bf16/Q8 を一時バッファなしで直接内積 |
 | 高速化 2 (Q8) | 完了 | ロード時量子化 (32 要素ブロック、f16 スケール = max\|w\|/127)。行列 + `lm_head` が対象、埋め込みと norm は bf16 のまま。重み 5.76→3.32 GB、ロード時の変換 約 0.65 s。CLI の既定を q8 に変更 (`--quant bf16` で無損失) |
-| M3 | 完了 | `yakusel-api` (共有の型)、`yakusel-server` (axum + axum-server/rustls(ring))、`web/index.html`、`yakusel client`。下記「M3 の実装メモ」参照。M2 より先に実施 |
-| M2 | 完了 | `yakusel-backend-wgpu`。下記「M2 の実装メモ」参照 |
+| M3 | 完了 | `yaxus-api` (共有の型)、`yaxus-server` (axum + axum-server/rustls(ring))、`web/index.html`、`yaxus client`。下記「M3 の実装メモ」参照。M2 より先に実施 |
+| M2 | 完了 | `yaxus-backend-wgpu`。下記「M2 の実装メモ」参照 |
 | v2 エンジン | 計画済み | 行ベースのエンジンへの作り直し (KV 再利用、投機の 1 投入化、同時処理、document API)。第 11 章 |
 | 投機的デコード | 完了 | 0.8B を下書きに使う greedy 投機的デコード。下記 8.4 参照。GPU で 22.5 → 30.4 tok/s、出力は完全一致 |
 | プリフィルの f16 化 | 完了 | wgpu 30 の cooperative matrix (RDNA3 の WMMA) で f16 入力・f32 累積の GEMM。下記 8.6 参照。512 トークンで 209 → **392 tok/s** |
@@ -339,30 +339,30 @@ CPU 実装の 2B 実測 (32 トークンの英文 → 日本語、18 トーク�
 python tests/golden/gen_tokenizer.py $MODEL_DIR > tests/golden/tokenizer.jsonl
 python tests/golden/gen_logits.py   $MODEL_DIR > tests/golden/logits_2b.jsonl
 cargo test --release                         # トークナイザ
-cargo test --release -p yakusel-backend-cpu -- --ignored   # モデル (2B ロードあり)
+cargo test --release -p yaxus-backend-cpu -- --ignored   # モデル (2B ロードあり)
 ```
 
 ### 8.2 M3 の実装メモ
 
-- **バックエンドは当面 CPU (Q8)**。`yakusel serve` は推論スレッド 1 本 + tokio (2 スレッド)。キューは `--queue` (既定 16) 件まで待たせ、超えたら 429。
-- **TLS**: §4.1 の「自己署名証明書」は「ローカル CA + サーバ証明書」に変更した。初回起動時に `~/.config/yakusel/ca.pem` (CA) を作り、それで署名したサーバ証明書を発行する。SAN は localhost / 127.0.0.1 / ::1 / ホスト名 / `ホスト名.local` / 主 IP + `--san` で追加したもの。SAN が変わればサーバ証明書だけ再発行するので、クライアントが信頼する `ca.pem` は変わらない。秘密鍵とトークンは 0600。
-- **トークン**: `--token` / `YAKUSEL_TOKEN`、未指定なら初回に 192 bit の乱数を生成し `~/.config/yakusel/token` に保存 (以降の起動ではパスだけ表示)。比較は定数時間。
+- **バックエンドは当面 CPU (Q8)**。`yaxus serve` は推論スレッド 1 本 + tokio (2 スレッド)。キューは `--queue` (既定 16) 件まで待たせ、超えたら 429。
+- **TLS**: §4.1 の「自己署名証明書」は「ローカル CA + サーバ証明書」に変更した。初回起動時に `~/.config/yaxus/ca.pem` (CA) を作り、それで署名したサーバ証明書を発行する。SAN は localhost / 127.0.0.1 / ::1 / ホスト名 / `ホスト名.local` / 主 IP + `--san` で追加したもの。SAN が変わればサーバ証明書だけ再発行するので、クライアントが信頼する `ca.pem` は変わらない。秘密鍵とトークンは 0600。
+- **トークン**: `--token` / `YAXUS_TOKEN`、未指定なら初回に 192 bit の乱数を生成し `~/.config/yaxus/token` に保存 (以降の起動ではパスだけ表示)。比較は定数時間。
 - **認証が必要なのは `POST /v1/translate` のみ**。`/`、`/healthz` (モデル名・キュー長)、`/v1/languages` は認証なし。
 - `Usage` に `prefill_ms` (最初のトークンまで) と `queue_ms` (待ち時間) を追加。SSE はクライアント切断を検知して生成を打ち切る。未知の JSON フィールドは 400。
 - 長文分割 (§10 の保留事項) は **段落 (空行区切り) 単位** に決定。CLI client と Web UI の両方で、直前 2 段落の原文/訳文を `history` として渡す。
-- `yakusel-cli` の `server` feature (既定で有効) を外す (`--no-default-features`) と、client だけのバイナリになる (GPU/モデル依存なし)。
+- `yaxus-cli` の `server` feature (既定で有効) を外す (`--no-default-features`) と、client だけのバイナリになる (GPU/モデル依存なし)。
 
 使い方:
 
 ```
 # サーバ (初回はトークンと CA を生成して表示)
-yakusel serve                              # 0.0.0.0:8443, 2B, Q8
-yakusel serve --san myhost.example.lan     # 証明書に名前を追加
+yaxus serve                              # 0.0.0.0:8443, 2B, Q8
+yaxus serve --san myhost.example.lan     # 証明書に名前を追加
 
-# 別マシン: サーバの ~/.config/yakusel/ca.pem をコピーしておく
-export YAKUSEL_SERVER=https://myhost.local:8443 YAKUSEL_TOKEN=... YAKUSEL_CA=~/yakusel-ca.pem
-yakusel client --to en < doc.txt
-yakusel client --to ja --form polite -g "owner=オーナー" "The owner approved it."
+# 別マシン: サーバの ~/.config/yaxus/ca.pem をコピーしておく
+export YAXUS_SERVER=https://myhost.local:8443 YAXUS_TOKEN=... YAXUS_CA=~/yaxus-ca.pem
+yaxus client --to en < doc.txt
+yaxus client --to ja --form polite -g "owner=オーナー" "The owner approved it."
 
 # ブラウザ: https://<host>:8443/ を開き、トークンを入力 (ca.pem を取り込めば警告なし)
 ```
@@ -374,10 +374,10 @@ yakusel client --to ja --form polite -g "owner=オーナー" "The owner approved
 - 行列積: T=1 は `gemv1` (8 行/WG、1 行 32 レーン、16 バイト単位の読み込み)、T≤8 は `gemv8`、それより大きいプリフィルは 64×64 タイルの `gemm`。
 - **APU では計算ジョブも gfx リングで動き、1 ジョブが約 2 秒を超えるとカーネルが GPU をリセットする** (448 トークンのプリフィルを 1 回で投入して発生)。行列積の FLOP を積算し、32 GFLOP (780M で約 40 ms) ごとに投入を分ける。デスクトップのカクつき防止も兼ねる。
 - `--backend auto` (既定) は Vulkan の GPU があれば使い、無ければ CPU。llvmpipe などソフトウェア実装のアダプタは選ばない。
-- CPU との比較 (`cargo test --release -p yakusel-backend-wgpu -- --ignored`): Q8/bf16 とも全語彙の logits 差 ≤ 5e-5、greedy 完全一致、600 トークン (2 チャンク) でも 8e-5。7 言語 18 文の訳が CPU と完全一致。
-- `YAKUSEL_PROFILE=1` で命令記録時間と GPU 待ち時間を表示。デコード 1 トークンは記録 約 1 ms、GPU 約 42 ms (GPU 律速)。
+- CPU との比較 (`cargo test --release -p yaxus-backend-wgpu -- --ignored`): Q8/bf16 とも全語彙の logits 差 ≤ 5e-5、greedy 完全一致、600 トークン (2 チャンク) でも 8e-5。7 言語 18 文の訳が CPU と完全一致。
+- `YAXUS_PROFILE=1` で命令記録時間と GPU 待ち時間を表示。デコード 1 トークンは記録 約 1 ms、GPU 約 42 ms (GPU 律速)。
 
-`yakusel bench` (2B、Q8、32 トークン生成、ベスト値):
+`yaxus bench` (2B、Q8、32 トークン生成、ベスト値):
 
 | プロンプト長 | CPU プリフィル | Vulkan プリフィル | CPU デコード | Vulkan デコード |
 |---|---|---|---|---|
@@ -390,9 +390,9 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 8.4 投機的デコード
 
-- `yakusel-model::speculative`。0.8B (トークナイザ・テンプレートは 2B と完全一致を確認済み) が k トークンを greedy に下書きし、2B が「直前の確定トークン + 下書き k 個」を 1 回の forward で検証して、各位置の argmax と一致する最長の接頭辞を採用し、最初の不一致位置では 2B の予測を採用する。greedy なので **出力は 2B 単体と完全に同一**。
+- `yaxus-model::speculative`。0.8B (トークナイザ・テンプレートは 2B と完全一致を確認済み) が k トークンを greedy に下書きし、2B が「直前の確定トークン + 下書き k 個」を 1 回の forward で検証して、各位置の argmax と一致する最長の接頭辞を採用し、最初の不一致位置では 2B の予測を採用する。greedy なので **出力は 2B 単体と完全に同一**。
 - KV キャッシュは `Session::rewind` で位置を戻すだけ (attention はクエリ位置より後ろのキーを読まないので、捨てたエントリは後で上書きされる)。
-- 検証用に T=2..8 行専用の `gemvm{T}` カーネルを追加: K を 512 ずつ区切って全行の活性値をワークグループメモリに置き、8 レーングループ × 2 行で共有、レーン間の和は subgroup shuffle。これで T=5 の forward が 66 → 48 ms (T=1 は 42 ms)。最初の版は活性値をレジスタに抱えて遅く (40〜51 GB/s)、K=10240 の `down_proj` は活性値が L1 に収まらず 35 GB/s だった。`YAKUSEL_PROFILE=2` (タイムスタンプクエリ) で行列の形ごとの時間と帯域を出して特定した。
+- 検証用に T=2..8 行専用の `gemvm{T}` カーネルを追加: K を 512 ずつ区切って全行の活性値をワークグループメモリに置き、8 レーングループ × 2 行で共有、レーン間の和は subgroup shuffle。これで T=5 の forward が 66 → 48 ms (T=1 は 42 ms)。最初の版は活性値をレジスタに抱えて遅く (40〜51 GB/s)、K=10240 の `down_proj` は活性値が L1 に収まらず 35 GB/s だった。`YAXUS_PROFILE=2` (タイムスタンプクエリ) で行列の形ごとの時間と帯域を出して特定した。
 - CLI/サーバの既定は `--draft auto` (0.8B が HF キャッシュにあれば使う)、`--draft-k 5`、`--draft none` で無効。CPU バックエンドでは自動的に無効 (CPU の行列積は複数行をまとめても得をせず、18.5 → 14.6 tok/s と遅くなるため)。
 - 7 言語 18 文 + 長文 1 (計 19 件) の実測 (2B Q8、780M):
 
@@ -409,7 +409,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 8.5 下書き側 (と全体) の高速化
 
-`YAKUSEL_PROFILE=2` で 0.8B の 1 トークン (約 16 ms) を分解すると、カーネル合計 11.2 ms に対して **ディスパッチ間の空き 約 4.4 ms + CPU での記録 0.8 ms** が無駄だった (213 ディスパッチ、各 約 20 µs)。行列積自体は 55〜83 GB/s で帯域上限に近い。
+`YAXUS_PROFILE=2` で 0.8B の 1 トークン (約 16 ms) を分解すると、カーネル合計 11.2 ms に対して **ディスパッチ間の空き 約 4.4 ms + CPU での記録 0.8 ms** が無駄だった (213 ディスパッチ、各 約 20 µs)。行列積自体は 55〜83 GB/s で帯域上限に近い。
 
 | 変更 | 0.8B デコード | 2B デコード |
 |---|---|---|
@@ -531,7 +531,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 - **KV アリーナ (ページ方式)**: 層ごとに K と V のバッファを 1 つずつ持ち、128 トークン単位のページに分ける。スロットはページ表 (最大 64 エントリ = 8192 トークン) を持ち、キーのアドレスは `ページ表[位置 / 128] * 128 + 位置 % 128`。リングバッファは廃止し、位置は絶対位置のみ。
   - 既定のアリーナは 16384 トークン分 (2B: 12.6 MB/ページ × 128 = 1.6 GB、0.8B: 2.1 MB/ページ × 128 = 0.27 GB)。`--kv-tokens` で変更。KV は f32 のまま (f16 化は後の選択肢)。
   - attention はページ単位で回す (128 キー/ページが現行カーネルの 1 ステップと一致)。
-- **Backend トレイト**: 演算単位の構成は維持しつつ、`attention(qkv, rows, arena)`、`embed(ids)`、`argmax_rows -> Ids::Device`、`read_ids` (同期点) に改める。ページの割り当て・参照カウント・ページ表は `yakusel-model` 側 (CPU) で管理し、バックエンドは保存領域とページコピーだけを提供する。CPU バックエンドも同じインタフェースを実装して参照実装であり続ける (速度は問わない)。
+- **Backend トレイト**: 演算単位の構成は維持しつつ、`attention(qkv, rows, arena)`、`embed(ids)`、`argmax_rows -> Ids::Device`、`read_ids` (同期点) に改める。ページの割り当て・参照カウント・ページ表は `yaxus-model` 側 (CPU) で管理し、バックエンドは保存領域とページコピーだけを提供する。CPU バックエンドも同じインタフェースを実装して参照実装であり続ける (速度は問わない)。
 
 ### 11.5 プレフィックスの KV 再利用
 
@@ -566,7 +566,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 - `POST /v1/translate`: 1 セグメント。項目は現行と同じ。`history` の件数制限なし。同時に複数投げれば自動的に同じパスで処理される。
 - `POST /v1/translate/document` (新設): `segments: [..]` と共通オプション、`chains` (既定は自動) を受け取り、SSE で `{"i": 段落番号, "delta": ".."}` を流す。サーバ側で文書を **チェーン** に分ける: チェーン内は履歴つきの逐次 (11.5 の再利用が効く)、チェーン同士は並列。チェーン数は `min(8, 段落数 / 4)` を初期値にする。
 - 履歴の扱いは評価してから決める (11.11 の検討事項)。チェーン方式なら履歴を捨てるのはチェーンの境目だけで済む。
-- CLI: `yakusel client` と `translate` は複数段落の入力で document 経路を使う。`--chains 1` で従来どおりの完全な逐次。`yakusel bench` に `rows` (行数スケーリング)、`doc` (文書シナリオ)、`streams N` (並列) を追加。
+- CLI: `yaxus client` と `translate` は複数段落の入力で document 経路を使う。`--chains 1` で従来どおりの完全な逐次。`yaxus bench` に `rows` (行数スケーリング)、`doc` (文書シナリオ)、`streams N` (並列) を追加。
 - Web UI: 複数段落は document 経路で、段落ごとに並行して埋まっていく表示にする。
 
 ### 11.9 精度と再現性の方針
@@ -602,7 +602,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.13 P0 の結果 (基準値、2026-11-10)
 
-計測は `yakusel bench rows|decode|set|doc` で行う (`set` は `tests/bench/sentences.tsv` の 19 件、`doc` はモデル同梱の `README_ja.md` から散文 14 段落を実行時に抽出)。
+計測は `yaxus bench rows|decode|set|doc` で行う (`set` は `tests/bench/sentences.tsv` の 19 件、`doc` はモデル同梱の `README_ja.md` から散文 14 段落を実行時に抽出)。
 
 - `bench rows --draft none`: 1 行 37.0 ms、8 行 46.1 ms、9 行 139.4 ms、64 行 153.6 ms、256 行 598.5 ms (11.1 の表を再現)。
 - `bench set`: 再現性設定 (`--draft none --prefill-precision f32`) 25.5 tok/s、既定 48.3 tok/s・平均プリフィル 174 ms。両者の訳文は 19 件とも同一。参照として `tests/bench/ref_f32.txt` と `ref_default.txt` を保存 (以降の段階は `bench set --compare` で確認する)。
@@ -611,7 +611,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.14 P1 の結果 (エンジン中核)
 
-- `yakusel-model`: `Session` を廃止し、モデルが KV アリーナ (128 トークンのページ、参照カウント付きページプール) と系列 (`SeqId`: ページ表と長さ) を管理する。`forward(&[(SeqId, &[u32])], all_rows)` が複数系列の行を 1 パスで処理する (行メタデータ `PassMeta`: トークン、位置、KV スロット、ページ表オフセット)。`prefill`、`truncate` (投機の巻き戻し)、`fork` (P2 用、共有ページ + 末尾ページのコピー)、コピーオンライト (`reserve`) を用意。既定のアリーナは 16384 トークン (`YAKUSEL_KV_TOKENS` で変更)、最大位置 8192。
+- `yaxus-model`: `Session` を廃止し、モデルが KV アリーナ (128 トークンのページ、参照カウント付きページプール) と系列 (`SeqId`: ページ表と長さ) を管理する。`forward(&[(SeqId, &[u32])], all_rows)` が複数系列の行を 1 パスで処理する (行メタデータ `PassMeta`: トークン、位置、KV スロット、ページ表オフセット)。`prefill`、`truncate` (投機の巻き戻し)、`fork` (P2 用、共有ページ + 末尾ページのコピー)、コピーオンライト (`reserve`) を用意。既定のアリーナは 16384 トークン (`YAXUS_KV_TOKENS` で変更)、最大位置 8192。
 - Backend トレイト: `Cache`/`new_cache`/`last_row` を廃止し、`Kv`/`new_kv`/`copy_page`/`begin_pass`/`select_rows`/`reserve_activations` を追加。`embed` と `attention` はパスのメタデータを読む。CPU バックエンドも同じ形に移行 (HF との誤差は従来と完全に同じ)。
 - wgpu: コンテキスト `Gpu` を `Arc<Mutex<..>>` で共有するハンドル `WgpuBackend` (`share()`) に分け、本体と下書きが 1 つのデバイス・1 つのエンコーダを使う。埋め込み表は GPU (bf16)。行メタデータは一時バッファからのエンコーダ内コピーで転送し、記録済みの命令との順序を保つ (宛先が固定なのでバインドグループのキャッシュも効く)。`qk_rope` は行ごとの位置と KV スロット、`attention` はページ表を引く (キーのスロットは 1 ステップに 1 回だけ計算して共有メモリに置く)。
 - **落とし穴**: 移行直後、512 トークンのプリフィルが 7% 遅くなった。カーネル時間を比べると `down_proj` の行列演算ユニット GEMM だけが +18% (K=10240 で活性値を 40 KB 間隔の 64 行から読むので、バッファがどのメモリに置かれたかに敏感)。KV アリーナや埋め込み表の大きさ・確保順は無関係で、**活性値のバッファを重みより先に確保すると解消** した (専用領域に載るためと見られる)。`reserve_activations` でモデル読み込みの最初に 512 行分のバッファをプールに作っておく。down_proj は 7.6 ms (旧 7.7 ms)。
@@ -621,7 +621,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 - `Model::start(prompt)` / `finish(seq)`: 終わった系列を消費トークン列ごと LRU で保持し (最大 32 系列、ページ不足時は古い順に解放)、新しいプロンプトとの最長共通接頭辞が 16 トークン以上ならフォークして残りだけを処理する。投機的デコードは本体・下書きとも同じ仕組みを使い、下書きの `start` は最初のトークンを出した後に回す (出始めを遅らせない)。`--no-kv-cache` で無効、`--kv-tokens` でアリーナの大きさ。
 - WebGPU は同一バッファ内のコピーを禁止しているので、ページのコピーは 1 ページ分の作業バッファを経由する。
-- **履歴の方式を変えた**: 直前 N 組の窓をずらすと毎回プロンプトの先頭が変わって再利用できない (直前 2 組で再利用率 17%)。クライアント側の `HistoryWindow` (`yakusel-api`、CLI、Web UI で同じ規則) は開始位置を固定し、上限 (既定 4000 文字、`--history-chars`) を超えたときだけ、上限の 1/4 に収まる最新の組に切り詰める。切り詰めのたびに残した分を再計算するが、平均すると 1 段落あたり約 1/3 組分で済む (「古い半分を落とす」だと上限によらず 1 組分になり、上限 2000 文字では 14 段落中 4 回の全再計算が起きた)。
+- **履歴の方式を変えた**: 直前 N 組の窓をずらすと毎回プロンプトの先頭が変わって再利用できない (直前 2 組で再利用率 17%)。クライアント側の `HistoryWindow` (`yaxus-api`、CLI、Web UI で同じ規則) は開始位置を固定し、上限 (既定 4000 文字、`--history-chars`) を超えたときだけ、上限の 1/4 に収まる最新の組に切り詰める。切り詰めのたびに残した分を再計算するが、平均すると 1 段落あたり約 1/3 組分で済む (「古い半分を落とす」だと上限によらず 1 組分になり、上限 2000 文字では 14 段落中 4 回の全再計算が起きた)。
 - 文書シナリオ (14 段落、ja→en):
 
 | 構成 | 通し | 2 段落目以降の出始め | 再利用率 |
@@ -657,7 +657,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.17 P4 の結果 (スケジューラと同時処理)
 
-- `yakusel-model::engine`: `Engine` が複数のリクエストを `step()` ごとに 1 パスずつ進める。
+- `yaxus-model::engine`: `Engine` が複数のリクエストを `step()` ごとに 1 パスずつ進める。
   - プリフィル: 待っているリクエストのプロンプトを古い順にまとめて 1 パスで処理する (上限は、空いていれば 512 行、デコード中なら 64 行で、デコードと交互)。
   - デコード: デコード中のリクエストを 1 パス最大 8 本 (総当たり) で 1 トークンずつ進める。
   - 投機的デコード: デコード中が 1 本以下なら、その 1 本を投機ラウンドで進める。下書きは本体の消費済みトークン列から追いつくので、途中で投機と通常のデコードを行き来できる。
@@ -678,7 +678,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.18 P5 の結果 (文書 API と履歴の扱いの評価)
 
-- `yakusel-server::document`: `DocJob` が文書を連続する段落の **チェーン** に分ける (既定はチェーン数 = 段落数 / 4、最大 8)。チェーン内は前の段落を履歴にして順に訳し (`HistoryWindow`、4000 文字)、チェーン同士はエンジン上で並列に流す。空の段落は空の訳で完了し、履歴にも入れない。`run_document` (ローカル用ドライバ) とサーバのワーカー (段落リクエストが終わるたびに同じチェーンの次の段落を投入) が同じ `DocJob` を使う。
+- `yaxus-server::document`: `DocJob` が文書を連続する段落の **チェーン** に分ける (既定はチェーン数 = 段落数 / 4、最大 8)。チェーン内は前の段落を履歴にして順に訳し (`HistoryWindow`、4000 文字)、チェーン同士はエンジン上で並列に流す。空の段落は空の訳で完了し、履歴にも入れない。`run_document` (ローカル用ドライバ) とサーバのワーカー (段落リクエストが終わるたびに同じチェーンの次の段落を投入) が同じ `DocJob` を使う。
 - API: `POST /v1/translate/document` (`segments`、共通オプション、`chains`、`history_chars`、`neighbor_context`、`stream`)。SSE は `{"segment": i, "delta": ..}`、`{"segment": i, "end": true}`、最後に `{"done": true, "usage": {...}}`。各段落は受付時にテンプレートで検証し、不正なら 400。
 - CLI: `translate` と `client` は入力の段落数によらず文書経路を使い (`--chains`、`--history-chars`、`--neighbor-context`)、並列に届く段落を順番どおりに表示する (先頭の未完了段落だけ逐次表示し、後続はバッファ)。クライアントの出力はローカルで同じチェーン数を指定した場合と一致。Web UI も文書 API に切り替え、複数の段落が同時に埋まっていく。
 - **履歴の扱いの評価** (逐次 (a) との比較、技術文 = モデルカード 14 段落 / 『羅生門』29 段落):
@@ -711,7 +711,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 - **応答キャッシュ** (`Engine`): 終わったリクエストの出力を、プロンプトと停止トークンをキーに LRU で 256 件保持する。同じリクエストはパスを一切回さずに即答する。`max_new_tokens` で途中まで切った出力は、より大きい上限の要求には使わない。`--no-kv-cache` または `--no-response-cache` で無効になる。
 - **ヒント** (`Request.hint`): 「出力に現れそうなトークン列」を受け取る。直近の出力の末尾 3, 2, 1 トークンが一致するヒント上の位置 (1 トークン一致は想定位置の近くに限る) から、続く最大 7 トークンを下書きと同じように 1 パスで検証する。下書きモデルは動かさない。ヒントの末尾には、直前に止まったリクエストの停止トークンを足す。こうすると出力の終わりもヒントで検証でき、下書きモデルの追いつき (プロンプト全体のプリフィル、約 200 ms) が要らない。出力がヒントから外れたら、4 回までは 1 行のデコードでヒントへの再合流を待ち、それでも合流しなければ下書きモデルに切り替える (この切り替えで 8.50 → 8.01 s)。下書きモデルがなくてもヒントは使える。
-- **翻訳メモリ** (`yakusel-server::memory`): 原文・対象言語・原文の言語・文体をキーに、前回の出力トークンを 4096 件保持する (履歴、context、用語集はキーに含めない)。サーバのワーカーと `run_document` が、各リクエストのヒントとして渡す。前の段落を直すと後続段落のプロンプト (履歴) が変わって応答キャッシュには当たらないが、翻訳メモリのヒントがほぼそのまま当たる。
+- **翻訳メモリ** (`yaxus-server::memory`): 原文・対象言語・原文の言語・文体をキーに、前回の出力トークンを 4096 件保持する (履歴、context、用語集はキーに含めない)。サーバのワーカーと `run_document` が、各リクエストのヒントとして渡す。前の段落を直すと後続段落のプロンプト (履歴) が変わって応答キャッシュには当たらないが、翻訳メモリのヒントがほぼそのまま当たる。
 - `bench doc --edit N`: 同じエンジンで文書を訳したあと、段落 N の最後の文を削って再び訳す。
 
 | 再翻訳の例 | 1 回目 | 2 回目 | 内訳 |
@@ -768,7 +768,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 ### 11.22 8B 対応 (旧 M4)
 
 - 8B (`pfnet/plamo-3-translate-8b`: hidden 4096、32 層、クエリヘッド 32 / KV ヘッド 4、intermediate 16384) は、アーキテクチャ・トークナイザ・参照実装とも 2B と同じで、コードの変更なしで動いた。`--model 8b` (`0.8b`/`2b`/`8b`/`31b` の短縮名) で指定できる。
-- 正しさ: HF の f32 参照で `tests/golden/logits_8b.jsonl` を作り (`YAKUSEL_MODEL_DIR` と `YAKUSEL_GOLDEN` で既存テストを 8B に向けられる)、CPU の bf16 が上位 20 logits で 3e-5 以内、greedy 完全一致。GPU の bf16 も greedy が一致した。Q8 の CPU は 3 件中 2 件が途中から言い回しの違う正しい訳になった (「お願いします」と「お願いいたします」、「会」と「将」)。19 件セットでは Q8 + 下書きが 19/19、bf16 と同一。
+- 正しさ: HF の f32 参照で `tests/golden/logits_8b.jsonl` を作り (`YAXUS_MODEL_DIR` と `YAXUS_GOLDEN` で既存テストを 8B に向けられる)、CPU の bf16 が上位 20 logits で 3e-5 以内、greedy 完全一致。GPU の bf16 も greedy が一致した。Q8 の CPU は 3 件中 2 件が途中から言い回しの違う正しい訳になった (「お願いします」と「お願いいたします」、「会」と「将」)。19 件セットでは Q8 + 下書きが 19/19、bf16 と同一。
 - 直した問題:
   - **読み込み中のメモリ**: `create_buffer_init` の一時バッファは次の送信まで解放されず、読み込み中に重みの 2 倍のメモリを使っていた。8B の bf16 (17 GB) が TTM の上限 (30.3 GiB) を超えて「Not enough memory for command submission」で落ちていた。512 MB ごとに送信して待つようにして解消し、読み込みも 11 → 7 秒に縮んだ。
   - **量子化スケールの配置**: 8B の `down_proj` (K = 16384) は 1 行のスケールが 512 個 (1024 バイト、2 の累乗) になる。行列演算ユニットの GEMM のタイルの 64 行が衝突するアドレスからスケールを読み、Q8/Q4 だけが bf16 の 1.7〜2.8 倍遅かった。重みの行に詰め物を入れても改善せず、スケールの行に 8 個 (16 バイト) 詰め物を入れたら直った (ブロック数が 256 の倍数の行だけ、`pad_scales` / `sstride`)。4096×16384 で、40 行は 12.3 → 5.5 ms、512 行は 61.7 → 37.5 ms。8B の 19 件セットの平均プリフィルは 827 → 594 ms。
@@ -788,10 +788,10 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 ### 11.23 Ollama との比較
 
 - Ollama 0.30.8 (インストール済み) は PLaMo 3 のトークナイザに未対応だった。そこで v0.40.16 を別ポートで動かし (`OLLAMA_VULKAN=1 OLLAMA_IGPU_ENABLE=1 OLLAMA_FLASH_ATTENTION=1 OLLAMA_NUM_PARALLEL=8`、KV は f16)、公式 GGUF の Q4_K_M を使った。GPU (Vulkan) で動いていることを `ollama ps` で確認した。
-- 計測は `tests/bench/compare/compare.py`。両方に同じ方法で送る (Ollama には HF のチャットテンプレートで作った PFML3 プロンプトを `raw` で、yakusel には `/v1/translate`)。文書はクライアント側で、yakusel と同じチェーン分割と `HistoryWindow` を使う。yakusel は `--no-response-cache`。greedy、最大 256 トークン。
+- 計測は `tests/bench/compare/compare.py`。両方に同じ方法で送る (Ollama には HF のチャットテンプレートで作った PFML3 プロンプトを `raw` で、yaxus には `/v1/translate`)。文書はクライアント側で、yaxus と同じチェーン分割と `HistoryWindow` を使う。yaxus は `--no-response-cache`。greedy、最大 256 トークン。
 - 時間 (秒、少ないほど速い):
 
-| 測定 | 2B: yakusel Q8 | 2B: yakusel Q4 | 2B: Ollama Q4_K_M | 8B: yakusel Q8 | 8B: yakusel Q4 | 8B: Ollama Q4_K_M |
+| 測定 | 2B: yaxus Q8 | 2B: yaxus Q4 | 2B: Ollama Q4_K_M | 8B: yaxus Q8 | 8B: yaxus Q4 | 8B: Ollama Q4_K_M |
 |---|---|---|---|---|---|---|
 | 文セット 19 件 | 9.74 | **8.82** | 9.91 | 25.5 | **25.2** | 28.5 |
 | 文書 14 段落 (逐次) | 49.1 | 45.2 | **39.9** | 110.7 | **100.8** | 113.2 |
@@ -799,9 +799,9 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 | 同時 8 件 | 2.24 | **1.95** | 2.82 | **7.04** | 7.14 | 7.91 |
 | 同時 16 件 | 2.70 | **2.30** | 4.01 | 8.36 | **7.56** | 10.79 |
 
-- 訳の品質 (同じ yakusel の bf16・下書きなしの出力を基準に、完全一致の数 / 平均類似度):
+- 訳の品質 (同じ yaxus の bf16・下書きなしの出力を基準に、完全一致の数 / 平均類似度):
 
-| 測定 | yakusel Q8 | yakusel Q4 | Ollama Q4_K_M |
+| 測定 | yaxus Q8 | yaxus Q4 | Ollama Q4_K_M |
 |---|---|---|---|
 | 2B 文セット | 18/19, 1.000 | 14/19, 0.966 | 15/19, 0.972 |
 | 2B 文書 14 段落 | 6/14, 0.975 | 1/14, 0.890 | 1/14, 0.929 |
@@ -810,12 +810,12 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
   文書は前の段落の訳を履歴に使うので、1 か所の違いが後の段落に広がる。
 - 分かったこと:
-  - 1 本のデコード速度は同等。2B の Q4 で、yakusel は下書きなし 40〜44 tok/s、Ollama は 44〜47 tok/s。
-  - yakusel が速いのは、同時リクエスト (16 件で 1.4〜1.7 倍) と、下書きがよく当たる短文。
+  - 1 本のデコード速度は同等。2B の Q4 で、yaxus は下書きなし 40〜44 tok/s、Ollama は 44〜47 tok/s。
+  - yaxus が速いのは、同時リクエスト (16 件で 1.4〜1.7 倍) と、下書きがよく当たる短文。
   - Ollama が速いのは、逐次の文学的な文書 (2B) と、プリフィルの多い 8B の 8 チェーン文書。
     - 前者: 下書きの採用率が低く (約 47%)、Q4 本体では投機がかえって損になっていた (下書きありで 38.9 tok/s、下書きなしで 40.3)。
-    - 後者: 平均プリフィルが yakusel 3.7 s、Ollama 2.3 s で、llama.cpp の行列演算 (8B、Q4_K_M) が速い。
-  - 品質は Q8 が bf16 に最も近い。4 ビット同士では、Q4_K_M (6 ビットの部分を含む k-quant) のほうが yakusel の Q4 (Q4_0 相当) より bf16 に近い。
+    - 後者: 平均プリフィルが yaxus 3.7 s、Ollama 2.3 s で、llama.cpp の行列演算 (8B、Q4_K_M) が速い。
+  - 品質は Q8 が bf16 に最も近い。4 ビット同士では、Q4_K_M (6 ビットの部分を含む k-quant) のほうが yaxus の Q4 (Q4_0 相当) より bf16 に近い。
 - 改善の候補:
   1. 投機の自動調整 (採用率が低いときは下書きを止める、k を変える)。
   2. 8B のプリフィル GEMM の高速化。
@@ -825,7 +825,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 - `--model` に GGUF ファイルのパス、`REPO:QUANT` (例 `pfnet/plamo-3-translate-2b-GGUF:Q4_K_M`)、`SIZE:QUANT` (例 `2b:Q4_K_M`) を指定できる。GGUF リポジトリを量子化を付けずに指定すると、選べるファイルの一覧をエラーで示す。設定 (`plamo3.*` メタデータ) とトークナイザ (`tokenizer.ggml.*`) は GGUF から作るので、HF のディレクトリは要らない。
 - 実装:
-  - `yakusel-model::gguf` (ヘッダとメタデータの読み取り、llama.cpp の名前から HF の名前への対応) と `yakusel-model::ggml` (CPU での展開、GPU 向けの並べ替え)。
+  - `yaxus-model::gguf` (ヘッダとメタデータの読み取り、llama.cpp の名前から HF の名前への対応) と `yaxus-model::ggml` (CPU での展開、GPU 向けの並べ替え)。
   - `TensorRef` が型 (`GgmlType`) を持ち、どの型でも bf16/f32 に展開できる。
 - llama.cpp の変換器は、RMSNorm の重みにオフセット (1.0、0.2、0.0894) を足して保存している。`blk.0.attn_norm` の平均が 0.5 を超えるときは足されているとみなし、読み込み時に引き戻す。gate/up は `ffn_up` に結合された順番のまま、qkv も並べ替えなしだった (いずれも safetensors との比較で確認)。
 - `--quant auto` (新しい既定):
@@ -846,10 +846,10 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 | 構成 | 2B | 8B |
 |---|---|---|
-| yakusel、GGUF Q4_K_M | **16/19** | 17/19 |
+| yaxus、GGUF Q4_K_M | **16/19** | 17/19 |
 | Ollama、同じ GGUF | 15/19 | 18/19 |
-| yakusel、独自の Q4 | 14/19 | 13/19 |
-| デコード (yakusel GGUF、下書きなし / 0.8B 下書き) | 33.5 / 54.4 tok/s | 11.3 / 26.5 tok/s |
+| yaxus、独自の Q4 | 14/19 | 13/19 |
+| デコード (yaxus GGUF、下書きなし / 0.8B 下書き) | 33.5 / 54.4 tok/s | 11.3 / 26.5 tok/s |
 
   同じ重みでも Ollama とは 2B で 4 件、8B で 2 件の訳が違う (llama.cpp は活性値を量子化して内積を取る経路を使うため、と考えられる)。
 - 最初の版は Q4_K を Q4M (0.625 バイト/重み)、Q6_K を Q8B16 (1.125 バイト/重み) に広げて持っていたので、読み出し量がファイルより約 2 割多かった。11.25 でファイルと同じビット数の形式に置き換えた。
@@ -881,7 +881,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 ### 11.26 行列積以外の時間の削減
 
-- 計り直し: 11.25 で「行列積以外が 1 トークンあたり約 6 ms」と書いたのは誤りだった。タイムスタンプ付きのプロファイル (`YAKUSEL_PROFILE=2`) はそれ自体で 2 割近く遅くなり、その実行時間から引き算していた。プロファイルなしの実行時間とカーネル時間の合計を比べると、2B GGUF の文脈 32 で行列積以外は約 2 ms (1 トークン 24.6 ms のうち)。ディスパッチ間の空きはほぼ無かった。ホストが次のパスを記録する約 0.35 ms (と読み戻しの待ち) の間は GPU が止まる。
+- 計り直し: 11.25 で「行列積以外が 1 トークンあたり約 6 ms」と書いたのは誤りだった。タイムスタンプ付きのプロファイル (`YAXUS_PROFILE=2`) はそれ自体で 2 割近く遅くなり、その実行時間から引き算していた。プロファイルなしの実行時間とカーネル時間の合計を比べると、2B GGUF の文脈 32 で行列積以外は約 2 ms (1 トークン 24.6 ms のうち)。ディスパッチ間の空きはほぼ無かった。ホストが次のパスを記録する約 0.35 ms (と読み戻しの待ち) の間は GPU が止まる。
 - 文脈が長いと、デコードの attention が増える (文脈 1024 で 1 層 129 µs、1 トークン 3.1 ms)。次の 3 点を直した。
   1. 分割 attention のチャンクの大きさを可変 (`{CH}`、1 キーを `128 / CH` レーンで処理) にした。文脈 64 以下は 16 キー、それより長いと 32 キー。subgroup があれば、8 行以下では常に分割版を使う (行ごとの版は文脈 32 で 1 層 35.6 µs かかっていたが、分割版は 6 µs)。
   2. 値の足し込みのループを 4 キーずつ展開し、読み出しを並べて出す (32 キーのチャンクで 87 → 67 µs)。
@@ -913,11 +913,11 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
   - 複数行 GEMV の 1 組あたりの行数 (R=2 が最適で、1 や 4 は遅い)。
   - 参考: Q4K のスケールの計算を定数にすると 13% 速くなるので、ヘッダの読み出しと展開に伸びしろはある。
 - Ollama (v0.40.16、llama.cpp の Vulkan) との比較。同じ GGUF (2B Q4_K_M)、同じプロンプトで greedy、Ollama の `eval_duration` で測った。
-  - Ollama は 45.3 tok/s (22.1 ms/トークン)、yakusel は 42.9 tok/s (23.3 ms)。
+  - Ollama は 45.3 tok/s (22.1 ms/トークン)、yaxus は 42.9 tok/s (23.3 ms)。
   - 以前の「約 46 tok/s」は比較スクリプトの近似 (応答時間 − プリフィル時間) による値で、同じ条件の差はもっと小さかった。
-- `GGML_VK_PERF_LOGGER=1` による llama.cpp の演算ごとの時間 (1 トークン、GPU 時間の合計 22.4 ms) と、yakusel の比較:
+- `GGML_VK_PERF_LOGGER=1` による llama.cpp の演算ごとの時間 (1 トークン、GPU 時間の合計 22.4 ms) と、yaxus の比較:
 
-| 行列 | llama.cpp | yakusel |
+| 行列 | llama.cpp | yaxus |
 |---|---|---|
 | gate/up Q4_K 20480×2560 | 364 µs (+ GLU 5 µs) | 374 µs (SwiGLU 込み) |
 | down Q4_K 2560×10240 | **184 µs** | 200 µs |
@@ -930,13 +930,13 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 | norm・RoPE などの合計 | 約 1.0 ms | 約 0.6 ms |
 
 - 差 1.2 ms/トークンの内訳 (推定):
-  1. **Q6_K のデータ量**: llama.cpp はファイルのまま 0.82 バイト/重み (16 個ごとの int8 スケールと 256 個ごとの f16)。yakusel の Q6 は 16 個ごとに f16 スケールを持つので 0.875 (+7%)。約 0.35 ms。
+  1. **Q6_K のデータ量**: llama.cpp はファイルのまま 0.82 バイト/重み (16 個ごとの int8 スケールと 256 個ごとの f16)。yaxus の Q6 は 16 個ごとに f16 スケールを持つので 0.875 (+7%)。約 0.35 ms。
   2. **Q4_K の計算**:
-     - llama.cpp (`mul_mat_vec_q4_k.comp`) は最小値の項を `dmin·m·Σx` として 16 要素ごとにまとめる。yakusel は要素ごとに `q·scale − min` を計算する。
+     - llama.cpp (`mul_mat_vec_q4_k.comp`) は最小値の項を `dmin·m·Σx` として 16 要素ごとにまとめる。yaxus は要素ごとに `q·scale − min` を計算する。
      - llama.cpp は 6 ビットのスケールを、u32 を `unpack8` して 4 つずつ取り出す。
      - down で 8% の差、約 0.25 ms。
-  3. **ホスト側の待ち**: yakusel は毎トークン、パスの記録 (約 0.33 ms) と読み戻しの間 GPU が止まる。llama.cpp は、GPU 時間の合計 (22.4 ms) と実時間 (22.1 ms、計時なし) がほぼ同じ。約 0.4 ms。
-- プリフィルは yakusel のほうが速い (2B で 68 行: llama.cpp の行列積の合計 約 190 ms、yakusel の 64 行パス 約 155 ms)。
+  3. **ホスト側の待ち**: yaxus は毎トークン、パスの記録 (約 0.33 ms) と読み戻しの間 GPU が止まる。llama.cpp は、GPU 時間の合計 (22.4 ms) と実時間 (22.1 ms、計時なし) がほぼ同じ。約 0.4 ms。
+- プリフィルは yaxus のほうが速い (2B で 68 行: llama.cpp の行列積の合計 約 190 ms、yaxus の 64 行パス 約 155 ms)。
 
 ### 11.28 Q6 と Q4K の改善 (llama.cpp との差を詰める)
 
@@ -1012,7 +1012,7 @@ Vulkan のデコードは Q8 で実効 約 66 GB/s、bf16 で 約 69 GB/s (13.4 
 
 **現状** (同じ GGUF Q4_K_M、`tests/bench/compare/compare.py`、秒。Ollama は v0.40.16 で 11.23 と同じ値):
 
-| 測定 | 2B: yakusel | 2B: Ollama | 8B: yakusel | 8B: Ollama |
+| 測定 | 2B: yaxus | 2B: Ollama | 8B: yaxus | 8B: Ollama |
 |---|---|---|---|---|
 | 文セット 19 件 | **8.67** | 9.91 | **21.9** | 28.5 |
 | 文書 14 段落 (逐次) | **37.4** | 39.9 | **89.4** | 113.2 |
@@ -1027,7 +1027,7 @@ Ollama が勝つのは、8B の 8 チェーン文書 (プリフィルが多い) 
 
 - メモリは DDR5-5600 の 2 チャネルで、理論値は 89.6 GB/s。GPU の読み出しは実測 82〜84 GB/s で、すでに壁に当たっている。CPU と GPU で分担しても、同じメモリバスを分け合うだけで合計は増えない。
 - 2B GGUF は 1 トークンあたり 1654 MB を読む。83 GB/s なら 19.9 ms (50 tok/s) が、下書きなし・同じ重みでの上限。現状は 22.2 ms (行列積 21.1 + attention/norm 0.75 + ホスト 0.3)。伸びしろは約 8% で、Ollama も同じ壁の手前にいる。
-- したがって大きく超えるには、「1 回の重み読み出しで進むトークン数を増やす」か「読む量を減らす」しかない。前者は投機と同時実行で、Ollama にはない yakusel の領分。
+- したがって大きく超えるには、「1 回の重み読み出しで進むトークン数を増やす」か「読む量を減らす」しかない。前者は投機と同時実行で、Ollama にはない yaxus の領分。
 
 **候補と見込み** (効果の大きい順):
 
@@ -1073,7 +1073,7 @@ Ollama が勝つのは、8B の 8 チェーン文書 (プリフィルが多い) 
 
 **項目 2 (下書きを安くする)**: GGUF の Q2_K と Q3_K をそのまま読むカーネルを追加し、0.8B の Q2_K ファイルを既定の下書きにした。
 
-- レイアウト (`yakusel-model/src/ggml.rs`、値は GGUF と同一):
+- レイアウト (`yaxus-model/src/ggml.rs`、値は GGUF と同一):
   - Q2: 2 bit を要素順に並べ (16 個で u32 1 つ)、行ごとのメタに `d`・`dmin` (256 個ごとの f16) と scale/min (16 個ごとの 4 bit ずつ) を置く。デコードのカーネルは `s * Σ(q·x) - m * Σx` の形で計算する。
   - Q3: 32 個を 12 バイト (下位 2 bit × 32 + 上位 1 bit × 32) にまとめ、スケールは Q6 と同じ形。
   - プリフィルの GEMM 用に、16 個ごとの f16 (Q2 は scale と min の組) を別に持つ (Q6 と同じ理由)。
@@ -1113,12 +1113,12 @@ Ollama が勝つのは、8B の 8 チェーン文書 (プリフィルが多い) 
 **順序を 5 → 4 に入れ替えた理由。** 項目 4 (プリフィルとデコードの融合) の前にパス時間を測ったところ、8B の差の主因は融合で省ける重みの読み直しではなく、GEMM の演算効率だった。
 
 - 8B GGUF のパス: 1 行 64.5 ms、7 行 112 ms、64 行 548 ms、512 行 3786 ms。64 行のうち重みの読み出しは約 65 ms で、残りは演算 (約 2.1 TFLOPS)。融合で省けるのは 1 交互あたり約 60 ms (9%)。
-- Ollama (llama.cpp) のプリフィルを直接測った (`prompt_eval_duration`): 8B は 408 トークンで 1760 ms (232 tok/s、傾き 3.9 ms/トークン)、2B は 578 ms (705 tok/s、1.29 ms/トークン)。yakusel は 8B が 7.4 ms/行 (135 行/s)、2B が 2.23 ms/行 (448 行/s) で、しかも 64 行のタイル単位 (32 トークンでも 1 タイル分)。
+- Ollama (llama.cpp) のプリフィルを直接測った (`prompt_eval_duration`): 8B は 408 トークンで 1760 ms (232 tok/s、傾き 3.9 ms/トークン)、2B は 578 ms (705 tok/s、1.29 ms/トークン)。yaxus は 8B が 7.4 ms/行 (135 行/s)、2B が 2.23 ms/行 (448 行/s) で、しかも 64 行のタイル単位 (32 トークンでも 1 タイル分)。
 - 融合カーネルは GEMM の上に作るものなので、GEMM を先に作り直した。
 
 **llama.cpp が速い理由。** 活性化を int8 (32 個ごとにスケールを持つ Q8_1) に量子化し、重みの整数値と int8 × int8 → int32 で掛けている (`mul_mmq_cm1.comp`、RDNA3 では整数の行列演算ユニットを使う経路)。Ollama v0.40.16 の `libggml-vulkan.so` に `matmul_q4_k_q8_1` と `cm1_accumulate` が入っていることを確認した。f32/f16 の FMA は 1 命令で積和 1 つ、整数ドット積は 1 命令で 4 つなので、演算律速のプリフィルではそのまま差になる。
 
-**yakusel での実現** (`yakusel-backend-wgpu/src/gemm_int.rs`):
+**yaxus での実現** (`yaxus-backend-wgpu/src/gemm_int.rs`):
 
 - naga の cooperative matrix は f16/f32 だけで、int8 の行列は WGSL で書けない。一方 `dot4I8Packed` は WGSL の標準関数で、wgpu 30 は Vulkan の `OpSDot` (`VK_KHR_shader_integer_dot_product`) にそのまま落とす。行列演算ユニットなしで同じ密度が得られる。
 - 前処理 `xquant`: 活性化を行ごと・32 個ごとに `max|x|` で正規化して int8 にする。
@@ -1221,7 +1221,7 @@ Ollama が勝つのは、8B の 8 チェーン文書 (プリフィルが多い) 
 
 11.33 の最後に挙げた候補を実装した。**11.9 の方針を変える**: 16 行以下のパス (デコード、投機の検証、短いプロンプト) も、既定で活性化を 15 bit + 符号に丸めた整数ドット積 (int16) で計算する。f32 のままにするには `--decode-precision f32`。
 
-**カーネル** (`yakusel-backend-wgpu/src/gemv_int.rs`、WGSL を生成):
+**カーネル** (`yaxus-backend-wgpu/src/gemv_int.rs`、WGSL を生成):
 
 - 前処理 `xquantr`: プリフィルの `xquant` と同じ丸め (行ごと・32 個ごとに `max|x|/16383`、`128·hi + lo` の 2 プレーン)。並びだけが違う (下記)。
 - GEMV: 1 ワークグループが重み 8 組 × 32 レーン。1 レーンが 1 ステップで重み 32 個 (スケールの 1 ブロック) を読み、整数値のままレジスタに置いて、すべての活性化行と `dot4I8Packed` を取る。重みは 1 回しか読まない (LDS も使わない)。

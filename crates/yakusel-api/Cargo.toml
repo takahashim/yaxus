@@ -1,9 +1,0 @@
-[package]
-name = "yakusel-api"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "HTTP API types shared by the yakusel server and client"
-
-[dependencies]
-serde.workspace = true
