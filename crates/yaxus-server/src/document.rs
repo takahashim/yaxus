@@ -218,10 +218,10 @@ pub fn run_document(
                 Event::Token { id, token } => {
                     if let Some(l) = live.get_mut(&id) {
                         l.tokens.push(token);
-                        let s = l.dec.push(tok, token);
-                        if !s.is_empty() {
-                            on(DocEvent::Delta { segment: l.seg, text: &s });
-                            l.text += &s;
+                        let start = l.text.len();
+                        l.dec.push_into(tok, token, &mut l.text);
+                        if l.text.len() > start {
+                            on(DocEvent::Delta { segment: l.seg, text: &l.text[start..] });
                         }
                     }
                 }
