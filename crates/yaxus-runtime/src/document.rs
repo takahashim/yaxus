@@ -2,14 +2,14 @@
 //! chain they are translated in order, each with the earlier ones of the chain as history
 //! (see [`HistoryWindow`]); the chains run in parallel on the engine.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
-use yaxus_api::{HistoryWindow, Pair};
-use yaxus_model::{Event, Finish, Generator, ReqId, Request};
-use yaxus_tokenizer::{EOS_ID, GlossaryEntry, StreamDecoder, TAG_ID, Tokenizer, TranslationPair, TranslationRequest};
+use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
+use yaxus_model::{DEFAULT_MAX_POS, Finish, Generator};
+use yaxus_tokenizer::{PromptError, Tokenizer, TranslationRequest, is_blank, validate_message};
 
-use crate::memory::{self, Memory};
+use crate::memory::Memory;
+use crate::prompt::{self, Prompt};
+use crate::session::{Session, Update};
 
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
 pub fn auto_chains(segments: usize) -> usize {
@@ -32,6 +32,23 @@ pub struct DocOptions {
     pub max_new_tokens: usize,
 }
 
+impl DocOptions {
+    /// Options for a translation into `target_lang`, with the API defaults otherwise.
+    pub fn new(target_lang: impl Into<String>) -> Self {
+        DocOptions {
+            target_lang: target_lang.into(),
+            source_lang: None,
+            form: None,
+            context: None,
+            glossary: Vec::new(),
+            history_chars: yaxus_api::DEFAULT_HISTORY_CHARS,
+            chains: 0,
+            neighbor_context: false,
+            max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS,
+        }
+    }
+}
+
 struct Chain {
     /// Segment indices of the chain, in order.
     segs: Vec<usize>,
@@ -41,17 +58,39 @@ struct Chain {
 
 /// The state of one document.
 pub struct DocJob {
-    pub segments: Vec<String>,
-    pub opts: DocOptions,
-    pub outputs: Vec<Option<String>>,
+    segments: Vec<String>,
+    opts: DocOptions,
+    outputs: Vec<Option<String>>,
     /// Segments submitted and not finished yet.
     in_flight: Vec<bool>,
     chains: Vec<Chain>,
     /// Chain of each segment.
     chain_of: Vec<usize>,
+    /// Most prompt + generated tokens per segment.
+    max_context: usize,
 }
 
 impl DocJob {
+    /// The job of a document request, with the API defaults for what it leaves out, for
+    /// at most `max_context` prompt + generated tokens per segment. A segment generates at
+    /// most half of that (and at least 1 token).
+    pub fn from_request(r: DocumentRequest, max_context: usize) -> Self {
+        let opts = DocOptions {
+            source_lang: r.requested_source_lang().map(String::from),
+            form: r.requested_form().map(String::from),
+            history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
+            chains: r.chains.unwrap_or(0),
+            neighbor_context: r.neighbor_context,
+            max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS).min(max_context / 2).max(1),
+            target_lang: r.target_lang,
+            context: r.context,
+            glossary: r.glossary,
+        };
+        DocJob { max_context, ..DocJob::new(r.segments, opts) }
+    }
+
+    /// A job with at most [`DEFAULT_MAX_POS`] prompt + generated tokens per segment, the
+    /// positions the model's KV covers.
     pub fn new(segments: Vec<String>, opts: DocOptions) -> Self {
         let n = segments.len();
         let k = if opts.chains == 0 { auto_chains(n) } else { opts.chains }.clamp(1, n.max(1));
@@ -68,11 +107,71 @@ impl DocJob {
             at += len;
             chains.push(Chain { segs, next: 0, window: HistoryWindow::new(opts.history_chars) });
         }
-        DocJob { outputs: vec![None; n], in_flight: vec![false; n], segments, opts, chains, chain_of }
+        DocJob {
+            outputs: vec![None; n],
+            in_flight: vec![false; n],
+            segments,
+            opts,
+            chains,
+            chain_of,
+            max_context: DEFAULT_MAX_POS,
+        }
+    }
+
+    /// Checks the segments' prompts before any is sent: the options once, then each
+    /// segment's prompt without history (its text, and the neighbouring segments when
+    /// they are the context), which must also fit the context (blank segments are allowed;
+    /// they come back empty). History is earlier output; what does not fit is dropped
+    /// when the segment is submitted (see [`prompt`](Self::prompt)).
+    pub fn validate(&self, tok: &Tokenizer) -> Result<(), PromptError> {
+        self.options_request().validate_options()?;
+        for i in (0..self.segments.len()).filter(|&i| !is_blank(&self.segments[i])) {
+            Prompt::fit(tok, self.bare_request(i), self.max_context, 0)
+                .map_err(|e| PromptError(format!("segment {i}: {}", e.0)))?;
+        }
+        Ok(())
+    }
+
+    /// The prompt of a request from [`ready`](Self::ready) and its generation budget, both
+    /// within the context: a history that leaves too little room is dropped.
+    pub fn prompt(&self, tok: &Tokenizer, req: TranslationRequest) -> Result<(Prompt, usize), PromptError> {
+        Prompt::fit(tok, req, self.max_context, self.opts.max_new_tokens)
+    }
+
+    /// The options of every segment's prompt (empty text and history).
+    fn options_request(&self) -> TranslationRequest {
+        TranslationRequest {
+            text: String::new(),
+            target_lang: self.opts.target_lang.clone(),
+            source_lang: self.opts.source_lang.clone(),
+            form: self.opts.form.clone(),
+            context: self.opts.context.clone(),
+            glossary: prompt::glossary(&self.opts.glossary),
+            history: Vec::new(),
+        }
     }
 
     pub fn chains(&self) -> usize {
         self.chains.len()
+    }
+
+    /// Number of segments.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// New tokens allowed per segment.
+    pub fn max_new_tokens(&self) -> usize {
+        self.opts.max_new_tokens
+    }
+
+    /// The translation of each segment, once it is done.
+    pub fn outputs(&self) -> &[Option<String>] {
+        &self.outputs
     }
 
     pub fn is_done(&self) -> bool {
@@ -88,22 +187,17 @@ impl DocJob {
             .iter()
             .take_while(|&&s| s != i)
             .map(|&s| Pair { source: self.segments[s].clone(), target: self.outputs[s].clone().unwrap_or_default() })
-            // Blank segments (and empty translations) cannot be history entries.
-            .filter(|p| !p.source.trim().is_empty() && !p.target.trim().is_empty())
+            // Only pairs a prompt may hold: not blank segments or translations, and no
+            // translation with reserved tokens (a control token the model emitted).
+            .filter(|p| validate_message(&p.source).is_ok() && validate_message(&p.target).is_ok())
             .collect();
-        let history: Vec<TranslationPair> = chain
-            .window
-            .select(&done)
-            .iter()
-            .map(|p| TranslationPair { source: p.source.clone(), target: p.target.clone() })
-            .collect();
+        let history = prompt::history(chain.window.select(&done));
         TranslationRequest { history, ..self.bare_request(i) }
     }
 
     /// The request for segment `i` without history: its text, the options and the
-    /// context (with the neighbouring segments when asked for). The server checks these
-    /// up front; history is added, or dropped, when the segment is submitted.
-    pub fn bare_request(&self, i: usize) -> TranslationRequest {
+    /// context (with the neighbouring segments when asked for).
+    fn bare_request(&self, i: usize) -> TranslationRequest {
         let mut context = self.opts.context.clone();
         if self.opts.neighbor_context {
             let mut parts = Vec::new();
@@ -119,20 +213,7 @@ impl DocJob {
                 _ => neighbors,
             });
         }
-        TranslationRequest {
-            text: self.segments[i].clone(),
-            target_lang: self.opts.target_lang.clone(),
-            source_lang: self.opts.source_lang.clone(),
-            form: self.opts.form.clone(),
-            context,
-            glossary: self
-                .opts
-                .glossary
-                .iter()
-                .map(|p| GlossaryEntry { source: p.source.clone(), target: p.target.clone() })
-                .collect(),
-            history: Vec::new(),
-        }
+        TranslationRequest { text: self.segments[i].clone(), context, ..self.options_request() }
     }
 
     /// Segments that can start now (the next one of every idle chain). Segments without
@@ -150,7 +231,7 @@ impl DocJob {
                     self.chains[c].next += 1;
                     continue;
                 }
-                if self.segments[i].trim().is_empty() {
+                if is_blank(&self.segments[i]) {
                     self.outputs[i] = Some(String::new());
                     self.chains[c].next += 1;
                     continue;
@@ -180,32 +261,6 @@ pub enum DocEvent<'a> {
     SegmentDone { segment: usize, prompt_tokens: usize, reused: usize, generated: usize },
 }
 
-/// Generation budget a segment keeps its history for: `max_new_tokens` is a cap that
-/// outputs rarely approach, so a prompt with history that leaves this much is kept.
-const MIN_BUDGET: usize = 512;
-
-/// Encodes the prompt of `req` so that it and the generation budget fit in `max_context`:
-/// the budget is cut to what the prompt leaves, and the history is dropped only when that
-/// would leave less than `MIN_BUDGET` (or `max_new`, if smaller). Returns (prompt ids,
-/// max new tokens), or an error when even the prompt without history does not fit.
-pub fn encode_within(
-    tok: &Tokenizer,
-    req: &mut TranslationRequest,
-    max_context: usize,
-    max_new: usize,
-) -> std::result::Result<(Vec<u32>, usize), String> {
-    let mut ids = tok.encode(&req.to_prompt().map_err(|e| e.0)?, false);
-    if max_context.saturating_sub(ids.len()) < max_new.min(MIN_BUDGET) && !req.history.is_empty() {
-        req.history.clear();
-        ids = tok.encode(&req.to_prompt().map_err(|e| e.0)?, false);
-    }
-    if ids.len() >= max_context {
-        return Err(format!("prompt is {} tokens; the limit is {max_context}", ids.len()));
-    }
-    let max_new = max_new.min(max_context - ids.len()).max(1);
-    Ok((ids, max_new))
-}
-
 /// Translates a document on `engine` (which must not have other requests in flight).
 /// Earlier translations in `memory` serve as hints; the new ones are added to it.
 ///
@@ -219,112 +274,115 @@ pub fn run_document(
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<()> {
-    struct Live {
-        seg: usize,
-        dec: StreamDecoder,
-        text: String,
-        tokens: Vec<u32>,
-        prompt_tokens: usize,
-        memo: u64,
-    }
-    let mut live: HashMap<ReqId, Live> = HashMap::new();
-    let submit = |engine: &mut dyn Generator,
-                  job: &mut DocJob,
-                  live: &mut HashMap<ReqId, Live>,
-                  memory: &Memory|
-     -> Result<()> {
-        for (seg, req) in job.ready() {
-            let ids = tok.encode(&req.to_prompt()?, false);
-            let id = engine.fresh_id();
-            let memo = memory::key(&req);
-            let prompt_tokens = ids.len();
-            live.insert(
-                id,
-                Live { seg, dec: StreamDecoder::new(), text: String::new(), tokens: Vec::new(), prompt_tokens, memo },
-            );
-            let mut r = Request::new(id, ids, job.opts.max_new_tokens, vec![EOS_ID, TAG_ID]);
-            r.hint = memory.get(memo);
-            engine.submit(r);
+    let mut session = Session::new(engine, tok, memory);
+    let submit = |session: &mut Session<usize>, job: &mut DocJob| -> Result<()> {
+        for (segment, req) in job.ready() {
+            let (prompt, max_new) = job.prompt(tok, req).map_err(|e| anyhow::anyhow!("segment {segment}: {}", e.0))?;
+            session.submit(prompt, max_new, segment);
         }
         Ok(())
     };
-    submit(engine, job, &mut live, memory)?;
+    submit(&mut session, job)?;
     let mut stopped = false;
     // Once stopped, run only until the requests in flight have left the engine.
-    while !job.is_done() && !(stopped && live.is_empty()) {
-        let mut finished = Vec::new();
-        let mut error = None;
-        let worked = engine.step(&mut |ev| {
-            match ev {
+    while !job.is_done() && !(stopped && session.is_idle()) {
+        let (mut finished, mut failed) = (Vec::new(), None);
+        // The request whose own text was refused: its end still counts (as it ended).
+        let mut refused = None;
+        let worked = session.step(&mut |u| {
+            match u {
                 // Returning `false` cancels the request.
-                Event::Token { .. } if stopped => return false,
-                Event::Token { id, token } => {
-                    if let Some(l) = live.get_mut(&id) {
-                        l.tokens.push(token);
-                        let start = l.text.len();
-                        l.dec.push_into(tok, token, &mut l.text);
-                        if l.text.len() > start && !on(DocEvent::Delta { segment: l.seg, text: &l.text[start..] }) {
-                            stopped = true;
-                            return false;
-                        }
+                Update::Delta { .. } if stopped => return false,
+                Update::Delta { tag, text } => {
+                    if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
+                        (stopped, refused) = (true, Some(*tag));
+                        return false;
                     }
                 }
-                Event::Done { id, generated, start, finish } => finished.push((id, generated, start.reused, finish)),
-                Event::Error { message, .. } => error = Some(message),
+                Update::Done { tag, done } => finished.push((tag, done)),
+                Update::Failed { tag, message } => failed = Some(format!("segment {tag}: {message}")),
             }
             true
         })?;
-        if let Some(e) = error {
+        if let Some(e) = failed {
             anyhow::bail!(e);
         }
-        for (id, generated, reused, finish) in finished {
-            if let Some(mut l) = live.remove(&id) {
-                if finish == Finish::Stop {
-                    memory.put(l.memo, std::mem::take(&mut l.tokens));
-                }
-                if stopped {
-                    continue;
-                }
-                let tail = l.dec.finish();
-                if !tail.is_empty() {
-                    stopped = !on(DocEvent::Delta { segment: l.seg, text: &tail });
-                    l.text += &tail;
-                }
-                if !stopped {
-                    stopped = !on(DocEvent::SegmentDone {
-                        segment: l.seg,
-                        prompt_tokens: l.prompt_tokens,
-                        reused,
-                        generated,
-                    });
-                }
-                job.finished(l.seg, l.text);
+        for (segment, done) in finished {
+            // After a stop: cancelled requests and the others' ends are dropped.
+            if done.finish == Finish::Cancelled || (stopped && refused != Some(segment)) {
+                continue;
             }
+            if !stopped {
+                stopped = !on(DocEvent::SegmentDone {
+                    segment,
+                    prompt_tokens: done.prompt_tokens,
+                    reused: done.start.reused,
+                    generated: done.generated,
+                });
+            }
+            job.finished(segment, done.text);
         }
         if !stopped {
-            submit(engine, job, &mut live, memory)?;
+            submit(&mut session, job)?;
         }
-        anyhow::ensure!(worked || job.is_done() || !live.is_empty(), "engine idle with segments left");
+        anyhow::ensure!(worked || job.is_done() || !session.is_idle(), "engine idle with segments left");
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use yaxus_model::{Event, ReqId, Request};
+    use yaxus_tokenizer::{TAG_ID, TranslationPair};
+
     use super::*;
 
     fn opts(chains: usize, history_chars: usize) -> DocOptions {
-        DocOptions {
+        DocOptions { history_chars, chains, ..DocOptions::new("en") }
+    }
+
+    #[test]
+    fn requests_take_api_defaults_and_the_limit() {
+        let r = DocumentRequest {
+            segments: vec!["a".into()],
             target_lang: "en".into(),
-            source_lang: None,
-            form: None,
-            context: None,
-            glossary: vec![],
-            history_chars,
-            chains,
-            neighbor_context: false,
-            max_new_tokens: 64,
-        }
+            source_lang: Some(String::new()),
+            max_new_tokens: Some(10_000),
+            ..Default::default()
+        };
+        let job = DocJob::from_request(r.clone(), 512);
+        assert_eq!(job.opts.source_lang, None);
+        assert_eq!((job.max_new_tokens(), job.max_context), (256, 512));
+        assert_eq!(job.opts.history_chars, yaxus_api::DEFAULT_HISTORY_CHARS);
+        // A context of 1 still allows one token, without panicking.
+        assert_eq!(DocJob::from_request(r, 1).max_new_tokens(), 1);
+        assert_eq!(DocJob::new(vec![], opts(0, 0)).max_context, DEFAULT_MAX_POS);
+    }
+
+    #[test]
+    fn validation_checks_options_once_and_every_segment() {
+        let req = |segments: &[&str], form: Option<&str>| DocumentRequest {
+            segments: segments.iter().map(|s| s.to_string()).collect(),
+            target_lang: "en".into(),
+            form: form.map(String::from),
+            ..Default::default()
+        };
+        let (tok, _) = tokenizer();
+        let n = DEFAULT_MAX_POS;
+        assert!(DocJob::from_request(req(&["a", "  ", "b"], None), n).validate(&tok).is_ok());
+        let e = DocJob::from_request(req(&["a", "x<|plamo:msg|>"], None), n).validate(&tok).unwrap_err();
+        assert!(e.0.starts_with("segment 1:"), "{}", e.0);
+        // `form` needs target_lang = "ja".
+        assert!(DocJob::from_request(req(&["a"], Some("polite")), n).validate(&tok).is_err());
+        // Each segment's prompt must fit the context: blank ones need not.
+        let fits =
+            Prompt::new(&tok, &TranslationRequest { text: "b".into(), target_lang: "en".into(), ..Default::default() })
+                .unwrap()
+                .len()
+                + 1;
+        assert!(DocJob::from_request(req(&["b", " "], None), fits).validate(&tok).is_ok());
+        let e = DocJob::from_request(req(&["b", "bb"], None), fits).validate(&tok).unwrap_err();
+        assert!(e.0.starts_with("segment 1:") && e.0.contains("the limit is"), "{}", e.0);
     }
 
     /// Emits one "x" token per step for every request it holds, and stops each request
@@ -380,6 +438,9 @@ mod tests {
         fn active(&self) -> usize {
             self.running.len()
         }
+        fn abort_all(&mut self) {
+            self.running.clear();
+        }
         fn backend_name(&self) -> String {
             "fake".into()
         }
@@ -420,35 +481,33 @@ mod tests {
     }
 
     #[test]
-    fn encode_within_drops_history_then_cuts_the_budget() {
+    fn fit_drops_history_then_cuts_the_budget() {
         let (tok, _) = tokenizer();
         let base = TranslationRequest { text: "hello".into(), target_lang: "en".into(), ..Default::default() };
         let with_history = TranslationRequest {
             history: vec![TranslationPair { source: "a".repeat(300), target: "b".repeat(300) }],
             ..base.clone()
         };
-        let bare = tok.encode(&base.to_prompt().unwrap(), false).len();
-        let full = tok.encode(&with_history.to_prompt().unwrap(), false).len();
+        let bare = Prompt::new(&tok, &base).unwrap().len();
+        let full = Prompt::new(&tok, &with_history).unwrap().len();
         assert!(full > bare + 500);
+        let fit = |r: &TranslationRequest, ctx, max_new| {
+            Prompt::fit(&tok, r.clone(), ctx, max_new).map(|(p, n)| (p.len(), n))
+        };
 
         // Everything fits: unchanged.
-        let mut r = with_history.clone();
-        let (ids, n) = encode_within(&tok, &mut r, full + 10, 10).unwrap();
-        assert_eq!((ids.len(), n, r.history.len()), (full, 10, 1));
+        assert_eq!(fit(&with_history, full + 10, 10).unwrap(), (full, 10));
         // A large cap is cut while the history leaves a useful budget.
-        let mut r = with_history.clone();
-        let (ids, n) = encode_within(&tok, &mut r, full + 600, 4096).unwrap();
-        assert_eq!((ids.len(), n, r.history.len()), (full, 600, 1));
+        assert_eq!(fit(&with_history, full + 600, 4096).unwrap(), (full, 600));
         // History plus budget too long: the history goes, the budget stays.
-        let mut r = with_history.clone();
-        let (ids, n) = encode_within(&tok, &mut r, full, 10).unwrap();
-        assert_eq!((ids.len(), n, r.history.len()), (bare, 10, 0));
+        assert_eq!(fit(&with_history, full, 10).unwrap(), (bare, 10));
         // Without history the budget is cut to what is left (at least 1).
-        let mut r = base.clone();
-        assert_eq!(encode_within(&tok, &mut r, bare + 3, 10).unwrap().1, 3);
+        assert_eq!(fit(&base, bare + 3, 10).unwrap(), (bare, 3));
         // The prompt alone does not fit.
-        let mut r = base.clone();
-        assert!(encode_within(&tok, &mut r, bare, 0).unwrap_err().contains("the limit is"));
+        assert!(fit(&base, bare, 0).unwrap_err().0.contains("the limit is"));
+        // The memory key is that of the prompt sent.
+        let (p, _) = Prompt::fit(&tok, with_history.clone(), full, 10).unwrap();
+        assert_eq!(p.into_parts().1, crate::memory::key(&base));
     }
 
     #[test]
@@ -526,8 +585,32 @@ mod tests {
         let next = job.ready();
         assert_eq!(next[0].0, 2);
         assert_eq!(next[0].1.history.len(), 1);
-        assert_eq!(job.outputs[1].as_deref(), Some(""));
+        assert_eq!(job.outputs()[1].as_deref(), Some(""));
         assert!(next[0].1.to_prompt().is_ok());
+    }
+
+    #[test]
+    fn blank_means_what_the_prompt_template_means() {
+        // U+001F is whitespace to Python's strip (and so to the template), not to Rust's.
+        let segs = vec!["a".to_string(), "\u{1f}".to_string()];
+        let mut job = DocJob::new(segs, opts(1, 1000));
+        assert!(job.validate(&tokenizer().0).is_ok());
+        assert_eq!(job.ready()[0].0, 0);
+        job.finished(0, "A".into());
+        assert!(job.ready().is_empty() && job.is_done(), "the blank segment completes empty");
+    }
+
+    #[test]
+    fn translations_with_reserved_tokens_stay_out_of_history() {
+        let segs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut job = DocJob::new(segs, opts(1, 1000));
+        job.ready();
+        job.finished(0, "A<|plamo:msg|>".into()); // a control token the model emitted
+        let next = job.ready();
+        assert!(next[0].1.history.is_empty());
+        assert!(next[0].1.to_prompt().is_ok());
+        job.finished(1, "B".into());
+        assert_eq!(job.ready()[0].1.history.len(), 1, "later pairs are kept");
     }
 
     #[test]

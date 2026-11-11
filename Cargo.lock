@@ -2739,6 +2739,7 @@ dependencies = [
  "tracing-subscriber",
  "yaxus-api",
  "yaxus-model",
+ "yaxus-runtime",
  "yaxus-server",
  "yaxus-tokenizer",
 ]
@@ -2754,6 +2755,20 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "yaxus-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tracing",
+ "yaxus-api",
+ "yaxus-backend-cpu",
+ "yaxus-backend-wgpu",
+ "yaxus-model",
+ "yaxus-tokenizer",
 ]
 
 [[package]]
@@ -2773,9 +2788,8 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "yaxus-api",
- "yaxus-backend-cpu",
- "yaxus-backend-wgpu",
  "yaxus-model",
+ "yaxus-runtime",
  "yaxus-tokenizer",
 ]
 

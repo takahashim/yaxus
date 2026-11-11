@@ -71,7 +71,8 @@ pub struct EngineConfig {
     pub max_streams: usize,
     /// Most requests advanced by one decode pass. With f32 kernels 8 rows are the
     /// cheapest per row on a Radeon 780M (2B: 38 ms for 8 rows, 108 ms for 16); with the
-    /// integer kernels 16 are (26 and 38 ms), and the CLI then asks for 16.
+    /// integer kernels 16 are (26 and 38 ms). The default here is 8; callers that load
+    /// through `yaxus-runtime` get the precision's own (`Decode::default_rows`).
     pub decode_rows: usize,
     /// Prompt rows per pass while other requests are decoding.
     pub busy_prefill_rows: usize,
@@ -395,6 +396,21 @@ impl<B: Backend> Engine<B> {
 
     pub fn is_idle(&self) -> bool {
         self.waiting.is_empty() && self.streams.is_empty()
+    }
+
+    /// Drops every request, waiting or running, without events, and frees their KV (for
+    /// recovery after a failed [`step`](Engine::step): the caller has given up on them).
+    pub fn abort_all(&mut self) {
+        self.waiting.clear();
+        for s in self.streams.drain(..) {
+            self.target.free_seq(s.ts);
+            if let (Some(d), Some(dm)) = (s.ds, self.draft.as_mut()) {
+                dm.free_seq(d);
+            }
+        }
+        self.rr = 0;
+        self.prefill_turn = false;
+        self.draft_in_sync = false;
     }
 
     /// Runs one pass. `emit` receives tokens and completions; returning `false` for a
@@ -789,6 +805,8 @@ pub trait Generator: Send {
     fn fresh_id(&mut self) -> ReqId;
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
+    /// See [`Engine::abort_all`].
+    fn abort_all(&mut self);
     fn backend_name(&self) -> String;
     fn weight_bytes(&self) -> usize;
     /// Speculative decoding statistics, if any rounds ran.
@@ -854,6 +872,9 @@ where
     }
     fn active(&self) -> usize {
         Engine::active(self)
+    }
+    fn abort_all(&mut self) {
+        Engine::abort_all(self)
     }
     fn backend_name(&self) -> String {
         match &self.draft {

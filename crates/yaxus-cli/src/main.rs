@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, Pair};
 
-#[cfg(feature = "server")]
+#[cfg(feature = "local")]
 mod local;
 
 #[derive(Parser)]
@@ -56,7 +56,7 @@ enum Cmd {
     #[cfg(feature = "server")]
     Serve(local::ServeArgs),
     /// Translate locally without a server.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "local")]
     Translate {
         #[command(flatten)]
         model: local::ModelArgs,
@@ -67,7 +67,7 @@ enum Cmd {
         verbose: bool,
     },
     /// Measure prefill and decode speed.
-    #[cfg(feature = "server")]
+    #[cfg(feature = "local")]
     Bench(local::BenchArgs),
     /// Translate through a remote yaxus server.
     Client {
@@ -262,9 +262,9 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         #[cfg(feature = "server")]
         Cmd::Serve(args) => local::serve(args),
-        #[cfg(feature = "server")]
+        #[cfg(feature = "local")]
         Cmd::Bench(args) => local::bench(args),
-        #[cfg(feature = "server")]
+        #[cfg(feature = "local")]
         Cmd::Translate { model, lang, verbose } => local::translate(model, lang, verbose),
         Cmd::Client { server, token, ca, insecure, no_stream, lang } => {
             run_client(server, token, ca, insecure, no_stream, lang)

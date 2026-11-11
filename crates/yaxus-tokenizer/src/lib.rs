@@ -23,7 +23,9 @@ use std::path::Path;
 mod pfml;
 mod stream;
 
-pub use pfml::{GlossaryEntry, PromptError, TranslationPair, TranslationRequest, validate_lang};
+pub use pfml::{
+    GlossaryEntry, PromptError, TranslationPair, TranslationRequest, is_blank, validate_lang, validate_message,
+};
 pub use stream::StreamDecoder;
 
 const INVALID_SCORE: i64 = -20_000_000;

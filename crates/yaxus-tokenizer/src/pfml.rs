@@ -31,7 +31,9 @@ pub struct PromptError(pub String);
 
 const RESERVED: &str = "<|plamo:";
 
-fn is_blank(s: &str) -> bool {
+/// Whether `s` is empty or only whitespace, as the prompt template sees it (Jinja's
+/// `trim` is Python's `str.strip()`, which also strips U+001C..U+001F).
+pub fn is_blank(s: &str) -> bool {
     // Jinja `trim` uses Python `str.strip()`.
     s.chars().all(crate::py_isspace)
 }
@@ -68,20 +70,18 @@ fn alias(lang: &str) -> &str {
     if lang == "ja(easy)" { "ja-easy" } else { lang }
 }
 
-impl TranslationRequest {
-    /// Renders the PFML3 prompt, including the leading `<|plamo:bos|>`.
-    /// Tokenize the result with `add_bos = false`.
-    pub fn to_prompt(&self) -> Result<String, PromptError> {
-        for pair in &self.history {
-            check_text(&pair.source, "message content", false)?;
-            check_text(&pair.target, "message content", false)?;
-        }
-        check_text(&self.text, "message content", false)?;
+/// Checks a text to translate (or a history entry): not blank, no reserved tokens.
+pub fn validate_message(text: &str) -> Result<(), PromptError> {
+    check_text(text, "message content", false)
+}
 
+impl TranslationRequest {
+    /// Checks everything [`to_prompt`](TranslationRequest::to_prompt) checks except the
+    /// text and the history: the languages, the form, the context and the glossary.
+    pub fn validate_options(&self) -> Result<(), PromptError> {
         let target_lang = alias(&self.target_lang);
-        let source_lang = self.source_lang.as_deref().map(alias);
         validate_lang(target_lang, "target_lang")?;
-        if let Some(s) = source_lang {
+        if let Some(s) = self.source_lang.as_deref().map(alias) {
             validate_lang(s, "source_lang")?;
         }
         if let Some(c) = &self.context {
@@ -96,6 +96,20 @@ impl TranslationRequest {
             check_text(&term.source, "glossary source", false)?;
             check_text(&term.target, "glossary target", false)?;
         }
+        Ok(())
+    }
+
+    /// Renders the PFML3 prompt, including the leading `<|plamo:bos|>`.
+    /// Tokenize the result with `add_bos = false`.
+    pub fn to_prompt(&self) -> Result<String, PromptError> {
+        for pair in &self.history {
+            validate_message(&pair.source)?;
+            validate_message(&pair.target)?;
+        }
+        validate_message(&self.text)?;
+        self.validate_options()?;
+        let target_lang = alias(&self.target_lang);
+        let source_lang = self.source_lang.as_deref().map(alias);
 
         let mut p = String::from("<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation");
         if let Some(c) = self.context.as_deref().filter(|c| !c.is_empty()) {

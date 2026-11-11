@@ -1,7 +1,9 @@
 //! The single inference thread. HTTP handlers only enqueue jobs and read events; this
 //! thread feeds them to the engine, which runs many of them in the same passes.
 //! A document job becomes one engine request per segment; when a segment finishes, the
-//! next segment of its chain is submitted.
+//! next segment of its chain is submitted. What each request goes through (hints from
+//! the translation memory, decoding, recording its output) is the runtime's [`Session`];
+//! this module only routes its updates to the clients.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -12,19 +14,14 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use yaxus_api::{DocumentUsage, Usage};
-use yaxus_model::{Event as EngineEvent, Finish, Generator, ReqId, Request};
-use yaxus_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, Tokenizer};
-
-use crate::document::{DocJob, encode_within};
-use crate::memory::{self, Memory};
+use yaxus_model::{Finish, Generator};
+use yaxus_runtime::document::DocJob;
+use yaxus_runtime::memory::{self, Memory};
+use yaxus_runtime::{Finished, Prompt, Session, Update};
+use yaxus_tokenizer::Tokenizer;
 
 pub enum Work {
-    /// `memo`: the request's translation memory key.
-    Single {
-        prompt_ids: Vec<u32>,
-        max_new_tokens: usize,
-        memo: u64,
-    },
+    Single { prompt: Prompt, max_new_tokens: usize },
     Document(Box<DocJob>),
 }
 
@@ -47,20 +44,10 @@ pub enum Event {
     DocumentDone(DocumentUsage),
 }
 
+/// Whose an engine request is.
 enum Owner {
-    Single { events: mpsc::UnboundedSender<Event>, label: String, enqueued: Instant, prompt_len: usize },
+    Single { events: mpsc::UnboundedSender<Event>, label: String, enqueued: Instant },
     Doc { key: u64, segment: usize },
-}
-
-struct Active {
-    owner: Owner,
-    dec: StreamDecoder,
-    text: String,
-    tokens: Vec<u32>,
-    memo: u64,
-    /// When the engine accepted the request.
-    start: Instant,
-    first: Option<Instant>,
 }
 
 struct Doc {
@@ -76,15 +63,13 @@ struct Doc {
     stopped: bool,
 }
 
-struct State {
-    active: HashMap<ReqId, Active>,
+/// The documents in progress.
+#[derive(Default)]
+struct Docs {
     docs: HashMap<u64, Doc>,
-    next_id: ReqId,
+    next_key: u64,
     /// Documents whose chains may continue after this step.
     resubmit: Vec<u64>,
-    memory: Memory,
-    /// Most prompt + generated tokens per request.
-    max_context: usize,
 }
 
 pub fn run(
@@ -93,37 +78,31 @@ pub fn run(
     mut rx: mpsc::Receiver<Job>,
     queued: Arc<AtomicUsize>,
     queue_limit: usize,
-    max_context: usize,
     failed: tokio::sync::oneshot::Sender<()>,
 ) {
-    let mut st = State {
-        active: HashMap::new(),
-        docs: HashMap::new(),
-        next_id: 0,
-        resubmit: Vec::new(),
-        memory: Memory::new(memory::DEFAULT_ENTRIES),
-        max_context,
-    };
+    let mut memory = Memory::new(memory::DEFAULT_ENTRIES);
+    let mut session: Session<Owner> = Session::new(engine.as_mut(), &tok, &mut memory);
+    let mut docs = Docs::default();
     loop {
         // Block only when there is nothing to run.
-        if st.active.is_empty() {
+        if session.is_idle() {
             match rx.blocking_recv() {
-                Some(job) => add(job, &mut st, engine.as_mut(), &tok, &queued),
+                Some(job) => add(job, &mut session, &mut docs, &queued),
                 None => return,
             }
         }
-        while engine.waiting() < queue_limit {
+        while session.waiting() < queue_limit {
             match rx.try_recv() {
-                Ok(job) => add(job, &mut st, engine.as_mut(), &tok, &queued),
+                Ok(job) => add(job, &mut session, &mut docs, &queued),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) if st.active.is_empty() => return,
+                Err(TryRecvError::Disconnected) if session.is_idle() => return,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-        if st.active.is_empty() {
+        if session.is_idle() {
             continue;
         }
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| engine.step(&mut |ev| handle(ev, &tok, &mut st))));
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| session.step(&mut |u| handle(u, &mut docs))));
         let panicked = result.is_err();
         let failure = match result {
             Ok(Ok(_)) => None,
@@ -132,111 +111,84 @@ pub fn run(
         };
         if let Some(msg) = failure {
             tracing::error!("inference step failed: {msg}");
-            for (_, a) in st.active.drain() {
-                if let Owner::Single { events, .. } = a.owner {
-                    let _ = events.send(Event::Error(msg.clone()));
-                }
-            }
-            for (_, d) in st.docs.drain() {
-                let _ = d.events.send(Event::Error(msg.clone()));
-            }
             if panicked {
                 // The engine may be half-way through a pass (KV pages, stream state): do
-                // not serve from it again. The server shuts down so that it can be
-                // restarted; until then new requests get 503 and /healthz says so.
+                // not call it again. The server shuts down so that it can be restarted;
+                // until then new requests get 503 and /healthz says so.
+                fail_all(session.abandon(), &mut docs, &msg);
                 tracing::error!("stopping the inference thread after a panic");
                 let _ = failed.send(());
                 return;
             }
+            fail_all(session.abort_all(), &mut docs, &msg);
             continue;
         }
-        for key in std::mem::take(&mut st.resubmit) {
-            submit_ready(key, &mut st, engine.as_mut(), &tok);
+        for key in std::mem::take(&mut docs.resubmit) {
+            submit_ready(key, &mut session, &mut docs);
         }
     }
 }
 
-fn add(job: Job, st: &mut State, engine: &mut dyn Generator, tok: &Tokenizer, queued: &AtomicUsize) {
+/// Tells the clients of the requests in flight and of every document that they failed.
+fn fail_all(owners: Vec<Owner>, docs: &mut Docs, msg: &str) {
+    for owner in owners {
+        if let Owner::Single { events, .. } = owner {
+            let _ = events.send(Event::Error(msg.to_string()));
+        }
+    }
+    for (_, d) in docs.docs.drain() {
+        let _ = d.events.send(Event::Error(msg.to_string()));
+    }
+}
+
+fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs, queued: &AtomicUsize) {
     queued.fetch_sub(1, Ordering::SeqCst);
     if job.events.is_closed() {
         return; // the client left while waiting
     }
     match job.work {
-        Work::Single { prompt_ids, max_new_tokens, memo } => {
-            st.next_id += 1;
-            let prompt_len = prompt_ids.len();
-            let mut req = Request::new(st.next_id, prompt_ids, max_new_tokens, vec![EOS_ID, TAG_ID]);
-            req.hint = st.memory.get(memo);
-            engine.submit(req);
-            st.active.insert(
-                st.next_id,
-                Active {
-                    owner: Owner::Single { events: job.events, label: job.label, enqueued: job.enqueued, prompt_len },
-                    dec: StreamDecoder::new(),
-                    text: String::new(),
-                    tokens: Vec::new(),
-                    memo,
-                    start: Instant::now(),
-                    first: None,
-                },
-            );
+        Work::Single { prompt, max_new_tokens } => {
+            let owner = Owner::Single { events: job.events, label: job.label, enqueued: job.enqueued };
+            session.submit(prompt, max_new_tokens, owner);
         }
         Work::Document(doc) => {
-            st.next_id += 1;
-            let key = st.next_id;
-            let usage = DocumentUsage { segments: doc.segments.len(), chains: doc.chains(), ..Default::default() };
-            st.docs.insert(
-                key,
-                Doc {
-                    doc: *doc,
-                    events: job.events,
-                    label: job.label,
-                    enqueued: job.enqueued,
-                    start: Instant::now(),
-                    usage,
-                    live: 0,
-                    stopped: false,
-                },
-            );
-            submit_ready(key, st, engine, tok);
+            docs.next_key += 1;
+            let key = docs.next_key;
+            let usage = DocumentUsage { segments: doc.len(), chains: doc.chains(), ..Default::default() };
+            let d = Doc {
+                doc: *doc,
+                events: job.events,
+                label: job.label,
+                enqueued: job.enqueued,
+                start: Instant::now(),
+                usage,
+                live: 0,
+                stopped: false,
+            };
+            docs.docs.insert(key, d);
+            submit_ready(key, session, docs);
         }
     }
 }
 
 /// Submits the segments of document `key` that can start, and completes the document
 /// when nothing is left.
-fn submit_ready(key: u64, st: &mut State, engine: &mut dyn Generator, tok: &Tokenizer) {
-    let Some(d) = st.docs.get_mut(&key) else { return };
+fn submit_ready(key: u64, session: &mut Session<Owner>, docs: &mut Docs) {
+    let Some(d) = docs.docs.get_mut(&key) else { return };
     if !d.stopped {
-        for (segment, mut req) in d.doc.ready() {
-            // A long history may not fit with the segment: it is dropped then.
-            let (ids, max_new) = match encode_within(tok, &mut req, st.max_context, d.doc.opts.max_new_tokens) {
+        for (segment, req) in d.doc.ready() {
+            // A history that leaves too little room is dropped.
+            let (prompt, max_new) = match d.doc.prompt(session.tokenizer(), req) {
                 Ok(x) => x,
                 Err(e) => {
-                    let _ = d.events.send(Event::Error(format!("segment {segment}: {e}")));
+                    let _ = d.events.send(Event::Error(format!("segment {segment}: {}", e.0)));
                     d.stopped = true;
                     break;
                 }
             };
-            st.next_id += 1;
-            d.usage.prompt_tokens += ids.len();
+            d.usage.prompt_tokens += prompt.len();
             d.live += 1;
-            let memo = memory::key(&req);
-            let mut r = Request::new(st.next_id, ids, max_new, vec![EOS_ID, TAG_ID]);
-            r.hint = st.memory.get(memo);
-            engine.submit(r);
-            st.active.insert(
-                st.next_id,
-                Active {
-                    owner: Owner::Doc { key, segment },
-                    dec: StreamDecoder::new(),
-                    text: String::new(),
-                    tokens: Vec::new(),
-                    memo,
-                    start: Instant::now(),
-                    first: None,
-                },
-            );
+            session.submit(prompt, max_new, Owner::Doc { key, segment });
         }
         // Segments without text complete without the engine.
         if d.doc.is_done() {
@@ -253,132 +205,116 @@ fn submit_ready(key: u64, st: &mut State, engine: &mut dyn Generator, tok: &Toke
                 d.usage.elapsed_ms
             );
             let _ = d.events.send(Event::DocumentDone(d.usage.clone()));
-            st.docs.remove(&key);
+            docs.docs.remove(&key);
             return;
         }
     }
     if d.stopped && d.live == 0 {
-        st.docs.remove(&key);
+        docs.docs.remove(&key);
     }
 }
 
-/// Delivers one engine event; returns `false` to cancel a request whose client is gone.
-fn handle(ev: EngineEvent, tok: &Tokenizer, st: &mut State) -> bool {
-    match ev {
-        EngineEvent::Token { id, token } => {
-            let Some(a) = st.active.get_mut(&id) else { return false };
-            a.first.get_or_insert_with(Instant::now);
-            a.tokens.push(token);
-            let s = a.dec.push(tok, token);
-            a.text += &s;
-            match &a.owner {
-                Owner::Single { events, .. } => {
-                    if s.is_empty() {
-                        !events.is_closed()
-                    } else {
-                        events.send(Event::Delta(s)).is_ok()
-                    }
-                }
-                Owner::Doc { key, segment } => {
-                    let Some(d) = st.docs.get_mut(key) else { return false };
-                    let ok = !d.stopped
-                        && if s.is_empty() {
-                            !d.events.is_closed()
-                        } else {
-                            d.events.send(Event::SegmentDelta(*segment, s)).is_ok()
-                        };
-                    if !ok {
-                        d.stopped = true;
-                    }
-                    ok
-                }
+/// Delivers one update to its client; returns `false` to cancel a request whose client
+/// is gone.
+fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
+    match u {
+        Update::Delta { tag: Owner::Single { events, .. }, text } => {
+            if text.is_empty() {
+                !events.is_closed()
+            } else {
+                events.send(Event::Delta(text.to_string())).is_ok()
             }
         }
-        EngineEvent::Done { id, finish, generated, start } => {
-            let Some(mut a) = st.active.remove(&id) else { return true };
-            if finish == Finish::Stop {
-                st.memory.put(a.memo, std::mem::take(&mut a.tokens));
+        Update::Delta { tag: Owner::Doc { key, segment }, text } => {
+            let Some(d) = docs.docs.get_mut(key) else { return false };
+            let ok = !d.stopped
+                && if text.is_empty() {
+                    !d.events.is_closed()
+                } else {
+                    d.events.send(Event::SegmentDelta(*segment, text.to_string())).is_ok()
+                };
+            if !ok {
+                d.stopped = true;
             }
-            let tail = a.dec.finish();
-            a.text += &tail;
-            let elapsed = a.start.elapsed();
-            match a.owner {
-                Owner::Single { events, label, enqueued, prompt_len } => {
-                    if !tail.is_empty() {
-                        let _ = events.send(Event::Delta(tail));
-                    }
-                    let usage = Usage {
-                        prompt_tokens: prompt_len,
-                        completion_tokens: generated,
-                        elapsed_ms: elapsed.as_millis() as u64,
-                        // Without any token (immediate stop), prompt processing was the whole time.
-                        prefill_ms: a.first.map_or(elapsed, |t| t - a.start).as_millis() as u64,
-                        queue_ms: (a.start - enqueued).as_millis() as u64,
-                    };
-                    tracing::info!(
-                        "{label}: {} -> {} tokens in {elapsed:.2?} ({}, queued {} ms){}",
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        if start.cached {
-                            "from the response cache".to_string()
-                        } else {
-                            format!("reused {} prompt tokens", start.reused)
-                        },
-                        usage.queue_ms,
-                        if finish == Finish::Cancelled { ", cancelled by client" } else { "" }
-                    );
-                    let _ = events.send(Event::Done(usage));
+            ok
+        }
+        Update::Done { tag: Owner::Single { events, label, enqueued }, done } => {
+            let usage = usage(&done, enqueued);
+            log_single(&label, &usage, &done);
+            let _ = events.send(Event::Done(usage));
+            true
+        }
+        Update::Done { tag: Owner::Doc { key, segment }, done } => {
+            if let Some(d) = docs.docs.get_mut(&key) {
+                d.live -= 1;
+                if !d.stopped {
+                    d.usage.completion_tokens += done.generated;
+                    d.usage.reused_tokens += done.start.reused;
+                    d.doc.finished(segment, done.text);
+                    let _ = d.events.send(Event::SegmentEnd(segment));
                 }
-                Owner::Doc { key, segment } => {
-                    if let Some(d) = st.docs.get_mut(&key) {
-                        d.live -= 1;
-                        if !d.stopped {
-                            if !tail.is_empty() {
-                                let _ = d.events.send(Event::SegmentDelta(segment, tail));
-                            }
-                            d.usage.completion_tokens += generated;
-                            d.usage.reused_tokens += start.reused;
-                            d.doc.finished(segment, a.text);
-                            let _ = d.events.send(Event::SegmentEnd(segment));
-                        }
-                        st.resubmit.push(key);
-                    }
-                }
+                docs.resubmit.push(key);
             }
             true
         }
-        EngineEvent::Error { id, message } => {
-            if let Some(a) = st.active.remove(&id) {
-                match a.owner {
-                    Owner::Single { events, label, .. } => {
-                        tracing::warn!("{label}: generation failed: {message}");
-                        let _ = events.send(Event::Error(message));
-                    }
-                    Owner::Doc { key, segment } => {
-                        if let Some(d) = st.docs.get_mut(&key) {
-                            tracing::warn!("{}: segment {segment} failed: {message}", d.label);
-                            d.live -= 1;
-                            if !d.stopped {
-                                let _ = d.events.send(Event::Error(format!("segment {segment}: {message}")));
-                            }
-                            d.stopped = true;
-                            st.resubmit.push(key);
-                        }
-                    }
+        Update::Failed { tag: Owner::Single { events, label, .. }, message } => {
+            tracing::warn!("{label}: generation failed: {message}");
+            let _ = events.send(Event::Error(message));
+            true
+        }
+        Update::Failed { tag: Owner::Doc { key, segment }, message } => {
+            if let Some(d) = docs.docs.get_mut(&key) {
+                tracing::warn!("{}: segment {segment} failed: {message}", d.label);
+                d.live -= 1;
+                if !d.stopped {
+                    let _ = d.events.send(Event::Error(format!("segment {segment}: {message}")));
                 }
+                d.stopped = true;
+                docs.resubmit.push(key);
             }
             true
         }
     }
+}
+
+/// The usage report of a single request that waited in the queue since `enqueued`.
+fn usage(done: &Finished, enqueued: Instant) -> Usage {
+    Usage {
+        prompt_tokens: done.prompt_tokens,
+        completion_tokens: done.generated,
+        elapsed_ms: done.elapsed().as_millis() as u64,
+        prefill_ms: done.prefill().as_millis() as u64,
+        queue_ms: (done.submitted - enqueued).as_millis() as u64,
+    }
+}
+
+fn log_single(label: &str, usage: &Usage, done: &Finished) {
+    tracing::info!(
+        "{label}: {} -> {} tokens in {:.2?} ({}, queued {} ms){}",
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        done.elapsed(),
+        if done.start.cached {
+            "from the response cache".to_string()
+        } else {
+            format!("reused {} prompt tokens", done.start.reused)
+        },
+        usage.queue_ms,
+        if done.finish == Finish::Cancelled { ", cancelled by client" } else { "" }
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yaxus_model::StartInfo;
+    use yaxus_model::{Event as EngineEvent, ReqId, Request, StartInfo};
+    use yaxus_tokenizer::{TAG_ID, TranslationRequest};
 
     /// An engine whose every pass panics.
-    struct Panicking;
+    #[derive(Default)]
+    struct Panicking {
+        aborted: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl Generator for Panicking {
         fn submit(&mut self, _: Request) {}
@@ -393,6 +329,9 @@ mod tests {
         }
         fn active(&self) -> usize {
             1
+        }
+        fn abort_all(&mut self) {
+            self.aborted.store(true, Ordering::SeqCst);
         }
         fn backend_name(&self) -> String {
             "panicking".into()
@@ -426,21 +365,24 @@ mod tests {
 
     #[test]
     fn a_panic_fails_the_requests_and_stops_the_worker() {
+        let tok = Arc::new(tokenizer());
         let (jobs, rx) = mpsc::channel(4);
         let (events, mut out) = mpsc::unbounded_channel();
+        let req = TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let job = Job {
-            work: Work::Single { prompt_ids: vec![1, 2, 3], max_new_tokens: 4, memo: 0 },
+            work: Work::Single { prompt: Prompt::new(&tok, &req).unwrap(), max_new_tokens: 4 },
             enqueued: Instant::now(),
             events,
             label: "test".into(),
         };
         let queued = Arc::new(AtomicUsize::new(1));
         jobs.try_send(job).unwrap();
-        let tok = Arc::new(tokenizer());
+        let engine = Panicking::default();
+        let aborted = engine.aborted.clone();
         let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            run(Box::new(Panicking), tok, rx, queued, 4, 8192, failed_tx);
+            run(Box::new(engine), tok, rx, queued, 4, failed_tx);
             let _ = done_tx.send(());
         });
         // The worker returns instead of serving from the broken engine (a timeout rather
@@ -449,5 +391,6 @@ mod tests {
         assert!(matches!(out.try_recv(), Ok(Event::Error(m)) if m.contains("internal error")));
         assert!(jobs.is_closed());
         assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
+        assert!(!aborted.load(Ordering::SeqCst), "the broken engine was called again");
     }
 }
