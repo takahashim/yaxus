@@ -38,10 +38,8 @@ const REPEATED_CHARS_THRESHOLD: usize = 4;
 /// `break_around_consecutive_spaces_threshold` from tokenizer_config.json.
 const CONSECUTIVE_SPACES_THRESHOLD: usize = 2;
 
-pub const UNK_ID: u32 = 0;
 pub const BOS_ID: u32 = 1;
 pub const EOS_ID: u32 = 1; // tokenizer_config: eos_token = <|plamo:bos|>
-pub const PAD_ID: u32 = 3;
 pub const TAG_ID: u32 = 16;
 
 /// Token ids the rest of the crate (and its users) hard-code, checked at load time
