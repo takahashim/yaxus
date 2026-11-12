@@ -14,46 +14,45 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use yaxus_api::{DocumentUsage, Usage};
+use yaxus_api::{DocumentEvent, DocumentUsage, StreamEvent, Usage};
 use yaxus_model::{Finish, Generator};
 use yaxus_runtime::document::{DocJob, DocRun};
 use yaxus_runtime::memory::{self, Memory};
 use yaxus_runtime::{Finished, Prompt, Session, Update};
 use yaxus_tokenizer::Tokenizer;
 
+/// What a job is, and where its events (those of the API) go.
 pub enum Work {
-    Single { prompt: Prompt, max_new_tokens: usize },
-    Document(Box<DocJob>),
+    Single { prompt: Prompt, max_new_tokens: usize, events: mpsc::UnboundedSender<StreamEvent> },
+    Document { job: Box<DocJob>, events: mpsc::UnboundedSender<DocumentEvent> },
 }
 
 pub struct Job {
     pub work: Work,
     pub enqueued: Instant,
-    pub events: mpsc::UnboundedSender<Event>,
     /// Short description for the log line.
     pub label: String,
 }
 
-#[derive(Debug)]
-pub enum Event {
-    Delta(String),
-    Done(Usage),
-    Error(String),
-    /// Document jobs: text of one segment.
-    SegmentDelta(usize, String),
-    SegmentEnd(usize),
-    DocumentDone(DocumentUsage),
+impl Job {
+    /// The client left while the job waited.
+    fn is_abandoned(&self) -> bool {
+        match &self.work {
+            Work::Single { events, .. } => events.is_closed(),
+            Work::Document { events, .. } => events.is_closed(),
+        }
+    }
 }
 
 /// Whose an engine request is.
 enum Owner {
-    Single { events: mpsc::UnboundedSender<Event>, label: String, enqueued: Instant },
+    Single { events: mpsc::UnboundedSender<StreamEvent>, label: String, enqueued: Instant },
     Doc { key: u64, segment: usize },
 }
 
 struct Doc {
     run: DocRun,
-    events: mpsc::UnboundedSender<Event>,
+    events: mpsc::UnboundedSender<DocumentEvent>,
     label: String,
     enqueued: Instant,
     start: Instant,
@@ -129,34 +128,29 @@ pub fn run(
 fn fail_all(owners: Vec<Owner>, docs: &mut Docs, msg: &str) {
     for owner in owners {
         if let Owner::Single { events, .. } = owner {
-            let _ = events.send(Event::Error(msg.to_string()));
+            let _ = events.send(StreamEvent::Error { error: msg.to_string() });
         }
     }
     for (_, d) in docs.docs.drain() {
-        let _ = d.events.send(Event::Error(msg.to_string()));
+        let _ = d.events.send(DocumentEvent::Error { error: msg.to_string() });
     }
 }
 
 fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs, queued: &AtomicUsize) {
     queued.fetch_sub(1, Ordering::SeqCst);
-    if job.events.is_closed() {
-        return; // the client left while waiting
+    if job.is_abandoned() {
+        return;
     }
     match job.work {
-        Work::Single { prompt, max_new_tokens } => {
-            let owner = Owner::Single { events: job.events, label: job.label, enqueued: job.enqueued };
+        Work::Single { prompt, max_new_tokens, events } => {
+            let owner = Owner::Single { events, label: job.label, enqueued: job.enqueued };
             session.submit(prompt, max_new_tokens, owner);
         }
-        Work::Document(doc) => {
+        Work::Document { job: doc, events } => {
             docs.next_key += 1;
             let key = docs.next_key;
-            let d = Doc {
-                run: DocRun::new(*doc),
-                events: job.events,
-                label: job.label,
-                enqueued: job.enqueued,
-                start: Instant::now(),
-            };
+            let d =
+                Doc { run: DocRun::new(*doc), events, label: job.label, enqueued: job.enqueued, start: Instant::now() };
             docs.docs.insert(key, d);
             submit_ready(key, session, docs);
         }
@@ -169,7 +163,7 @@ fn submit_ready(key: u64, session: &mut Session<Owner>, docs: &mut Docs) {
     let Some(d) = docs.docs.get_mut(&key) else { return };
     // A history that leaves too little room is dropped.
     if let Err(e) = d.run.submit_ready(session, |segment| Owner::Doc { key, segment }) {
-        let _ = d.events.send(Event::Error(e.0));
+        let _ = d.events.send(DocumentEvent::Error { error: e.0 });
     }
     if !d.run.is_over() {
         return;
@@ -191,7 +185,7 @@ fn submit_ready(key: u64, session: &mut Session<Owner>, docs: &mut Docs) {
             usage.reused_tokens,
             usage.elapsed_ms
         );
-        let _ = d.events.send(Event::DocumentDone(usage));
+        let _ = d.events.send(DocumentEvent::Done { done: true, usage });
     }
     docs.docs.remove(&key);
 }
@@ -204,7 +198,7 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
             if text.is_empty() {
                 !events.is_closed()
             } else {
-                events.send(Event::Delta(text.to_string())).is_ok()
+                events.send(StreamEvent::Delta { delta: text.to_string() }).is_ok()
             }
         }
         Update::Delta { tag: Owner::Doc { key, segment }, text } => {
@@ -213,7 +207,7 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
                 && if text.is_empty() {
                     !d.events.is_closed()
                 } else {
-                    d.events.send(Event::SegmentDelta(*segment, text.to_string())).is_ok()
+                    d.events.send(DocumentEvent::Delta { segment: *segment, delta: text.to_string() }).is_ok()
                 };
             if !ok {
                 d.run.stop();
@@ -223,12 +217,14 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         Update::Done { tag: Owner::Single { events, label, enqueued }, done } => {
             let usage = usage(&done, enqueued);
             log_single(&label, &usage, &done);
-            let _ = events.send(Event::Done(usage));
+            let _ = events.send(StreamEvent::Done { done: true, usage });
             true
         }
         Update::Done { tag: Owner::Doc { key, segment }, done } => {
             if let Some(d) = docs.docs.get_mut(&key) {
-                if d.run.on_done(segment, done).is_some() && d.events.send(Event::SegmentEnd(segment)).is_err() {
+                if d.run.on_done(segment, done).is_some()
+                    && d.events.send(DocumentEvent::SegmentEnd { segment, end: true }).is_err()
+                {
                     d.run.stop();
                 }
                 docs.resubmit.push(key);
@@ -237,14 +233,14 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         }
         Update::Failed { tag: Owner::Single { events, label, .. }, message } => {
             tracing::warn!("{label}: generation failed: {message}");
-            let _ = events.send(Event::Error(message));
+            let _ = events.send(StreamEvent::Error { error: message });
             true
         }
         Update::Failed { tag: Owner::Doc { key, segment }, message } => {
             if let Some(d) = docs.docs.get_mut(&key) {
                 tracing::warn!("{}: segment {segment} failed: {message}", d.label);
                 if let Some(e) = d.run.on_failed(segment, &message) {
-                    let _ = d.events.send(Event::Error(e));
+                    let _ = d.events.send(DocumentEvent::Error { error: e });
                 }
                 docs.resubmit.push(key);
             }
@@ -334,9 +330,8 @@ mod tests {
         let (events, mut out) = mpsc::unbounded_channel();
         let req = TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let job = Job {
-            work: Work::Single { prompt: Prompt::new(&tok, &req.validate().unwrap()), max_new_tokens: 4 },
+            work: Work::Single { prompt: Prompt::new(&tok, &req.validate().unwrap()), max_new_tokens: 4, events },
             enqueued: Instant::now(),
-            events,
             label: "test".into(),
         };
         let queued = Arc::new(AtomicUsize::new(1));
@@ -352,7 +347,7 @@ mod tests {
         // The worker returns instead of serving from the broken engine (a timeout rather
         // than join(), so that a regression fails instead of hanging the test run).
         assert!(done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the worker kept running");
-        assert!(matches!(out.try_recv(), Ok(Event::Error(m)) if m.contains("internal error")));
+        assert!(matches!(out.try_recv(), Ok(StreamEvent::Error { error: m }) if m.contains("internal error")));
         assert!(jobs.is_closed());
         assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
         assert!(!aborted.load(Ordering::SeqCst), "the broken engine was called again");

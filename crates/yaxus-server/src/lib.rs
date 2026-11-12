@@ -19,6 +19,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use yaxus_api::{
@@ -29,7 +30,7 @@ use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenize
 use yaxus_tokenizer::Tokenizer;
 
 pub use tls::default_sans;
-use worker::{Event, Job, Work};
+use worker::{Job, Work};
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 
@@ -133,8 +134,19 @@ fn label(source_lang: Option<&str>, target_lang: &str) -> String {
     format!("{}->{}", source_lang.unwrap_or("auto"), target_lang)
 }
 
-fn sse_json(ev: &StreamEvent) -> Result<SseEvent, Infallible> {
-    Ok(SseEvent::default().data(serde_json::to_string(ev).unwrap()))
+/// The events of a job as an SSE stream, one JSON object per event.
+fn sse_response<E: Serialize + Send + 'static>(rx: mpsc::UnboundedReceiver<E>) -> Response {
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|ev| Ok::<_, Infallible>(SseEvent::default().data(serde_json::to_string(&ev).unwrap())));
+    let mut r = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    // Keep reverse proxies from buffering the stream.
+    r.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    r
+}
+
+/// The worker dropped a job's channel without a final event.
+fn worker_stopped() -> Response {
+    error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
 }
 
 async fn translate(
@@ -145,48 +157,31 @@ async fn translate(
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let (prompt, max_new) = match Prompt::for_request(&st.tok, &req, st.max_context) {
+    let (prompt, max_new_tokens) = match Prompt::for_request(&st.tok, &req, st.max_context) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.0),
     };
-
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (events, mut rx) = mpsc::unbounded_channel();
     let job = Job {
-        work: Work::Single { prompt, max_new_tokens: max_new },
+        work: Work::Single { prompt, max_new_tokens, events },
         enqueued: Instant::now(),
-        events: tx,
         label: label(req.requested_source_lang(), &req.target_lang),
     };
     if let Err(r) = enqueue(&st, job) {
         return r;
     }
-
     if req.stream {
-        let stream = UnboundedReceiverStream::new(rx).map(|ev| {
-            sse_json(&match ev {
-                Event::Delta(delta) => StreamEvent::Delta { delta },
-                Event::Done(usage) => StreamEvent::Done { done: true, usage },
-                Event::Error(error) => StreamEvent::Error { error },
-                _ => StreamEvent::Error { error: "unexpected event".into() },
-            })
-        });
-        let mut r = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
-        // Keep reverse proxies from buffering the stream.
-        r.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
-        return r;
+        return sse_response(rx);
     }
-
-    let mut rx = rx;
     let mut text = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {
-            Event::Delta(d) => text.push_str(&d),
-            Event::Done(usage) => return Json(TranslateResponse { text, usage }).into_response(),
-            Event::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
-            _ => {}
+            StreamEvent::Delta { delta } => text.push_str(&delta),
+            StreamEvent::Done { usage, .. } => return Json(TranslateResponse { text, usage }).into_response(),
+            StreamEvent::Error { error: e } => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
     }
-    error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
+    worker_stopped()
 }
 
 // (the error is the response to send; boxing it buys nothing on this path)
@@ -231,42 +226,26 @@ async fn translate_document(
     if let Err(e) = doc.validate(&st.tok) {
         return error(StatusCode::BAD_REQUEST, e.0);
     }
-    let (tx, rx) = mpsc::unbounded_channel();
-    let job = Job { work: Work::Document(Box::new(doc)), enqueued: Instant::now(), events: tx, label };
+    let (events, mut rx) = mpsc::unbounded_channel();
+    let job = Job { work: Work::Document { job: Box::new(doc), events }, enqueued: Instant::now(), label };
     if let Err(r) = enqueue(&st, job) {
         return r;
     }
     if stream {
-        let stream = UnboundedReceiverStream::new(rx).map(|ev| {
-            sse_json_doc(&match ev {
-                Event::SegmentDelta(segment, delta) => DocumentEvent::Delta { segment, delta },
-                Event::SegmentEnd(segment) => DocumentEvent::SegmentEnd { segment, end: true },
-                Event::DocumentDone(usage) => DocumentEvent::Done { done: true, usage },
-                Event::Error(error) => DocumentEvent::Error { error },
-                _ => DocumentEvent::Error { error: "unexpected event".into() },
-            })
-        });
-        let mut r = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
-        r.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
-        return r;
+        return sse_response(rx);
     }
-    let mut rx = rx;
     let mut out = vec![String::new(); n];
     while let Some(ev) = rx.recv().await {
         match ev {
-            Event::SegmentDelta(i, d) => out[i].push_str(&d),
-            Event::DocumentDone(usage) => {
+            DocumentEvent::Delta { segment, delta } => out[segment].push_str(&delta),
+            DocumentEvent::SegmentEnd { .. } => {}
+            DocumentEvent::Done { usage, .. } => {
                 return Json(DocumentResponse { segments: out, usage }).into_response();
             }
-            Event::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
-            _ => {}
+            DocumentEvent::Error { error: e } => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
     }
-    error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
-}
-
-fn sse_json_doc(ev: &DocumentEvent) -> Result<SseEvent, Infallible> {
-    Ok(SseEvent::default().data(serde_json::to_string(ev).unwrap()))
+    worker_stopped()
 }
 
 fn router(st: Shared) -> Router {
