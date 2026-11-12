@@ -74,6 +74,18 @@ pub struct PassMeta {
     pub pages: Vec<u32>,
 }
 
+impl PassMeta {
+    /// The page table of row `row`'s sequence (followed by those of later sequences).
+    pub fn page_table(&self, row: usize) -> &[u32] {
+        &self.pages[self.pt_off[row] as usize..]
+    }
+
+    /// The arena slot of position `pos` of row `row`'s sequence.
+    pub fn slot(&self, row: usize, pos: usize) -> usize {
+        kv::slot(self.page_table(row), pos)
+    }
+}
+
 /// Compute primitives. Tensors are row-major `[rows, cols]` f32 activations.
 ///
 /// A forward pass starts with `begin_pass`, whose row metadata `embed` and `attention`

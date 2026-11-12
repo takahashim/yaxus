@@ -491,8 +491,7 @@ impl Backend for CpuBackend {
             let (i, h) = (idx / hq, idx % hq);
             let kh = h / group;
             let p = pass.pos[i] as usize;
-            let pages = &pass.pages[pass.pt_off[i] as usize..];
-            let slot = |s: usize| pages[s / PAGE] as usize * PAGE + s % PAGE;
+            let slot = |s: usize| pass.slot(i, s);
             let lo = match layer.window {
                 Some(w) => (p + 1).saturating_sub(w),
                 None => 0,
@@ -662,7 +661,7 @@ mod tests {
             });
             meta.ids.push(0);
             meta.pos.push(p as u32);
-            meta.kv_slot.push(pages[sq][p / PAGE] * PAGE as u32 + (p % PAGE) as u32);
+            meta.kv_slot.push(yaxus_model::kv::slot(&pages[sq], p) as u32);
             meta.pt_off.push(o);
         }
         b.begin_pass(&meta);
