@@ -367,6 +367,87 @@ fn matmul<M: MatrixRows>(x: &Tensor, w: &M) -> Tensor {
     out
 }
 
+/// One layer's attention in the current pass.
+struct LayerPass<'a> {
+    pass: &'a PassMeta,
+    cfg: &'a Config,
+    layer: &'a LayerMeta,
+}
+
+impl LayerPass<'_> {
+    /// Normalizes and rotates the queries and keys of `qkv`'s rows and writes the keys and
+    /// values to the rows' slots of `lc`; returns the queries, `[T, Hq*D]`.
+    fn write_rows(&self, qkv: &Tensor, qn: &[f32], kn: &[f32], lc: &mut LayerKv) -> Vec<f32> {
+        let (hq, hkv, d) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
+        let (qd, kvd) = (hq * d, hkv * d);
+        let eps = self.cfg.rms_norm_eps;
+        let mut cos = vec![0f32; d / 2];
+        let mut sin = vec![0f32; d / 2];
+        let mut q = vec![0f32; qkv.rows * qd];
+        for i in 0..qkv.rows {
+            let row = qkv.row(i);
+            self.layer.rope.cos_sin(self.pass.pos[i] as usize, &mut cos, &mut sin);
+            for h in 0..hq {
+                let dst = &mut q[i * qd + h * d..i * qd + (h + 1) * d];
+                rmsnorm_row(&row[h * d..(h + 1) * d], qn, 1.0, eps, dst);
+                rope_inplace(dst, &cos, &sin);
+            }
+            let slot = self.pass.kv_slot[i] as usize;
+            for h in 0..hkv {
+                let src = &row[qd + h * d..qd + (h + 1) * d];
+                let dst = &mut lc.k[slot * kvd + h * d..slot * kvd + (h + 1) * d];
+                rmsnorm_row(src, kn, 1.0, eps, dst);
+                rope_inplace(dst, &cos, &sin);
+                let vsrc = &row[qd + kvd + h * d..qd + kvd + (h + 1) * d];
+                lc.v[slot * kvd + h * d..slot * kvd + (h + 1) * d].copy_from_slice(vsrc);
+            }
+        }
+        q
+    }
+
+    /// Causal (optionally sliding-window) GQA attention of the queries `q` over the keys
+    /// and values of each row's sequence in `lc`: `[T, Hq*D]`.
+    fn attend(&self, q: &[f32], lc: &LayerKv) -> Tensor {
+        let (hq, hkv, d) = (self.cfg.num_attention_heads, self.cfg.num_key_value_heads, self.cfg.head_dim);
+        let (qd, kvd) = (hq * d, hkv * d);
+        let group = hq / hkv;
+        let scale = 1.0 / (d as f32).sqrt();
+        let (kc, vc) = (&lc.k, &lc.v);
+        let mut out = Tensor::zeros(q.len() / qd, qd);
+        out.data.par_chunks_mut(d).enumerate().for_each(|(idx, o)| {
+            let (i, h) = (idx / hq, idx % hq);
+            let kh = h / group;
+            let p = self.pass.pos[i] as usize;
+            let slot = |s: usize| self.pass.slot(i, s);
+            let lo = match self.layer.window {
+                Some(w) => (p + 1).saturating_sub(w),
+                None => 0,
+            };
+            let qv = &q[i * qd + h * d..i * qd + (h + 1) * d];
+            let scores: Vec<f32> = (lo..=p)
+                .map(|s| {
+                    let off = slot(s) * kvd + kh * d;
+                    dot(qv, &kc[off..off + d]) * scale
+                })
+                .collect();
+            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0f32;
+            for (s, &sc) in (lo..=p).zip(&scores) {
+                let e = (sc - m).exp();
+                denom += e;
+                let off = slot(s) * kvd + kh * d;
+                for (ov, &vv) in o.iter_mut().zip(&vc[off..off + d]) {
+                    *ov += e * vv;
+                }
+            }
+            for ov in o.iter_mut() {
+                *ov /= denom;
+            }
+        });
+        out
+    }
+}
+
 impl Backend for CpuBackend {
     type Tensor = Tensor;
     type Weight = Weight;
@@ -450,74 +531,11 @@ impl Backend for CpuBackend {
         cfg: &Config,
         layer: &LayerMeta,
     ) -> Tensor {
-        let pass = &self.pass;
-        let (hq, hkv, d) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
-        let (qd, kvd) = (hq * d, hkv * d);
-        let group = hq / hkv;
-        let t = qkv.rows;
-        let qn = q_norm.vector_f32();
-        let kn = k_norm.vector_f32();
-        let eps = cfg.rms_norm_eps;
+        assert_eq!(qkv.rows, self.pass.pos.len(), "attention rows differ from the pass");
+        let at = LayerPass { pass: &self.pass, cfg, layer };
         let lc = &mut kv.layers[layer.index];
-        assert_eq!(t, pass.pos.len(), "attention rows differ from the pass");
-
-        let mut cos = vec![0f32; d / 2];
-        let mut sin = vec![0f32; d / 2];
-        let mut q = vec![0f32; t * qd];
-        for i in 0..t {
-            let row = qkv.row(i);
-            let pos = pass.pos[i] as usize;
-            layer.rope.cos_sin(pos, &mut cos, &mut sin);
-            for h in 0..hq {
-                let dst = &mut q[i * qd + h * d..i * qd + (h + 1) * d];
-                rmsnorm_row(&row[h * d..(h + 1) * d], &qn, 1.0, eps, dst);
-                rope_inplace(dst, &cos, &sin);
-            }
-            let slot = pass.kv_slot[i] as usize;
-            for h in 0..hkv {
-                let src = &row[qd + h * d..qd + (h + 1) * d];
-                let dst = &mut lc.k[slot * kvd + h * d..slot * kvd + (h + 1) * d];
-                rmsnorm_row(src, &kn, 1.0, eps, dst);
-                rope_inplace(dst, &cos, &sin);
-                let vsrc = &row[qd + kvd + h * d..qd + kvd + (h + 1) * d];
-                lc.v[slot * kvd + h * d..slot * kvd + (h + 1) * d].copy_from_slice(vsrc);
-            }
-        }
-
-        let scale = 1.0 / (d as f32).sqrt();
-        let (kc, vc) = (&lc.k, &lc.v);
-        let mut out = Tensor::zeros(t, qd);
-        out.data.par_chunks_mut(d).enumerate().for_each(|(idx, o)| {
-            let (i, h) = (idx / hq, idx % hq);
-            let kh = h / group;
-            let p = pass.pos[i] as usize;
-            let slot = |s: usize| pass.slot(i, s);
-            let lo = match layer.window {
-                Some(w) => (p + 1).saturating_sub(w),
-                None => 0,
-            };
-            let qv = &q[i * qd + h * d..i * qd + (h + 1) * d];
-            let scores: Vec<f32> = (lo..=p)
-                .map(|s| {
-                    let off = slot(s) * kvd + kh * d;
-                    dot(qv, &kc[off..off + d]) * scale
-                })
-                .collect();
-            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut denom = 0f32;
-            for (s, &sc) in (lo..=p).zip(&scores) {
-                let e = (sc - m).exp();
-                denom += e;
-                let off = slot(s) * kvd + kh * d;
-                for (ov, &vv) in o.iter_mut().zip(&vc[off..off + d]) {
-                    *ov += e * vv;
-                }
-            }
-            for ov in o.iter_mut() {
-                *ov /= denom;
-            }
-        });
-        out
+        let q = at.write_rows(qkv, &q_norm.vector_f32(), &k_norm.vector_f32(), lc);
+        at.attend(&q, lc)
     }
 
     fn swiglu(&mut self, x: &Tensor) -> Tensor {
