@@ -10,8 +10,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -212,30 +212,64 @@ fn router(st: Shared, token: Arc<AccessToken>) -> Router {
 /// Loads the model, starts the inference thread and serves until Ctrl-C.
 pub fn serve(opts: ServeOptions) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-
+    opts.check()?;
     let (token, created) = match opts.token.as_deref() {
         Some(t) => (AccessToken::new(t)?, false),
         None => AccessToken::load_or_create(&opts.config_dir)?,
     };
-    // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass the
-    // checks here and then fail in the engine.
-    anyhow::ensure!(
-        // (at least 2: documents give each segment up to half of it to generate)
-        (2..=yaxus_model::DEFAULT_MAX_POS).contains(&opts.max_context),
-        "max context must be 2..={} tokens",
-        yaxus_model::DEFAULT_MAX_POS
-    );
+    let tls = opts.tls_files()?;
+    let (st, failed) = start_inference(&opts)?;
+    let token = Arc::new(token);
+    let app = router(Arc::new(st), token.clone());
 
-    let tls = match (&opts.cert, &opts.key) {
-        (Some(c), Some(k)) => tls::TlsFiles { cert: c.clone(), key: k.clone(), ca: None, sans: vec![] },
-        (None, None) => {
-            let mut sans = default_sans();
-            sans.extend(opts.extra_sans.iter().cloned());
-            tls::ensure_self_signed(&opts.config_dir, sans)?
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    rt.block_on(async move {
+        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
+            .await
+            .context("loading TLS certificate")?;
+        let handle = axum_server::Handle::new();
+        let inference_failed = shut_down_on(handle.clone(), failed);
+        print_banner(&opts, &tls, &token, created);
+        axum_server::bind_rustls(opts.listen, config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .context("server error")?;
+        anyhow::ensure!(!inference_failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
+        Ok(())
+    })
+}
+
+impl ServeOptions {
+    fn check(&self) -> Result<()> {
+        // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass
+        // the checks of the handlers and then fail in the engine.
+        anyhow::ensure!(
+            // (at least 2: documents give each segment up to half of it to generate)
+            (2..=yaxus_model::DEFAULT_MAX_POS).contains(&self.max_context),
+            "max context must be 2..={} tokens",
+            yaxus_model::DEFAULT_MAX_POS
+        );
+        Ok(())
+    }
+
+    /// The user's certificate, or the self-signed one in `config_dir` (created if needed).
+    fn tls_files(&self) -> Result<tls::TlsFiles> {
+        match (&self.cert, &self.key) {
+            (Some(c), Some(k)) => Ok(tls::TlsFiles { cert: c.clone(), key: k.clone(), ca: None, sans: vec![] }),
+            (None, None) => {
+                let mut sans = default_sans();
+                sans.extend(self.extra_sans.iter().cloned());
+                tls::ensure_self_signed(&self.config_dir, sans)
+            }
+            _ => anyhow::bail!("--cert and --key must be given together"),
         }
-        _ => anyhow::bail!("--cert and --key must be given together"),
-    };
+    }
+}
 
+/// Loads the model and starts the inference thread on it. Returns the handlers' state,
+/// and the channel on which the thread reports a fatal failure.
+fn start_inference(opts: &ServeOptions) -> Result<(AppState, tokio::sync::oneshot::Receiver<()>)> {
     let tok = Arc::new(load_tokenizer(&opts.model_dir)?);
     let t0 = Instant::now();
     let model = load_generator(&opts.model_dir, &opts.load)
@@ -250,68 +284,55 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     );
     let health =
         Health { status: "ok".into(), model: opts.model_name.clone(), backend: model.backend_name(), quant, queue: 0 };
-
     let (jobs, queue) = job_queue(opts.queue_limit);
-    // The inference thread reports a fatal failure here; the server then shuts down and
-    // `serve` returns an error, so a supervisor can restart the process.
     let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
-    {
-        let tok = tok.clone();
-        std::thread::Builder::new()
-            .name("inference".into())
-            .spawn(move || worker::run(model, tok, queue, failed_tx))?;
+    let worker_tok = tok.clone();
+    std::thread::Builder::new()
+        .name("inference".into())
+        .spawn(move || worker::run(model, worker_tok, queue, failed_tx))?;
+    Ok((AppState { tok, jobs, health, max_context: opts.max_context }, failed_rx))
+}
+
+/// Shuts the server down gracefully on Ctrl-C, or when the inference thread reports a
+/// fatal failure on `failed` (then `serve` returns an error, so that a supervisor can
+/// restart the process). Returns the flag set in that case.
+fn shut_down_on(handle: axum_server::Handle, failed: tokio::sync::oneshot::Receiver<()>) -> Arc<AtomicBool> {
+    const GRACE: Duration = Duration::from_secs(5);
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+        h.graceful_shutdown(Some(GRACE));
+    });
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = flag.clone();
+    tokio::spawn(async move {
+        // (an Err means the thread ended normally and dropped the sender)
+        if failed.await.is_ok() {
+            tracing::error!("the inference thread stopped after an internal error; shutting down");
+            f.store(true, Ordering::SeqCst);
+            handle.graceful_shutdown(Some(GRACE));
+        }
+    });
+    flag
+}
+
+/// Where to reach the server, and how to trust it and authenticate.
+fn print_banner(opts: &ServeOptions, tls: &tls::TlsFiles, token: &AccessToken, created: bool) {
+    let port = opts.listen.port();
+    eprintln!();
+    eprintln!("yaxus listening on https://{}", opts.listen);
+    for san in tls.sans.iter().filter(|s| !s.contains(':')) {
+        eprintln!("  https://{san}:{port}/");
     }
-    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let st = Arc::new(AppState { tok, jobs, health, max_context: opts.max_context });
-    let token = Arc::new(token);
-    let app = router(st, token.clone());
-
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
-    rt.block_on(async move {
-        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
-            .await
-            .context("loading TLS certificate")?;
-        let handle = axum_server::Handle::new();
-        let h = handle.clone();
-        tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-            h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-        });
-        let (h, f) = (handle.clone(), failed.clone());
-        tokio::spawn(async move {
-            // (an Err means the thread ended normally and dropped the sender)
-            if failed_rx.await.is_ok() {
-                tracing::error!("the inference thread stopped after an internal error; shutting down");
-                f.store(true, Ordering::SeqCst);
-                h.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-            }
-        });
-
-        let port = opts.listen.port();
-        eprintln!();
-        eprintln!("yaxus listening on https://{}", opts.listen);
-        for san in tls.sans.iter().filter(|s| !s.contains(':')) {
-            eprintln!("  https://{san}:{port}/");
-        }
-        if let Some(ca) = &tls.ca {
-            eprintln!("CA certificate (for `yaxus client --ca` or to import into a browser): {}", ca.display());
-        }
-        if created {
-            eprintln!("Generated access token (saved to {}):", opts.config_dir.join("token").display());
-            eprintln!("  {}", token.as_str());
-        } else if opts.token.is_none() {
-            eprintln!("Access token: {}", opts.config_dir.join("token").display());
-        }
-        eprintln!();
-
-        axum_server::bind_rustls(opts.listen, config)
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await
-            .context("server error")?;
-        anyhow::ensure!(!failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
-        Ok(())
-    })
+    if let Some(ca) = &tls.ca {
+        eprintln!("CA certificate (for `yaxus client --ca` or to import into a browser): {}", ca.display());
+    }
+    if created {
+        eprintln!("Generated access token (saved to {}):", opts.config_dir.join("token").display());
+        eprintln!("  {}", token.as_str());
+    } else if opts.token.is_none() {
+        eprintln!("Access token: {}", opts.config_dir.join("token").display());
+    }
+    eprintln!();
 }
