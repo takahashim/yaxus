@@ -1,16 +1,10 @@
 //! Compiling the kernels: the base set when the device opens, the integer kernels of a
 //! model's formats ahead of use, and the rest on first use.
 
-use crate::device::{CompileSettings, DeviceCaps, Tuning};
+use crate::dev::Kernel;
+use crate::device::{DeviceCaps, Tuning};
 use crate::shaders;
-use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
-
-pub(crate) struct Kernel {
-    /// Its number in the device's kernel set (bind groups are cached by it).
-    pub(crate) id: usize,
-    pub(crate) pipeline: wgpu::ComputePipeline,
-    pub(crate) layout: wgpu::BindGroupLayout,
-}
+use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_f32, gemv_int, plan};
 
 /// Kernel names, the one place each family's name is spelt: `build_kernels` and
 /// `precompile` compile under them, the ops dispatch by them.
@@ -28,6 +22,22 @@ pub(crate) mod name {
     /// The multi-row f32 GEMV of exactly `t` rows.
     pub(crate) fn gemvm(t: usize, f: Format) -> String {
         format!("gemvm{t}_{}", f.suffix())
+    }
+    /// `gemv_f32` for `t` rows with `rw` weight rows per lane group.
+    pub(crate) fn gemv_f32(t: usize, rw: usize, glu: bool, f: Format) -> String {
+        format!("gemvf{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
+    }
+    /// The `msl::gemv2` kernel `k`.
+    pub(crate) fn gemv2(k: crate::msl::Gemv2, f: Format) -> String {
+        let glu = if k.glu { "g" } else { "" };
+        match k.tiles {
+            None => format!("gemv2_{}{glu}_{}", k.t, f.suffix()),
+            Some(nt) => format!("gemv2m{nt}_{}{glu}_{}", k.t, f.suffix()),
+        }
+    }
+    /// The `msl::gemm` kernel `k`.
+    pub(crate) fn gemm_msl(k: crate::msl::Gemm, f: Format) -> String {
+        format!("gemm{}{}_{}", if k.f16 { "h" } else { "f" }, k.rb, f.suffix())
     }
     /// The single-row f32 GEMV with SwiGLU.
     pub(crate) fn glu(f: Format) -> String {
@@ -64,13 +74,53 @@ pub(crate) mod name {
     }
 }
 
-/// An integer kernel compiled ahead of use: (name, read-only bindings, source).
+/// A kernel compiled ahead of use: (name, read-only bindings, source).
 pub(crate) type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
 
-/// The integer kernels a model with weights of `formats` can use with `gemv` and `gemm`.
+/// The kernels compiled ahead of use for a model with weights of `formats`, with `gemv`
+/// and `gemm`: the integer ones, and `gemv_f32` where the tuning takes it.
 pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, formats: &[Format], gemv: Gemv) -> Vec<Job> {
     let rw = tuning.gemvi_rows;
     let mut jobs: Vec<Job> = Vec::new();
+    // (`gemv_f32` in place of the f32 GEMVs: the base set does not hold it, since a
+    // model compiles its formats only)
+    if gemv.planes.is_none() && tuning.gemv_f32 {
+        let (rf, wgmem) = (tuning.gemv_f32_rows, caps.max_workgroup_storage);
+        for &f in formats {
+            if plan::gemm_msl_takes(caps, tuning, f) {
+                for rb in plan::GEMM_MSL_RB {
+                    let k = crate::msl::Gemm { f16: gemm == GemmKind::CoopF16, rb };
+                    jobs.push((
+                        name::gemm_msl(k, f),
+                        decode_layout(f).to_vec(),
+                        Box::new(move || k.source(f).unwrap()),
+                    ));
+                }
+            }
+            if plan::gemv2_for(caps, tuning, f) {
+                for glu in [false, true] {
+                    for t in 1..=tuning.apple.gemv2_max_rows.clamp(1, GEMVM_MAX_T) {
+                        let k = crate::msl::Gemv2::for_rows(t, glu, &tuning.apple);
+                        jobs.push((
+                            name::gemv2(k, f),
+                            decode_layout(f).to_vec(),
+                            Box::new(move || k.source(f).unwrap()),
+                        ));
+                    }
+                }
+                continue;
+            }
+            for glu in [false, true] {
+                for t in 1..=GEMVM_MAX_T {
+                    jobs.push((
+                        name::gemv_f32(t, rf, glu, f),
+                        decode_layout(f).to_vec(),
+                        Box::new(move || gemv_f32_source(f, t, rf, glu, wgmem)),
+                    ));
+                }
+            }
+        }
+    }
     if let Some(planes) = gemv.planes {
         jobs.push((
             name::xquant_rows(planes),
@@ -153,8 +203,12 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         .into_iter()
         .chain([(Format::Q6, W_Q6), (Format::Q3, W_Q3), (Format::Q2, W_Q2)]);
     for (f, w4) in prefill {
-        if caps.coop {
+        if caps.coop_size == 16 {
             let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
+            add(name::gemm_coop(f), &c, layout(f));
+        } else if caps.coop_size == 8 {
+            // (the decode loader: `gemm_coop8` decodes 16 weights at a time)
+            let c = format!("enable wgpu_cooperative_matrix;\n{MM_PARAMS}{}{}", w16(f), gemm_coop8());
             add(name::gemm_coop(f), &c, layout(f));
         }
         add(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));
@@ -185,71 +239,53 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         }
     }
     add("attn_combine".into(), ATTN_COMBINE, &[false, true, true]);
-    // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
-    // without it, prefill attention takes the per-row kernel.
+    // Without subgroups, prefill attention takes the per-row kernel.
     if plan::tile_compiled(caps) {
-        add("attn_tile".into(), ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+        let src = attn_tile(plan::tile_stages_queries(caps));
+        add("attn_tile".into(), &src, &[false, false, false, true, true, true, true, true, true]);
+    }
+    // (the MSL ones beside them, chosen at dispatch: `AppleTuning::msl_small`)
+    if caps.msl {
+        for (name, src, read_only) in crate::msl::small_kernels() {
+            add(name.to_string(), &src, read_only);
+        }
     }
     add("swiglu".into(), SWIGLU, &[false, true]);
     add("add".into(), ADD, &[false, true]);
     out
 }
 
-pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
+/// The decode kernels' weight access for `f` (16 values at a time).
+pub(crate) fn w16(f: Format) -> &'static str {
+    use shaders::*;
+    match f {
+        Format::Q8 => W_Q8_16,
+        Format::Q4 => W_Q4_16,
+        Format::Bf16 => W_BF16_16,
+        Format::Q4K => W_Q4K_16,
+        Format::Q6 => W_Q6_16,
+        Format::Q3 => W_Q3_16,
+        Format::Q2 => W_Q2_16,
     }
 }
 
-pub(crate) fn compile_kernel(
-    device: &wgpu::Device,
-    settings: CompileSettings,
-    name: &str,
-    src: &str,
-    read_only: &[bool],
-) -> Kernel {
-    let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
-    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-    let checks = wgpu::ShaderRuntimeChecks {
-        force_loop_bounding: settings.loop_bounding,
-        ..wgpu::ShaderRuntimeChecks::checked()
-    };
-    // SAFETY: without loop counters wgpu requires that no loop runs forever. The kernels'
-    // loops count to shapes or halve to zero, which `every_kernel_loop_ends` checks for
-    // every source; bounds checks stay on.
-    let module = unsafe { device.create_shader_module_trusted(desc, checks) };
-    let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
-    let layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(name),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 32,
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(name),
-        layout: Some(&pl),
-        module: &module,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
-            ..Default::default()
-        },
-        cache: None,
-    });
-    Kernel { id: 0, pipeline, layout }
+/// The weight bindings of the decode kernels for `f` (values and scales, or the bf16
+/// matrix alone), after the output and the activations.
+pub(crate) fn decode_layout(f: Format) -> &'static [bool] {
+    if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
+}
+
+/// The source of `gemv_f32` for `f`, on a device with `max_storage` bytes of workgroup
+/// memory.
+pub(crate) fn gemv_f32_source(f: Format, t: usize, rw: usize, glu: bool, max_storage: u32) -> String {
+    let stage = gemv_f32::stages(t, rw, glu, max_storage);
+    format!("{}{}{}", shaders::MM_PARAMS, w16(f), gemv_f32::source(t, rw, glu, stage))
 }
 
 impl Gpu {
     pub(crate) fn add_kernel(&mut self, name: String, src: &str, read_only: &[bool]) {
-        let k = compile_kernel(&self.device, self.compile, &name, src, read_only);
+        let src = src.replace("{SPAD}", &SCALE_PAD.to_string());
+        let k = self.dev.compiler(self.compile).compile(&name, &src, read_only);
         self.insert_kernel(name, k);
     }
 
@@ -275,7 +311,7 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (device, settings, jobs) = (&self.device, self.compile, &jobs);
+        let (compiler, jobs) = (self.dev.compiler(self.compile), &jobs);
         let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -284,7 +320,8 @@ impl Gpu {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            out.push((name.clone(), compile_kernel(device, settings, name, &source(), read_only)));
+                            let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                            out.push((name.clone(), compiler.compile(name, &src, read_only)));
                         }
                         out
                     })
@@ -339,6 +376,10 @@ mod tests {
     /// constant (`s <<= 1u` from a positive start while `s < C`).
     fn unbounded_loop(src: &str) -> Option<String> {
         let code: String = src.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        // (MSL: no string literals, which hold only `_Pragma` arguments; the unrolled loops
+        // are loops too; `constant constexpr uint` is a module-scope constant)
+        let code: String = code.split('"').step_by(2).collect();
+        let code = code.replace("FOR_UNROLL (", "for (").replace("constant constexpr uint ", "const ");
         let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
         let words = || code.split(|c: char| !is_word(c));
         if let Some(w) = words().find(|&w| w == "loop" || w == "while") {
@@ -364,7 +405,13 @@ mod tests {
         let mut rest = code.as_str();
         while let Some(i) = rest.find("for (") {
             let after = &rest[i + "for (".len()..];
-            let header = &after[..after.find(')')?];
+            // (to the `)` that closes the header: conditions may hold parentheses)
+            let mut open = 1;
+            let close = after.char_indices().find_map(|(j, c)| {
+                open += (c == '(') as i32 - (c == ')') as i32;
+                (open == 0).then_some(j)
+            })?;
+            let header = &after[..close];
             // The body: from the `{` after the header to its matching `}`.
             let body = after[header.len() + 1..].trim_start();
             if !body.starts_with('{') {
@@ -381,7 +428,8 @@ mod tests {
             let [init, cond, step] = parts[..] else { return fail() };
             // (the variable is declared in the header, or before the loop when the header
             // leaves it out: `for (; k < n; k++)`)
-            let v = match init.strip_prefix("var ") {
+            // (`var` in WGSL; `uint` and `int` in the MSL kernels)
+            let v = match init.strip_prefix("var ").or(init.strip_prefix("uint ")).or(init.strip_prefix("int ")) {
                 Some(r) => r.split('=').next().unwrap().trim(),
                 None if init.is_empty() => step.split([' ', '+']).next().unwrap(),
                 None => return fail(),
@@ -448,23 +496,43 @@ mod tests {
     fn every_kernel_loop_ends() {
         let caps = DeviceCaps {
             name: "test".into(),
-            backend: wgpu::Backend::Vulkan,
+            api: crate::device::Api::Vulkan,
             vendor: Vendor::Amd,
-            device_type: wgpu::DeviceType::IntegratedGpu,
+            kind: crate::device::DeviceKind::Integrated,
             f16: true,
             subgroups: true,
             coop: true,
+            coop_size: 16,
             fast_math: false,
+            msl: true,
             timestamps: false,
             max_workgroup_storage: 65536,
         };
         let formats = [Format::Q8, Format::Q4, Format::Q4K, Format::Q6, Format::Q3, Format::Q2, Format::Bf16];
         let gemvs = [Gemv::INT16, Gemv { planes: Some(1), single_f32: false }, Gemv::INT16.for_draft()];
         let mut sources = Vec::new();
-        for (subgroups, fast_math) in [(true, false), (true, true), (false, false)] {
-            let caps = DeviceCaps { subgroups, coop: subgroups, fast_math, ..caps.clone() };
-            for rows in [1, 4] {
-                let tuning = Tuning { gemvm_rows: rows, gemvi_rows: rows, ..Tuning::for_device(&caps) };
+        // (Vulkan with matrix cores, Metal with its 8x8 matrices, no subgroups)
+        for (subgroups, fast_math, coop_size) in [(true, false, 16), (true, true, 8), (false, false, 0)] {
+            // (Apple's 32 KiB of workgroup memory: `gemv_f32` both staged and not)
+            let max_workgroup_storage = if coop_size == 8 { 32768 } else { 65536 };
+            let caps = DeviceCaps {
+                subgroups,
+                coop: coop_size != 0,
+                coop_size,
+                fast_math,
+                max_workgroup_storage,
+                ..caps.clone()
+            };
+            // (with and without the MSL kernels where the device takes them)
+            for (rows, msl) in [(1, false), (4, false), (2, true)] {
+                let tuning = Tuning {
+                    gemvm_rows: rows,
+                    gemvi_rows: rows,
+                    gemv_f32: true,
+                    gemv_f32_rows: rows,
+                    apple: crate::device::AppleTuning { gemv2: msl, gemm_msl: msl, ..Tuning::for_device(&caps).apple },
+                    ..Tuning::for_device(&caps)
+                };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));
                 for gemm in [GemmKind::Int16, GemmKind::Int8] {
                     for gemv in gemvs.into_iter().chain([Gemv::F32]) {

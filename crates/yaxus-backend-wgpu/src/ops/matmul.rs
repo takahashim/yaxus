@@ -1,13 +1,56 @@
 //! Matrix products: the f32 kernels, the integer GEMVs and GEMM, and the fused GLU.
 
 use super::grid;
+use crate::dev::Buf;
 use crate::kernels::name;
-use crate::plan::{GluPlan, MatmulCase, MatmulPlan};
+use crate::plan::{self, GluPlan, MatmulCase, MatmulPlan, Piece};
 use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_int, gemv_int};
 
 impl Gpu {
     /// `x · w^T`; passes of up to 16 rows (and more where the integer GEMVs win) take
     /// the kernels `gemv` says.
+    /// Whether `msl::gemv2` gives a row the same bits alone (the scalar kernel) and in
+    /// passes of 8 and 16 rows (simdgroup matrices), on a Q8_0 matrix of varied values.
+    /// The matrix kernel relies on the device multiplying 8x8 matrices as an `fma` chain
+    /// in order, measured on the M2 only; a device that does not is left without gemv2.
+    pub(crate) fn gemv2_rows_agree(&mut self) -> bool {
+        let (n, k, t) = (40, 512, 16);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut bytes = Vec::with_capacity(n * k / 32 * 34);
+        for _ in 0..n * k / 32 {
+            let d = half::f16::from_f32((1 + next() % 1000) as f32 * 1e-4);
+            bytes.extend_from_slice(&d.to_le_bytes());
+            bytes.extend((0..32).map(|_| next() as u8));
+        }
+        let x: Vec<f32> = (0..t * k)
+            .map(|_| {
+                let r = next();
+                let v = (r >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                v * (1u64 << (r % 16)) as f32
+            })
+            .collect();
+        let Some(m) = self.load_ggml(yaxus_model::ggml::GgmlType::Q8_0, &bytes, n, k) else { return false };
+        let w = Weight::Matrix(m);
+        let run = |g: &mut Gpu, r0: usize, rows: usize| {
+            let xt = g.tensor(rows, k);
+            g.dev.write(xt.buf(), 0, bytemuck::cast_slice(&x[r0 * k..(r0 + rows) * k]));
+            let y = g.matmul(&xt, &w, Gemv::F32);
+            g.to_host(&y)
+        };
+        let all = run(self, 0, t);
+        let eight = run(self, 8, 8);
+        let ones: Vec<f32> = [0, 9, 15].iter().flat_map(|&r| run(self, r, 1)).collect();
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits());
+        same(&eight, &all[8 * n..])
+            && [0, 9, 15].iter().enumerate().all(|(i, &r)| same(&ones[i * n..(i + 1) * n], &all[r * n..(r + 1) * n]))
+    }
+
     pub(crate) fn matmul(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
         let (n, k) = (m.n, m.k);
@@ -23,21 +66,35 @@ impl Gpu {
         let case = MatmulCase { t, n, k, fmt: m.fmt, gemm: self.gemm, gemv };
         let plan = case.plan(&self.caps, &self.tuning);
         if let MatmulPlan::GemvInt { planes, inline } = plan {
-            let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
+            let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
             self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
+            return y;
+        }
+        if plan == MatmulPlan::GemvF32 {
+            self.gemv_f32(x, &y, m, n, false);
+            return y;
+        }
+        if plan == MatmulPlan::Gemv2 {
+            self.run_pieces(x, &y, m, n, false, &plan::gemv2_pieces(0, t, false, &self.tuning.apple));
+            return y;
+        }
+        if let MatmulPlan::GemmMsl { f16, gemv2 } = plan {
+            self.run_pieces(x, &y, m, n, false, &plan::gemm_msl_pieces(t, f16, gemv2, &self.tuning.apple));
             return y;
         }
         if let MatmulPlan::GemmInt { planes } = plan {
             // The integer GEMM reads the per-16 scale arrays where a format has them.
-            let [wq, scales] = <[wgpu::Buffer; 2]>::try_from(m.prefill_bufs()).unwrap();
+            let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
             self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
             return y;
         }
         // The f32 kernels: the GEMVs read the decode layout, the GEMMs the per-16 scales
         // (see `W_Q6`).
         let mut all = vec![y.buf().clone(), x.buf().clone()];
-        all.extend(if plan.is_gemm() { m.prefill_bufs() } else { m.decode_bufs() });
-        let refs: Vec<&wgpu::Buffer> = all.iter().collect();
+        // (`gemm_coop8` reads the decode layout too: it decodes through `load16`)
+        let coop8 = matches!(plan, MatmulPlan::GemmCoop { .. }) && self.caps.coop_size == 8;
+        all.extend(if plan.is_gemm() && !coop8 { m.prefill_bufs() } else { m.decode_bufs() });
+        let refs: Vec<&Buf> = all.iter().collect();
         let (n32, k32) = (n as u32, k as u32);
         let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {
             MatmulPlan::GemvMulti { first } => [(0, first), (first, t - first)]
@@ -52,16 +109,30 @@ impl Gpu {
             MatmulPlan::Gemv8 => {
                 vec![(name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
             }
-            MatmulPlan::GemmCoop => {
-                vec![(name::gemm_coop(m.fmt), [n32, k32, t as u32, 0], ((n / 64) as u32, t.div_ceil(64) as u32))]
+            MatmulPlan::GemmCoop { gemv2_rest } => {
+                let tiled = t - gemv2_rest;
+                let rest = plan::gemv2_pieces(tiled, gemv2_rest, false, &self.tuning.apple);
+                self.run_pieces(x, &y, m, n, false, &rest);
+                if tiled == 0 {
+                    return y;
+                }
+                vec![(
+                    name::gemm_coop(m.fmt),
+                    [n32, k32, tiled as u32, 0],
+                    ((n / 64) as u32, tiled.div_ceil(64) as u32),
+                )]
             }
             MatmulPlan::GemmF32 => {
                 vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
             }
-            MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } => unreachable!(),
+            MatmulPlan::GemvInt { .. }
+            | MatmulPlan::GemmInt { .. }
+            | MatmulPlan::GemvF32
+            | MatmulPlan::Gemv2
+            | MatmulPlan::GemmMsl { .. } => unreachable!(),
         };
         for (name, params, groups) in dispatches {
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
             self.dispatch(&name, &refs, &params, groups);
@@ -78,8 +149,18 @@ impl Gpu {
         match case.plan_glu(&self.caps, &self.tuning) {
             GluPlan::GemvInt { planes, inline } => {
                 let y = self.tensor(x.rows, n2 / 2);
-                let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
+                let [q, s] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
                 self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), (planes, inline), true);
+                return y;
+            }
+            GluPlan::GemvF32 => {
+                let y = self.tensor(x.rows, n2 / 2);
+                self.gemv_f32(x, &y, m, n2 / 2, true);
+                return y;
+            }
+            GluPlan::Gemv2 => {
+                let y = self.tensor(x.rows, n2 / 2);
+                self.run_pieces(x, &y, m, n2 / 2, true, &plan::gemv2_pieces(0, x.rows, true, &self.tuning.apple));
                 return y;
             }
             GluPlan::MatmulThenSwiglu => {
@@ -95,13 +176,46 @@ impl Gpu {
         let y = self.tensor(1, inter);
         let mut all = vec![y.buf().clone(), x.buf().clone()];
         all.extend(bufs);
-        let refs: Vec<&wgpu::Buffer> = all.iter().collect();
-        if self.kernels_profile.is_some() {
+        let refs: Vec<&Buf> = all.iter().collect();
+        if self.dev.timing() {
             self.prof_detail = Some(format!("{n2}x{k}"));
         }
         self.dispatch(&kernel, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
         self.account(2.0 * (n2 * k) as f64);
         y
+    }
+
+    /// The MSL dispatches `pieces` of `y = x W^T` (or `swiglu` of it with `glu`, `n` then
+    /// the intermediate size), each on its rows of `x` and `y` (see `plan::Piece`).
+    fn run_pieces(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool, pieces: &[Piece]) {
+        if pieces.is_empty() {
+            return;
+        }
+        let k = x.cols;
+        let bufs = [y.buf().clone(), x.buf().clone()].into_iter().chain(m.decode_bufs()).collect::<Vec<_>>();
+        let refs: Vec<&Buf> = bufs.iter().collect();
+        let layout = crate::kernels::decode_layout(m.fmt);
+        let mut rows = 0;
+        for &piece in pieces {
+            if self.dev.timing() {
+                self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
+            }
+            match piece {
+                Piece::Gemv2 { r0, kernel } => {
+                    let name = self.int_kernel(name::gemv2(kernel, m.fmt), layout, || kernel.source(m.fmt).unwrap());
+                    let imm = [n as u32, k as u32, kernel.t as u32, r0 as u32];
+                    self.dispatch(&name, &refs, &imm, grid(n.div_ceil(kernel.outputs()) as u32));
+                    rows += kernel.t;
+                }
+                Piece::Gemm { r0, rows: r, kernel } => {
+                    let name = self.int_kernel(name::gemm_msl(kernel, m.fmt), layout, || kernel.source(m.fmt).unwrap());
+                    let imm = [n as u32, k as u32, (r0 + r) as u32, r0 as u32];
+                    self.dispatch(&name, &refs, &imm, (r.div_ceil(kernel.rows()) as u32, (n / 64) as u32));
+                    rows += r;
+                }
+            }
+        }
+        self.account(2.0 * (rows * n * k) as f64 * if glu { 2.0 } else { 1.0 });
     }
 
     /// `y = x W^T` for more than 16 rows with integer dot products (`gemm_int`): the rows
@@ -112,8 +226,8 @@ impl Gpu {
         &mut self,
         x: &Tensor,
         y: &Tensor,
-        wq: &wgpu::Buffer,
-        scales: &wgpu::Buffer,
+        wq: &Buf,
+        scales: &Buf,
         n: usize,
         f: &'static gemm_int::IntFmt,
         planes: usize,
@@ -131,7 +245,7 @@ impl Gpu {
             grid(lanes.div_ceil(64) as u32),
         );
         let bufs = [y.buf().clone(), xq.buf().clone(), wq.clone(), scales.clone(), xs.buf().clone()];
-        let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+        let refs: Vec<&Buf> = bufs.iter().collect();
         let rest = t % 128;
         let wide = t / 128 + usize::from(rest > 64);
         let tail = match rest {
@@ -146,7 +260,7 @@ impl Gpu {
             let kernel = self.int_kernel(name::gemm_int(planes, tn, f.name), &[false, true, true, true, true], || {
                 gemm_int::source(f, tn, planes)
             });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
             self.dispatch(
@@ -167,8 +281,8 @@ impl Gpu {
         &mut self,
         x: &Tensor,
         y: &Tensor,
-        wq: &wgpu::Buffer,
-        wsc: &wgpu::Buffer,
+        wq: &Buf,
+        wsc: &Buf,
         n: usize,
         f: &'static gemv_int::IntFmt,
         (planes, inline): (usize, bool),
@@ -182,7 +296,7 @@ impl Gpu {
                 self.int_kernel(name::gemv_int(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
                     gemv_int::source(f, 1, planes, rw, glu, true)
                 });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
@@ -212,7 +326,7 @@ impl Gpu {
                 &[false, true, true, true, true],
                 || gemv_int::source(f, rows, planes, rw, glu, false),
             );
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
@@ -220,6 +334,25 @@ impl Gpu {
             self.dispatch(&kernel, &[y.buf(), xq.buf(), wq, wsc, xs.buf()], &params, groups);
             r0 += rows;
         }
+        self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
+    }
+
+    /// `y = x W^T` for up to 16 rows in f32 (`gemv_f32`), or `swiglu` of it with `glu`
+    /// (`n` is then the intermediate size).
+    fn gemv_f32(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool) {
+        let (t, k) = (x.rows, x.cols);
+        let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
+        let kernel = self.int_kernel(name::gemv_f32(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
+            crate::kernels::gemv_f32_source(m.fmt, t, rw, glu, wgmem)
+        });
+        if self.dev.timing() {
+            self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
+        }
+        let mut bufs = vec![y.buf().clone(), x.buf().clone()];
+        bufs.extend(m.decode_bufs());
+        let refs: Vec<&Buf> = bufs.iter().collect();
+        let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
+        self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
         self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
     }
 

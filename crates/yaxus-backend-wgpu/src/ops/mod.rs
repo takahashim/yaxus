@@ -26,7 +26,7 @@ pub(crate) fn grid(groups: u32) -> (u32, u32) {
 
 impl Gpu {
     pub(crate) fn name(&self) -> String {
-        format!("{}: {}", format!("{:?}", self.caps.backend).to_lowercase(), self.caps.name)
+        format!("{}: {}", self.caps.api, self.caps.name)
     }
 
     /// Pre-creates pooled buffers for the tensors of a `rows`-row pass (see the trait).
@@ -50,27 +50,15 @@ impl Gpu {
         );
         let kv_dim = cfg.kv_dim();
         let size = (pages * PAGE * kv_dim * 4) as u64;
-        anyhow::ensure!(size <= self.device.limits().max_storage_buffer_binding_size, "KV arena too large per layer");
-        let mk = |label| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
+        anyhow::ensure!(size <= self.dev.max_binding(), "KV arena too large per layer");
+        let mk = |label| self.dev.storage(label, size);
         let k = metas.iter().map(|_| mk("k")).collect();
         let v = metas.iter().map(|_| mk("v")).collect();
         // A model may have only one kind of layer: the other table is then unused.
         let any = metas.first().context("a model without layers")?;
         let sliding = metas.iter().find(|m| !m.full_attn).unwrap_or(any);
         let full = metas.iter().find(|m| m.full_attn).unwrap_or(any);
-        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kv-page-scratch"),
-            size: (PAGE * kv_dim * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let scratch = self.dev.storage("kv-page-scratch", (PAGE * kv_dim * 4) as u64);
         Ok(Kv {
             k,
             v,
@@ -83,10 +71,9 @@ impl Gpu {
 
     pub(crate) fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
         let bytes = (PAGE * kv.kv_dim * 4) as u64;
-        let enc = self.encoder();
         for b in kv.k.iter().chain(&kv.v) {
-            enc.copy_buffer_to_buffer(b, src as u64 * bytes, &kv.scratch, 0, bytes);
-            enc.copy_buffer_to_buffer(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
+            self.dev.copy(b, src as u64 * bytes, &kv.scratch, 0, bytes);
+            self.dev.copy(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
         }
     }
 
@@ -126,8 +113,9 @@ impl Gpu {
     pub(crate) fn rmsnorm(&mut self, x: &Tensor, w: &Weight, offset: f32, eps: f32) -> Tensor {
         let Weight::Vector(wb) = w else { panic!("rmsnorm weight must be a vector") };
         let y = self.tensor(x.rows, x.cols);
+        let msl = self.tuning.apple.msl_small && self.caps.msl && x.cols.is_multiple_of(4);
         self.dispatch(
-            "rmsnorm",
+            if msl { "rmsnorm_msl" } else { "rmsnorm" },
             &[y.buf(), x.buf(), wb],
             &[x.cols as u32, offset.to_bits(), eps.to_bits()],
             (x.rows as u32, 1),
@@ -151,7 +139,13 @@ impl Gpu {
         let h = self.tensor(x.rows, x.cols);
         let xb = x.buf().clone();
         // (the subgroup kernel holds a row in registers, which bounds its width)
-        let name = if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS { "add_norm_sg" } else { "add_norm" };
+        let name = if self.tuning.apple.msl_small && self.caps.msl && x.cols.is_multiple_of(4) {
+            "add_norm_msl"
+        } else if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS {
+            "add_norm_sg"
+        } else {
+            "add_norm"
+        };
         self.dispatch(
             name,
             &[h.buf(), &xb, delta.buf(), w1, w2],
@@ -172,7 +166,6 @@ impl Gpu {
         let y = self.tensor(rows.len(), x.cols);
         let bytes = (x.cols * 4) as u64;
         let (src, dst) = (x.buf().clone(), y.buf().clone());
-        let enc = self.encoder();
         // Copy runs of consecutive rows at once.
         let mut i = 0;
         while i < rows.len() {
@@ -180,7 +173,7 @@ impl Gpu {
             while j < rows.len() && rows[j] == rows[j - 1] + 1 {
                 j += 1;
             }
-            enc.copy_buffer_to_buffer(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
+            self.dev.copy(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
             i = j;
         }
         y

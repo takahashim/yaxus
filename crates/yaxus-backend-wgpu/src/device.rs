@@ -1,13 +1,8 @@
-//! What the GPU can do ([`DeviceCaps`], detected from the adapter), how the kernels are
-//! compiled for it ([`CompileSettings`]) and the measured choices they are run with on
-//! it ([`Tuning`]).
+//! What the GPU can do ([`DeviceCaps`], detected by the device layer, `dev`), how the
+//! kernels are compiled for it ([`CompileSettings`]) and the measured choices they are run
+//! with on it ([`Tuning`]). Nothing here depends on wgpu.
 
 use crate::{GemmKind, Gemv};
-
-/// The graphics API the backend runs on: Vulkan on Linux and Windows, Metal on macOS.
-pub(crate) fn platform_backends() -> wgpu::Backends {
-    if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN }
-}
 
 /// GPU vendors the tuning distinguishes (PCI vendor ids; Apple's on Metal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,17 +14,44 @@ pub enum Vendor {
     Other,
 }
 
-impl Vendor {
-    fn of(info: &wgpu::AdapterInfo) -> Self {
-        match info.vendor {
-            0x1002 => Vendor::Amd,
-            0x106b => Vendor::Apple,
-            0x8086 => Vendor::Intel,
-            0x10de => Vendor::Nvidia,
-            _ if info.backend == wgpu::Backend::Metal => Vendor::Apple,
-            _ => Vendor::Other,
-        }
+/// How the GPU is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    /// Vulkan through wgpu.
+    Vulkan,
+    /// Metal through wgpu.
+    Metal,
+    /// Metal without wgpu (`dev::metal`, `YAXUS_DEVICE=metal`).
+    MetalDirect,
+    /// Another wgpu backend.
+    Other,
+}
+
+impl Api {
+    pub fn is_metal(self) -> bool {
+        matches!(self, Api::Metal | Api::MetalDirect)
     }
+}
+
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Api::Vulkan => "vulkan",
+            Api::Metal => "metal",
+            Api::MetalDirect => "metal (direct)",
+            Api::Other => "other",
+        })
+    }
+}
+
+/// What kind of device the GPU is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Integrated,
+    Discrete,
+    /// A software rasterizer (lavapipe, llvmpipe).
+    Software,
+    Other,
 }
 
 /// Features of the device the kernels depend on.
@@ -37,59 +59,31 @@ impl Vendor {
 pub struct DeviceCaps {
     /// The adapter's name, e.g. `AMD Radeon 780M Graphics (RADV PHOENIX)`.
     pub name: String,
-    pub backend: wgpu::Backend,
+    /// How the device is reached.
+    pub api: Api,
     pub vendor: Vendor,
-    /// Integrated (sharing the host's memory) or discrete.
-    pub device_type: wgpu::DeviceType,
+    /// Integrated (sharing the host's memory), discrete or software.
+    pub kind: DeviceKind,
     /// `shader-f16`.
     pub f16: bool,
     /// Subgroups of at least 32 lanes: the multi-row and integer GEMVs, the split
     /// attention and `add_norm_sg` reduce within 32 lanes with shuffles.
     pub subgroups: bool,
-    /// Cooperative matrices of 16x16x16 with f16 operands and f32 accumulators (the
-    /// `Coop` GEMM).
+    /// Cooperative matrices for the `Coop` GEMM (see `coop_size`).
     pub coop: bool,
     /// The shader compiler may reassociate float arithmetic and contract it into FMAs
-    /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
-    /// it off). Kernels that must agree to the bit then may not.
+    /// (Metal through wgpu: it leaves `MTLCompileOptions` at their defaults and offers no
+    /// way to turn it off). Kernels that must agree to the bit then may not.
     pub fast_math: bool,
+    /// Kernels in Metal Shading Language (`msl`): through wgpu's passthrough, or compiled
+    /// directly.
+    pub msl: bool,
+    /// Their size: 16 (16x16x16, f16 operands and f32 accumulators: matrix cores on
+    /// Vulkan) or 8 (8x8x8 in f32: Metal's simdgroup matrices); 0 without.
+    pub coop_size: u32,
     /// Timestamp queries (`YAXUS_PROFILE=2`).
     pub timestamps: bool,
     pub max_workgroup_storage: u32,
-}
-
-impl DeviceCaps {
-    pub(crate) fn detect(adapter: &wgpu::Adapter) -> Self {
-        let info = adapter.get_info();
-        let features = adapter.features();
-        let vendor = Vendor::of(&info);
-        let f16 = features.contains(wgpu::Features::SHADER_F16);
-        // Metal reports subgroup sizes of 4..=64 whatever the GPU, but Apple GPUs run
-        // SIMD-groups of 32 threads, as the kernels need.
-        let lanes32 = info.subgroup_min_size >= 32 || (info.backend == wgpu::Backend::Metal && vendor == Vendor::Apple);
-        let subgroups = features.contains(wgpu::Features::SUBGROUP) && lanes32;
-        // (Metal's simdgroup matrices are 8x8, so the `Coop` GEMM is not available there.)
-        let coop = f16
-            && subgroups
-            && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-            && adapter.cooperative_matrix_properties().iter().any(|c| {
-                (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
-                    && c.ab_type == wgpu::CooperativeScalarType::F16
-                    && c.cr_type == wgpu::CooperativeScalarType::F32
-            });
-        DeviceCaps {
-            name: info.name.clone(),
-            backend: info.backend,
-            vendor,
-            device_type: info.device_type,
-            f16,
-            subgroups,
-            coop,
-            fast_math: info.backend == wgpu::Backend::Metal,
-            timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
-            max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
-        }
-    }
 }
 
 /// Choices that depend on the device's speeds rather than its features: when to submit,
@@ -121,6 +115,14 @@ pub struct Tuning {
     pub multi_split_max_rows: usize,
     /// Weight rows per 32-lane group in the multi-row f32 GEMV.
     pub gemvm_rows: usize,
+    /// f32 passes of up to 16 rows take `gemv_f32` (one kernel family for every row
+    /// count, a row's result the same whatever the pass) rather than `gemv1`, `gemvm`
+    /// and the single-row GLU kernel.
+    pub gemv_f32: bool,
+    /// Weight rows per 32-lane group in `gemv_f32`.
+    pub gemv_f32_rows: usize,
+    /// The MSL kernels of Apple GPUs and their sizes (used where `DeviceCaps::msl`).
+    pub apple: AppleTuning,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -154,6 +156,85 @@ pub struct Tuning {
     pub gemv: Gemv,
 }
 
+/// The MSL kernels of Apple GPUs (`msl`), and their sizes. They run where the device
+/// takes MSL (`DeviceCaps::msl`) and the switch is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppleTuning {
+    /// `rmsnorm`, `add_norm` and `qk_rope` in MSL (`msl::small_kernels`).
+    pub msl_small: bool,
+    /// Passes of up to 16 rows on `msl::gemv2` (for the formats it reads), in place of
+    /// `gemv_f32`.
+    pub gemv2: bool,
+    /// The most rows gemv2 takes in its scalar kernel; more go to simdgroup matrices (M2,
+    /// 2B Q4_K_M, 2 rows: scalar 26.2 ms, matrices 34.7).
+    pub gemv2_scalar_max: usize,
+    /// Weight tiles of 8 rows a simdgroup of gemv2's matrix kernel takes, for passes of
+    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill).
+    pub gemv2_tiles: [usize; 2],
+    /// Rows a gemv2 dispatch takes at most; more go to further dispatches.
+    pub gemv2_max_rows: usize,
+    /// On the WGSL matrix GEMM (`gemm_coop8`), a rest of at most this many rows past the
+    /// last whole 64-row tile goes to gemv2 (M2, 2B Q4_K_M, ms: a tile 166, gemv2 16 rows
+    /// 56, 8 rows 35).
+    pub gemv2_tail_rows: usize,
+    /// The matrix GEMM (`GemmKind::Coop`, `CoopF16`) on `msl::gemm` in place of
+    /// `gemm_coop8`.
+    pub gemm_msl: bool,
+}
+
+impl Default for AppleTuning {
+    fn default() -> Self {
+        AppleTuning {
+            msl_small: false,
+            gemv2: false,
+            gemv2_scalar_max: 2,
+            gemv2_tiles: [4, 2],
+            gemv2_max_rows: 16,
+            gemv2_tail_rows: 40,
+            gemm_msl: false,
+        }
+    }
+}
+
+impl AppleTuning {
+    /// With the environment's overrides: `YAXUS_MSL_SMALL=0|1`, `YAXUS_GEMV2=0|1`,
+    /// `YAXUS_GEMV2_SCALAR`, `YAXUS_GEMV2_NT`, `YAXUS_GEMV2_NT2`, `YAXUS_GEMV2_MAX_ROWS`,
+    /// `YAXUS_GEMV2_TAIL` and `YAXUS_GEMM_MSL=wgsl|f32|f16` (`f16` also selects
+    /// `GemmKind::CoopF16`, in `Tuning::with_env`).
+    fn with_env(mut self) -> Self {
+        let var = |name: &str| std::env::var(name).ok();
+        let num = |name: &str| var(name).and_then(|v| v.parse::<usize>().ok());
+        let switch = |name: &str, v: &mut bool| match var(name).as_deref() {
+            Some("0") => *v = false,
+            Some("1") => *v = true,
+            _ => {}
+        };
+        switch("YAXUS_MSL_SMALL", &mut self.msl_small);
+        switch("YAXUS_GEMV2", &mut self.gemv2);
+        if let Some(v) = num("YAXUS_GEMV2_SCALAR") {
+            self.gemv2_scalar_max = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_NT") {
+            self.gemv2_tiles[0] = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_NT2") {
+            self.gemv2_tiles[1] = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_MAX_ROWS") {
+            self.gemv2_max_rows = v.clamp(1, crate::GEMVM_MAX_T);
+        }
+        if let Some(v) = num("YAXUS_GEMV2_TAIL") {
+            self.gemv2_tail_rows = v;
+        }
+        match var("YAXUS_GEMM_MSL").as_deref() {
+            Some("wgsl") => self.gemm_msl = false,
+            Some("f32" | "f16") => self.gemm_msl = true,
+            _ => {}
+        }
+        self
+    }
+}
+
 impl Tuning {
     /// The values measured on a Radeon 780M.
     fn radeon_780m() -> Self {
@@ -164,6 +245,9 @@ impl Tuning {
             gemv_int8_max_rows: 24,
             multi_split_max_rows: 20,
             gemvm_rows: 2,
+            gemv_f32: false,
+            gemv_f32_rows: 2,
+            apple: AppleTuning::default(),
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -188,18 +272,37 @@ impl Tuning {
             // 3450 / 39900, f32 30 / 56 / 305 / 1681).
             t.gemm = GemmKind::F32;
             t.gemv = Gemv::F32;
+            t.gemv_f32 = true;
+            // (M2, 2B Q4_K_M, ms per pass of 1 / 2 / 4 / 8 / 16 rows: gemv_f32 22.5 / 28.2 /
+            // 40.9 / 59.4 / 140, gemv2 21.1 / 26.4 / 34.0 / 34.9 / 55.8; gemv2 is checked
+            // at start, `Gpu::gemv2_rows_agree`. 32 / 64 / 256 rows: `gemm_coop8` 161 / 166
+            // / 648, MSL f32 tiles about 78 / 136 / 536; llama.cpp, f16 tiles, 71 / 140 / 515)
+            t.apple = AppleTuning { msl_small: true, gemv2: true, gemm_msl: true, ..t.apple };
+            // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
+            // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
+            // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
+            t.tile_wgs = 128;
+            if caps.coop_size == 8 {
+                // The 8x8 matrix GEMM in f32: 2.1x the f32 GEMM (256 rows 1744 -> 809 ms),
+                // and a whole 64-row tile (32 rows: 197 ms) costs less than two 16-row
+                // f32 GEMVs (17 rows: 246 ms), so passes of more than 16 rows take it.
+                t.gemm = GemmKind::Coop;
+                t.multi_split_max_rows = crate::GEMVM_MAX_T;
+            }
         }
         t
     }
 
     /// The tuning with the overrides of the environment, for experiments and tests:
-    /// `YAXUS_GEMM=f32|coop|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
-    /// `YAXUS_TILE_WGS` and `YAXUS_GEMVM_R`.
+    /// `YAXUS_GEMM=f32|coop|coop16|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
+    /// `YAXUS_TILE_WGS`, `YAXUS_GEMVM_R`, `YAXUS_EARLY_SUBMIT`, `YAXUS_ATTN_SPLIT_WGS`,
+    /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`.
     pub fn with_env(mut self) -> Self {
         let var = |name: &str| std::env::var(name).ok();
         match var("YAXUS_GEMM").as_deref() {
             Some("f32") => self.gemm = GemmKind::F32,
             Some("coop") => self.gemm = GemmKind::Coop,
+            Some("coop16") => self.gemm = GemmKind::CoopF16,
             Some("int8") => self.gemm = GemmKind::Int8,
             Some("int16") => self.gemm = GemmKind::Int16,
             _ => {}
@@ -211,11 +314,32 @@ impl Tuning {
             Some("int16") => self.gemv = Gemv::INT16,
             _ => {}
         }
+        if let Some(v) = var("YAXUS_EARLY_SUBMIT").and_then(|v| v.parse().ok()) {
+            self.early_submit_dispatches = v;
+        }
+        if let Some(v) = var("YAXUS_ATTN_SPLIT_WGS").and_then(|v| v.parse().ok()) {
+            self.attn_split_wgs = v;
+        }
+        if let Some(v) = var("YAXUS_SHORT_CONTEXT").and_then(|v| v.parse().ok()) {
+            self.short_context = v;
+        }
         if let Some(v) = var("YAXUS_TILE_WGS").and_then(|v| v.parse().ok()) {
             self.tile_wgs = v;
         }
         if let Some(v) = var("YAXUS_GEMVM_R").and_then(|v| v.parse().ok()) {
             self.gemvm_rows = v;
+        }
+        match var("YAXUS_GEMV_F32").as_deref() {
+            Some("0") => self.gemv_f32 = false,
+            Some("1") => self.gemv_f32 = true,
+            _ => {}
+        }
+        if var("YAXUS_GEMM_MSL").as_deref() == Some("f16") {
+            self.gemm = GemmKind::CoopF16;
+        }
+        self.apple = self.apple.with_env();
+        if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
+            self.gemv_f32_rows = v;
         }
         self
     }
@@ -226,7 +350,7 @@ impl Tuning {
         match gemm {
             GemmKind::F32 => crate::GEMVM_MAX_T,
             GemmKind::Int8 => self.gemv_int8_max_rows,
-            GemmKind::Coop | GemmKind::Int16 => self.gemv_int_max_rows,
+            GemmKind::Coop | GemmKind::CoopF16 | GemmKind::Int16 => self.gemv_int_max_rows,
         }
     }
 }
@@ -251,7 +375,7 @@ pub(crate) struct CompileSettings {
 impl CompileSettings {
     /// No loop counters anywhere; workgroup memory zeroed except on Metal.
     pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
-        CompileSettings { loop_bounding: false, zero_workgroup_memory: caps.backend != wgpu::Backend::Metal }
+        CompileSettings { loop_bounding: false, zero_workgroup_memory: !caps.api.is_metal() }
     }
 
     /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`

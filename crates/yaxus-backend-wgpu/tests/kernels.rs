@@ -282,6 +282,39 @@ fn integer_rows_do_not_depend_on_the_pass() {
     }
 }
 
+/// With the f32 kernels of `gemv_f32` (Apple GPUs), a row's result is the same bits
+/// whether it runs alone or among the rows of a larger pass, as with the integer kernels.
+/// Elsewhere the f32 GEMVs make no such promise: the test only reports how many differ.
+#[test]
+#[ignore]
+fn f32_rows_do_not_depend_on_the_pass() {
+    let mut gpu = WgpuBackend::new().unwrap();
+    let strict = gpu.tuning().gemv_f32;
+    gpu.set_gemm(GemmKind::F32);
+    gpu.set_gemv(Gemv::F32);
+    let (n, k) = (200, 1536);
+    for dtype in [GgmlType::Q2K, GgmlType::Q3K, GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0, GgmlType::Q4_0] {
+        let bytes = ggml_blocks(dtype, n, k, 5);
+        let x = values(16 * k, 31);
+        for glu in [false, true] {
+            let cols = if glu { n / 2 } else { n };
+            let all = gpu.debug_matmul_ggml(&x, 16, dtype, &bytes, n, k, glu);
+            let mut differ = 0;
+            // Alone, and as rows of passes of 3 and 7.
+            for (start, t) in [(0, 1), (5, 1), (15, 1), (2, 3), (8, 7)] {
+                let part = gpu.debug_matmul_ggml(&x[start * k..(start + t) * k], t, dtype, &bytes, n, k, glu);
+                let want = &all[start * cols..(start + t) * cols];
+                differ += part.iter().zip(want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            }
+            if strict {
+                assert_eq!(differ, 0, "{dtype:?} glu={glu}: rows differ from the 16-row pass");
+            } else if differ > 0 {
+                eprintln!("{dtype:?} glu={glu}: {differ} outputs differ from the 16-row pass (no gemv_f32 here)");
+            }
+        }
+    }
+}
+
 /// Argmax over a whole pass of rows (more than one workgroup's worth of partials), with
 /// the CPU's choice on degenerate rows.
 #[test]

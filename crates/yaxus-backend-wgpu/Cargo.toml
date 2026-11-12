@@ -19,6 +19,12 @@ wgpu = { version = "30", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"] }
+# Metal without wgpu (`dev::metal`): the bindings wgpu-hal uses, and naga to translate
+# the WGSL kernels to MSL.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+naga = { version = "30", default-features = false, features = ["wgsl-in", "msl-out"] }
 
 [features]
 # Single ops on given data for the integration tests (`debug_*`).

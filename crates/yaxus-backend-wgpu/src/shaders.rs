@@ -591,6 +591,44 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// `ATTN_TILE`, with `stage_queries` as written; without, the tile's queries are read
+/// from the buffer at each block of keys instead of from `qs` (16.5 KiB of workgroup
+/// memory less: 21.1 KiB, for devices with 32 KiB). The arithmetic is the same.
+pub fn attn_tile(stage_queries: bool) -> String {
+    if stage_queries {
+        return ATTN_TILE.to_string();
+    }
+    let mut s = ATTN_TILE.to_string();
+    let mut sub = |a: &str, b: &str| {
+        assert_eq!(s.matches(a).count(), 1, "{a}");
+        s = s.replace(a, b);
+    };
+    sub("var<workgroup> qs: array<vec4<f32>, 1056>;  // [BM][LD] queries, pre-scaled\n", "");
+    sub(
+        "    for (var i = li; i < BM * 32u; i += 128u) {
+        let r = i / 32u;
+        let cc = i % 32u;
+        var v = vec4<f32>(0.0);
+        if (r < nr) { v = q[(r0 + r) * qd4 + h * 32u + cc] * p.scale; }
+        qs[r * LD + cc] = v;
+    }
+",
+        "",
+    );
+    sub(
+        "    var acc: array<vec4<f32>, 8>;",
+        "    // The queries of this lane's two score rows (zero past the tile's rows).
+    let qb0 = (r0 + min(2u * tr, nr - 1u)) * qd4 + h * 32u;
+    let qb1 = (r0 + min(2u * tr + 1u, nr - 1u)) * qd4 + h * 32u;
+    let qk0 = select(0.0, p.scale, 2u * tr < nr);
+    let qk1 = select(0.0, p.scale, 2u * tr + 1u < nr);
+    var acc: array<vec4<f32>, 8>;",
+    );
+    sub("            let q0 = qs[(2u * tr) * LD + cc];", "            let q0 = q[qb0 + cc] * qk0;");
+    sub("            let q1 = qs[(2u * tr + 1u) * LD + cc];", "            let q1 = q[qb1 + cc] * qk1;");
+    s
+}
+
 pub const SWIGLU: &str = r#"
 struct P { inter: u32, total: u32, _a: u32, _b: u32 }
 var<immediate> p: P;
@@ -1047,6 +1085,106 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     }
 }
 "#;
+
+/// The `Coop` GEMM on 8x8x8 cooperative matrices in f32 (Metal's simdgroup matrices): a
+/// workgroup of 4 subgroups computes 64 tokens x 64 outputs, each subgroup a 32 x 32
+/// quarter in 4 x 4 accumulators. K goes through workgroup memory 32 at a time, in f32:
+/// Apple GPUs multiply f32 matrices at the rate of f16 ones, so nothing is rounded.
+/// Stores whole 64-token tiles (the output is padded) and needs N % 64 == 0.
+///
+/// The weights come through a format's decode loader (`W_*_16`, the decode layout of
+/// the weights): a lane decodes 16 of them at once, as llama.cpp's `kernel_mul_mm` does,
+/// rather than 4 at a time with a scale lookup each. They are stored k-major, so the
+/// matrix B loads without a transpose (naga's column-major `coopLoad` is a transposed
+/// `simdgroup_load`). M2, 2B Q4_K_M, 256-row pass: 809 -> 770 ms (16 at a time) -> 757
+/// ms (no transpose). Padding the rows to 36 or 40 f32 was 12% slower; 8x8-blocked tiles,
+/// 128-output tiles and reading the next step into registers early were no faster. (f16
+/// tiles would take 757 -> 698 ms, rounding the activations to 11 bits.)
+pub fn gemm_coop8() -> String {
+    use std::fmt::Write;
+    // Row stride of the staged activations, in f32.
+    const LD: usize = 32;
+    let mut s = format!(
+        "var<workgroup> xs: array<f32, {sz}>;  // [64 tokens][32 k]
+var<workgroup> wsm: array<f32, {sz}>; // [32 k][64 outputs]
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32,
+        @builtin(subgroup_id) sg: u32) {{
+    let n0 = wg.x * 64u;
+    let t0 = wg.y * 64u;
+    let k4 = p.k / 4u;
+    let tm = (sg / 2u) * 32u;  // the subgroup's quarter: first token and output
+    let tn = (sg % 2u) * 32u;
+",
+        sz = 64 * LD
+    );
+    let w = &mut s;
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "    var c{i}{j} = coop_mat8x8<f32, C>();").unwrap();
+        }
+    }
+    write!(
+        w,
+        "    for (var kb = 0u; kb < p.k; kb += 32u) {{
+        for (var r = 0u; r < 4u; r++) {{
+            let idx = li + 128u * r;  // vec4 of a 64 x 8 slice
+            let row = idx / 8u;
+            let c = idx % 8u;
+            var v = vec4<f32>(0.0);
+            if (t0 + row < p.t) {{ v = x[(t0 + row) * k4 + kb / 4u + c]; }}
+            let o = row * {LD}u + c * 4u;
+            xs[o] = v.x;
+            xs[o + 1u] = v.y;
+            xs[o + 2u] = v.z;
+            xs[o + 3u] = v.w;
+        }}
+        {{
+            // 16 weights of a row a lane
+            let row = li / 2u;
+            let h = li % 2u;
+            let w = load16(n0 + row, kb / 16u + h);
+            let o = (h * 16u) * 64u + row;
+            for (var q = 0u; q < 4u; q++) {{
+                wsm[o + (4u * q) * 64u] = w[q].x;
+                wsm[o + (4u * q + 1u) * 64u] = w[q].y;
+                wsm[o + (4u * q + 2u) * 64u] = w[q].z;
+                wsm[o + (4u * q + 3u) * 64u] = w[q].w;
+            }}
+        }}
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk += 8u) {{
+"
+    )
+    .unwrap();
+    // (indices bound to `let`s: naga does not emit them inline in cooperative pointers)
+    for i in 0..4 {
+        writeln!(w, "            let ia{i} = (tm + {}u) * {LD}u + kk;", 8 * i).unwrap();
+        writeln!(w, "            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&xs[ia{i}], {LD}u);").unwrap();
+    }
+    for j in 0..4 {
+        // B[k][n] = W[n][k]: row-major as staged.
+        writeln!(w, "            let ib{j} = kk * 64u + tn + {}u;", 8 * j).unwrap();
+        writeln!(w, "            let b{j} = coopLoadT<coop_mat8x8<f32, B>>(&wsm[ib{j}], 64u);").unwrap();
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "            c{i}{j} = coopMultiplyAdd(a{i}, b{j}, c{i}{j});").unwrap();
+        }
+    }
+    writeln!(w, "        }}\n        workgroupBarrier();\n    }}\n    let ldy = p.n;").unwrap();
+    // (`var`s and `p.n` bound to `let`s: naga does not emit them as coopStore arguments)
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "    let o{i}{j} = (t0 + tm + {}u) * ldy + n0 + tn + {}u;", 8 * i, 8 * j).unwrap();
+            writeln!(w, "    let r{i}{j} = c{i}{j};").unwrap();
+            writeln!(w, "    coopStoreT(r{i}{j}, &y[o{i}{j}], ldy);").unwrap();
+        }
+    }
+    s.push_str("}\n");
+    s
+}
 
 /// Embedding gather from the bf16 table (two values per u32): one workgroup per row.
 pub const EMBED: &str = r#"

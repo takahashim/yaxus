@@ -28,9 +28,9 @@ impl Gpu {
         eps: f32,
     ) -> (Vec<f32>, Vec<f32>) {
         let mut xt = self.tensor(rows, cols);
-        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
+        self.dev.write(xt.buf(), 0, bytemuck::cast_slice(x));
         let dt = self.tensor(rows, cols);
-        self.queue.write_buffer(dt.buf(), 0, bytemuck::cast_slice(delta));
+        self.dev.write(dt.buf(), 0, bytemuck::cast_slice(delta));
         let w1 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w1)));
         let w2 = Weight::Vector(self.upload("vector", bytemuck::cast_slice(w2)));
         let h = self.add_norm(&mut xt, &dt, &w1, o1, &w2, o2, eps);
@@ -54,7 +54,7 @@ impl Gpu {
     ) -> Vec<f32> {
         let w = Weight::Matrix(self.load_ggml(dtype, bytes, n, k).expect("a type with a GPU layout"));
         let xt = self.tensor(t, k);
-        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
+        self.dev.write(xt.buf(), 0, bytemuck::cast_slice(x));
         let y = if glu { self.matmul_glu(&xt, &w, gemv) } else { self.matmul(&xt, &w, gemv) };
         self.to_host(&y)
     }
@@ -76,7 +76,7 @@ impl Gpu {
     ) -> Vec<f32> {
         let w = Weight::Matrix(self.load_matrix(w, n, k, quant).unwrap());
         let xt = self.tensor(t, k);
-        self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
+        self.dev.write(xt.buf(), 0, bytemuck::cast_slice(x));
         let y = if glu { self.matmul_glu(&xt, &w, gemv) } else { self.matmul(&xt, &w, gemv) };
         self.to_host(&y)
     }
@@ -84,12 +84,7 @@ impl Gpu {
     #[doc(hidden)]
     pub fn debug_alloc(&mut self, size: u64) -> Result<()> {
         self.checked("allocating a test buffer", |g| {
-            let _buf = g.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("test"),
-                size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
+            let _buf = g.dev.storage("test", size);
             Ok(())
         })
     }
@@ -97,7 +92,7 @@ impl Gpu {
     #[doc(hidden)]
     pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
         let x = self.tensor(rows, logits.len() / rows);
-        self.queue.write_buffer(x.buf(), 0, bytemuck::cast_slice(logits));
+        self.dev.write(x.buf(), 0, bytemuck::cast_slice(logits));
         self.argmax_rows(&x)
     }
 }
@@ -108,6 +103,11 @@ impl WgpuBackend {
     /// per-row kernel when `target_wgs` is 0.
     pub fn set_tiled_attention(&self, target_wgs: usize) {
         self.g().tuning.tile_wgs = target_wgs;
+    }
+
+    /// Whether the small per-row kernels run in MSL (`AppleTuning::msl_small`).
+    pub fn set_msl_small(&self, on: bool) {
+        self.g().tuning.apple.msl_small = on;
     }
 
     /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
@@ -178,6 +178,6 @@ impl WgpuBackend {
 
     #[doc(hidden)]
     pub fn max_buffer_size(&self) -> u64 {
-        self.g().device.limits().max_buffer_size
+        self.g().dev.max_buffer()
     }
 }

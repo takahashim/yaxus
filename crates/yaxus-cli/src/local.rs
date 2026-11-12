@@ -30,9 +30,9 @@ pub struct ModelArgs {
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
     /// Arithmetic of GPU prompt processing (long passes): auto (the device's choice: int16
-    /// on AMD GPUs, f32 on Apple GPUs), int16 (integer dot products, activations rounded
+    /// on AMD GPUs, f16 on Apple GPUs), int16 (integer dot products, activations rounded
     /// to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than int16, logits move
-    /// ~100x more), f16 (matrix cores) or f32 (reference).
+    /// ~100x more), f16 (matrix cores; on Metal, 8x8 matrices in f32) or f32 (reference).
     #[arg(long, default_value = "auto")]
     prefill_precision: yaxus_runtime::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
@@ -463,10 +463,11 @@ fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Op
     let gen_after_first: usize = stats.iter().map(|s| s.generated.saturating_sub(1)).sum();
     let pf: f64 = stats.iter().map(|s| s.prefill.as_secs_f64()).sum::<f64>() / stats.len() as f64;
     println!(
-        "{} items, {generated_total} tokens: decode {:.2} tok/s, mean prefill {:.0} ms",
+        "{} items, {generated_total} tokens: decode {:.2} tok/s, mean prefill {:.0} ms, mean per item {:.0} ms",
         stats.len(),
         gen_after_first as f64 / dec,
-        pf * 1e3
+        pf * 1e3,
+        (pf + dec / stats.len() as f64) * 1e3
     );
     if let Some(s) = model.stats() {
         println!("speculative: {s}");

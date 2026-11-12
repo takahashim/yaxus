@@ -1,8 +1,8 @@
 //! Attention over the paged KV cache, and the RoPE tables it reads.
 
-use wgpu::util::DeviceExt;
 use yaxus_model::{Config, LayerMeta};
 
+use crate::dev::Buf;
 use crate::plan::{AttentionCase, AttentionPlan};
 use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight};
 
@@ -27,10 +27,12 @@ impl Gpu {
         assert!(rope_bytes <= rope.size(), "position beyond the rope table");
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
         let q = self.tensor(t, hq * HEAD_DIM);
+        // (the fourth immediate: the rope table's half length, which only the MSL kernel reads)
+        let msl = self.tuning.apple.msl_small && self.caps.msl;
         self.dispatch(
-            "qk_rope",
+            if msl { "qk_rope_msl" } else { "qk_rope" },
             &[q.buf(), &kc, &vc, qkv.buf(), qn, kn, &rope, &rows],
-            &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits()],
+            &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits(), (rope.size() / 8) as u32],
             ((hq + hkv) as u32, t as u32),
         );
         let o = self.tensor(t, hq * HEAD_DIM);
@@ -93,17 +95,13 @@ impl Gpu {
         o
     }
 
-    pub(crate) fn rope_table(&self, meta: &LayerMeta, max_len: usize, d: usize) -> wgpu::Buffer {
+    pub(crate) fn rope_table(&mut self, meta: &LayerMeta, max_len: usize, d: usize) -> Buf {
         let half = d / 2;
         let mut tab = vec![0f32; 2 * max_len * half];
         let (cos, sin) = tab.split_at_mut(max_len * half);
         for pos in 0..max_len {
             meta.rope.cos_sin(pos, &mut cos[pos * half..(pos + 1) * half], &mut sin[pos * half..(pos + 1) * half]);
         }
-        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("rope"),
-            contents: bytemuck::cast_slice(&tab),
-            usage: wgpu::BufferUsages::STORAGE,
-        })
+        self.dev.upload("rope", bytemuck::cast_slice(&tab))
     }
 }
