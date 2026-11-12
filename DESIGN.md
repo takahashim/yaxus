@@ -235,7 +235,7 @@ yaxus/
   - `DeviceCaps`: アダプタから調べる機能 (バックエンド、ベンダー、f16、32 レーン以上の subgroup、16×16×16 の cooperative matrix、fast math、タイムスタンプ、workgroup メモリの大きさ)。
   - `CompileSettings`: naga と wgpu が足す安全装置のうち外すもの。ループのカウンタはすべてのバックエンドで外し、workgroup メモリのゼロ初期化は Metal だけで外す (経緯 11.39、11.40)。外す前提 (どのループも必ず終わる) は `every_kernel_loop_ends` が全カーネルのソースで検査する。範囲チェックは残す。
   - `DeviceCaps` は wgpu の型を持たない (`Api`、`DeviceKind`)。wgpu のアダプタからの検出は `dev::wgpu` にある。
-  - `Tuning`: 速さだけで決まる選択 (投入の FLOP 閾値、早期投入、GEMV と GEMM を切り替える行数、attention の分割など)。780M で測った値が基準で、ほかのデバイスは `for_device` で上書きする (Apple GPU は f32 のカーネル)。MSL のカーネルのスイッチと大きさは `Tuning::apple` (`AppleTuning`) にまとめる。`YAXUS_GEMM` などの環境変数で実験用に上書きできる。
+  - `Tuning`: 速さだけで決まる選択 (投入の FLOP 閾値、早期投入、GEMV と GEMM を切り替える行数、attention の分割など)。780M で測った値が基準で、ほかのデバイスは `for_device` で上書きする (Apple GPU は f32 のカーネル)。MSL のカーネルのスイッチと大きさは `Tuning::apple` (`AppleTuning`) にまとめる。環境変数での上書きは持たない。テストは `GpuBackend` の setter (`set_gemm`、`set_gemv`、`set_tiled_attention`、`set_msl_small`) で切り替える。
 - `plan.rs`: 形状、`DeviceCaps`、`Tuning` だけから、行列積 (`MatmulPlan`、`GluPlan`) と attention (`AttentionPlan`) に使うカーネルを決める。MSL のカーネルも同じで、パスを行で分ける形 (`gemv2_pieces`、`gemm_msl_pieces`) も plan の関数。`ops/` は plan を実行するだけ。事前コンパイルも同じ plan の関数とカーネルの名前を使うので、実行するカーネルと食い違わない。
 - `kernels.rs`: カーネルの名前 (`name::*`)、ソースの一覧 (`base_sources`、`int_jobs`)、コンパイル。基本のカーネルはデバイスを開いたときに、整数カーネルはモデルを読み込んだあと全コアで事前コンパイルする (`precompile`)。それ以外の行数の整数カーネルは初回の使用時にコンパイルする。
 - `weights.rs` は重みの形式とバッファ、`commands.rs` は記録・投入・読み戻しとバインドグループのキャッシュ、`profile.rs` は `YAXUS_PROFILE` の集計。
