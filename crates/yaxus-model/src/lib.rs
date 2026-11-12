@@ -471,6 +471,80 @@ impl<B: Backend> Model<B> {
     }
 }
 
+/// How likely the model found one token of a text it was made to read as its output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenScore {
+    /// The token's log-probability.
+    pub logprob: f32,
+    /// The model's most likely token at this place, and its log-probability.
+    pub best: u32,
+    pub best_logprob: f32,
+}
+
+/// The scores of `targets[r]` under logits row `r` of `logits` (`targets.len()` rows of
+/// `vocab` each): log-softmax, in f64 for the sum.
+pub fn token_scores(logits: &[f32], vocab: usize, targets: &[u32]) -> Vec<TokenScore> {
+    targets
+        .iter()
+        .enumerate()
+        .map(|(r, &t)| {
+            let row = &logits[r * vocab..(r + 1) * vocab];
+            let (best, &max) =
+                row.iter().enumerate().fold((0, &f32::NEG_INFINITY), |m, (i, x)| if *x > *m.1 { (i, x) } else { m });
+            let lse = max as f64 + row.iter().map(|&x| ((x - max) as f64).exp()).sum::<f64>().ln();
+            let lp = |x: f32| (x as f64 - lse) as f32;
+            TokenScore { logprob: lp(row[t as usize]), best: best as u32, best_logprob: lp(max) }
+        })
+        .collect()
+}
+
+/// Rows of logits read back at a time by [`Model::score`] (a row is the vocabulary: 107520
+/// f32s for PLaMo 3, so 64 rows are 27 MB).
+const SCORE_ROWS: usize = 64;
+
+impl<B: Backend> Model<B> {
+    /// How likely `forced` is as the continuation of `prompt`: for each of its tokens,
+    /// its log-probability given the prompt and the tokens before it, and the model's own
+    /// choice there (teacher forcing: the model reads `forced` rather than its own
+    /// output). The sequence is kept for prefix reuse, as a finished request's.
+    pub fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<TokenScore>> {
+        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+        if forced.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (id, reused) = self.begin(prompt)?;
+        let r = (|| {
+            // The prompt up to its last token, then that token and `forced` but its last:
+            // row j of those predicts forced[j].
+            let last = prompt.len() - 1;
+            for c in prompt[reused..last].chunks(self.chunk) {
+                self.forward(&[(id, c)], false)?;
+            }
+            let mut input = vec![prompt[last]];
+            input.extend_from_slice(&forced[..forced.len() - 1]);
+            let mut scores = Vec::with_capacity(forced.len());
+            for (k, c) in input.chunks(SCORE_ROWS.min(self.chunk)).enumerate() {
+                let logits = self.forward(&[(id, c)], true)?;
+                let host = self.backend.to_host(&logits);
+                anyhow::ensure!(
+                    !host.is_empty() && host.len().is_multiple_of(c.len()),
+                    "logits of {} values for {} rows",
+                    host.len(),
+                    c.len()
+                );
+                let start = k * SCORE_ROWS.min(self.chunk);
+                scores.extend(token_scores(&host, host.len() / c.len(), &forced[start..start + c.len()]));
+            }
+            Ok(scores)
+        })();
+        match r {
+            Ok(_) => self.finish(id),
+            Err(_) => self.free_seq(id),
+        }
+        r
+    }
+}
+
 /// A model with a do-nothing backend, for tests of the KV and scheduling logic (tensors
 /// are just their row counts and every argmax is token 0).
 #[cfg(test)]
@@ -583,6 +657,20 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::model;
     use super::*;
+
+    #[test]
+    fn token_scores_are_log_softmax() {
+        // Two rows of a vocabulary of 3.
+        let logits = [0.0, (2.0f32).ln(), 0.0, 5.0, 1.0, 1.0];
+        let s = token_scores(&logits, 3, &[0, 0]);
+        // Row 0: probabilities 1/4, 2/4, 1/4.
+        assert!((s[0].logprob - (0.25f32).ln()).abs() < 1e-6);
+        assert_eq!(s[0].best, 1);
+        assert!((s[0].best_logprob - (0.5f32).ln()).abs() < 1e-6);
+        // Row 1: the forced token is the best one.
+        assert_eq!(s[1].best, 0);
+        assert_eq!(s[1].logprob, s[1].best_logprob);
+    }
 
     #[test]
     fn reuse_falls_back_to_a_fresh_sequence_when_the_arena_is_full() {
