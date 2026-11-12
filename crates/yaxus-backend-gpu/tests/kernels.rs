@@ -75,6 +75,8 @@ fn gemm_kinds(gpu: &GpuBackend) -> Vec<(GemmKind, f32)> {
     let mut kinds = vec![(GemmKind::F32, 0.0), (GemmKind::Int16, 3e-3), (GemmKind::Int8, 3e-2)];
     if gpu.caps().coop {
         kinds.push((GemmKind::Coop, 3e-3)); // (the default where matrix cores exist)
+        // (on Metal f16 tiles, rounding weights and activations; on Vulkan as `Coop`)
+        kinds.push((GemmKind::CoopF16, 3e-3));
     }
     kinds
 }

@@ -223,8 +223,8 @@ impl Gpu {
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
         let (dev, caps) = Dev::open(&diag)?;
-        let tuning = Tuning::for_device(&caps).with_env();
-        let compile = CompileSettings::for_device(&caps).with_env();
+        let tuning = Tuning::for_device(&caps);
+        let compile = CompileSettings::for_device(&caps);
         let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);
         let argmax_part = dev.storage("argmax-part", (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64);
         let mut b = Gpu {

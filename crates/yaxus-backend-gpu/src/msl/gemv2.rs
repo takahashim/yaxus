@@ -30,6 +30,7 @@ impl Gemv2 {
     /// The kernel for `t` rows with `apple`'s sizes.
     pub(crate) fn for_rows(t: usize, glu: bool, apple: &AppleTuning) -> Self {
         let tiles = (t > apple.gemv2_scalar_max).then(|| apple.gemv2_tiles[usize::from(t > 8)]);
+        debug_assert!(tiles.is_none_or(|nt| nt >= 2 && nt % 2 == 0), "gemv2 weight tiles must be even");
         Gemv2 { t, glu, tiles }
     }
 

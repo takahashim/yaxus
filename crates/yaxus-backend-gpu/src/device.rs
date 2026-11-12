@@ -169,7 +169,8 @@ pub struct AppleTuning {
     /// 2B Q4_K_M, 2 rows: scalar 26.2 ms, matrices 34.7).
     pub gemv2_scalar_max: usize,
     /// Weight tiles of 8 rows a simdgroup of gemv2's matrix kernel takes, for passes of
-    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill).
+    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill). Even and at
+    /// least 2: with `glu` half are gate rows, half up rows.
     pub gemv2_tiles: [usize; 2],
     /// Rows a gemv2 dispatch takes at most; more go to further dispatches.
     pub gemv2_max_rows: usize,
@@ -193,45 +194,6 @@ impl Default for AppleTuning {
             gemv2_tail_rows: 40,
             gemm_msl: false,
         }
-    }
-}
-
-impl AppleTuning {
-    /// With the environment's overrides: `YAXUS_MSL_SMALL=0|1`, `YAXUS_GEMV2=0|1`,
-    /// `YAXUS_GEMV2_SCALAR`, `YAXUS_GEMV2_NT`, `YAXUS_GEMV2_NT2`, `YAXUS_GEMV2_MAX_ROWS`,
-    /// `YAXUS_GEMV2_TAIL` and `YAXUS_GEMM_MSL=wgsl|f32|f16` (`f16` also selects
-    /// `GemmKind::CoopF16`, in `Tuning::with_env`).
-    fn with_env(mut self) -> Self {
-        let var = |name: &str| std::env::var(name).ok();
-        let num = |name: &str| var(name).and_then(|v| v.parse::<usize>().ok());
-        let switch = |name: &str, v: &mut bool| match var(name).as_deref() {
-            Some("0") => *v = false,
-            Some("1") => *v = true,
-            _ => {}
-        };
-        switch("YAXUS_MSL_SMALL", &mut self.msl_small);
-        switch("YAXUS_GEMV2", &mut self.gemv2);
-        if let Some(v) = num("YAXUS_GEMV2_SCALAR") {
-            self.gemv2_scalar_max = v;
-        }
-        if let Some(v) = num("YAXUS_GEMV2_NT") {
-            self.gemv2_tiles[0] = v;
-        }
-        if let Some(v) = num("YAXUS_GEMV2_NT2") {
-            self.gemv2_tiles[1] = v;
-        }
-        if let Some(v) = num("YAXUS_GEMV2_MAX_ROWS") {
-            self.gemv2_max_rows = v.clamp(1, crate::GEMVM_MAX_T);
-        }
-        if let Some(v) = num("YAXUS_GEMV2_TAIL") {
-            self.gemv2_tail_rows = v;
-        }
-        match var("YAXUS_GEMM_MSL").as_deref() {
-            Some("wgsl") => self.gemm_msl = false,
-            Some("f32" | "f16") => self.gemm_msl = true,
-            _ => {}
-        }
-        self
     }
 }
 
@@ -293,57 +255,6 @@ impl Tuning {
         t
     }
 
-    /// The tuning with the overrides of the environment, for experiments and tests:
-    /// `YAXUS_GEMM=f32|coop|coop16|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
-    /// `YAXUS_TILE_WGS`, `YAXUS_GEMVM_R`, `YAXUS_EARLY_SUBMIT`, `YAXUS_ATTN_SPLIT_WGS`,
-    /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`.
-    pub fn with_env(mut self) -> Self {
-        let var = |name: &str| std::env::var(name).ok();
-        match var("YAXUS_GEMM").as_deref() {
-            Some("f32") => self.gemm = GemmKind::F32,
-            Some("coop") => self.gemm = GemmKind::Coop,
-            Some("coop16") => self.gemm = GemmKind::CoopF16,
-            Some("int8") => self.gemm = GemmKind::Int8,
-            Some("int16") => self.gemm = GemmKind::Int16,
-            _ => {}
-        }
-        match var("YAXUS_GEMV").as_deref() {
-            Some("f32") => self.gemv = Gemv::F32,
-            Some("int8") => self.gemv = Gemv { planes: Some(1), single_f32: false },
-            Some("mixed") => self.gemv = Gemv { planes: Some(2), single_f32: true },
-            Some("int16") => self.gemv = Gemv::INT16,
-            _ => {}
-        }
-        if let Some(v) = var("YAXUS_EARLY_SUBMIT").and_then(|v| v.parse().ok()) {
-            self.early_submit_dispatches = v;
-        }
-        if let Some(v) = var("YAXUS_ATTN_SPLIT_WGS").and_then(|v| v.parse().ok()) {
-            self.attn_split_wgs = v;
-        }
-        if let Some(v) = var("YAXUS_SHORT_CONTEXT").and_then(|v| v.parse().ok()) {
-            self.short_context = v;
-        }
-        if let Some(v) = var("YAXUS_TILE_WGS").and_then(|v| v.parse().ok()) {
-            self.tile_wgs = v;
-        }
-        if let Some(v) = var("YAXUS_GEMVM_R").and_then(|v| v.parse().ok()) {
-            self.gemvm_rows = v;
-        }
-        match var("YAXUS_GEMV_F32").as_deref() {
-            Some("0") => self.gemv_f32 = false,
-            Some("1") => self.gemv_f32 = true,
-            _ => {}
-        }
-        if var("YAXUS_GEMM_MSL").as_deref() == Some("f16") {
-            self.gemm = GemmKind::CoopF16;
-        }
-        self.apple = self.apple.with_env();
-        if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
-            self.gemv_f32_rows = v;
-        }
-        self
-    }
-
     /// Rows up to which a pass runs as GEMVs of up to 16 rows each with `gemm` as the
     /// prefill GEMM.
     pub(crate) fn gemv_max_rows(&self, gemm: GemmKind) -> usize {
@@ -376,23 +287,6 @@ impl CompileSettings {
     /// No loop counters anywhere; workgroup memory zeroed except on Metal.
     pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
         CompileSettings { loop_bounding: false, zero_workgroup_memory: !caps.api.is_metal() }
-    }
-
-    /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`
-    /// and `YAXUS_ZERO_WGMEM=0|1`.
-    pub(crate) fn with_env(mut self) -> Self {
-        let flag = |name: &str| match std::env::var(name).as_deref() {
-            Ok("0") => Some(false),
-            Ok("1") => Some(true),
-            _ => None,
-        };
-        if let Some(v) = flag("YAXUS_LOOP_BOUNDING") {
-            self.loop_bounding = v;
-        }
-        if let Some(v) = flag("YAXUS_ZERO_WGMEM") {
-            self.zero_workgroup_memory = v;
-        }
-        self
     }
 }
 
