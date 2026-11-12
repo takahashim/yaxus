@@ -229,12 +229,14 @@ yaxus/
 
 - `Gpu` がデバイス、カーネル、バッファプールを持つ。本体と下書きは `WgpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
 - `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。
-- `msl.rs`: Apple GPU 用に MSL で書いたカーネル (1〜16 行の GEMV `gemv2`、prefill の GEMM `gemm`、`rmsnorm`・`add_norm`・`qk_rope`)。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
+- `msl/`: Apple GPU 用に MSL で書いたカーネル。`access` (形式ごとの重みの展開)、`gemv2` (1〜16 行の GEMV)、`gemm` (prefill の GEMM)、`small` (`rmsnorm`・`add_norm`・`qk_rope`)。カーネルは値 (`msl::Gemv2 { t, glu, tiles }`、`msl::Gemm { f16, rb }`) で表し、名前は `kernels::name`、ソースは値から作る。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
+- `dev/metal/translate.rs`: Metal 直接のときに、WGSL のカーネルを naga で MSL に変換する。immediates を `buffer(0)`、binding `i` を `buffer(i + 1)` に置き、MSL のカーネルと同じ形でディスパッチできるようにする (単体テストで固定)。
 - `device.rs`:
   - `DeviceCaps`: アダプタから調べる機能 (バックエンド、ベンダー、f16、32 レーン以上の subgroup、16×16×16 の cooperative matrix、fast math、タイムスタンプ、workgroup メモリの大きさ)。
   - `CompileSettings`: naga と wgpu が足す安全装置のうち外すもの。ループのカウンタはすべてのバックエンドで外し、workgroup メモリのゼロ初期化は Metal だけで外す (経緯 11.39、11.40)。外す前提 (どのループも必ず終わる) は `every_kernel_loop_ends` が全カーネルのソースで検査する。範囲チェックは残す。
-  - `Tuning`: 速さだけで決まる選択 (投入の FLOP 閾値、早期投入、GEMV と GEMM を切り替える行数、attention の分割など)。780M で測った値が基準で、ほかのデバイスは `for_device` で上書きする (Apple GPU は f32 のカーネル)。`YAXUS_GEMM` などの環境変数で実験用に上書きできる。
-- `plan.rs`: 形状、`DeviceCaps`、`Tuning` だけから、行列積 (`MatmulPlan`、`GluPlan`) と attention (`AttentionPlan`) に使うカーネルを決める。`ops/` は plan を実行するだけ。事前コンパイルも同じ plan の関数を使うので、実行するカーネルと食い違わない。
+  - `DeviceCaps` は wgpu の型を持たない (`Api`、`DeviceKind`)。wgpu のアダプタからの検出は `dev::wgpu` にある。
+  - `Tuning`: 速さだけで決まる選択 (投入の FLOP 閾値、早期投入、GEMV と GEMM を切り替える行数、attention の分割など)。780M で測った値が基準で、ほかのデバイスは `for_device` で上書きする (Apple GPU は f32 のカーネル)。MSL のカーネルのスイッチと大きさは `Tuning::apple` (`AppleTuning`) にまとめる。`YAXUS_GEMM` などの環境変数で実験用に上書きできる。
+- `plan.rs`: 形状、`DeviceCaps`、`Tuning` だけから、行列積 (`MatmulPlan`、`GluPlan`) と attention (`AttentionPlan`) に使うカーネルを決める。MSL のカーネルも同じで、パスを行で分ける形 (`gemv2_pieces`、`gemm_msl_pieces`) も plan の関数。`ops/` は plan を実行するだけ。事前コンパイルも同じ plan の関数とカーネルの名前を使うので、実行するカーネルと食い違わない。
 - `kernels.rs`: カーネルの名前 (`name::*`)、ソースの一覧 (`base_sources`、`int_jobs`)、コンパイル。基本のカーネルはデバイスを開いたときに、整数カーネルはモデルを読み込んだあと全コアで事前コンパイルする (`precompile`)。それ以外の行数の整数カーネルは初回の使用時にコンパイルする。
 - `weights.rs` は重みの形式とバッファ、`commands.rs` は記録・投入・読み戻しとバインドグループのキャッシュ、`profile.rs` は `YAXUS_PROFILE` の集計。
 - カーネル固有の引数は push constant (wgpu の `IMMEDIATES`) で渡す。RoPE の cos/sin は CPU で表を作って渡す。
