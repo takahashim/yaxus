@@ -3,7 +3,7 @@ name = "yaxus-backend-wgpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Vulkan (wgpu) backend for yaxus with hand-written WGSL kernels"
+description = "GPU backend for yaxus (wgpu on Vulkan or Metal) with hand-written WGSL kernels"
 
 [dependencies]
 anyhow.workspace = true

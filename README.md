@@ -4,8 +4,8 @@
 
 yaxus runs [PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-2b) as a
 translation server and command-line tool, written in Rust. It does not use llama.cpp or
-Python. It has its own model code, tokenizer and GPU kernels (WGSL on Vulkan through wgpu)
-in one process.
+Python. It has its own model code, tokenizer and GPU kernels (WGSL through wgpu, on Vulkan or
+Metal) in one process.
 
 - **Server:** `yaxus serve` serves HTTPS with a bearer token. It provides a JSON/SSE API
   and a web UI, and other machines connect through `yaxus client` or a browser.
@@ -25,15 +25,16 @@ The model weights and tokenizer are not part of this repository. They are distri
 Preferred Networks under the PLaMo Community License (see [License](#license)).
 
 This is a personal project. It is developed and measured on one machine: Ubuntu 24.04 with
-a Radeon 780M (RDNA3 integrated GPU) and Mesa RADV. Other GPUs should work, but have not
-been tested. The design notes and every measurement are in [DESIGN.md](DESIGN.md)
+a Radeon 780M (RDNA3 integrated GPU) and Mesa RADV. It also runs on macOS through Metal
+(tested on an Apple M2). Other GPUs should work, but have not been tested. The design notes and every measurement are in [DESIGN.md](DESIGN.md)
 (in Japanese).
 
 ## Requirements
 
 - **Rust:** the current stable toolchain (edition 2024).
-- **GPU:** a GPU with a Vulkan driver. The fast decode kernels need 32-lane subgroups, and
-  integer dot products help the most. On Linux the user must be in the `render` group.
+- **GPU:** a GPU with a Vulkan driver, or Metal on macOS. The fast decode kernels need
+  32-lane subgroups, and integer dot products help the most. On Linux the user must be in
+  the `render` group.
   Without a GPU, `--backend cpu` works, but slowly.
 - **Model:** a model in the Hugging Face cache. For example, with the
   [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli):
@@ -89,10 +90,12 @@ In a browser, open `https://host.example:8443/` and enter the token. The API is
 
 ### Speed and precision
 
-By default (`--prefill-precision auto`, `--decode-precision auto`: the device's choice,
-`int16` on the AMD GPUs measured so far), matrix products round their input rows to
-15 bits per block of 32 values and use packed integer dot products. The logits differ from an all-f32 computation by about 6e-3. In the tests so far,
-the translations were identical.
+By default (`--prefill-precision auto`, `--decode-precision auto`) the device chooses the
+arithmetic. On the AMD GPUs measured so far that is `int16`: matrix products round their
+input rows to 15 bits per block of 32 values and use packed integer dot products. The
+logits differ from an all-f32 computation by about 6e-3. In the tests so far, the
+translations were identical. Apple GPUs have no integer dot product, so on them the
+default is `f32`.
 
 - **Reference:** `--prefill-precision f32 --decode-precision f32 --draft none
   --no-kv-cache` computes everything in f32.
@@ -122,6 +125,9 @@ A single stream without a draft model decodes at about the same speed as Ollama
   These need a GPU and the models in the Hugging Face cache.
 - **Software Vulkan:** the kernel tests also run on lavapipe, as in CI:
   `YAXUS_SOFTWARE_GPU=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+- **macOS:** the same commands test the Metal backend. The tests that compare the GPU with
+  the CPU hold the model twice, and the bf16 ones expand it, so they need more memory than
+  a 16 GB Mac has.
 - **CI:** runs `cargo fmt --check` and `cargo clippy` with warnings as errors, and the
   tests ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 

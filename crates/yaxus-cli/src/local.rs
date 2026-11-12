@@ -30,15 +30,15 @@ pub struct ModelArgs {
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
     /// Arithmetic of GPU prompt processing (long passes): auto (the device's choice: int16
-    /// on AMD GPUs), int16 (integer dot products, activations rounded to 15 bits), int8
-    /// (7 bits as llama.cpp does: 1.5x faster than int16, logits move ~100x more), f16
-    /// (matrix cores) or f32 (reference).
+    /// on AMD GPUs, f32 on Apple GPUs), int16 (integer dot products, activations rounded
+    /// to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than int16, logits move
+    /// ~100x more), f16 (matrix cores) or f32 (reference).
     #[arg(long, default_value = "auto")]
     prefill_precision: yaxus_runtime::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
-    /// drafts, short prompts): auto (the device's choice: int16 on AMD GPUs), int16
-    /// (integer dot products, activations rounded to 15 bits; several rows cost little
-    /// more than one) or f32 (reference).
+    /// drafts, short prompts): auto (the device's choice: int16 on AMD GPUs, f32 on Apple
+    /// GPUs), int16 (integer dot products, activations rounded to 15 bits; several rows
+    /// cost little more than one) or f32 (reference).
     #[arg(long, default_value = "auto")]
     decode_precision: yaxus_runtime::Decode,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
