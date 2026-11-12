@@ -16,6 +16,11 @@ use crate::PassMeta;
 /// several sequences (common prefixes) and is copied before it is written while shared.
 pub const PAGE: usize = 128;
 
+/// The arena slot of position `pos` of a sequence whose page table is `pages`.
+pub fn slot(pages: &[u32], pos: usize) -> usize {
+    pages[pos / PAGE] as usize * PAGE + pos % PAGE
+}
+
 /// Shortest common prefix worth reusing (shorter ones are recomputed).
 pub const MIN_REUSE: usize = 16;
 /// Finished sequences kept for reuse at most.
@@ -326,7 +331,7 @@ impl KvCache {
                 let pos = s.len + j;
                 meta.ids.push(t);
                 meta.pos.push(pos as u32);
-                meta.kv_slot.push(s.pages[pos / PAGE] * PAGE as u32 + (pos % PAGE) as u32);
+                meta.kv_slot.push(slot(&s.pages, pos) as u32);
                 meta.pt_off.push(off);
             }
             s.len += toks.len();
