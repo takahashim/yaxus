@@ -169,7 +169,8 @@ pub struct AppleTuning {
     /// 2B Q4_K_M, 2 rows: scalar 26.2 ms, matrices 34.7).
     pub gemv2_scalar_max: usize,
     /// Weight tiles of 8 rows a simdgroup of gemv2's matrix kernel takes, for passes of
-    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill).
+    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill). Even and at
+    /// least 2: with `glu` half are gate rows, half up rows.
     pub gemv2_tiles: [usize; 2],
     /// Rows a gemv2 dispatch takes at most; more go to further dispatches.
     pub gemv2_max_rows: usize,
@@ -198,7 +199,7 @@ impl Default for AppleTuning {
 
 impl AppleTuning {
     /// With the environment's overrides: `YAXUS_MSL_SMALL=0|1`, `YAXUS_GEMV2=0|1`,
-    /// `YAXUS_GEMV2_SCALAR`, `YAXUS_GEMV2_NT`, `YAXUS_GEMV2_NT2`, `YAXUS_GEMV2_MAX_ROWS`,
+    /// `YAXUS_GEMV2_SCALAR`, `YAXUS_GEMV2_MAX_ROWS`,
     /// `YAXUS_GEMV2_TAIL` and `YAXUS_GEMM_MSL=wgsl|f32|f16` (`f16` also selects
     /// `GemmKind::CoopF16`, in `Tuning::with_env`).
     fn with_env(mut self) -> Self {
@@ -213,12 +214,6 @@ impl AppleTuning {
         switch("YAXUS_GEMV2", &mut self.gemv2);
         if let Some(v) = num("YAXUS_GEMV2_SCALAR") {
             self.gemv2_scalar_max = v;
-        }
-        if let Some(v) = num("YAXUS_GEMV2_NT") {
-            self.gemv2_tiles[0] = v;
-        }
-        if let Some(v) = num("YAXUS_GEMV2_NT2") {
-            self.gemv2_tiles[1] = v;
         }
         if let Some(v) = num("YAXUS_GEMV2_MAX_ROWS") {
             self.gemv2_max_rows = v.clamp(1, crate::GEMVM_MAX_T);
