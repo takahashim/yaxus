@@ -95,8 +95,8 @@ By default (`--prefill-precision auto`, `--decode-precision auto`) the device ch
 arithmetic. On the AMD GPUs measured so far that is `int16`: matrix products round their
 input rows to 15 bits per block of 32 values and use packed integer dot products. The
 logits differ from an all-f32 computation by about 6e-3. In the tests so far, the
-translations were identical. Apple GPUs have no integer dot product, so on them the
-default is `f32`.
+translations were identical. Apple GPUs have no integer dot product. On them, decoding
+is `f32`, and prompt processing (`f16`) runs on Apple's 8x8 matrices, in f32 as well.
 
 - **Reference:** `--prefill-precision f32 --decode-precision f32 --draft none
   --no-kv-cache` computes everything in f32.

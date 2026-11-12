@@ -30,9 +30,9 @@ pub struct ModelArgs {
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
     /// Arithmetic of GPU prompt processing (long passes): auto (the device's choice: int16
-    /// on AMD GPUs, f32 on Apple GPUs), int16 (integer dot products, activations rounded
+    /// on AMD GPUs, f16 on Apple GPUs), int16 (integer dot products, activations rounded
     /// to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than int16, logits move
-    /// ~100x more), f16 (matrix cores) or f32 (reference).
+    /// ~100x more), f16 (matrix cores; on Metal, 8x8 matrices in f32) or f32 (reference).
     #[arg(long, default_value = "auto")]
     prefill_precision: yaxus_runtime::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of

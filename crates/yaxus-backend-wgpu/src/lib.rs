@@ -151,7 +151,9 @@ pub enum GemmKind {
     /// 64x128 tiles in f32 (CUDA-core style).
     F32,
     /// Matrix cores (cooperative matrices): f16 operands, f32 accumulation. Logits move by
-    /// ~5e-3 instead of ~5e-5 against the CPU; prefill is ~1.35x faster on a 780M.
+    /// ~5e-3 instead of ~5e-5 against the CPU; prefill is ~1.35x faster on a 780M. On
+    /// Metal the matrices are Apple's 8x8 simdgroup matrices in f32 (`gemm_coop8`), and
+    /// nothing is rounded.
     Coop,
     /// Packed integer dot products on the weights' integer values, the activations
     /// rounded to 15 bits and a sign per block of 32 (`gemm_int`, two int8 planes). Logits

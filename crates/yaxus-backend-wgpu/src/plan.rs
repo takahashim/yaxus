@@ -203,6 +203,7 @@ mod tests {
             subgroups,
             coop,
             fast_math: false,
+            coop_size: if coop { 16 } else { 0 },
             timestamps: false,
             max_workgroup_storage: 65536,
         }

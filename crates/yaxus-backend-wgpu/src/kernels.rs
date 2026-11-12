@@ -153,8 +153,11 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         .into_iter()
         .chain([(Format::Q6, W_Q6), (Format::Q3, W_Q3), (Format::Q2, W_Q2)]);
     for (f, w4) in prefill {
-        if caps.coop {
+        if caps.coop_size == 16 {
             let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
+            add(name::gemm_coop(f), &c, layout(f));
+        } else if caps.coop_size == 8 {
+            let c = format!("enable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{}", gemm_coop8());
             add(name::gemm_coop(f), &c, layout(f));
         }
         add(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));
@@ -454,6 +457,7 @@ mod tests {
             f16: true,
             subgroups: true,
             coop: true,
+            coop_size: 16,
             fast_math: false,
             timestamps: false,
             max_workgroup_storage: 65536,
@@ -461,8 +465,9 @@ mod tests {
         let formats = [Format::Q8, Format::Q4, Format::Q4K, Format::Q6, Format::Q3, Format::Q2, Format::Bf16];
         let gemvs = [Gemv::INT16, Gemv { planes: Some(1), single_f32: false }, Gemv::INT16.for_draft()];
         let mut sources = Vec::new();
-        for (subgroups, fast_math) in [(true, false), (true, true), (false, false)] {
-            let caps = DeviceCaps { subgroups, coop: subgroups, fast_math, ..caps.clone() };
+        // (Vulkan with matrix cores, Metal with its 8x8 matrices, no subgroups)
+        for (subgroups, fast_math, coop_size) in [(true, false, 16), (true, true, 8), (false, false, 0)] {
+            let caps = DeviceCaps { subgroups, coop: coop_size != 0, coop_size, fast_math, ..caps.clone() };
             for rows in [1, 4] {
                 let tuning = Tuning { gemvm_rows: rows, gemvi_rows: rows, ..Tuning::for_device(&caps) };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));

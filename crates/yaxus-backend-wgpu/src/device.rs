@@ -46,13 +46,15 @@ pub struct DeviceCaps {
     /// Subgroups of at least 32 lanes: the multi-row and integer GEMVs, the split
     /// attention and `add_norm_sg` reduce within 32 lanes with shuffles.
     pub subgroups: bool,
-    /// Cooperative matrices of 16x16x16 with f16 operands and f32 accumulators (the
-    /// `Coop` GEMM).
+    /// Cooperative matrices for the `Coop` GEMM (see `coop_size`).
     pub coop: bool,
     /// The shader compiler may reassociate float arithmetic and contract it into FMAs
     /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
     /// it off). Kernels that must agree to the bit then may not.
     pub fast_math: bool,
+    /// Their size: 16 (16x16x16, f16 operands and f32 accumulators: matrix cores on
+    /// Vulkan) or 8 (8x8x8 in f32: Metal's simdgroup matrices); 0 without.
+    pub coop_size: u32,
     /// Timestamp queries (`YAXUS_PROFILE=2`).
     pub timestamps: bool,
     pub max_workgroup_storage: u32,
@@ -68,15 +70,23 @@ impl DeviceCaps {
         // SIMD-groups of 32 threads, as the kernels need.
         let lanes32 = info.subgroup_min_size >= 32 || (info.backend == wgpu::Backend::Metal && vendor == Vendor::Apple);
         let subgroups = features.contains(wgpu::Features::SUBGROUP) && lanes32;
-        // (Metal's simdgroup matrices are 8x8, so the `Coop` GEMM is not available there.)
-        let coop = f16
-            && subgroups
-            && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-            && adapter.cooperative_matrix_properties().iter().any(|c| {
-                (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
-                    && c.ab_type == wgpu::CooperativeScalarType::F16
+        let props = adapter.cooperative_matrix_properties();
+        let has = |size: u32, ab: wgpu::CooperativeScalarType| {
+            props.iter().any(|c| {
+                (c.m_size, c.n_size, c.k_size) == (size, size, size)
+                    && c.ab_type == ab
                     && c.cr_type == wgpu::CooperativeScalarType::F32
-            });
+            })
+        };
+        let matrices = subgroups && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+        let coop_size = if matrices && f16 && has(16, wgpu::CooperativeScalarType::F16) {
+            16
+        } else if matrices && info.backend == wgpu::Backend::Metal && has(8, wgpu::CooperativeScalarType::F32) {
+            8
+        } else {
+            0
+        };
+        let coop = coop_size != 0;
         DeviceCaps {
             name: info.name.clone(),
             backend: info.backend,
@@ -86,6 +96,7 @@ impl DeviceCaps {
             subgroups,
             coop,
             fast_math: info.backend == wgpu::Backend::Metal,
+            coop_size,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
         }
@@ -188,6 +199,13 @@ impl Tuning {
             // 3450 / 39900, f32 30 / 56 / 305 / 1681).
             t.gemm = GemmKind::F32;
             t.gemv = Gemv::F32;
+            if caps.coop_size == 8 {
+                // The 8x8 matrix GEMM in f32: 2.1x the f32 GEMM (256 rows 1744 -> 809 ms),
+                // and a whole 64-row tile (32 rows: 197 ms) costs less than two 16-row
+                // f32 GEMVs (17 rows: 246 ms), so passes of more than 16 rows take it.
+                t.gemm = GemmKind::Coop;
+                t.multi_split_max_rows = crate::GEMVM_MAX_T;
+            }
         }
         t
     }

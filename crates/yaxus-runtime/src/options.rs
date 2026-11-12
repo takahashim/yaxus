@@ -45,14 +45,15 @@ pub struct DraftOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefill {
     /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemm`]; `Int16` on the AMD GPUs
-    /// measured so far, `F32` on Apple GPUs).
+    /// measured so far, `F16` on Apple GPUs, whose matrices are f32 there).
     #[default]
     Auto,
     /// Integer dot products, activations rounded to 15 bits per block of 32: 2.6x, 6e-3.
     Int16,
     /// The same with 7 bits, as llama.cpp does: 3.9x, 4e-1 to 6e-1.
     Int8,
-    /// Matrix cores with f16 operands: 2.0x, 2e-2 to 3e-2.
+    /// Matrix cores with f16 operands: 2.0x, 2e-2 to 3e-2. (On Metal, Apple's 8x8
+    /// matrices in f32: 2.1x the f32 GEMM on an M2, and nothing is rounded.)
     F16,
     /// f32 throughout: the reference.
     F32,

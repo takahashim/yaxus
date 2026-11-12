@@ -1048,6 +1048,92 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// The `Coop` GEMM on 8x8x8 cooperative matrices in f32 (Metal's simdgroup matrices): a
+/// workgroup of 4 subgroups computes 64 tokens x 64 outputs, each subgroup a 32 x 32
+/// quarter in 4 x 4 accumulators. K goes through workgroup memory 32 at a time, in f32:
+/// Apple GPUs multiply f32 matrices at the rate of f16 ones, so nothing is rounded.
+/// Stores whole 64-token tiles (the output is padded) and needs N % 64 == 0.
+pub fn gemm_coop8() -> String {
+    use std::fmt::Write;
+    // Row stride of the staged tiles, in f32. Measured on an M2 (2B Q4_K_M, 256-row
+    // pass): padding the rows to 36 or 40 was 12% slower, tiles of 128 outputs (8
+    // subgroups) no faster, and reading the next step into registers before this one's
+    // products no faster either.
+    const LD: usize = 32;
+    let mut s = format!(
+        "var<workgroup> xs: array<f32, {sz}>;  // [64 tokens][32 k]
+var<workgroup> wsm: array<f32, {sz}>; // [64 outputs][32 k]
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32,
+        @builtin(subgroup_id) sg: u32) {{
+    let n0 = wg.x * 64u;
+    let t0 = wg.y * 64u;
+    let k4 = p.k / 4u;
+    let tm = (sg / 2u) * 32u;  // the subgroup's quarter: first token and output
+    let tn = (sg % 2u) * 32u;
+",
+        sz = 64 * LD
+    );
+    let w = &mut s;
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "    var c{i}{j} = coop_mat8x8<f32, C>();").unwrap();
+        }
+    }
+    write!(
+        w,
+        "    for (var kb = 0u; kb < p.k; kb += 32u) {{
+        for (var r = 0u; r < 4u; r++) {{
+            let idx = li + 128u * r;  // vec4 of a 64 x 8 slice
+            let row = idx / 8u;
+            let c = idx % 8u;
+            var v = vec4<f32>(0.0);
+            if (t0 + row < p.t) {{ v = x[(t0 + row) * k4 + kb / 4u + c]; }}
+            let w = load4(n0 + row, kb / 4u + c);
+            let o = row * {LD}u + c * 4u;
+            xs[o] = v.x;
+            xs[o + 1u] = v.y;
+            xs[o + 2u] = v.z;
+            xs[o + 3u] = v.w;
+            wsm[o] = w.x;
+            wsm[o + 1u] = w.y;
+            wsm[o + 2u] = w.z;
+            wsm[o + 3u] = w.w;
+        }}
+        workgroupBarrier();
+        for (var kk = 0u; kk < 32u; kk += 8u) {{
+"
+    )
+    .unwrap();
+    // (indices bound to `let`s: naga does not emit them inline in cooperative pointers)
+    for i in 0..4 {
+        writeln!(w, "            let ia{i} = (tm + {}u) * {LD}u + kk;", 8 * i).unwrap();
+        writeln!(w, "            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&xs[ia{i}], {LD}u);").unwrap();
+    }
+    for j in 0..4 {
+        // B[k][n] = W[n][k]: column-major.
+        writeln!(w, "            let ib{j} = (tn + {}u) * {LD}u + kk;", 8 * j).unwrap();
+        writeln!(w, "            let b{j} = coopLoad<coop_mat8x8<f32, B>>(&wsm[ib{j}], {LD}u);").unwrap();
+    }
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "            c{i}{j} = coopMultiplyAdd(a{i}, b{j}, c{i}{j});").unwrap();
+        }
+    }
+    writeln!(w, "        }}\n        workgroupBarrier();\n    }}\n    let ldy = p.n;").unwrap();
+    // (`var`s and `p.n` bound to `let`s: naga does not emit them as coopStore arguments)
+    for i in 0..4 {
+        for j in 0..4 {
+            writeln!(w, "    let o{i}{j} = (t0 + tm + {}u) * ldy + n0 + tn + {}u;", 8 * i, 8 * j).unwrap();
+            writeln!(w, "    let r{i}{j} = c{i}{j};").unwrap();
+            writeln!(w, "    coopStoreT(r{i}{j}, &y[o{i}{j}], ldy);").unwrap();
+        }
+    }
+    s.push_str("}\n");
+    s
+}
+
 /// Embedding gather from the bf16 table (two values per u32): one workgroup per row.
 pub const EMBED: &str = r#"
 struct P { h: u32, _a: u32, _b: u32, _c: u32 }
