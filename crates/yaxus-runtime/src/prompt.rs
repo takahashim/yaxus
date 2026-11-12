@@ -60,7 +60,7 @@ impl Prompt {
         max_new: usize,
     ) -> Result<(Self, usize), PromptError> {
         let mut prompt = Prompt::new(tok, &req);
-        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.request().history.is_empty() {
+        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.history().is_empty() {
             prompt = Prompt::new(tok, &req.without_history());
         }
         prompt.within(max_context, max_new)

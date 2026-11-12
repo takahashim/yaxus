@@ -143,21 +143,38 @@ impl TranslationRequest {
     }
 }
 
-/// A request that passed [`TranslationRequest::validate`], with its language aliases
-/// normalized.
+/// A request that passed [`TranslationRequest::validate`]: its language aliases are
+/// normalized and its form is parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidRequest {
+    /// The request as validated (its `form` is the unparsed one; [`form`](Self::form) is
+    /// what counts).
     req: TranslationRequest,
     form: Option<Form>,
 }
 
 impl ValidRequest {
-    pub fn request(&self) -> &TranslationRequest {
-        &self.req
+    pub fn text(&self) -> &str {
+        &self.req.text
+    }
+
+    /// The target language, `ja(easy)` spelled `ja-easy`.
+    pub fn target_lang(&self) -> &str {
+        &self.req.target_lang
+    }
+
+    /// The source language, `ja(easy)` spelled `ja-easy`.
+    pub fn source_lang(&self) -> Option<&str> {
+        self.req.source_lang.as_deref()
     }
 
     pub fn form(&self) -> Option<Form> {
         self.form
+    }
+
+    /// Earlier source/translation pairs, oldest first.
+    pub fn history(&self) -> &[Pair] {
+        &self.req.history
     }
 
     /// The same request without history (still valid).
@@ -306,10 +323,11 @@ mod tests {
         r.form = Some("plain".into());
         r.history = vec![Pair { source: "a".into(), target: "b".into() }];
         let v = r.validate().unwrap();
-        assert_eq!(v.request().source_lang.as_deref(), Some("ja-easy"));
+        assert_eq!((v.source_lang(), v.target_lang()), (Some("ja-easy"), "ja"));
         assert_eq!(v.form(), Some(Form::Plain));
         let bare = v.clone().without_history();
-        assert!(bare.request().history.is_empty());
+        assert_eq!(v.history().len(), 1);
+        assert!(bare.history().is_empty());
         assert!(v.render().len() > bare.render().len());
         assert!(!bare.render().contains("<|plamo:msg|>a<|plamo:tag|>"));
     }
