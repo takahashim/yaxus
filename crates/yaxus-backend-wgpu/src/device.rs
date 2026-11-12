@@ -236,7 +236,9 @@ impl Tuning {
 
     /// The tuning with the overrides of the environment, for experiments and tests:
     /// `YAXUS_GEMM=f32|coop|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
-    /// `YAXUS_TILE_WGS` and `YAXUS_GEMVM_R`.
+    /// `YAXUS_TILE_WGS`, `YAXUS_GEMVM_R`, `YAXUS_EARLY_SUBMIT`, `YAXUS_ATTN_SPLIT_WGS`,
+    /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`, `YAXUS_GEMV_MMA=0|1`
+    /// and `YAXUS_GEMV_Q=0|1`.
     pub fn with_env(mut self) -> Self {
         let var = |name: &str| std::env::var(name).ok();
         match var("YAXUS_GEMM").as_deref() {
@@ -252,6 +254,15 @@ impl Tuning {
             Some("mixed") => self.gemv = Gemv { planes: Some(2), single_f32: true },
             Some("int16") => self.gemv = Gemv::INT16,
             _ => {}
+        }
+        if let Some(v) = var("YAXUS_EARLY_SUBMIT").and_then(|v| v.parse().ok()) {
+            self.early_submit_dispatches = v;
+        }
+        if let Some(v) = var("YAXUS_ATTN_SPLIT_WGS").and_then(|v| v.parse().ok()) {
+            self.attn_split_wgs = v;
+        }
+        if let Some(v) = var("YAXUS_SHORT_CONTEXT").and_then(|v| v.parse().ok()) {
+            self.short_context = v;
         }
         if let Some(v) = var("YAXUS_TILE_WGS").and_then(|v| v.parse().ok()) {
             self.tile_wgs = v;
