@@ -36,11 +36,7 @@ impl Gpu {
         // The f32 kernels: the GEMVs read the decode layout, the GEMMs the per-16 scales
         // (see `W_Q6`).
         let mut all = vec![y.buf().clone(), x.buf().clone()];
-        all.extend(if t <= GEMVM_MAX_T || matches!(plan, MatmulPlan::GemvMulti { .. }) {
-            m.decode_bufs()
-        } else {
-            m.prefill_bufs()
-        });
+        all.extend(if plan.is_gemm() { m.prefill_bufs() } else { m.decode_bufs() });
         let refs: Vec<&wgpu::Buffer> = all.iter().collect();
         let (n32, k32) = (n as u32, k as u32);
         let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {

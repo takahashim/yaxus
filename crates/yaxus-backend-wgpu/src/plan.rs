@@ -25,6 +25,14 @@ pub(crate) enum MatmulPlan {
     GemmF32,
 }
 
+impl MatmulPlan {
+    /// Whether it runs a GEMM, which reads the prefill layout of the weights (the
+    /// per-16 scales of Q6, Q3 and Q2); the GEMVs read the decode layout.
+    pub(crate) fn is_gemm(self) -> bool {
+        matches!(self, MatmulPlan::GemmInt { .. } | MatmulPlan::GemmCoop | MatmulPlan::GemmF32)
+    }
+}
+
 /// What a matrix product's plan depends on besides the device.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MatmulCase {
@@ -221,6 +229,8 @@ mod tests {
             (p(1), p(8), p(9), p(100)),
             (MatmulPlan::Gemv1, MatmulPlan::Gemv8, MatmulPlan::GemmF32, MatmulPlan::GemmInt { planes: 2 })
         );
+        // 9..=16 rows there are a GEMM, which binds the prefill layout of the weights.
+        assert!(p(16).is_gemm() && !p(8).is_gemm());
     }
 
     #[test]
