@@ -210,10 +210,10 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         }
     }
     add("attn_combine".into(), ATTN_COMBINE, &[false, true, true]);
-    // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
-    // without it, prefill attention takes the per-row kernel.
+    // Without subgroups, prefill attention takes the per-row kernel.
     if plan::tile_compiled(caps) {
-        add("attn_tile".into(), ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+        let src = attn_tile(plan::tile_stages_queries(caps));
+        add("attn_tile".into(), &src, &[false, false, false, true, true, true, true, true, true]);
     }
     add("swiglu".into(), SWIGLU, &[false, true]);
     add("add".into(), ADD, &[false, true]);

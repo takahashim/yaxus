@@ -208,6 +208,10 @@ impl Tuning {
             t.gemm = GemmKind::F32;
             t.gemv = Gemv::F32;
             t.gemv_f32 = true;
+            // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
+            // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
+            // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
+            t.tile_wgs = 128;
             if caps.coop_size == 8 {
                 // The 8x8 matrix GEMM in f32: 2.1x the f32 GEMM (256 rows 1744 -> 809 ms),
                 // and a whole 64-row tile (32 rows: 197 ms) costs less than two 16-row

@@ -344,6 +344,38 @@ fn tiled_attention_matches_cpu() {
     }
 }
 
+/// The tiled attention against the per-row kernel on the GPU alone (the CPU model is not
+/// loaded, for machines without the memory for two copies): 40 rows after 2600 keys,
+/// whole and with the keys split. `YAXUS_MODEL_DIR` may name a GGUF file.
+#[test]
+#[ignore]
+fn tiled_attention_matches_per_row() {
+    let dir = model_dir();
+    let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
+    let gpu = WgpuBackend::new().unwrap();
+    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
+    let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(quant)).unwrap();
+    gpu.set_prefix_cache(false);
+    let ids: Vec<u32> = (0..2640u32).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let (a, b) = ids.split_at(2600);
+    let mut run = |wgs: usize| {
+        gpu.backend.set_tiled_attention(wgs);
+        let sg = gpu.new_seq();
+        gpu.prefill(sg, a).unwrap();
+        let l = gpu.forward(&[(sg, b)], true).unwrap();
+        let l = gpu.backend.to_host(&l);
+        gpu.free_seq(sg);
+        l
+    };
+    let base = run(0);
+    for (name, wgs) in [("tiled", 384), ("tiled, split keys", 100_000)] {
+        let l = run(wgs);
+        let e = base.iter().zip(&l).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        eprintln!("{name}: 40 rows after 2600: max |per-row - tiled| = {e:.2e}");
+        assert!(e < 2e-3, "{name}: {e}");
+    }
+}
+
 /// Decode steps (the split attention, 16-key chunks for short and 32-key chunks for long
 /// contexts, and its merge) against the CPU with the f32 prefill GEMM, teacher-forced.
 #[test]

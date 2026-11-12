@@ -591,6 +591,44 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// `ATTN_TILE`, with `stage_queries` as written; without, the tile's queries are read
+/// from the buffer at each block of keys instead of from `qs` (16.5 KiB of workgroup
+/// memory less: 21.1 KiB, for devices with 32 KiB). The arithmetic is the same.
+pub fn attn_tile(stage_queries: bool) -> String {
+    if stage_queries {
+        return ATTN_TILE.to_string();
+    }
+    let mut s = ATTN_TILE.to_string();
+    let mut sub = |a: &str, b: &str| {
+        assert_eq!(s.matches(a).count(), 1, "{a}");
+        s = s.replace(a, b);
+    };
+    sub("var<workgroup> qs: array<vec4<f32>, 1056>;  // [BM][LD] queries, pre-scaled\n", "");
+    sub(
+        "    for (var i = li; i < BM * 32u; i += 128u) {
+        let r = i / 32u;
+        let cc = i % 32u;
+        var v = vec4<f32>(0.0);
+        if (r < nr) { v = q[(r0 + r) * qd4 + h * 32u + cc] * p.scale; }
+        qs[r * LD + cc] = v;
+    }
+",
+        "",
+    );
+    sub(
+        "    var acc: array<vec4<f32>, 8>;",
+        "    // The queries of this lane's two score rows (zero past the tile's rows).
+    let qb0 = (r0 + min(2u * tr, nr - 1u)) * qd4 + h * 32u;
+    let qb1 = (r0 + min(2u * tr + 1u, nr - 1u)) * qd4 + h * 32u;
+    let qk0 = select(0.0, p.scale, 2u * tr < nr);
+    let qk1 = select(0.0, p.scale, 2u * tr + 1u < nr);
+    var acc: array<vec4<f32>, 8>;",
+    );
+    sub("            let q0 = qs[(2u * tr) * LD + cc];", "            let q0 = q[qb0 + cc] * qk0;");
+    sub("            let q1 = qs[(2u * tr + 1u) * LD + cc];", "            let q1 = q[qb1 + cc] * qk1;");
+    s
+}
+
 pub const SWIGLU: &str = r#"
 struct P { inter: u32, total: u32, _a: u32, _b: u32 }
 var<immediate> p: P;

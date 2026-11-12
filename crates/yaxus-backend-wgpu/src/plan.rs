@@ -2,7 +2,7 @@
 //! its tuning only. The ops in `lib.rs` carry the plans out.
 
 use crate::device::{DeviceCaps, Tuning};
-use crate::{ATTN_TILE_SHARED_BYTES, Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv};
+use crate::{ATTN_TILE_SHARED_BYTES, ATTN_TILE_SHARED_BYTES_NO_QS, Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv};
 
 /// The kernels of `x [t, k] · w [n, k]^T`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,10 +190,17 @@ impl AttentionCase {
     }
 }
 
-/// Whether the tiled attention kernel is compiled: it needs subgroups and more workgroup
-/// memory than some devices (32 KiB) have.
+/// Whether the tiled attention kernel is compiled: it needs subgroups, and the workgroup
+/// memory of one of its variants (see [`tile_stages_queries`]).
 pub(crate) fn tile_compiled(caps: &DeviceCaps) -> bool {
-    caps.subgroups && caps.max_workgroup_storage >= ATTN_TILE_SHARED_BYTES
+    caps.subgroups && caps.max_workgroup_storage >= ATTN_TILE_SHARED_BYTES_NO_QS
+}
+
+/// Whether the tiled attention stages the tile's queries in workgroup memory (37.6 KiB in
+/// all), or reads them from the buffer at each block of keys (21.1 KiB: devices with 32
+/// KiB, such as Apple GPUs).
+pub(crate) fn tile_stages_queries(caps: &DeviceCaps) -> bool {
+    caps.max_workgroup_storage >= ATTN_TILE_SHARED_BYTES
 }
 
 #[cfg(test)]

@@ -220,6 +220,9 @@ enum MetaBuf {
 /// Workgroup memory of `attn_tile`: the `var<workgroup>` arrays of `ATTN_TILE` in
 /// shaders.rs (`qs`, `kv`, `ss`, `rm`, `rl`, `rc`, `kslot`); keep the two in step.
 pub(crate) const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
+/// The same without `qs`, for the variant that reads the queries from the buffer
+/// (`shaders::attn_tile(false)`).
+pub(crate) const ATTN_TILE_SHARED_BYTES_NO_QS: u32 = ATTN_TILE_SHARED_BYTES - 1056 * 16;
 
 impl Gpu {
     /// Opens the first GPU of the platform's API (Vulkan; Metal on macOS).
