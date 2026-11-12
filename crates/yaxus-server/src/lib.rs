@@ -1,20 +1,22 @@
 //! `yaxus serve`: HTTPS + bearer-token API, SSE streaming and an embedded web UI.
 
+mod auth;
 mod queue;
+mod secret_file;
 mod tls;
 mod worker;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::extract::{Request, State};
+use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -30,6 +32,7 @@ use yaxus_api::{
 use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
+use auth::AccessToken;
 use queue::{JobQueue, Rejected, job_queue};
 pub use tls::default_sans;
 use worker::{Job, Work};
@@ -56,7 +59,6 @@ pub struct ServeOptions {
 struct AppState {
     tok: Arc<Tokenizer>,
     jobs: JobQueue,
-    token: String,
     health: Health,
     max_context: usize,
 }
@@ -65,50 +67,6 @@ type Shared = Arc<AppState>;
 
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
-}
-
-/// Loads the stored token or creates a new random one. Returns (token, newly_created).
-fn load_or_create_token(dir: &Path) -> Result<(String, bool)> {
-    let path = dir.join("token");
-    match std::fs::read_to_string(&path) {
-        Ok(t) if !t.trim().is_empty() => return Ok((t.trim().to_string(), false)),
-        // Missing or empty: create one below.
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        // Replacing an unreadable token would lock every client out without saying why.
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    }
-    std::fs::create_dir_all(dir)?;
-    let mut buf = [0u8; 24];
-    getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-    let t: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    tls::write_private(&path, format!("{t}\n").as_bytes())?;
-    Ok((t, true))
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-/// The token of an `Authorization: Bearer <token>` header (the scheme is case-insensitive).
-fn bearer_token(value: &str) -> Option<&str> {
-    let (scheme, token) = value.trim().split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-}
-
-async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Response {
-    let ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(bearer_token)
-        .is_some_and(|t| constant_time_eq(t.as_bytes(), st.token.as_bytes()));
-    if !ok {
-        let mut r = error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
-        r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        return r;
-    }
-    next.run(req).await
 }
 
 async fn index() -> impl IntoResponse {
@@ -238,11 +196,11 @@ async fn translate_document(
     worker_stopped()
 }
 
-fn router(st: Shared) -> Router {
+fn router(st: Shared, token: Arc<AccessToken>) -> Router {
     let api = Router::new()
         .route("/v1/translate", post(translate))
         .route("/v1/translate/document", post(translate_document))
-        .route_layer(middleware::from_fn_with_state(st.clone(), auth));
+        .route_layer(middleware::from_fn_with_state(token, auth::require));
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -256,11 +214,9 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let (token, created) = match opts.token.as_deref() {
-        // Clients' tokens are trimmed before the comparison, so trim this one too.
-        Some(t) => (t.trim().to_string(), false),
-        None => load_or_create_token(&opts.config_dir)?,
+        Some(t) => (AccessToken::new(t)?, false),
+        None => AccessToken::load_or_create(&opts.config_dir)?,
     };
-    anyhow::ensure!(token.len() >= 16, "token must be at least 16 characters");
     // The KV's RoPE tables cover DEFAULT_MAX_POS positions; longer requests would pass the
     // checks here and then fail in the engine.
     anyhow::ensure!(
@@ -307,8 +263,9 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     }
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let st = Arc::new(AppState { tok, jobs, token: token.clone(), health, max_context: opts.max_context });
-    let app = router(st);
+    let st = Arc::new(AppState { tok, jobs, health, max_context: opts.max_context });
+    let token = Arc::new(token);
+    let app = router(st, token.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     rt.block_on(async move {
@@ -343,7 +300,7 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         }
         if created {
             eprintln!("Generated access token (saved to {}):", opts.config_dir.join("token").display());
-            eprintln!("  {token}");
+            eprintln!("  {}", token.as_str());
         } else if opts.token.is_none() {
             eprintln!("Access token: {}", opts.config_dir.join("token").display());
         }
@@ -357,43 +314,4 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
         anyhow::ensure!(!failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
         Ok(())
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bearer_scheme_is_case_insensitive() {
-        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
-        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
-        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
-        assert_eq!(bearer_token("Basic abc"), None);
-        assert_eq!(bearer_token("Bearerabc"), None);
-    }
-
-    #[test]
-    fn token_file_is_created_reused_and_never_silently_replaced() {
-        let dir = std::env::temp_dir().join(format!("yaxus-token-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (t, created) = load_or_create_token(&dir).unwrap();
-        assert!(created && t.len() == 48);
-        assert_eq!(load_or_create_token(&dir).unwrap(), (t.clone(), false));
-        // An empty file gets a new token.
-        std::fs::write(dir.join("token"), "\n").unwrap();
-        let (t2, created) = load_or_create_token(&dir).unwrap();
-        assert!(created && t2 != t);
-        // A file that cannot be read is an error, not a new token.
-        std::fs::write(dir.join("token"), [0xff, 0xfe]).unwrap();
-        assert!(load_or_create_token(&dir).is_err());
-        assert_eq!(std::fs::read(dir.join("token")).unwrap(), [0xff, 0xfe]);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn token_compare() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-    }
 }
