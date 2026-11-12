@@ -27,10 +27,12 @@ impl Gpu {
         assert!(rope_bytes <= rope.size(), "position beyond the rope table");
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
         let q = self.tensor(t, hq * HEAD_DIM);
+        // (the fourth immediate: the rope table's half length, which only the MSL kernel reads)
+        let msl = self.tuning.msl_small && self.caps.msl;
         self.dispatch(
-            "qk_rope",
+            if msl { "qk_rope_msl" } else { "qk_rope" },
             &[q.buf(), &kc, &vc, qkv.buf(), qn, kn, &rope, &rows],
-            &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits()],
+            &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits(), (rope.size() / 8) as u32],
             ((hq + hkv) as u32, t as u32),
         );
         let o = self.tensor(t, hq * HEAD_DIM);

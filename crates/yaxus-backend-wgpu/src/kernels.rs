@@ -249,6 +249,12 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         let src = attn_tile(plan::tile_stages_queries(caps));
         add("attn_tile".into(), &src, &[false, false, false, true, true, true, true, true, true]);
     }
+    // (the MSL ones beside them, chosen at dispatch: `Tuning::msl_small`)
+    if caps.msl {
+        for (name, src, read_only) in crate::msl::small_kernels() {
+            add(name.to_string(), &src, read_only);
+        }
+    }
     add("swiglu".into(), SWIGLU, &[false, true]);
     add("add".into(), ADD, &[false, true]);
     out

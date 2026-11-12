@@ -376,6 +376,46 @@ fn tiled_attention_matches_per_row() {
     }
 }
 
+/// The MSL versions of the small per-row kernels (`rmsnorm`, `add_norm`, `qk_rope`)
+/// against the WGSL ones on the GPU alone, over a prompt, decode steps and an 8-row pass.
+/// Only on devices that take MSL. `YAXUS_MODEL_DIR` may name a GGUF file.
+#[test]
+#[ignore]
+fn msl_small_kernels_match_wgsl() {
+    let backend = WgpuBackend::new().unwrap();
+    if !backend.caps().msl {
+        eprintln!("no MSL on this device; skipping");
+        return;
+    }
+    let dir = model_dir();
+    let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
+    let mut gpu = Model::load(&dir, backend, &ModelOptions::new(quant)).unwrap();
+    gpu.set_prefix_cache(false);
+    for prompt in [300u32, 1300] {
+        let ids: Vec<u32> = (0..prompt + 12).map(|i| 1000 + (i * 7919) % 50000).collect();
+        let (a, b) = ids.split_at(prompt as usize);
+        let mut run = |msl: bool| {
+            gpu.backend.set_msl_small(msl);
+            let sg = gpu.new_seq();
+            let l = gpu.prefill(sg, a).unwrap();
+            let mut out = gpu.backend.to_host(&l);
+            for &t in &b[..4] {
+                let l = gpu.forward(&[(sg, &[t])], false).unwrap();
+                out.extend(gpu.backend.to_host(&l));
+            }
+            let l = gpu.forward(&[(sg, &b[4..])], true).unwrap();
+            out.extend(gpu.backend.to_host(&l));
+            gpu.free_seq(sg);
+            out
+        };
+        let base = run(false);
+        let l = run(true);
+        let e = base.iter().zip(&l).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        eprintln!("after {prompt}: prompt, 4 decode steps and 8 rows: max |wgsl - msl| = {e:.2e}");
+        assert!(e < 2e-3, "after {prompt}: {e}");
+    }
+}
+
 /// Decode steps (the split attention, 16-key chunks for short and 32-key chunks for long
 /// contexts, and its merge) against the CPU with the f32 prefill GEMM, teacher-forced.
 #[test]

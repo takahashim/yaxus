@@ -126,8 +126,9 @@ impl Gpu {
     pub(crate) fn rmsnorm(&mut self, x: &Tensor, w: &Weight, offset: f32, eps: f32) -> Tensor {
         let Weight::Vector(wb) = w else { panic!("rmsnorm weight must be a vector") };
         let y = self.tensor(x.rows, x.cols);
+        let msl = self.tuning.msl_small && self.caps.msl && x.cols.is_multiple_of(4);
         self.dispatch(
-            "rmsnorm",
+            if msl { "rmsnorm_msl" } else { "rmsnorm" },
             &[y.buf(), x.buf(), wb],
             &[x.cols as u32, offset.to_bits(), eps.to_bits()],
             (x.rows as u32, 1),
@@ -151,7 +152,13 @@ impl Gpu {
         let h = self.tensor(x.rows, x.cols);
         let xb = x.buf().clone();
         // (the subgroup kernel holds a row in registers, which bounds its width)
-        let name = if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS { "add_norm_sg" } else { "add_norm" };
+        let name = if self.tuning.msl_small && self.caps.msl && x.cols.is_multiple_of(4) {
+            "add_norm_msl"
+        } else if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS {
+            "add_norm_sg"
+        } else {
+            "add_norm"
+        };
         self.dispatch(
             name,
             &[h.buf(), &xb, delta.buf(), w1, w2],
