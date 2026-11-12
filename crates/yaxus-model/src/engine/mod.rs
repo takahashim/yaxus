@@ -625,6 +625,11 @@ pub trait Generator: Send {
     fn stats(&self) -> Option<String>;
     /// Prefix reuse of the last finished request.
     fn last_start(&self) -> StartInfo;
+    /// How likely the target model finds `forced` as the output for `prompt` (see
+    /// [`Model::score`](crate::Model::score)). Runs at once, between steps.
+    fn score(&mut self, _prompt: &[u32], _forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
+        anyhow::bail!("this engine does not score text")
+    }
 
     /// Runs one request to completion on its own. `on_token` returns `false` to stop.
     fn generate(
@@ -717,6 +722,9 @@ where
     }
     fn last_start(&self) -> StartInfo {
         self.last_start
+    }
+    fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
+        self.target.score(prompt, forced)
     }
 }
 

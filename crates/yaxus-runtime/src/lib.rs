@@ -12,6 +12,7 @@ mod options;
 mod prompt;
 mod resolve;
 mod run;
+pub mod score;
 mod session;
 
 pub use load::{load_generator, load_tokenizer};

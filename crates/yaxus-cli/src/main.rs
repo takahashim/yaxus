@@ -7,6 +7,8 @@ use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, Document
 
 #[cfg(feature = "local")]
 mod local;
+#[cfg(feature = "local")]
+mod polish;
 
 #[derive(Parser)]
 #[command(name = "yaxus", version, about = "PLaMo 3 Translate in pure Rust")]
@@ -69,6 +71,10 @@ enum Cmd {
     /// Measure prefill and decode speed.
     #[cfg(feature = "local")]
     Bench(local::BenchArgs),
+    /// Proofreading help for Japanese: rewrite each paragraph (directly, or there and back
+    /// through another language) and show what changed; `polish mark` marks instead.
+    #[cfg(feature = "local")]
+    Polish(local::PolishCmd),
     /// Translate through a remote yaxus server.
     Client {
         /// Server URL.
@@ -266,6 +272,8 @@ fn main() -> Result<()> {
         Cmd::Bench(args) => local::bench(args),
         #[cfg(feature = "local")]
         Cmd::Translate { model, lang, verbose } => local::translate(model, lang, verbose),
+        #[cfg(feature = "local")]
+        Cmd::Polish(c) => local::polish(c),
         Cmd::Client { server, token, ca, insecure, no_stream, lang } => {
             run_client(server, token, ca, insecure, no_stream, lang)
         }

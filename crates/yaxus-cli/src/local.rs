@@ -1,4 +1,4 @@
-//! Subcommands that run the model in this process (`serve`, `translate`, `bench`).
+//! Subcommands that run the model in this process (`serve`, `translate`, `polish`, `bench`).
 
 #[cfg(feature = "server")]
 use std::net::SocketAddr;
@@ -14,66 +14,76 @@ use yaxus_runtime::{
 
 use crate::LangArgs;
 
+// (global: `polish --model 8b mark` and `polish mark --model 8b` are the same; the other
+// commands have no subcommands, so it changes nothing there)
 #[derive(Args)]
 pub struct ModelArgs {
     /// Model: a Hugging Face directory, a GGUF file, a repo id in the local HF cache, or a
     /// size (0.8b, 2b, 8b, 31b) for pfnet/plamo-3-translate-<size>. `REPO:QUANT` or
     /// `SIZE:QUANT` picks a file of a GGUF repo (e.g. `2b:Q4_K_M` for
     /// pfnet/plamo-3-translate-2b-GGUF).
-    #[arg(long, default_value = "pfnet/plamo-3-translate-2b")]
+    #[arg(global = true, long, default_value = "pfnet/plamo-3-translate-2b")]
     model: String,
     /// Weight format for matrices: auto (GGUF: as in the file where possible, else q8;
     /// safetensors: q8), q8, q4 or bf16 (lossless for safetensors).
-    #[arg(long, default_value = "auto")]
+    #[arg(global = true, long, default_value = "auto")]
     quant: Quant,
     /// auto (the GPU if available, else the CPU), gpu (Vulkan, or Metal on macOS) or cpu.
-    #[arg(long, default_value = "auto")]
+    #[arg(global = true, long, default_value = "auto")]
     backend: BackendKind,
     /// Arithmetic of GPU prompt processing (long passes): auto (the device's choice: int16
     /// on AMD GPUs, f16 on Apple GPUs), int16 (integer dot products, activations rounded
     /// to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than int16, logits move
     /// ~100x more), f16 (matrix cores; on Metal, 8x8 matrices in f32) or f32 (reference).
-    #[arg(long, default_value = "auto")]
+    #[arg(global = true, long, default_value = "auto")]
     prefill_precision: yaxus_runtime::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
     /// drafts, short prompts): auto (the device's choice: int16 on AMD GPUs, f32 on Apple
     /// GPUs), int16 (integer dot products, activations rounded to 15 bits; several rows
     /// cost little more than one) or f32 (reference).
-    #[arg(long, default_value = "auto")]
+    #[arg(global = true, long, default_value = "auto")]
     decode_precision: yaxus_runtime::Decode,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
     /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
     /// The output is identical with or without it; only the speed differs.
-    #[arg(long, default_value = "auto")]
+    #[arg(global = true, long, default_value = "auto")]
     draft: yaxus_runtime::DraftSpec,
     /// Most tokens the draft model proposes per round (the length adapts to how often
     /// they are accepted).
-    #[arg(long, default_value_t = 7)]
+    #[arg(global = true, long, default_value_t = 7)]
     draft_k: usize,
     /// Do not reuse the KV or the answers of earlier requests (prefix and response caches).
-    #[arg(long)]
+    #[arg(global = true, long)]
     no_kv_cache: bool,
     /// Do not answer repeated requests from the response cache.
-    #[arg(long)]
+    #[arg(global = true, long)]
     no_response_cache: bool,
     /// KV arena size in tokens, per model.
-    #[arg(long, default_value_t = yaxus_model::DEFAULT_KV_TOKENS)]
+    #[arg(global = true, long, default_value_t = yaxus_model::DEFAULT_KV_TOKENS)]
     kv_tokens: usize,
     /// Requests processed at once (more wait in the queue).
-    #[arg(long, default_value_t = 16)]
+    #[arg(global = true, long, default_value_t = 16)]
     max_streams: usize,
     /// Most requests advanced by one decode pass [default: 16 with the integer decode
     /// kernels (rows are cheap there), 8 with f32].
-    #[arg(long)]
+    #[arg(global = true, long)]
     decode_rows: Option<usize>,
     /// Weight format of the draft model: auto4 (GGUF tensors of up to 4 bits as in the file,
     /// everything else q4), q4 or q8. Affects speed only, never the output.
-    #[arg(long, default_value = "auto4")]
+    #[arg(global = true, long, default_value = "auto4")]
     draft_quant: Quant,
 }
 
 impl ModelArgs {
+    /// No draft model where nothing is generated (`--via direct` only scores): the draft
+    /// changes the speed of generation, never its output, and would only be loaded.
+    fn no_draft_unless_generating(&mut self, via: &crate::polish::Via) {
+        if *via == crate::polish::Via::Direct {
+            self.draft = yaxus_runtime::DraftSpec::None;
+        }
+    }
+
     /// The draft model for the target at `target` (from [`ModelArgs::resolve`]).
     fn draft_options(&self, target: &Path) -> Result<Option<yaxus_runtime::DraftOptions>> {
         Ok(yaxus_runtime::resolve_draft(&self.draft, target)?.map(|dir| yaxus_runtime::DraftOptions {
@@ -255,6 +265,98 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+/// The model `polish` runs on, loaded in this process.
+struct Local<'a> {
+    model: &'a mut dyn yaxus_model::Generator,
+    tok: &'a yaxus_tokenizer::Tokenizer,
+    verbose: bool,
+}
+
+impl crate::polish::Polisher for Local<'_> {
+    fn translate(&mut self, stage: &str, req: yaxus_api::DocumentRequest) -> Result<Vec<String>> {
+        use yaxus_runtime::document::{DocJob, run_document};
+        let t0 = Instant::now();
+        let job = DocJob::from_request(req, yaxus_model::DEFAULT_MAX_POS);
+        job.validate(self.tok)?;
+        // (each step its own memory: a hint from another direction would not apply)
+        let mut memory = yaxus_runtime::memory::Memory::new(yaxus_runtime::memory::DEFAULT_ENTRIES);
+        let job = run_document(self.model, self.tok, job, &mut memory, &mut |_| true)?;
+        if self.verbose {
+            eprintln!("[{stage}: {:.2?}]", t0.elapsed());
+        }
+        Ok(job.outputs().iter().map(|o| o.clone().unwrap_or_default()).collect())
+    }
+
+    fn score(&mut self, r: &crate::polish::ScoreRequest) -> Result<Vec<crate::polish::Scored>> {
+        let req = yaxus_pfml::TranslationRequest {
+            text: r.input.to_string(),
+            target_lang: r.to.to_string(),
+            source_lang: Some(r.from.to_string()),
+            form: r.form,
+            ..Default::default()
+        }
+        .validate()?;
+        let pieces = yaxus_runtime::score::score_text(self.model, self.tok, &req, r.output)?;
+        Ok(pieces
+            .into_iter()
+            .map(|p| crate::polish::Scored {
+                start: p.start,
+                end: p.end,
+                logprob: p.logprob,
+                best: p.best,
+                best_logprob: p.best_logprob,
+            })
+            .collect())
+    }
+}
+
+/// `yaxus polish`: the rewrite, or `polish mark`. The model's options and -v go before
+/// or after `mark` alike.
+#[derive(Args)]
+pub struct PolishCmd {
+    #[command(subcommand)]
+    mark: Option<PolishMode>,
+    #[command(flatten)]
+    model: ModelArgs,
+    #[command(flatten)]
+    args: crate::polish::RewriteArgs,
+    /// Print each step's time to stderr.
+    #[arg(global = true, long, short)]
+    verbose: bool,
+}
+
+#[derive(clap::Subcommand)]
+enum PolishMode {
+    /// Rewrite nothing: mark where the model would have written otherwise, with its own
+    /// choice there (`会議[?において→で?]`).
+    Mark(crate::polish::MarkArgs),
+}
+
+/// Loads the model for `polish` and runs `f` on it (loaded once for every step).
+fn with_polisher(m: &ModelArgs, verbose: bool, f: impl FnOnce(&mut Local) -> Result<()>) -> Result<()> {
+    init_logging("warn", LogTo::Stderr);
+    let ResolvedModel { path: dir, name } = m.resolve()?;
+    let tok = load_tokenizer(&dir)?;
+    let t0 = Instant::now();
+    let mut model = m.load(&dir)?;
+    if verbose {
+        eprintln!("loaded {name} ({}) on {} in {:.2?}", quant_label(&dir, m.quant), model.backend_name(), t0.elapsed());
+    }
+    f(&mut Local { model: model.as_mut(), tok: &tok, verbose })
+}
+
+pub fn polish(mut c: PolishCmd) -> Result<()> {
+    match c.mark {
+        Some(PolishMode::Mark(args)) => {
+            let given = c.args.given();
+            anyhow::ensure!(given.is_empty(), "{} before `mark`: put them after it", given.join(", "));
+            c.model.no_draft_unless_generating(args.via());
+            with_polisher(&c.model, c.verbose, |p| crate::polish::mark(&args, p))
+        }
+        None => with_polisher(&c.model, c.verbose, |p| crate::polish::run(&c.args, p)),
+    }
+}
+
 #[derive(Args)]
 pub struct BenchArgs {
     #[command(subcommand)]
@@ -312,6 +414,28 @@ enum BenchKind {
         #[arg(long = "gen")]
         fixed_gen: Option<usize>,
     },
+    /// `polish mark` against an annotated set (`kind<TAB>sentence`, the unnatural parts
+    /// in [brackets]): precision and recall of the marks for each threshold.
+    Polish {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, default_value = "tests/bench/polish.tsv")]
+        file: PathBuf,
+        /// Probabilities to try.
+        #[arg(long, value_delimiter = ',', default_value = "0.005,0.01,0.02,0.05,0.1,0.15,0.2,0.3,0.4,0.5")]
+        thresholds: Vec<f32>,
+        /// Print each sentence with its marks at this threshold.
+        #[arg(long)]
+        show: Option<f32>,
+        /// How the sentences are scored (see `polish mark --via`).
+        #[arg(long, default_value = "direct")]
+        via: crate::polish::Via,
+        /// Instead, pairs of the same content (`id<TAB>human<TAB>ai`): how often each measure
+        /// finds the human paragraph the more natural, scored through --via (--file,
+        /// --thresholds and --show do not apply).
+        #[arg(long)]
+        pairs: Option<PathBuf>,
+    },
     /// Document scenario: paragraphs split into chains; within a chain in order with the
     /// earlier paragraphs as history, chains in parallel.
     Doc {
@@ -362,6 +486,10 @@ pub fn bench(a: BenchArgs) -> Result<()> {
         }
         BenchKind::Set { model, file, save, compare } => bench_set(model, file, save, compare),
         BenchKind::Streams { model, n, file, compare, fixed_gen } => bench_streams(model, n, file, compare, fixed_gen),
+        BenchKind::Polish { model, pairs: Some(pairs), via, .. } => bench_pairs(model, pairs, via),
+        BenchKind::Polish { model, file, thresholds, show, via, .. } => {
+            bench_polish(model, file, thresholds, show, via)
+        }
         BenchKind::Doc {
             model,
             file,
@@ -375,6 +503,230 @@ pub fn bench(a: BenchArgs) -> Result<()> {
             edit,
         } => bench_doc(model, file, to, history_chars, chains, neighbor_context, max_paragraphs, save, verbose, edit),
     }
+}
+
+/// A sentence of the polish set: its text without the brackets, the bracketed byte ranges
+/// and its kind.
+struct Annotated {
+    kind: String,
+    text: String,
+    gold: Vec<(usize, usize)>,
+}
+
+fn parse_annotated(line: &str) -> Result<Annotated> {
+    let (kind, marked) = line.split_once('\t').context("polish set lines are `kind<TAB>sentence`")?;
+    let (mut text, mut gold, mut open) = (String::new(), Vec::new(), None);
+    for c in marked.chars() {
+        match c {
+            '[' => {
+                anyhow::ensure!(open.is_none(), "nested [ in {marked:?}");
+                open = Some(text.len());
+            }
+            ']' => gold.push((open.take().with_context(|| format!("] without [ in {marked:?}"))?, text.len())),
+            c => text.push(c),
+        }
+    }
+    anyhow::ensure!(open.is_none(), "[ without ] in {marked:?}");
+    anyhow::ensure!((kind == "clean") == gold.is_empty(), "{kind}: {marked:?} (clean sentences have no [ ])");
+    Ok(Annotated { kind: kind.to_string(), text, gold })
+}
+
+/// Marks against the annotations: (marks, marks on an annotated part, annotated parts
+/// found, clean sentences with a mark).
+fn tally<'a>(
+    sentences: impl IntoIterator<Item = (&'a Annotated, &'a Vec<(usize, usize, usize)>)>,
+) -> (usize, usize, usize, usize) {
+    let overlaps = |(s, e): (usize, usize), (gs, ge): (usize, usize)| s < ge && gs < e;
+    let (mut n, mut hit, mut found, mut clean_marked) = (0, 0, 0, 0);
+    for (a, m) in sentences {
+        n += m.len();
+        hit += m.iter().filter(|&&(s, e, _)| a.gold.iter().any(|&g| overlaps((s, e), g))).count();
+        found += a.gold.iter().filter(|&&g| m.iter().any(|&(s, e, _)| overlaps((s, e), g))).count();
+        clean_marked += usize::from(a.gold.is_empty() && !m.is_empty());
+    }
+    (n, hit, found, clean_marked)
+}
+
+/// The options of the bench's translations: each paragraph on its own (no history).
+fn bench_opts() -> crate::polish::Opts {
+    crate::polish::Opts { max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS, history_chars: 0, chains: 0 }
+}
+
+fn bench_pairs(mut m: ModelArgs, file: PathBuf, via: crate::polish::Via) -> Result<()> {
+    use crate::polish::{FormChoice, Via, forms, naturalness, stock_phrases};
+    m.no_response_cache = true;
+    m.no_draft_unless_generating(&via);
+    let ResolvedModel { path: dir, name } = m.resolve()?;
+    let tok = load_tokenizer(&dir)?;
+    let mut model = m.load(&dir)?;
+    header(&name, &dir, &m, model.as_ref());
+    let src = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let (mut human, mut ai) = (Vec::new(), Vec::new());
+    for line in src.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+        let mut f = line.split('\t');
+        let (Some(_), Some(h), Some(a), None) = (f.next(), f.next(), f.next(), f.next()) else {
+            anyhow::bail!("pair lines are `id<TAB>human<TAB>ai`: {line:?}");
+        };
+        human.push(h.to_string());
+        ai.push(a.to_string());
+    }
+    anyhow::ensure!(!human.is_empty(), "{} has no pairs", file.display());
+    let n = human.len();
+    let mut local = Local { model: model.as_mut(), tok: &tok, verbose: false };
+    let o = bench_opts();
+    let t0 = Instant::now();
+    let fh = forms(FormChoice::Auto, &human);
+    let fa = forms(FormChoice::Auto, &ai);
+    let nh = naturalness(&mut local, &o, &via, &human, &fh)?;
+    let na = naturalness(&mut local, &o, &via, &ai, &fa)?;
+    println!("{n} pairs via {via}, scored in {:.2?}", t0.elapsed());
+    let per100 = |t: &str| 100.0 * stock_phrases(t) as f64 / t.chars().count().max(1) as f64;
+    // Each measure over the pairs it applies to: both sides scored (a pivot can come back
+    // empty), and for the gap both sides with a rewrite of their own.
+    let share = |idx: &[usize], f: &dyn Fn(usize) -> bool| {
+        idx.iter().filter(|&&i| f(i)).count() as f64 / idx.len().max(1) as f64
+    };
+    let mean =
+        |idx: &[usize], f: &dyn Fn(usize) -> f64| idx.iter().map(|&i| f(i)).sum::<f64>() / idx.len().max(1) as f64;
+    println!(
+        "\n{:<38} {:>10} {:>8} {:>8} {:>6}",
+        "measure (human more natural when)", "human won", "human", "ai", "pairs"
+    );
+    let row = |label: &str,
+               idx: &[usize],
+               won: &dyn Fn(usize) -> bool,
+               h: &dyn Fn(usize) -> f64,
+               a: &dyn Fn(usize) -> f64| {
+        println!("{label:<38} {:>10.2} {:>8.3} {:>8.3} {:>6}", share(idx, won), mean(idx, h), mean(idx, a), idx.len())
+    };
+    let lp = |x: &crate::polish::Natural| x.per_char.unwrap_or(f64::NAN);
+    let scored: Vec<usize> = (0..n).filter(|&i| nh[i].per_char.is_some() && na[i].per_char.is_some()).collect();
+    row("log-prob per char (higher)", &scored, &|i| lp(&nh[i]) > lp(&na[i]), &|i| lp(&nh[i]), &|i| lp(&na[i]));
+    if via != Via::Direct {
+        let gap = |x: &crate::polish::Natural| x.own.as_ref().map_or(f64::NAN, |(_, own)| own - lp(x));
+        let gapped: Vec<usize> =
+            scored.iter().copied().filter(|&i| nh[i].own.is_some() && na[i].own.is_some()).collect();
+        row("gap to the model's own (smaller)", &gapped, &|i| gap(&nh[i]) < gap(&na[i]), &|i| gap(&nh[i]), &|i| {
+            gap(&na[i])
+        });
+    }
+    let all: Vec<usize> = (0..n).collect();
+    row(
+        "stock phrases per 100 chars (fewer)",
+        &all,
+        &|i| per100(&human[i]) < per100(&ai[i]),
+        &|i| per100(&human[i]),
+        &|i| per100(&ai[i]),
+    );
+    if via != Via::Direct {
+        let own = |x: &crate::polish::Natural| x.own.as_ref().map_or(String::new(), |(t, _)| t.clone());
+        println!("\nthe model's rewrite via {via}: stock phrases per 100 chars");
+        // (over the paragraphs with a rewrite)
+        for (label, texts, nat) in [("human", &human, &nh), ("ai", &ai, &na)] {
+            let idx: Vec<usize> = (0..n).filter(|&i| nat[i].own.is_some()).collect();
+            println!(
+                "  {label:<5} {:.3} -> {:.3} ({} paragraphs)",
+                mean(&idx, &|i| per100(&texts[i])),
+                mean(&idx, &|i| per100(&own(&nat[i]))),
+                idx.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn bench_polish(
+    mut m: ModelArgs,
+    file: PathBuf,
+    thresholds: Vec<f32>,
+    show: Option<f32>,
+    via: crate::polish::Via,
+) -> Result<()> {
+    use crate::polish::{FormChoice, Scored, forms, naturalness, unlikely};
+    for &t in thresholds.iter().chain(&show) {
+        anyhow::ensure!(t > 0.0 && t < 1.0, "thresholds are probabilities between 0 and 1, not {t}");
+    }
+    m.no_response_cache = true;
+    m.no_draft_unless_generating(&via);
+    let ResolvedModel { path: dir, name } = m.resolve()?;
+    let tok = load_tokenizer(&dir)?;
+    let mut model = m.load(&dir)?;
+    header(&name, &dir, &m, model.as_ref());
+    let src = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let set: Vec<Annotated> = src
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(parse_annotated)
+        .collect::<Result<_>>()?;
+    anyhow::ensure!(!set.is_empty(), "{} has no sentences", file.display());
+    let t0 = Instant::now();
+    let texts: Vec<String> = set.iter().map(|a| a.text.clone()).collect();
+    let mut local = Local { model: model.as_mut(), tok: &tok, verbose: false };
+    let nat = naturalness(&mut local, &bench_opts(), &via, &texts, &forms(FormChoice::Auto, &texts))?;
+    let scored: Vec<Vec<Scored>> = nat.into_iter().map(|n| n.pieces).collect();
+    let gold: usize = set.iter().map(|a| a.gold.len()).sum();
+    let clean = set.iter().filter(|a| a.gold.is_empty()).count();
+    println!(
+        "{} sentences ({gold} annotated parts in {}, {clean} clean), scored in {:.2?}",
+        set.len(),
+        set.len() - clean,
+        t0.elapsed()
+    );
+    // The marks of `polish mark --threshold t`.
+    let marks_at = |t: f32| -> Vec<_> { set.iter().zip(&scored).map(|(a, p)| unlikely(&a.text, p, t.ln())).collect() };
+    println!(
+        "\n{:>7} {:>6} {:>10} {:>8} {:>10} {:>6} {:>6}",
+        "t", "marks", "precision", "recall", "clean FP", "F1", "F0.5"
+    );
+    for &t in &thresholds {
+        let marks = marks_at(t);
+        let (n, hit, found, clean_marked) = tally(set.iter().zip(&marks));
+        let prec = if n == 0 { 0.0 } else { hit as f64 / n as f64 };
+        let rec = found as f64 / gold.max(1) as f64;
+        let f = |b: f64| if prec + rec == 0.0 { 0.0 } else { (1.0 + b * b) * prec * rec / (b * b * prec + rec) };
+        println!(
+            "{t:>7} {n:>6} {prec:>10.2} {rec:>8.2} {:>10} {:>6.2} {:>6.2}",
+            format!("{clean_marked}/{clean}"),
+            f(1.0),
+            f(0.5)
+        );
+    }
+    // Recall by kind at the shown threshold (or the default).
+    let t = show.unwrap_or(0.05);
+    let marks = marks_at(t);
+    let mut kinds: Vec<&str> = Vec::new();
+    for a in &set {
+        if !kinds.contains(&a.kind.as_str()) {
+            kinds.push(&a.kind);
+        }
+    }
+    println!("\nby kind at p < {t}:");
+    for k in kinds {
+        let idx: Vec<usize> = (0..set.len()).filter(|&i| set[i].kind == k).collect();
+        let (n, hit, found, clean_marked) = tally(idx.iter().map(|&i| (&set[i], &marks[i])));
+        let g: usize = idx.iter().map(|&i| set[i].gold.len()).sum();
+        if g == 0 {
+            println!("  {k:<11} {clean_marked}/{} sentences marked ({n} marks)", idx.len());
+        } else {
+            println!("  {k:<11} found {found}/{g}, {hit}/{n} marks on target");
+        }
+    }
+    if show.is_some() {
+        println!();
+        for ((a, p), m) in set.iter().zip(&scored).zip(&marks) {
+            let mut line = String::new();
+            let mut at = 0;
+            for &(s, e, k) in m {
+                line += &a.text[at..s];
+                line += &format!("[?{}→{}?]", &a.text[s..e], p[k].best);
+                at = e;
+            }
+            line += &a.text[at..];
+            let gold: Vec<&str> = a.gold.iter().map(|&(s, e)| &a.text[s..e]).collect();
+            println!("{:<10} {line}    gold: {}", a.kind, gold.join(", "));
+        }
+    }
+    Ok(())
 }
 
 fn bench_rows(mut m: ModelArgs, rows: Vec<usize>, runs: usize) -> Result<()> {

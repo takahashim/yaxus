@@ -1,0 +1,89 @@
+# The evaluation set of `yaxus polish --mark` (`yaxus bench polish`): `kind<TAB>sentence`.
+# In a flawed sentence the unnatural part is in [brackets]; a mark that overlaps it finds
+# it. `clean` sentences should get no mark. All sentences were written for this set.
+#
+# Redundant wording (〜を行う, 〜することが可能)
+redundant	担当者が資料[の確認を行い]ました。
+redundant	このボタンを押す[ことによって]、設定を保存する[ことが可能です]。
+redundant	明日の会議[において]、新しい方針[についての説明を行う]予定です。
+redundant	来週までに報告書[の作成を行う]必要がある。
+redundant	弊社では、お客様の声を[もとにした形で]製品の改善を進めています。
+redundant	システムの更新[を実施することとなりました]。
+redundant	この問題[に関しての]検討を進める。
+redundant	彼女は毎朝ジョギング[をすることを]習慣にしている。
+redundant	新機能[の導入が行われた]ことにより、作業時間が短縮された。
+# Duplicated meaning (頭痛が痛い)
+duplicate	[頭痛が痛くて]、今日は早めに休んだ。
+duplicate	会議は[約一時間ほど]で終わった。
+duplicate	[まず最初に]、全体の流れを説明します。
+duplicate	[あとで後悔]しないように、慎重に選ぶべきだ。
+duplicate	[各部署ごとに]担当者を一人決めてください。
+duplicate	台風で[被害を被った]住民への支援が始まった。
+duplicate	[過半数を超える]賛成で可決された。
+duplicate	[一番最初に]開店したのは駅前の店だった。
+# Colloquial forms (ら抜き, い抜き)
+colloquial	ここからなら富士山が[見れる]。
+colloquial	明日は朝早く[来れます]か。
+colloquial	この服はまだ[着れる]。
+colloquial	今、資料を[読んでる]ところです。
+# Honorifics (二重敬語, 謙譲語の誤用)
+honorific	社長が[おっしゃられた]とおり、計画を見直します。
+honorific	先生が資料を[ご覧になられました]。
+honorific	お客様が[お見えになられました]。
+honorific	お手数ですが、こちらで[ご確認してください]。
+honorific	担当の者がすぐに[参られます]ので、少々お待ちください。
+# Particles and grammar
+grammar	私は昨日、駅で友人[が]会った。
+grammar	この本[を]とても面白い。
+grammar	雨が降った[のに]、試合は中止になった。
+grammar	彼は毎日図書館[に]勉強している。
+grammar	新しい計画[が]賛成した人は多かった。
+grammar	私の夢は医者に[なりたい]。
+grammar	この計画の目的は、作業時間を[減らします]。
+grammar	彼は決して約束を[守る]。
+grammar	なぜなら、雨が降っていた[ので]。
+# Wrong words and typos (誤変換, 誤用)
+word	彼の発言は[以外]だった。
+word	新しい規則を全員に[適応]する。
+word	[始めて]海外に行ったのは大学生のときだった。
+word	次の試合で汚名を[挽回]したい。
+word	新しい制度を[確率]するには時間がかかる。
+word	会議の[議事禄]を作成した。
+word	彼は[押しも押されぬ]人気作家だ。
+word	この薬は[食前後]に飲んでください。
+# Natural sentences: no mark is right
+clean	担当者が資料を確認しました。
+clean	このボタンを押すと、設定が保存されます。
+clean	明日の会議で、新しい方針を説明する予定です。
+clean	来週までに報告書を作成する必要がある。
+clean	会議は一時間ほどで終わった。
+clean	まず、全体の流れを説明します。
+clean	ここからなら富士山が見える。
+clean	社長がおっしゃったとおり、計画を見直します。
+clean	私は昨日、駅で友人に会った。
+clean	彼の発言は意外だった。
+clean	初めて海外に行ったのは大学生のときだった。
+clean	雨が降ったので、試合は中止になった。
+clean	私の夢は医者になることだ。
+clean	2026年4月に公開したv1.2では、「設定」画面からテーマを変更できます。
+clean	詳しくは https://example.com/docs を参照してください。
+clean	東京の人口はおよそ1400万人である。
+clean	猫は窓辺で日向ぼっこをしていた。
+clean	申込書は、受付窓口に提出してください。
+clean	この関数は、入力が空のときにエラーを返す。
+clean	新しい制度を確立するには時間がかかる。
+clean	彼女は毎朝ジョギングを習慣にしている。
+clean	次の駅で電車を降りて、バスに乗り換えてください。
+clean	実験の結果、温度が上がるほど反応が速くなることがわかった。
+clean	ご不明な点がございましたら、お気軽にお問い合わせください。
+clean	図書館で本を三冊借りた。
+clean	今日は風が強いので、傘を持っていくのはやめた。
+clean	山田さんは、来月から大阪支社に異動する。
+clean	この薬は食後に一錠ずつ飲んでください。
+clean	子どもたちは公園でサッカーをして遊んでいた。
+clean	プロジェクトの進捗は、毎週金曜日に共有しています。
+clean	窓が開いているので、少し寒い。
+clean	風邪をひいたので、今日は学校を休みます。
+clean	新しい計画に賛成した人は多かった。
+clean	この本はとても面白い。
+clean	彼は毎日図書館で勉強している。
