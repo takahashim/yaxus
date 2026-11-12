@@ -290,6 +290,9 @@ fn integer_rows_do_not_depend_on_the_pass() {
 fn f32_rows_do_not_depend_on_the_pass() {
     let mut gpu = WgpuBackend::new().unwrap();
     let strict = gpu.tuning().gemv_f32;
+    // (single rows through llama.cpp's kernels differ from the rows of larger passes, as
+    // `Tuning::gemv1_llama` says; passes of several rows must still agree)
+    let single_differs = gpu.tuning().gemv1_llama;
     gpu.set_gemm(GemmKind::F32);
     gpu.set_gemv(Gemv::F32);
     let (n, k) = (200, 1536);
@@ -302,6 +305,9 @@ fn f32_rows_do_not_depend_on_the_pass() {
             let mut differ = 0;
             // Alone, and as rows of passes of 3 and 7.
             for (start, t) in [(0, 1), (5, 1), (15, 1), (2, 3), (8, 7)] {
+                if t == 1 && single_differs {
+                    continue;
+                }
                 let part = gpu.debug_matmul_ggml(&x[start * k..(start + t) * k], t, dtype, &bytes, n, k, glu);
                 let want = &all[start * cols..(start + t) * cols];
                 differ += part.iter().zip(want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();

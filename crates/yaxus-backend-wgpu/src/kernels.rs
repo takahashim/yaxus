@@ -33,6 +33,10 @@ pub(crate) mod name {
     pub(crate) fn gemv_f32(t: usize, rw: usize, glu: bool, f: Format) -> String {
         format!("gemvf{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
     }
+    /// `msl::mv_llama`.
+    pub(crate) fn mv_llama(f: Format) -> String {
+        format!("mvllama_{}", f.suffix())
+    }
     /// `msl::gemv_q` for `t` rows with `rw` weight rows per lane group.
     pub(crate) fn gemv_q(t: usize, rw: usize, glu: bool, f: Format) -> String {
         format!("gemvq{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
@@ -91,6 +95,13 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
         for &f in formats {
             // (`msl::gemv_mma` for the formats it reads; K is known only at use, so both
             // families of a format are listed)
+            if tuning.gemv1_llama && caps.msl && crate::msl::mv_llama_reads(f) {
+                jobs.push((
+                    name::mv_llama(f),
+                    decode_layout(f).to_vec(),
+                    Box::new(move || crate::msl::mv_llama(f).unwrap()),
+                ));
+            }
             if tuning.gemv_q && caps.msl && crate::msl::gemv_q_reads(f) {
                 for glu in [false, true] {
                     for t in 1..=GEMVM_MAX_T {

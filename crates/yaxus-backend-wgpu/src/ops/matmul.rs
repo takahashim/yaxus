@@ -238,6 +238,28 @@ impl Gpu {
     /// (`n` is then the intermediate size).
     fn gemv_f32(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool) {
         let (t, k) = (x.rows, x.cols);
+        if crate::plan::mv_llama_takes(&self.caps, &self.tuning, m.fmt, t, k) {
+            let kernel = self.int_kernel(name::mv_llama(m.fmt), crate::kernels::decode_layout(m.fmt), || {
+                crate::msl::mv_llama(m.fmt).unwrap()
+            });
+            // (with `glu`, the gate and up rows into one row of 2 n, then `swiglu`)
+            let rows = if glu { 2 * n } else { n };
+            let tmp = glu.then(|| self.tensor(1, rows));
+            let out = tmp.as_ref().map_or(y.buf(), |t| t.buf()).clone();
+            if self.kernels_profile.is_some() {
+                self.prof_detail = Some(format!("{rows}x{k}"));
+            }
+            let mut bufs = vec![out.clone(), x.buf().clone()];
+            bufs.extend(m.decode_bufs());
+            let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+            let groups = grid(rows.div_ceil(crate::msl::MV_LLAMA_ROWS) as u32);
+            self.dispatch(&kernel, &refs, &[rows as u32, k as u32, 1, 0], groups);
+            self.account(2.0 * (rows * k) as f64);
+            if glu {
+                self.dispatch("swiglu", &[y.buf(), &out], &[n as u32, n as u32], grid(n.div_ceil(256) as u32));
+            }
+            return;
+        }
         if crate::plan::gemv_q_takes(&self.caps, &self.tuning, m.fmt) {
             let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
             let stage = crate::msl::gemv_q_stages(t, rw, glu, wgmem);
