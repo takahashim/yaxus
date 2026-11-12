@@ -2,6 +2,11 @@
 //! and kernel compilation, behind one interface for the two ways of reaching the GPU:
 //! wgpu (`wgpu`: Vulkan, or Metal through wgpu) and Metal directly (`metal`, macOS).
 //! Everything above it (the ops, the plans, the weights) is the same for both.
+//!
+//! The two implementations sit behind an enum, each method a `match`, rather than a trait
+//! object: there are two, both in this crate, and a dispatch is recorded some 200 times a
+//! token, so the call stays static. A third implementation would be the time to make the
+//! methods a trait.
 
 #[cfg(target_os = "macos")]
 pub(crate) mod metal;

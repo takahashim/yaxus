@@ -8,7 +8,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -18,6 +18,9 @@ use objc2_metal::{
     MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+mod translate;
+
+use self::translate::{Translated, translate};
 use super::Buf;
 use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
 
@@ -93,8 +96,8 @@ unsafe impl Sync for MetalCompiler {}
 
 impl MetalCompiler {
     pub(crate) fn compile(&self, name: &str, src: &str, read_only: &[bool]) -> MetalKernel {
-        let (msl, entry, threads, tg_memory, sized) = match crate::msl::workgroup_size(src) {
-            Some(size) => (src.to_string(), "k0".to_string(), size as usize, Vec::new(), Vec::new()),
+        let Translated { msl, entry, threads, tg_memory, sized } = match crate::msl::workgroup_size(src) {
+            Some(size) => Translated::msl(src, size),
             None => translate(src, read_only, self.settings).unwrap_or_else(|e| panic!("{name}: {e:#}")),
         };
         let options = MTLCompileOptions::new();
@@ -113,62 +116,6 @@ impl MetalCompiler {
             self.device.newComputePipelineStateWithFunction_error(&function).unwrap_or_else(|e| panic!("{name}: {e}"));
         MetalKernel { pipeline, threads, tg_memory, sized }
     }
-}
-
-/// The MSL of a WGSL kernel, its entry point's name, threads per threadgroup, the lengths of
-/// its threadgroup arguments and the bindings whose lengths it is passed.
-type Translated = (String, String, usize, Vec<usize>, Vec<usize>);
-
-/// WGSL to MSL with naga.
-fn translate(src: &str, read_only: &[bool], settings: CompileSettings) -> Result<Translated> {
-    use naga::back::msl;
-    let module = naga::front::wgsl::parse_str(src).map_err(|e| anyhow!("WGSL: {}", e.emit_to_string(src)))?;
-    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
-        .validate(&module)
-        .map_err(|e| anyhow!("validation: {e:?}"))?;
-    let ep = module.entry_points.first().context("no entry point")?;
-    let mut resources = msl::BindingMap::default();
-    for (i, &ro) in read_only.iter().enumerate() {
-        resources.insert(
-            naga::ResourceBinding { group: 0, binding: i as u32 },
-            msl::BindTarget { buffer: Some(i as u8 + 1), mutable: !ro, ..Default::default() },
-        );
-    }
-    let ep_res = msl::EntryPointResources {
-        resources,
-        immediates_buffer: Some(0),
-        sizes_buffer: Some(read_only.len() as u8 + 1),
-    };
-    let options = msl::Options {
-        lang_version: (3, 1),
-        per_entry_point_map: msl::EntryPointResourceMap::from([(ep.name.clone(), ep_res)]),
-        fake_missing_bindings: false,
-        bounds_check_policies: naga::proc::BoundsCheckPolicies::default(),
-        zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
-        force_loop_bounding: settings.loop_bounding,
-        emit_int_div_checks: false,
-        ..Default::default()
-    };
-    let pipeline =
-        msl::PipelineOptions { entry_point: Some((naga::ShaderStage::Compute, ep.name.clone())), ..Default::default() };
-    let (msl_src, tr) = msl::write_string(&module, &info, &options, &pipeline).map_err(|e| anyhow!("MSL: {e:?}"))?;
-    let entry = tr.entry_point_names[0].as_ref().map_err(|e| anyhow!("{e}"))?.clone();
-    let ep_info = info.get_entry_point(0);
-    let tg_memory = module
-        .global_variables
-        .iter()
-        .filter(|(h, v)| v.space == naga::AddressSpace::WorkGroup && !ep_info[*h].is_empty())
-        .map(|(_, v)| (module.types[v.ty].inner.size(module.to_ctx()) as usize).next_multiple_of(16))
-        .collect();
-    // (as naga's `_mslBufferSizes`: every global holding a runtime-sized array, in order)
-    let sized = module
-        .global_variables
-        .iter()
-        .filter(|(_, v)| module.types[v.ty].inner.needs_host_buffer_byte_size(&module.types))
-        .map(|(_, v)| v.binding.as_ref().map_or(0, |b| b.binding as usize))
-        .collect();
-    let threads = ep.workgroup_size.iter().product::<u32>() as usize;
-    Ok((msl_src, entry, threads, tg_memory, sized))
 }
 
 pub(crate) struct MetalDev {
