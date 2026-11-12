@@ -60,10 +60,17 @@ pub(super) fn translate(src: &str, read_only: &[bool], settings: CompileSettings
         lang_version: (3, 1),
         per_entry_point_map: msl::EntryPointResourceMap::from([(ep.name.clone(), ep_res)]),
         fake_missing_bindings: false,
-        bounds_check_policies: naga::proc::BoundsCheckPolicies::default(),
+        // (as wgpu's `ShaderRuntimeChecks::checked`, which the wgpu device keeps: indices
+        // clamped into range, integer division by zero defined)
+        bounds_check_policies: naga::proc::BoundsCheckPolicies {
+            index: naga::proc::BoundsCheckPolicy::Restrict,
+            buffer: naga::proc::BoundsCheckPolicy::Restrict,
+            image_load: naga::proc::BoundsCheckPolicy::Restrict,
+            binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+        },
         zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
         force_loop_bounding: settings.loop_bounding,
-        emit_int_div_checks: false,
+        emit_int_div_checks: true,
         ..Default::default()
     };
     let pipeline =

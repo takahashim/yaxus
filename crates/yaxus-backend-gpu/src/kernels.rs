@@ -175,9 +175,7 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
     };
     let gemv = |t: usize| GEMV.replace("{MAXT}", &t.to_string()).replace("{RED}", &(t * 256).to_string());
     // (the weight bindings: values and scales, or the bf16 matrix alone)
-    let layout = |f: Format| -> &'static [bool] {
-        if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
-    };
+    let layout = decode_layout;
     // The decode kernels read the weights 16 at a time (`W_*_16`), the prefill GEMMs
     // through `load4` (`W_*`).
     let decode = [(Format::Q8, W_Q8_16), (Format::Q4, W_Q4_16), (Format::Bf16, W_BF16_16), (Format::Q4K, W_Q4K_16)]

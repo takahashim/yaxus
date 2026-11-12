@@ -11,11 +11,11 @@ use std::ptr::NonNull;
 use anyhow::{Context, Result};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 mod translate;
@@ -124,9 +124,13 @@ pub(crate) struct MetalDev {
     /// The command buffer being recorded, and its open compute encoder.
     cmd: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     enc: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
-    /// The last committed command buffer (earlier ones complete before it).
-    last: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-    /// An allocation that failed since `take_failure` (a small buffer stood in for it).
+    /// The command buffers committed since the last wait, in order.
+    committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    /// Inside `Gpu::checked` (`capture` to `take_failure`): a failed allocation is reported
+    /// there, with a small buffer standing in for it. Elsewhere it panics, as wgpu's
+    /// uncaptured errors do.
+    capturing: std::cell::Cell<bool>,
+    /// An allocation that failed while capturing.
     failed: std::cell::Cell<Option<u64>>,
     /// `YAXUS_PROFILE=2`: each dispatch in a command buffer of its own, timed by the GPU.
     pub(crate) timed: Option<Timed>,
@@ -175,6 +179,12 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 impl MetalDev {
     pub(crate) fn open(timed: bool) -> Result<(MetalDev, DeviceCaps)> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
+        // The kernels need Apple's 8x8 simdgroup matrices and 32-lane simdgroups.
+        anyhow::ensure!(
+            device.supportsFamily(MTLGPUFamily::Apple7),
+            "YAXUS_DEVICE=metal needs an Apple GPU of the Apple7 family or later (M1 and later), not {}",
+            device.name()
+        );
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
         let caps = DeviceCaps {
             name: device.name().to_string(),
@@ -192,7 +202,17 @@ impl MetalDev {
             max_workgroup_storage: (device.maxThreadgroupMemoryLength() as u32).min(65536),
         };
         let timed = timed.then(Timed::default);
-        Ok((MetalDev { device, queue, cmd: None, enc: None, last: None, failed: Default::default(), timed }, caps))
+        let dev = MetalDev {
+            device,
+            queue,
+            cmd: None,
+            enc: None,
+            committed: Vec::new(),
+            capturing: Default::default(),
+            failed: Default::default(),
+            timed,
+        };
+        Ok((dev, caps))
     }
 
     pub(crate) fn compiler(&self, settings: CompileSettings) -> MetalCompiler {
@@ -210,22 +230,33 @@ impl MetalDev {
             (size <= self.max_buffer()).then(|| self.device.newBufferWithLength_options(size.max(16) as usize, SHARED));
         match b.flatten() {
             Some(b) => b,
-            None => {
+            None if self.capturing.get() => {
                 self.failed.set(Some(size));
                 self.device.newBufferWithLength_options(16, SHARED).expect("allocating 16 bytes")
             }
+            None => panic!("Metal could not allocate a buffer of {size} bytes"),
         }
     }
 
-    /// The size of an allocation that failed since the last call.
+    /// From now until `take_failure`, a failed allocation is reported rather than fatal.
+    pub(crate) fn capture(&self) {
+        self.capturing.set(true);
+    }
+
+    /// The size of an allocation that failed since `capture`, which this ends.
     pub(crate) fn take_failure(&self) -> Option<String> {
+        self.capturing.set(false);
         self.failed.take().map(|size| format!("Metal could not allocate a buffer of {size} bytes"))
     }
 
-    pub(crate) fn storage(&self, _label: &str, size: u64) -> Buf {
+    /// A zeroed buffer of `size` bytes: filled by the GPU, in order with what is recorded
+    /// (the CPU need not touch every page of a KV arena).
+    pub(crate) fn storage(&mut self, _label: &str, size: u64) -> Buf {
         let b = self.alloc(size);
-        // SAFETY: a shared buffer of `length` bytes, not yet used by the GPU.
-        unsafe { std::ptr::write_bytes(b.contents().as_ptr().cast::<u8>(), 0, b.length()) };
+        self.end_compute();
+        let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
+        blit.fillBuffer_range_value(&b, NSRange { location: 0, length: b.length() }, 0);
+        blit.endEncoding();
         Buf::Metal(MBuf(b))
     }
 
@@ -248,9 +279,10 @@ impl MetalDev {
         Buf::Metal(MBuf(self.with_bytes(bytes)))
     }
 
-    /// Waits for everything submitted so far.
+    /// Waits for everything submitted so far; a command buffer that failed is fatal (as
+    /// wgpu's device loss).
     fn wait(&mut self) {
-        if let Some(c) = self.last.take() {
+        for c in self.committed.drain(..) {
             c.waitUntilCompleted();
             if c.status() == MTLCommandBufferStatus::Error {
                 panic!("Metal command buffer failed: {:?}", c.error());
@@ -346,7 +378,7 @@ impl MetalDev {
             self.end_compute();
             let c = self.cmd.take().unwrap();
             c.commit();
-            self.last = Some(c.clone());
+            self.committed.push(c.clone());
             self.timed.as_mut().unwrap().pending.push((label.unwrap_or_default(), c));
         }
     }
@@ -355,7 +387,7 @@ impl MetalDev {
         self.end_compute();
         if let Some(c) = self.cmd.take() {
             c.commit();
-            self.last = Some(c);
+            self.committed.push(c);
         }
     }
 

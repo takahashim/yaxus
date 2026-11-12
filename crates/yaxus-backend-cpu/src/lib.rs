@@ -161,7 +161,7 @@ impl CpuFormat {
     fn of(quant: Quant, shape: &[usize]) -> Result<Self> {
         match quant {
             Quant::Bf16 => Ok(CpuFormat::Bf16),
-            Quant::Q4 => anyhow::bail!("q4 weights are only supported on the Vulkan backend"),
+            Quant::Q4 => anyhow::bail!("q4 weights are only supported on the GPU backend"),
             Quant::Q8 | Quant::Auto | Quant::Auto4 => {
                 anyhow::ensure!(
                     matches!(shape, [_, k] if k.is_multiple_of(Q8_BLOCK)),

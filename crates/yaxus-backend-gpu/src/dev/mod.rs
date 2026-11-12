@@ -121,7 +121,7 @@ impl Dev {
 
     /// A zeroed storage buffer of `size` bytes that kernels read and write and copies
     /// read from and write to.
-    pub(crate) fn storage(&self, label: &str, size: u64) -> Buf {
+    pub(crate) fn storage(&mut self, label: &str, size: u64) -> Buf {
         match self {
             Dev::Wgpu(d) => d.storage(label, size),
             #[cfg(target_os = "macos")]
@@ -227,7 +227,10 @@ impl Dev {
         match self {
             Dev::Wgpu(d) => ErrorScope::Wgpu(d.error_scope()),
             #[cfg(target_os = "macos")]
-            Dev::Metal(_) => ErrorScope::None,
+            Dev::Metal(d) => {
+                d.capture();
+                ErrorScope::None
+            }
         }
     }
 }
