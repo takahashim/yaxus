@@ -1,7 +1,7 @@
-//! `yaxus polish`: proofreading help for Japanese. Each paragraph is translated into
-//! Japanese, either directly (ja to ja: the model's own representation is the pivot) or
-//! there and back through another language, and what changed is shown for a person to
-//! judge. The rewrite is a suggestion: a round trip can drift in meaning or register, so
+//! `yaxus polish`: proofreading help for Japanese. Each paragraph is translated there and
+//! back through another language (English by default; the pivot can also come from a
+//! command, a general LLM that decides what is said) or directly (ja to ja), and what
+//! changed is shown for a person to judge. The rewrite is a suggestion: a round trip can drift in meaning or register, so
 //! the politeness of the source is carried over (`--form auto`) and the words a rewrite
 //! must keep (numbers, Latin words, URLs, quotations) are checked. `yaxus polish mark`
 //! rewrites nothing: it marks where the model would have written otherwise.
@@ -120,11 +120,19 @@ pub struct Shared {
 #[derive(Args)]
 #[command(next_help_heading = "Polish")]
 pub struct RewriteArgs {
-    /// How each paragraph is rewritten: `direct` (into Japanese at once, the closest to the
-    /// source) or a language code to go there and back (en, zh-hans, ...: freer, and more
-    /// prone to drift). Several, comma-separated, give one candidate each.
-    #[arg(long, value_delimiter = ',', default_value = "direct")]
+    /// How each paragraph is rewritten: a language code to go there and back (en, the
+    /// default; zh-hans, ...: the model writes the Japanese anew, in its own words) or
+    /// `direct` (into Japanese at once: the closest to the source, it fixes errors but
+    /// keeps the wording). Several, comma-separated, give one candidate each.
+    #[arg(long, value_delimiter = ',', default_value = "en")]
     via: Vec<Via>,
+    /// Make the pivot with this shell command instead of the model: it reads the Japanese
+    /// paragraphs on stdin and writes as many in the --via language on stdout, separated
+    /// by blank lines; the model writes the Japanese from them. With a general LLM, it
+    /// decides what is said (no emphasis, stock phrases or needless summaries) and the
+    /// model how it is said. The text goes wherever the command sends it.
+    #[arg(long, value_name = "CMD")]
+    pivot_cmd: Option<String>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Diff)]
     format: OutputFormat,
     #[command(flatten)]
@@ -186,7 +194,8 @@ impl RewriteArgs {
     pub fn given(&self) -> Vec<&'static str> {
         let d = &self.shared;
         [
-            ("--via", self.via != [Via::Direct]),
+            ("--via", self.via != [Via::Lang("en".into())]),
+            ("--pivot-cmd", self.pivot_cmd.is_some()),
             ("--format", self.format != OutputFormat::Diff),
             ("--form", d.form != FormChoice::Auto),
             ("--show-pivot", d.show_pivot),
@@ -282,7 +291,15 @@ fn home(
 }
 
 /// The rewrite of `segments` through `via`.
-fn route(p: &mut dyn Polisher, o: &Opts, via: &Via, segments: &[String], forms: &[Option<Form>]) -> Result<Candidate> {
+/// The rewrite of `segments` through `via`, the pivot made by the model or by `pivot_cmd`.
+fn route(
+    p: &mut dyn Polisher,
+    o: &Opts,
+    via: &Via,
+    segments: &[String],
+    forms: &[Option<Form>],
+    pivot_cmd: Option<&str>,
+) -> Result<Candidate> {
     let lang = LANG;
     let c = match via {
         Via::Direct => {
@@ -290,7 +307,10 @@ fn route(p: &mut dyn Polisher, o: &Opts, via: &Via, segments: &[String], forms: 
             Candidate { via: via.clone(), pivot: None, output }
         }
         Via::Lang(v) => {
-            let there = p.translate(&format!("{lang}→{v}"), request(o, segments.to_vec(), lang, v, None))?;
+            let there = match pivot_cmd {
+                Some(cmd) => pivot_by_command(cmd, segments)?,
+                None => p.translate(&format!("{lang}→{v}"), request(o, segments.to_vec(), lang, v, None))?,
+            };
             if there.len() != segments.len() {
                 bail!("{} paragraphs came back for {}", there.len(), segments.len());
             }
@@ -302,6 +322,46 @@ fn route(p: &mut dyn Polisher, o: &Opts, via: &Via, segments: &[String], forms: 
         bail!("{} paragraphs came back for {}", c.output.len(), segments.len());
     }
     Ok(c)
+}
+
+/// The pivot of `segments` from the shell command `cmd`: the paragraphs on its stdin, as
+/// many back on its stdout, both separated by blank lines.
+fn pivot_by_command(cmd: &str, segments: &[String]) -> Result<Vec<String>> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("--pivot-cmd: cannot run sh: {e}"))?;
+    let input = segments.join("\n\n") + "\n";
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    // (written apart from reading: a command that answers as it reads would block)
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let out = child.wait_with_output()?;
+    // A command that exits without reading all of its input closes the pipe: its status
+    // says whether that went wrong.
+    let written = writer.join().expect("the writer thread");
+    if !out.status.success() {
+        bail!("--pivot-cmd failed ({})", out.status);
+    }
+    // (a command that succeeded without reading all of it is answered as it is)
+    if let Err(e) = written
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        bail!("--pivot-cmd: writing its input: {e}");
+    }
+    let text = String::from_utf8(out.stdout).map_err(|_| anyhow::anyhow!("--pivot-cmd wrote invalid UTF-8"))?;
+    let pivot = yaxus_api::split_paragraphs(&text);
+    if pivot.len() != segments.len() {
+        bail!(
+            "--pivot-cmd wrote {} paragraphs for {}: it must keep the paragraphs, separated by blank lines",
+            pivot.len(),
+            segments.len()
+        );
+    }
+    Ok(pivot)
 }
 
 /// How likely the model finds a paragraph as its rewrite: how typical its wording is.
@@ -334,7 +394,7 @@ pub(crate) fn naturalness(
     let lang = LANG;
     let routed = match via {
         Via::Direct => None,
-        Via::Lang(_) => Some(route(p, o, via, segments, forms)?),
+        Via::Lang(_) => Some(route(p, o, via, segments, forms, None)?),
     };
     let mut out = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
@@ -537,8 +597,12 @@ pub fn run(a: &RewriteArgs, p: &mut dyn Polisher) -> Result<()> {
     let forms = forms(a.shared.form, &segments);
     let o = a.shared.opts();
     let mut candidates = Vec::new();
+    let pivots = a.via.iter().filter(|v| **v != Via::Direct).count();
+    if a.pivot_cmd.is_some() && pivots != 1 {
+        bail!("--pivot-cmd makes one pivot: give --via one language (and direct, if wanted)");
+    }
     for via in &a.via {
-        candidates.push(route(p, &o, via, &segments, &forms)?);
+        candidates.push(route(p, &o, via, &segments, &forms, a.pivot_cmd.as_deref())?);
     }
     let reviews: Vec<Vec<Review>> =
         candidates.iter().map(|c| segments.iter().zip(&c.output).map(|(s, o)| Review::of(s, o)).collect()).collect();
@@ -730,29 +794,43 @@ fn print_json(
 
 /// The politeness of Japanese text from its sentence endings: the more common of
 /// polite (です, ます, ...) and plain, or none when there are no sentences or as many of
-/// each. Only sentences that end in 。！？ count (not headings or list items).
+/// each. Sentences end in 。！？; a line that ends without one counts only when polite
+/// (`向上します✨`: a heading such as `概要` is no plain sentence). Headings (`#`) and list
+/// items are left out, and so are emoji and other symbols after an ending.
 pub fn detect_form(segments: &[String]) -> Option<Form> {
     const POLITE: [&str; 9] =
         ["です", "ます", "でした", "ました", "ません", "ください", "でしょう", "ましょう", "ませ"];
+    // Polite, plain, or no sentence (no Japanese).
+    let judge = |sentence: &str| -> Option<bool> {
+        let s = sentence.trim_end_matches(|c: char| !is_japanese(c) && !c.is_alphanumeric());
+        if !s.chars().any(is_japanese) {
+            return None;
+        }
+        // (final particles: ですか, ますね, ですよね)
+        let s = s.trim_end_matches(['か', 'ね', 'よ', 'な']);
+        Some(POLITE.iter().any(|e| s.ends_with(e)))
+    };
     let (mut polite, mut plain) = (0usize, 0usize);
-    let mut sentence = String::new();
-    for c in segments.iter().flat_map(|s| s.chars().chain(['\n'])) {
-        match c {
-            '。' | '！' | '？' | '!' | '?' => {
-                let s = sentence.trim().trim_end_matches(['」', '』', '）', ')', '"', '\'', '…']);
-                if s.chars().any(is_japanese) {
-                    // (final particles: ですか, ますね, ですよね)
-                    let s = s.trim_end_matches(['か', 'ね', 'よ', 'な']);
-                    if POLITE.iter().any(|e| s.ends_with(e)) {
-                        polite += 1;
-                    } else {
-                        plain += 1;
-                    }
+    for line in segments.iter().flat_map(|s| s.lines()) {
+        let line = line.trim();
+        if line.starts_with('#') || is_list_item(line) {
+            continue;
+        }
+        let mut sentence = String::new();
+        for c in line.chars() {
+            if matches!(c, '。' | '！' | '？' | '!' | '?') {
+                match judge(&sentence) {
+                    Some(true) => polite += 1,
+                    Some(false) => plain += 1,
+                    None => {}
                 }
                 sentence.clear();
+            } else {
+                sentence.push(c);
             }
-            '\n' => sentence.clear(),
-            c => sentence.push(c),
+        }
+        if judge(&sentence) == Some(true) {
+            polite += 1;
         }
     }
     match polite.cmp(&plain) {
@@ -761,6 +839,15 @@ pub fn detect_form(segments: &[String]) -> Option<Form> {
         std::cmp::Ordering::Less => Some(Form::Plain),
         std::cmp::Ordering::Equal => None,
     }
+}
+
+/// A Markdown list item: `- `, `* `, `+ `, `・`, `1. `, `1) `.
+fn is_list_item(line: &str) -> bool {
+    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("+ ") || line.starts_with('・') {
+        return true;
+    }
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
 }
 
 fn is_japanese(c: char) -> bool {
@@ -1020,6 +1107,10 @@ mod tests {
         // Several final particles.
         assert_eq!(detect_form(&s("そうですよね。便利ですよね。本だ。")), Some(Form::Polite));
         assert_eq!(detect_form(&s("どうですかね。いいですね。")), Some(Form::Polite));
+        // Emoji after an ending; a polite line without 。; list items and headings left out.
+        assert_eq!(detect_form(&s("生産性は向上します✨\nこれが鍵なのです🚀")), Some(Form::Polite));
+        assert_eq!(detect_form(&s("### ポイント\n- 実施する\n- 徹底する！\n1. 確認する。")), None);
+        assert_eq!(detect_form(&s("説明しなかった。\n概要")), Some(Form::Plain));
     }
 
     #[test]
@@ -1126,6 +1217,23 @@ mod tests {
         // (an empty rewrite would have scored 0, better than any text)
         assert_eq!(n[2].per_char, Some(-1.0));
         assert!(n[2].own.is_none());
+    }
+
+    #[test]
+    fn a_pivot_comes_from_a_command() {
+        let segs: Vec<String> = ["一つ目。", "二つ目。"].map(String::from).into();
+        assert_eq!(pivot_by_command("sed '/./s/^/E:/'", &segs).unwrap(), vec!["E:一つ目。", "E:二つ目。"]);
+        let e = pivot_by_command("echo one", &segs).unwrap_err().to_string();
+        assert!(e.contains("1 paragraphs for 2"), "{e}");
+        let e = pivot_by_command("exit 3", &segs).unwrap_err().to_string();
+        assert!(e.contains("failed"), "{e}");
+        // A route through it: the model writes the Japanese from the command's pivot.
+        let mut p = Fake(Vec::new());
+        let o = Opts { max_new_tokens: 8, history_chars: 0, chains: 0 };
+        let forms = forms(FormChoice::Auto, &segs);
+        let c = route(&mut p, &o, &Via::Lang("en".into()), &segs, &forms, Some("sed '/./s/^/E:/'")).unwrap();
+        assert_eq!(c.pivot.unwrap(), vec!["E:一つ目。", "E:二つ目。"]);
+        assert_eq!(c.output, vec!["E:一つ目。@ja", "E:二つ目。@ja"]);
     }
 
     #[test]
