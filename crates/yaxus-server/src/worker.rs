@@ -9,11 +9,12 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+
+use crate::queue::Jobs;
 use yaxus_api::{DocumentEvent, DocumentUsage, StreamEvent, Usage};
 use yaxus_model::{Finish, Generator};
 use yaxus_runtime::document::{DocJob, DocRun};
@@ -70,9 +71,7 @@ struct Docs {
 pub fn run(
     mut engine: Box<dyn Generator>,
     tok: Arc<Tokenizer>,
-    mut rx: mpsc::Receiver<Job>,
-    queued: Arc<AtomicUsize>,
-    queue_limit: usize,
+    mut jobs: Jobs,
     failed: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut memory = Memory::new(memory::DEFAULT_ENTRIES);
@@ -81,14 +80,14 @@ pub fn run(
     loop {
         // Block only when there is nothing to run.
         if session.is_idle() {
-            match rx.blocking_recv() {
-                Some(job) => add(job, &mut session, &mut docs, &queued),
+            match jobs.recv() {
+                Some(job) => add(job, &mut session, &mut docs),
                 None => return,
             }
         }
-        while session.waiting() < queue_limit {
-            match rx.try_recv() {
-                Ok(job) => add(job, &mut session, &mut docs, &queued),
+        while session.waiting() < jobs.limit() {
+            match jobs.try_recv() {
+                Ok(job) => add(job, &mut session, &mut docs),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) if session.is_idle() => return,
                 Err(TryRecvError::Disconnected) => break,
@@ -136,8 +135,7 @@ fn fail_all(owners: Vec<Owner>, docs: &mut Docs, msg: &str) {
     }
 }
 
-fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs, queued: &AtomicUsize) {
-    queued.fetch_sub(1, Ordering::SeqCst);
+fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs) {
     if job.is_abandoned() {
         return;
     }
@@ -279,6 +277,8 @@ fn log_single(label: &str, usage: &Usage, done: &Finished) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
     use yaxus_model::{Event as EngineEvent, ReqId, Request, StartInfo};
     use yaxus_pfml::TranslationRequest;
 
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn a_panic_fails_the_requests_and_stops_the_worker() {
         let tok = Arc::new(tokenizer());
-        let (jobs, rx) = mpsc::channel(4);
+        let (queue, jobs) = crate::queue::job_queue(4);
         let (events, mut out) = mpsc::unbounded_channel();
         let req = TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let job = Job {
@@ -334,21 +334,20 @@ mod tests {
             enqueued: Instant::now(),
             label: "test".into(),
         };
-        let queued = Arc::new(AtomicUsize::new(1));
-        jobs.try_send(job).unwrap();
+        queue.push(job).unwrap();
         let engine = Panicking::default();
         let aborted = engine.aborted.clone();
         let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            run(Box::new(engine), tok, rx, queued, 4, failed_tx);
+            run(Box::new(engine), tok, jobs, failed_tx);
             let _ = done_tx.send(());
         });
         // The worker returns instead of serving from the broken engine (a timeout rather
         // than join(), so that a regression fails instead of hanging the test run).
         assert!(done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the worker kept running");
         assert!(matches!(out.try_recv(), Ok(StreamEvent::Error { error: m }) if m.contains("internal error")));
-        assert!(jobs.is_closed());
+        assert!(queue.is_closed());
         assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
         assert!(!aborted.load(Ordering::SeqCst), "the broken engine was called again");
     }

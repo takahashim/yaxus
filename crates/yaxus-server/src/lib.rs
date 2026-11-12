@@ -1,5 +1,6 @@
 //! `yaxus serve`: HTTPS + bearer-token API, SSE streaming and an embedded web UI.
 
+mod queue;
 mod tls;
 mod worker;
 
@@ -7,7 +8,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -29,6 +30,7 @@ use yaxus_api::{
 use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
+use queue::{JobQueue, Rejected, job_queue};
 pub use tls::default_sans;
 use worker::{Job, Work};
 
@@ -53,8 +55,7 @@ pub struct ServeOptions {
 
 struct AppState {
     tok: Arc<Tokenizer>,
-    jobs: mpsc::Sender<Job>,
-    queued: Arc<AtomicUsize>,
+    jobs: JobQueue,
     token: String,
     health: Health,
     max_context: usize,
@@ -116,7 +117,7 @@ async fn index() -> impl IntoResponse {
 
 async fn healthz(State(st): State<Shared>) -> Response {
     let mut h = st.health.clone();
-    h.queue = st.queued.load(Ordering::SeqCst);
+    h.queue = st.jobs.len();
     // The inference thread has stopped (after a panic): report it instead of "ok".
     if st.jobs.is_closed() {
         h.status = "stopped".into();
@@ -187,21 +188,10 @@ async fn translate(
 // (the error is the response to send; boxing it buys nothing on this path)
 #[allow(clippy::result_large_err)]
 fn enqueue(st: &AppState, job: Job) -> std::result::Result<(), Response> {
-    st.queued.fetch_add(1, Ordering::SeqCst);
-    match st.jobs.try_send(job) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            st.queued.fetch_sub(1, Ordering::SeqCst);
-            Err(match e {
-                mpsc::error::TrySendError::Full(_) => {
-                    error(StatusCode::TOO_MANY_REQUESTS, "translation queue is full; retry later")
-                }
-                mpsc::error::TrySendError::Closed(_) => {
-                    error(StatusCode::SERVICE_UNAVAILABLE, "inference worker stopped")
-                }
-            })
-        }
-    }
+    st.jobs.push(job).map_err(|e| match e {
+        Rejected::Full => error(StatusCode::TOO_MANY_REQUESTS, "translation queue is full; retry later"),
+        Rejected::Stopped => error(StatusCode::SERVICE_UNAVAILABLE, "inference worker stopped"),
+    })
 }
 
 /// Most segments accepted in one document request.
@@ -305,21 +295,19 @@ pub fn serve(opts: ServeOptions) -> Result<()> {
     let health =
         Health { status: "ok".into(), model: opts.model_name.clone(), backend: model.backend_name(), quant, queue: 0 };
 
-    let (jobs, rx) = mpsc::channel(opts.queue_limit.max(1));
-    let queue_limit = opts.queue_limit.max(1);
-    let queued = Arc::new(AtomicUsize::new(0));
+    let (jobs, queue) = job_queue(opts.queue_limit);
     // The inference thread reports a fatal failure here; the server then shuts down and
     // `serve` returns an error, so a supervisor can restart the process.
     let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
     {
-        let (tok, queued) = (tok.clone(), queued.clone());
+        let tok = tok.clone();
         std::thread::Builder::new()
             .name("inference".into())
-            .spawn(move || worker::run(model, tok, rx, queued, queue_limit, failed_tx))?;
+            .spawn(move || worker::run(model, tok, queue, failed_tx))?;
     }
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let st = Arc::new(AppState { tok, jobs, queued, token: token.clone(), health, max_context: opts.max_context });
+    let st = Arc::new(AppState { tok, jobs, token: token.clone(), health, max_context: opts.max_context });
     let app = router(st);
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
