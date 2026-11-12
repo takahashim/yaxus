@@ -22,10 +22,10 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use yaxus_api::{
-    DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, ErrorResponse, Health, LANGUAGES,
-    Language, StreamEvent, TranslateRequest, TranslateResponse,
+    DocumentEvent, DocumentRequest, DocumentResponse, ErrorResponse, Health, LANGUAGES, Language, StreamEvent,
+    TranslateRequest, TranslateResponse,
 };
-use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, prompt_request, quant_label};
+use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
 pub use tls::default_sans;
@@ -145,17 +145,10 @@ async fn translate(
         Ok(b) => b,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let prompt = match prompt_request(&req).validate() {
-        Ok(r) => Prompt::new(&st.tok, &r),
+    let (prompt, max_new) = match Prompt::for_request(&st.tok, &req, st.max_context) {
+        Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.0),
     };
-    if prompt.len() >= st.max_context {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!("prompt is {} tokens; the limit is {}", prompt.len(), st.max_context),
-        );
-    }
-    let max_new = req.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS).clamp(1, st.max_context - prompt.len());
 
     let (tx, rx) = mpsc::unbounded_channel();
     let job = Job {
