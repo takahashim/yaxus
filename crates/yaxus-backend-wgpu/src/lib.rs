@@ -57,57 +57,78 @@ impl Drop for Tensor {
     }
 }
 
-pub enum Weight {
-    Q8 {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
-    Q4 {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
+/// How a weight matrix is stored on the GPU (and which kernels read it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Format {
+    /// Blocks of 32 int8 with an f16 scale.
+    Q8,
+    /// Blocks of 32 nibbles with an f16 scale.
+    Q4,
     /// GGUF Q4_K values: nibbles and the per-256 headers, decoded in the kernels.
-    Q4K {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
-    /// 6-bit values (GGUF Q6_K): `s` holds Q6_K's scales for the decode kernels, `s16` an
-    /// f16 scale per 16 for the prefill GEMMs.
-    Q6 {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        s16: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
-    /// 3-bit values (GGUF Q3_K), scales as for `Q6`.
-    Q3 {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        s16: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
-    /// 2-bit values (GGUF Q2_K): `s` holds Q2_K's scales and mins for the decode kernels,
-    /// `s16` a pair of f16 per 16 for the prefill GEMMs.
-    Q2 {
-        q: wgpu::Buffer,
-        s: wgpu::Buffer,
-        s16: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
-    Bf16 {
-        w: wgpu::Buffer,
-        n: usize,
-        k: usize,
-    },
+    Q4K,
+    /// 6-bit values (GGUF Q6_K).
+    Q6,
+    /// 3-bit values (GGUF Q3_K).
+    Q3,
+    /// 2-bit values (GGUF Q2_K), with mins.
+    Q2,
+    Bf16,
+}
+
+impl Format {
+    /// The suffix of the kernels that read it (`gemv1_q8`, ...).
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Format::Q8 => "q8",
+            Format::Q4 => "q4",
+            Format::Q4K => "q4k",
+            Format::Q6 => "q6",
+            Format::Q3 => "q3",
+            Format::Q2 => "q2",
+            Format::Bf16 => "bf16",
+        }
+    }
+
+    /// The integer GEMV's description of it, if that kernel reads it.
+    fn gemv_int(self) -> Option<&'static gemv_int::IntFmt> {
+        gemv_int::format(self.suffix())
+    }
+
+    /// The integer GEMM's description of it, if that kernel reads it.
+    fn gemm_int(self) -> Option<&'static gemm_int::IntFmt> {
+        gemm_int::format(self.suffix())
+    }
+}
+
+/// An `[n, k]` weight matrix on the GPU.
+pub struct Matrix {
+    fmt: Format,
+    n: usize,
+    k: usize,
+    /// The values (for `Bf16`, the whole matrix).
+    q: wgpu::Buffer,
+    /// The scales as the decode kernels read them (none for `Bf16`; for `Q4K` the same
+    /// buffer as `q`, read through a second binding).
+    s: Option<wgpu::Buffer>,
+    /// For `Q6`, `Q3`: an f16 scale per 16 values; for `Q2`, a pair of f16 per 16 (the
+    /// prefill GEMMs read these instead of `s`).
+    s16: Option<wgpu::Buffer>,
+}
+
+impl Matrix {
+    /// The weight bindings of the decode kernels (GEMVs).
+    fn decode_bufs(&self) -> Vec<wgpu::Buffer> {
+        std::iter::once(&self.q).chain(&self.s).cloned().collect()
+    }
+
+    /// The weight bindings of the prefill GEMMs: the per-16 scales where there are some.
+    fn prefill_bufs(&self) -> Vec<wgpu::Buffer> {
+        std::iter::once(&self.q).chain(self.s16.as_ref().or(self.s.as_ref())).cloned().collect()
+    }
+}
+
+pub enum Weight {
+    Matrix(Matrix),
     /// 1-D weights (norms), converted to f32.
     Vector(wgpu::Buffer),
     /// Embedding table `[V, H]` in bf16 (two values per u32).
@@ -115,6 +136,15 @@ pub enum Weight {
         table: wgpu::Buffer,
         h: usize,
     },
+}
+
+impl Weight {
+    fn matrix(&self) -> &Matrix {
+        match self {
+            Weight::Matrix(m) => m,
+            _ => panic!("a matrix product needs a matrix"),
+        }
+    }
 }
 
 /// Paged KV storage of one model: slot `s` of a layer holds `kv_dim` floats at `s * kv_dim`.
@@ -633,7 +663,7 @@ impl Gpu {
     /// SwiGLU, and the GEMM tiles. Their sources are long (written out, not looped) and
     /// take up to 40 ms each on a 780M; compiled on first use, they stalled the first
     /// requests (57 kernels and 1 s within the 19-sentence set).
-    fn precompile(&mut self, formats: &[&'static str], gemv: Gemv) {
+    fn precompile(&mut self, formats: &[Format], gemv: Gemv) {
         if !self.subgroups {
             return;
         }
@@ -646,7 +676,7 @@ impl Gpu {
                 vec![false, true, false],
                 Box::new(move || gemv_int::xquant_source(planes)),
             ));
-            for f in formats.iter().filter_map(|f| gemv_int::format(f)) {
+            for f in formats.iter().filter_map(|f| f.gemv_int()) {
                 for glu in [false, true] {
                     if !gemv.single_f32 {
                         let rw = GEMVI_ROWS;
@@ -673,7 +703,7 @@ impl Gpu {
                 vec![false, true, false],
                 Box::new(move || gemm_int::xquant_source(planes)),
             ));
-            for f in formats.iter().filter_map(|f| gemm_int::format(f)) {
+            for f in formats.iter().filter_map(|f| f.gemm_int()) {
                 for tn in [2, 4, 8] {
                     jobs.push((
                         format!("gemmint{planes}_{tn}_{}", f.name),
@@ -1064,9 +1094,9 @@ impl Gpu {
         use yaxus_model::ggml::GgmlType;
         let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
         if (quant == Quant::Auto || (quant == Quant::Auto4 && low_bit))
-            && let Some(w) = self.load_gguf_matrix(t, n, k)?
+            && let Some(m) = self.load_gguf_matrix(t, n, k)?
         {
-            return Ok(w);
+            return Ok(Weight::Matrix(m));
         }
         let raw;
         let bf16: &[u16] = match t.as_bf16() {
@@ -1076,7 +1106,7 @@ impl Gpu {
                 &raw
             }
         };
-        self.load_matrix(bf16, n, k, quant)
+        self.load_matrix(bf16, n, k, quant).map(Weight::Matrix)
     }
 
     /// Pre-creates pooled buffers for the tensors of a `rows`-row pass (see the trait).
@@ -1212,16 +1242,8 @@ impl Gpu {
     }
 
     fn matmul(&mut self, x: &Tensor, w: &Weight) -> Tensor {
-        let (n, k, suffix, bufs): (usize, usize, &str, Vec<&wgpu::Buffer>) = match w {
-            Weight::Q8 { q, s, n, k } => (*n, *k, "q8", vec![q, s]),
-            Weight::Q4 { q, s, n, k } => (*n, *k, "q4", vec![q, s]),
-            Weight::Q4K { q, s, n, k } => (*n, *k, "q4k", vec![q, s]),
-            Weight::Q6 { q, s, n, k, .. } => (*n, *k, "q6", vec![q, s]),
-            Weight::Q3 { q, s, n, k, .. } => (*n, *k, "q3", vec![q, s]),
-            Weight::Q2 { q, s, n, k, .. } => (*n, *k, "q2", vec![q, s]),
-            Weight::Bf16 { w, n, k } => (*n, *k, "bf16", vec![w]),
-            _ => panic!("matmul needs a matrix"),
-        };
+        let m = w.matrix();
+        let (n, k, suffix) = (m.n, m.k, m.fmt.suffix());
         assert_eq!(x.cols, k, "matmul inner dim");
         let t = x.rows;
         // The matrix-core GEMM stores whole 64-token tiles.
@@ -1231,34 +1253,29 @@ impl Gpu {
         } else {
             self.tensor(t, n)
         };
-        let mut all = vec![y.buf(), x.buf()];
-        all.extend(bufs);
         if t <= self.gemv_max_rows()
             && self.subgroups
             && let Some(planes) = self.gemv.planes(t)
-            && let Some(f) = gemv_int::format(suffix)
+            && let Some(f) = m.fmt.gemv_int()
         {
-            let (wq, wsc) = (all[2].clone(), all[3].clone());
+            let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
             self.gemv_int(x, &y, &wq, &wsc, n, f, planes, false);
             return y;
         }
         if t > GEMVM_MAX_T
             && let Some(planes) = self.gemm.planes()
-            && let Some(f) = gemm_int::format(suffix)
+            && let Some(f) = m.fmt.gemm_int()
         {
             // The integer GEMM reads the per-16 scale arrays where a format has them.
-            let scales = match w {
-                Weight::Q6 { s16, .. } | Weight::Q3 { s16, .. } | Weight::Q2 { s16, .. } => s16,
-                _ => all[3],
-            };
-            let (wq, scales) = (all[2].clone(), scales.clone());
+            let [wq, scales] = <[wgpu::Buffer; 2]>::try_from(m.prefill_bufs()).unwrap();
             self.gemm_int(x, &y, &wq, &scales, n, f, planes);
             return y;
         }
+        let mut all = vec![y.buf().clone(), x.buf().clone()];
         let multi = self.subgroups && k % 512 == 0;
         if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || self.multi_split(t)) {
             // Up to 16 rows in one dispatch, up to 32 in two (each reads the weights once).
-            let all: Vec<wgpu::Buffer> = all.into_iter().cloned().collect();
+            all.extend(m.decode_bufs());
             let refs: Vec<&wgpu::Buffer> = all.iter().collect();
             let first = t.div_ceil(2).min(GEMVM_MAX_T).max(if t <= GEMVM_MAX_T { t } else { 0 });
             for (r0, rows) in [(0, first), (first, t - first)] {
@@ -1283,6 +1300,8 @@ impl Gpu {
             return y;
         }
         let params = [n as u32, k as u32, t as u32, 0];
+        // The prefill GEMMs read the per-16 f16 scales (see `W_Q6`).
+        all.extend(if t <= GEMV_MAX_T { m.decode_bufs() } else { m.prefill_bufs() });
         let (name, groups) = if t == 1 {
             (format!("gemv1_{suffix}"), grid(n.div_ceil(8) as u32))
         } else if t <= GEMV_MAX_T && self.subgroups && k % 512 == 0 {
@@ -1290,10 +1309,6 @@ impl Gpu {
         } else if t <= GEMV_MAX_T {
             (format!("gemv8_{suffix}"), grid(n.div_ceil(8) as u32))
         } else {
-            // The prefill GEMMs read the per-16 f16 scales (see `W_Q6`).
-            if let Weight::Q6 { s16, .. } | Weight::Q3 { s16, .. } | Weight::Q2 { s16, .. } = w {
-                all[3] = s16;
-            }
             match self.gemm {
                 GemmKind::Coop | GemmKind::Int8 | GemmKind::Int16 if n % 64 == 0 && self.coop => {
                     (format!("gemmcoop_{suffix}"), ((n / 64) as u32, t.div_ceil(64) as u32))
@@ -1301,8 +1316,6 @@ impl Gpu {
                 _ => (format!("gemm2f32_{suffix}"), (n.div_ceil(128) as u32, t.div_ceil(64) as u32)),
             }
         };
-        // `all` borrows `y`; dispatch only needs the buffers for the bind group.
-        let all: Vec<wgpu::Buffer> = all.into_iter().cloned().collect();
         let refs: Vec<&wgpu::Buffer> = all.iter().collect();
         if self.kernels_profile.is_some() {
             self.prof_detail = Some(format!("{n}x{k}"));
@@ -1592,23 +1605,16 @@ impl Gpu {
     }
 
     fn matmul_glu(&mut self, x: &Tensor, w: &Weight) -> Tensor {
+        let m = w.matrix();
+        let (n2, k) = (m.n, m.k);
+        assert_eq!(x.cols, k);
         if x.rows <= self.gemv_max_rows()
             && self.subgroups
             && let Some(planes) = self.gemv.planes(x.rows)
-            && let Some((q, s, n2, k, f)) = match w {
-                Weight::Q8 { q, s, n, k } => Some((q, s, *n, *k, "q8")),
-                Weight::Q4 { q, s, n, k } => Some((q, s, *n, *k, "q4")),
-                Weight::Q4K { q, s, n, k } => Some((q, s, *n, *k, "q4k")),
-                Weight::Q6 { q, s, n, k, .. } => Some((q, s, *n, *k, "q6")),
-                Weight::Q3 { q, s, n, k, .. } => Some((q, s, *n, *k, "q3")),
-                Weight::Q2 { q, s, n, k, .. } => Some((q, s, *n, *k, "q2")),
-                _ => None,
-            }
+            && let Some(f) = m.fmt.gemv_int()
         {
-            assert_eq!(x.cols, k);
-            let f = gemv_int::format(f).unwrap();
             let y = self.tensor(x.rows, n2 / 2);
-            let (q, s) = (q.clone(), s.clone());
+            let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
             self.gemv_int(x, &y, &q, &s, n2 / 2, f, planes, true);
             return y;
         }
@@ -1616,17 +1622,9 @@ impl Gpu {
             let gu = self.matmul(x, w);
             return self.swiglu(&gu);
         }
-        let (n2, k, name, bufs): (usize, usize, &str, Vec<wgpu::Buffer>) = match w {
-            Weight::Q8 { q, s, n, k } => (*n, *k, "glu_q8", vec![q.clone(), s.clone()]),
-            // The block variant (`GLU_32`) measured slower here (174 vs 138 us on 12288x1536).
-            Weight::Q4 { q, s, n, k } => (*n, *k, "glu_q4", vec![q.clone(), s.clone()]),
-            Weight::Q4K { q, s, n, k } => (*n, *k, "glu_q4k", vec![q.clone(), s.clone()]),
-            Weight::Q6 { q, s, n, k, .. } => (*n, *k, "glu_q6", vec![q.clone(), s.clone()]),
-            Weight::Q3 { q, s, n, k, .. } => (*n, *k, "glu_q3", vec![q.clone(), s.clone()]),
-            Weight::Q2 { q, s, n, k, .. } => (*n, *k, "glu_q2", vec![q.clone(), s.clone()]),
-            Weight::Bf16 { w, n, k } => (*n, *k, "glu_bf16", vec![w.clone()]),
-            _ => panic!("matmul_glu needs a matrix"),
-        };
+        // (for Q4 the block variant `GLU_32` measured slower: 174 vs 138 us on 12288x1536)
+        let name = format!("glu_{}", m.fmt.suffix());
+        let bufs = m.decode_bufs();
         assert_eq!(x.cols, k);
         let inter = n2 / 2;
         let y = self.tensor(1, inter);
@@ -1636,7 +1634,7 @@ impl Gpu {
         if self.kernels_profile.is_some() {
             self.prof_detail = Some(format!("{n2}x{k}"));
         }
-        self.dispatch(name, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
+        self.dispatch(&name, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
         self.pending_flops += 2.0 * (n2 * k) as f64;
         y
     }
@@ -1742,18 +1740,21 @@ impl Gpu {
         r
     }
 
-    fn load_matrix(&mut self, bf16: &[u16], n: usize, k: usize, quant: Quant) -> Result<Weight> {
+    fn load_matrix(&mut self, bf16: &[u16], n: usize, k: usize, quant: Quant) -> Result<Matrix> {
         anyhow::ensure!(k.is_multiple_of(32), "K={k} must be a multiple of 32");
         Ok(match quant {
             Quant::Q8 | Quant::Auto => self.upload_q8(yaxus_model::quant::quantize_q8(bf16, k), n, k),
             Quant::Q4 | Quant::Auto4 => self.upload_q4(yaxus_model::quant::quantize_q4(bf16, k), n, k),
-            Quant::Bf16 => Weight::Bf16 { w: self.upload("bf16", bytemuck::cast_slice(bf16)), n, k },
+            Quant::Bf16 => {
+                let q = self.upload("bf16", bytemuck::cast_slice(bf16));
+                Matrix { fmt: Format::Bf16, n, k, q, s: None, s16: None }
+            }
         })
     }
 
     /// A GGUF matrix in a layout the kernels read directly, without changing its values
     /// (up to f16 rounding of Q6_K's combined scales); `None` for other types.
-    fn load_gguf_matrix(&mut self, t: &TensorRef, n: usize, k: usize) -> Result<Option<Weight>> {
+    fn load_gguf_matrix(&mut self, t: &TensorRef, n: usize, k: usize) -> Result<Option<Matrix>> {
         use yaxus_model::ggml::GgmlType;
         // The repacked layouts and the kernels take whole blocks per row: a file with
         // rows that straddle blocks would load without complaint and compute garbage.
@@ -1770,7 +1771,7 @@ impl Gpu {
         Ok(self.load_ggml(t.dtype, t.bytes(), n, k))
     }
 
-    fn load_ggml(&mut self, dtype: yaxus_model::ggml::GgmlType, b: &[u8], n: usize, k: usize) -> Option<Weight> {
+    fn load_ggml(&mut self, dtype: yaxus_model::ggml::GgmlType, b: &[u8], n: usize, k: usize) -> Option<Matrix> {
         use yaxus_model::ggml::{self, GgmlType};
         Some(match dtype {
             GgmlType::Q8_0 => self.upload_q8(ggml::q8_from_q8_0(b), n, k),
@@ -1778,7 +1779,7 @@ impl Gpu {
             GgmlType::Q4K => {
                 // One buffer, read through two bindings (nibbles and headers).
                 let qb = self.upload("q4k", &ggml::q4k_from_q4_k(b).data);
-                Weight::Q4K { q: qb.clone(), s: qb, n, k }
+                Matrix { fmt: Format::Q4K, n, k, q: qb.clone(), s: Some(qb), s16: None }
             }
             GgmlType::Q6K => {
                 let q = ggml::q6_from_q6_k(b, n, k);
@@ -1786,7 +1787,7 @@ impl Gpu {
                 let sb = self.upload("q6-meta", &q.meta);
                 let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
                 let s16 = self.upload("q6-scales", bytemuck::cast_slice(&s16));
-                Weight::Q6 { q: qb, s: sb, s16, n, k }
+                Matrix { fmt: Format::Q6, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             GgmlType::Q3K => {
                 let q = ggml::q3_from_q3_k(b, n, k);
@@ -1794,7 +1795,7 @@ impl Gpu {
                 let sb = self.upload("q3-meta", &q.meta);
                 let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
                 let s16 = self.upload("q3-scales", bytemuck::cast_slice(&s16));
-                Weight::Q3 { q: qb, s: sb, s16, n, k }
+                Matrix { fmt: Format::Q3, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             GgmlType::Q2K => {
                 let q = ggml::q2_from_q2_k(b, n, k);
@@ -1802,24 +1803,24 @@ impl Gpu {
                 let sb = self.upload("q2-meta", &q.meta);
                 let s16 = pad_scales(q.pairs16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 2);
                 let s16 = self.upload("q2-scales", bytemuck::cast_slice(&s16));
-                Weight::Q2 { q: qb, s: sb, s16, n, k }
+                Matrix { fmt: Format::Q2, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             _ => return None,
         })
     }
 
-    fn upload_q8(&mut self, q: yaxus_model::quant::Q8Data, n: usize, k: usize) -> Weight {
+    fn upload_q8(&mut self, q: yaxus_model::quant::Q8Data, n: usize, k: usize) -> Matrix {
         let qb = self.upload("q8", bytemuck::cast_slice(&q.qs));
         let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 32, 1);
         let sb = self.upload("q8-scales", bytemuck::cast_slice(&sc));
-        Weight::Q8 { q: qb, s: sb, n, k }
+        Matrix { fmt: Format::Q8, n, k, q: qb, s: Some(sb), s16: None }
     }
 
-    fn upload_q4(&mut self, q: yaxus_model::quant::Q4Data, n: usize, k: usize) -> Weight {
+    fn upload_q4(&mut self, q: yaxus_model::quant::Q4Data, n: usize, k: usize) -> Matrix {
         let qb = self.upload("q4", &q.qs);
         let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 32, 1);
         let sb = self.upload("q4-scales", bytemuck::cast_slice(&sc));
-        Weight::Q4 { q: qb, s: sb, n, k }
+        Matrix { fmt: Format::Q4, n, k, q: qb, s: Some(sb), s16: None }
     }
 }
 
@@ -1868,7 +1869,7 @@ impl Gpu {
         k: usize,
         glu: bool,
     ) -> Vec<f32> {
-        let w = self.load_ggml(dtype, bytes, n, k).expect("a type with a GPU layout");
+        let w = Weight::Matrix(self.load_ggml(dtype, bytes, n, k).expect("a type with a GPU layout"));
         let xt = self.tensor(t, k);
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
         let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
@@ -1889,7 +1890,7 @@ impl Gpu {
         quant: Quant,
         glu: bool,
     ) -> Vec<f32> {
-        let w = self.load_matrix(w, n, k, quant).unwrap();
+        let w = Weight::Matrix(self.load_matrix(w, n, k, quant).unwrap());
         let xt = self.tensor(t, k);
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
         let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
@@ -1926,8 +1927,8 @@ pub struct WgpuBackend {
     weight_bytes: usize,
     /// Kernels for this model's passes of up to 16 rows.
     gemv: Gemv,
-    /// Formats of the matrices loaded through this handle (`gemv_int` names).
-    formats: Vec<&'static str>,
+    /// Formats of the matrices loaded through this handle.
+    formats: Vec<Format>,
 }
 
 impl WgpuBackend {
@@ -2087,19 +2088,10 @@ impl Backend for WgpuBackend {
         let before = self.g().weight_bytes;
         let w = self.g().checked("loading a weight", |g| g.load_weight(t, quant));
         self.track(before);
-        let format = match &w {
-            Ok(Weight::Q8 { .. }) => Some("q8"),
-            Ok(Weight::Q4 { .. }) => Some("q4"),
-            Ok(Weight::Q4K { .. }) => Some("q4k"),
-            Ok(Weight::Q6 { .. }) => Some("q6"),
-            Ok(Weight::Q3 { .. }) => Some("q3"),
-            Ok(Weight::Q2 { .. }) => Some("q2"),
-            _ => None,
-        };
-        if let Some(f) = format
-            && !self.formats.contains(&f)
+        if let Ok(Weight::Matrix(m)) = &w
+            && !self.formats.contains(&m.fmt)
         {
-            self.formats.push(f);
+            self.formats.push(m.fmt);
         }
         w
     }
