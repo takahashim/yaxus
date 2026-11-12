@@ -2,7 +2,7 @@
 //! computed from the same quantized weights. Needs a Vulkan GPU:
 //! `cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored`
 //! or a software one (lavapipe, as in CI; without 32-lane subgroups only the f32 decode
-//! kernels and the prefill GEMMs run): `YAXUS_SOFTWARE_VULKAN=1
+//! kernels and the prefill GEMMs run): `YAXUS_SOFTWARE_GPU=1
 //! VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` in front.
 
 use yaxus_backend_wgpu::{GemmKind, Gemv, WgpuBackend};
@@ -73,7 +73,7 @@ fn reference(x: &[f32], t: usize, w: &[f32], n: usize, k: usize, glu: bool) -> V
 /// relative to the largest output (operands rounded to f16, to 15 bits, to 7 bits).
 fn gemm_kinds(gpu: &WgpuBackend) -> Vec<(GemmKind, f32)> {
     let mut kinds = vec![(GemmKind::F32, 0.0), (GemmKind::Int16, 3e-3), (GemmKind::Int8, 3e-2)];
-    if gpu.has_matrix_cores() {
+    if gpu.caps().coop {
         kinds.push((GemmKind::Coop, 3e-3)); // (the default where matrix cores exist)
     }
     kinds
@@ -237,7 +237,7 @@ fn ggml_matmul_kernels_match_host() {
 #[ignore]
 fn integer_rows_do_not_depend_on_the_pass() {
     let mut gpu = WgpuBackend::new().unwrap();
-    if !gpu.has_subgroups() {
+    if !gpu.caps().subgroups {
         eprintln!("no 32-lane subgroups (the integer decode kernels need them); skipping");
         return;
     }

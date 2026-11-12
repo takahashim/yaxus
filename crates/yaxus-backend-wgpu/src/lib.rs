@@ -6,6 +6,7 @@
 //! All ops are recorded into one command encoder and submitted at sync points
 //! (`argmax` / `to_host`), so a decode step is a single queue submission.
 
+mod device;
 mod gemm_int;
 mod gemv_int;
 mod shaders;
@@ -17,21 +18,14 @@ use anyhow::{Context, Result, bail};
 use wgpu::util::DeviceExt;
 use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef};
 
+use device::Diagnostics;
+pub use device::{DeviceCaps, Tuning, Vendor};
+
 /// Activation rows up to which the GEMV kernel (weights read once) is used.
 const GEMV_MAX_T: usize = 8;
 /// Rows up to which the multi-row GEMV (activations staged in workgroup memory) is
 /// compiled; passes of up to twice this many rows run it twice on halves of the rows.
-const GEMVM_MAX_T: usize = 16;
-
-/// Matmul work after which recorded commands are submitted. On APUs compute jobs run on
-/// the graphics ring, where the kernel resets the GPU if one job runs for ~2 s (observed
-/// with a 448-token prefill in one submission) and long jobs also stall the desktop.
-/// 32 GFLOP is roughly 40 ms on a Radeon 780M; a 2B decode step is ~5 GFLOP.
-const SUBMIT_FLOPS: f64 = 32e9;
-
-/// Dispatches of a small pass recorded before it is first submitted (about one layer):
-/// the GPU then runs while the host records the rest. 2B GGUF decode 44.0 -> 44.8 tok/s.
-const EARLY_SUBMIT_DISPATCHES: usize = 12;
+pub(crate) const GEMVM_MAX_T: usize = 16;
 
 type Pool = Arc<Mutex<HashMap<u64, Vec<wgpu::Buffer>>>>;
 
@@ -169,7 +163,9 @@ struct Kernel {
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    adapter_name: String,
+    caps: DeviceCaps,
+    tuning: Tuning,
+    diag: Diagnostics,
     kernels: HashMap<&'static str, Kernel>,
     encoder: Option<wgpu::CommandEncoder>,
     /// The compute pass being recorded into `encoder`, if any.
@@ -194,21 +190,12 @@ pub struct Gpu {
     pending_flops: f64,
     /// Dispatches recorded since the pass began (early submission of small passes).
     pass_dispatches: usize,
-    /// Subgroup shuffles available (multi-row GEMV kernels).
-    subgroups: bool,
-    /// Cooperative matrices (16x16x16, f16 x f16 -> f32) available.
-    coop: bool,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
     /// Bytes uploaded since the staging memory was last released.
     unflushed_upload: usize,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
     oversized: Option<(String, usize)>,
-    /// Tiled attention for passes of more than 16 rows: keys are split into chunks until
-    /// about this many workgroups run (0: the per-row kernel instead). `YAXUS_TILE_WGS`
-    /// sets it (0 now selects the per-row kernel). Devices without the kernel's workgroup
-    /// memory take the per-row kernel whatever this says.
-    tile_wgs: usize,
     kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
@@ -310,17 +297,6 @@ impl GemmKind {
             _ => None,
         }
     }
-
-    /// The default, `Int16`. `YAXUS_GEMM=f32|coop|int16|int8` overrides it (for tests;
-    /// the CLI and the server set the kind from `--prefill-precision`).
-    fn from_env() -> Self {
-        match std::env::var("YAXUS_GEMM").as_deref() {
-            Ok("f32") => GemmKind::F32,
-            Ok("coop") => GemmKind::Coop,
-            Ok("int8") => GemmKind::Int8,
-            _ => GemmKind::Int16,
-        }
-    }
 }
 
 /// Kernels for passes of up to 16 rows (decode, speculative verification, short prompts).
@@ -348,16 +324,6 @@ impl Gemv {
 
     fn planes(self, t: usize) -> Option<usize> {
         if t == 1 && self.single_f32 { None } else { self.planes }
-    }
-
-    /// The default, `INT16`. `YAXUS_GEMV=f32|int16|int8|mixed` overrides it (for tests).
-    fn from_env() -> Self {
-        match std::env::var("YAXUS_GEMV").as_deref() {
-            Ok("f32") => Gemv::F32,
-            Ok("int8") => Gemv { planes: Some(1), single_f32: false },
-            Ok("mixed") => Gemv { planes: Some(2), single_f32: true },
-            _ => Gemv::INT16,
-        }
     }
 }
 
@@ -415,56 +381,11 @@ const ARGMAX_ROWS: usize = 512;
 /// shaders.rs (`qs`, `kv`, `ss`, `rm`, `rl`, `rc`, `kslot`); keep the two in step.
 const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
 
-/// Passes with at most this many rows use the split-key attention (a workgroup per row
-/// and chunk of keys). Decode passes are rows of different requests, which the tiled
-/// attention of prompt passes handles badly: 16 requests in one pass took 74 ms with it
-/// against 38 ms (2B), so this covers every pass the decode kernels take in one dispatch.
-const SPLIT_ATTN_MAX_ROWS: usize = 16;
 /// Columns `add_norm_sg` keeps in registers (16 per lane of its 256); wider rows take the
 /// plain `add_norm`.
 const ADD_NORM_SG_MAX_COLS: usize = 16 * 256;
-/// Workgroups the split attention aims for at most when it splits heads (see `attention`).
-const ATTN_SPLIT_WGS: usize = 64;
-
 /// Keys per chunk of the split attention kernels.
 const SPLIT_CHUNKS: [usize; 2] = [16, 32];
-
-impl Gpu {
-    /// Rows up to which a pass runs as integer GEMVs of up to 16 rows each (when the
-    /// model's `Gemv` has them) rather than as the prefill GEMM: reading the weights two or
-    /// three times costs less than a GEMM tile. Measured on a 780M, ms per pass, GEMVs
-    /// against the int16 / int8 GEMM: 2B Q4_K_M 17 rows 50 / 79 / 59, 32 rows 73 / 82 / 61,
-    /// 48 rows 108 / 119 / 83, 64 rows 142 / 122 / 83; 8B 17 rows 147 / 290 / 260, 32 rows
-    /// 212 / 295 / 263, 48 rows 318 / 396 / 292, 64 rows 423 / 402 / 292. With the f32 GEMM
-    /// (asked for as the reference), only up to 16 rows.
-    fn gemv_max_rows(&self) -> usize {
-        match self.gemm {
-            GemmKind::F32 => GEMVM_MAX_T,
-            GemmKind::Int8 => 24,
-            GemmKind::Coop | GemmKind::Int16 => 48,
-        }
-    }
-
-    /// Whether a pass of `t` (17..=32) rows should run as two multi-row GEMVs rather than
-    /// the 64-row-tile GEMM: measured on the 2B, two GEMVs win up to about 20 rows
-    /// (17 rows: 101 vs 140 ms; 24 rows: 149 vs 142 ms).
-    fn multi_split(&self, t: usize) -> bool {
-        t <= 20
-    }
-}
-
-/// Weight rows per 32-lane group in the multi-row GEMV for `t` activation rows.
-fn gemvm_rows(_t: usize) -> usize {
-    std::env::var("YAXUS_GEMVM_R").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
-}
-
-/// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
-/// shared by more dot products, and a single row's rounding (done per workgroup) by more
-/// weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B Q4_K_M
-/// 8 rows 33.3 / 26.0 / 26.0 / 28.9, 8B 8 rows 107.9 / 76.6 / 74.4 / 81.3, 16 rows
-/// 185 / 116 / 109 / 180; single-row decode in tok/s with 1 / 4 / 8: 2B Q4_K_M
-/// 44.1 / 44.6 / 43.6, 0.8B Q2_K 166 / 188 / 184.
-const GEMVI_ROWS: usize = 4;
 
 /// The name of a `gemv_int` kernel (`inline`: the single-row one that rounds its row).
 fn gemvi_name(planes: usize, t: usize, rw: usize, glu: bool, inline: bool, format: &str) -> String {
@@ -503,44 +424,42 @@ fn grid(groups: u32) -> (u32, u32) {
 }
 
 impl Gpu {
-    /// Opens the first non-CPU Vulkan adapter. `YAXUS_SOFTWARE_VULKAN=1` accepts a software
-    /// one too (lavapipe), so the kernel tests can run on machines without a GPU (CI).
+    /// Opens the first GPU of the platform's API (Vulkan; Metal on macOS).
+    /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
+    /// can run on machines without a GPU (CI).
     pub fn new() -> Result<Self> {
+        let diag = Diagnostics::from_env();
+        let backends = device::platform_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-        let software = std::env::var_os("YAXUS_SOFTWARE_VULKAN").is_some_and(|v| v == "1");
-        let adapter =
-            adapters.into_iter().find(|a| software || a.get_info().device_type != wgpu::DeviceType::Cpu).context(
-                "no Vulkan GPU found (only a software renderer, if any). Check that the user is in \
-                 the `render` group and that the session has it (re-login, or run under `sg render`)",
-            )?;
-        let info = adapter.get_info();
+        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        let adapter = adapters
+            .into_iter()
+            .find(|a| diag.software || a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .with_context(|| {
+                let hint = if cfg!(target_os = "linux") {
+                    ". Check that the user is in the `render` group and that the session has it \
+                     (re-login, or run under `sg render`)"
+                } else {
+                    ""
+                };
+                format!("no {backends:?} GPU found (only a software renderer, if any){hint}")
+            })?;
         let alimits = adapter.limits();
+        let caps = DeviceCaps::detect(&adapter);
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
-            bail!("{} does not support push constants (wgpu IMMEDIATES)", info.name);
+            bail!("{} does not support push constants (wgpu IMMEDIATES)", caps.name);
         }
-        let f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
-        let timed = std::env::var("YAXUS_PROFILE").is_ok_and(|v| v == "2")
-            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        // The multi-row GEMV reduces 32-lane groups with subgroup shuffles.
-        let subgroups = adapter.features().contains(wgpu::Features::SUBGROUP) && info.subgroup_min_size >= 32;
-        // Matrix cores: 16x16x16 with f16 operands and f32 accumulators, via subgroups.
-        let coop = f16
-            && subgroups
-            && adapter.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
-            && adapter.cooperative_matrix_properties().iter().any(|c| {
-                (c.m_size, c.n_size, c.k_size) == (16, 16, 16)
-                    && c.ab_type == wgpu::CooperativeScalarType::F16
-                    && c.cr_type == wgpu::CooperativeScalarType::F32
-            });
+        let timed = diag.profile == Some(2) && caps.timestamps;
+        let (f16, coop, subgroups) = (caps.f16, caps.coop, caps.subgroups);
+        let tuning = Tuning::for_device(&caps).with_env();
         let limits = wgpu::Limits {
             max_buffer_size: alimits.max_buffer_size,
             max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
             max_storage_buffers_per_shader_stage: 10,
-            max_compute_workgroup_storage_size: alimits.max_compute_workgroup_storage_size.min(65536),
+            max_compute_workgroup_storage_size: caps.max_workgroup_storage,
             max_immediate_size: 32,
             ..wgpu::Limits::default()
         };
@@ -624,7 +543,9 @@ impl Gpu {
             prof_detail: None,
             device,
             queue,
-            adapter_name: format!("{} ({:?})", info.name, info.backend),
+            gemm: tuning.gemm,
+            tuning,
+            caps,
             kernels: HashMap::new(),
             encoder: None,
             pass: None,
@@ -638,13 +559,10 @@ impl Gpu {
             argmax_out,
             pending_flops: 0.0,
             pass_dispatches: 0,
-            subgroups,
-            coop,
-            gemm: GemmKind::from_env(),
-            tile_wgs: std::env::var("YAXUS_TILE_WGS").ok().and_then(|v| v.parse().ok()).unwrap_or(384),
             unflushed_upload: 0,
             oversized: None,
-            profile: std::env::var_os("YAXUS_PROFILE").map(|_| Profile::default()),
+            profile: diag.profile.map(|_| Profile::default()),
+            diag,
         };
         b.build_kernels();
         Ok(b)
@@ -661,9 +579,10 @@ impl Gpu {
     /// take up to 40 ms each on a 780M; compiled on first use, they stalled the first
     /// requests (57 kernels and 1 s within the 19-sentence set).
     fn precompile(&mut self, formats: &[Format], gemv: Gemv) {
-        if !self.subgroups {
+        if !self.caps.subgroups {
             return;
         }
+        let gemvi_rows = self.tuning.gemvi_rows;
         // (name, bindings, source)
         type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
         let mut jobs: Vec<Job> = Vec::new();
@@ -676,7 +595,7 @@ impl Gpu {
             for f in formats.iter().filter_map(|f| f.gemv_int()) {
                 for glu in [false, true] {
                     if !gemv.single_f32 {
-                        let rw = GEMVI_ROWS;
+                        let rw = gemvi_rows;
                         jobs.push((
                             gemvi_name(planes, 1, rw, glu, true, f.name),
                             vec![false, true, true, true],
@@ -684,7 +603,7 @@ impl Gpu {
                         ));
                     }
                     for t in 2..=GEMVM_MAX_T {
-                        let rw = GEMVI_ROWS;
+                        let rw = gemvi_rows;
                         jobs.push((
                             gemvi_name(planes, t, rw, glu, false, f.name),
                             vec![false, true, true, true, true],
@@ -735,7 +654,7 @@ impl Gpu {
                 .collect();
             workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
         });
-        if std::env::var_os("YAXUS_COMPILE_LOG").is_some() {
+        if self.diag.compile_log {
             eprintln!("[compile] {} kernels ahead of use, {:.0} ms", built.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
         self.kernels.extend(built);
@@ -744,7 +663,7 @@ impl Gpu {
     fn build_kernels(&mut self) {
         use shaders::*;
         let t0 = std::time::Instant::now();
-        let sg = self.subgroups;
+        let sg = self.caps.subgroups;
         // Decode GEMV: the subgroup kernel where available.
         let gemv1 = move |w16: &str| -> String {
             if sg {
@@ -761,9 +680,9 @@ impl Gpu {
         self.add_kernel("gemv8_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(GEMV_MAX_T)), &q8);
         self.add_kernel("glu_q4", &format!("{MM_PARAMS}{W_Q4_16}{GEMV_GLU}"), &q8);
         self.add_kernel("gemv8_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(GEMV_MAX_T)), &q8);
-        if self.subgroups {
+        if self.caps.subgroups {
             for t in 2..=GEMVM_MAX_T {
-                let r = gemvm_rows(t);
+                let r = self.tuning.gemvm_rows;
                 let body = GEMV_MULTI
                     .replace("{T}", &t.to_string())
                     .replace("{R}", &r.to_string())
@@ -778,7 +697,7 @@ impl Gpu {
             }
         }
         for (w, wsrc, layout) in [("q8", W_Q8, &q8[..]), ("q4", W_Q4, &q8[..]), ("bf16", W_BF16, &bf[..])] {
-            if self.coop {
+            if self.caps.coop {
                 let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{wsrc}{GEMM_COOP}");
                 self.add_kernel(Box::leak(format!("gemmcoop_{w}").into_boxed_str()), &c, layout);
             }
@@ -793,9 +712,9 @@ impl Gpu {
             self.add_kernel(name(format!("gemv1_{w}")), &gemv1(w16), &q8);
             self.add_kernel(name(format!("gemv8_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), &q8);
             self.add_kernel(name(format!("glu_{w}")), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), &q8);
-            if self.subgroups {
+            if self.caps.subgroups {
                 for t in 2..=GEMVM_MAX_T {
-                    let r = gemvm_rows(t);
+                    let r = self.tuning.gemvm_rows;
                     let body = GEMV_MULTI
                         .replace("{T}", &t.to_string())
                         .replace("{R}", &r.to_string())
@@ -804,7 +723,7 @@ impl Gpu {
                     self.add_kernel(name(format!("gemvm{t}_{w}")), &format!("{MM_PARAMS}{w16}{body}"), &q8);
                 }
             }
-            if self.coop {
+            if self.caps.coop {
                 let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
                 self.add_kernel(name(format!("gemmcoop_{w}")), &c, &q8);
             }
@@ -826,7 +745,7 @@ impl Gpu {
         self.add_kernel("embed", EMBED, &[false, true, true]);
         // (the split attention reduces with subgroup shuffles; without them the per-row
         // kernel takes every pass)
-        let sg = self.subgroups;
+        let sg = self.caps.subgroups;
         for g in [1usize, 2, 4, 6, 8, 12, 16].into_iter().filter(|_| sg) {
             for ch in SPLIT_CHUNKS {
                 for hg in [1usize, 2, 3, 4, 6, 8, 12, 16].into_iter().filter(|h| g % h == 0) {
@@ -843,12 +762,12 @@ impl Gpu {
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
         // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
         // without it, prefill attention takes the per-row kernel.
-        if self.subgroups && self.device.limits().max_compute_workgroup_storage_size >= ATTN_TILE_SHARED_BYTES {
+        if self.caps.subgroups && self.device.limits().max_compute_workgroup_storage_size >= ATTN_TILE_SHARED_BYTES {
             self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
         }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
         self.add_kernel("add", ADD, &[false, true]);
-        if std::env::var_os("YAXUS_COMPILE_LOG").is_some() {
+        if self.diag.compile_log {
             eprintln!("[compile] {} base kernels, {:.0} ms", self.kernels.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
     }
@@ -945,8 +864,8 @@ impl Gpu {
         // Small passes (decode, verification) are recorded while the GPU already runs their
         // first layer: one early submission. More submissions cost more than they hide.
         self.pass_dispatches += 1;
-        if self.pass_dispatches == EARLY_SUBMIT_DISPATCHES
-            && self.pass_rows <= SPLIT_ATTN_MAX_ROWS
+        if self.pass_dispatches == self.tuning.early_submit_dispatches
+            && self.pass_rows <= self.tuning.split_attn_max_rows
             && self.kernels_profile.is_none()
         {
             self.submit();
@@ -954,11 +873,11 @@ impl Gpu {
     }
 
     /// Records that the commands just recorded do `flops` of matrix work, and submits
-    /// them once `SUBMIT_FLOPS` have accumulated (so that no submission runs long enough
+    /// them once `Tuning::submit_flops` have accumulated (so that no submission runs long enough
     /// for the driver to reset the GPU).
     fn account(&mut self, flops: f64) {
         self.pending_flops += flops;
-        if self.pending_flops >= SUBMIT_FLOPS {
+        if self.pending_flops >= self.tuning.submit_flops {
             self.submit();
         }
     }
@@ -1077,7 +996,7 @@ impl Gpu {
 /// locks the shared context and forwards here).
 impl Gpu {
     fn name(&self) -> String {
-        format!("vulkan: {}", self.adapter_name)
+        format!("{}: {}", format!("{:?}", self.caps.backend).to_lowercase(), self.caps.name)
     }
 
     fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
@@ -1262,8 +1181,8 @@ impl Gpu {
         } else {
             self.tensor(t, n)
         };
-        if t <= self.gemv_max_rows()
-            && self.subgroups
+        if t <= self.tuning.gemv_max_rows(self.gemm)
+            && self.caps.subgroups
             && let Some(planes) = gemv.planes(t)
             && let Some(f) = m.fmt.gemv_int()
         {
@@ -1281,8 +1200,8 @@ impl Gpu {
             return y;
         }
         let mut all = vec![y.buf().clone(), x.buf().clone()];
-        let multi = self.subgroups && k % 512 == 0;
-        if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || self.multi_split(t)) {
+        let multi = self.caps.subgroups && k % 512 == 0;
+        if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || t <= self.tuning.multi_split_max_rows) {
             // Up to 16 rows in one dispatch, up to 32 in two (each reads the weights once).
             all.extend(m.decode_bufs());
             let refs: Vec<&wgpu::Buffer> = all.iter().collect();
@@ -1294,7 +1213,7 @@ impl Gpu {
                 if self.kernels_profile.is_some() {
                     self.prof_detail = Some(format!("{n}x{k}"));
                 }
-                let groups = grid(n.div_ceil(8 * gemvm_rows(rows)) as u32);
+                let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
                 self.dispatch(
                     &format!("gemvm{rows}_{suffix}"),
                     &refs,
@@ -1310,13 +1229,13 @@ impl Gpu {
         all.extend(if t <= GEMV_MAX_T { m.decode_bufs() } else { m.prefill_bufs() });
         let (name, groups) = if t == 1 {
             (format!("gemv1_{suffix}"), grid(n.div_ceil(8) as u32))
-        } else if t <= GEMV_MAX_T && self.subgroups && k % 512 == 0 {
-            (format!("gemvm{t}_{suffix}"), grid(n.div_ceil(8 * gemvm_rows(t)) as u32))
+        } else if t <= GEMV_MAX_T && self.caps.subgroups && k % 512 == 0 {
+            (format!("gemvm{t}_{suffix}"), grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32))
         } else if t <= GEMV_MAX_T {
             (format!("gemv8_{suffix}"), grid(n.div_ceil(8) as u32))
         } else {
             match self.gemm {
-                GemmKind::Coop | GemmKind::Int8 | GemmKind::Int16 if n % 64 == 0 && self.coop => {
+                GemmKind::Coop | GemmKind::Int8 | GemmKind::Int16 if n % 64 == 0 && self.caps.coop => {
                     (format!("gemmcoop_{suffix}"), ((n / 64) as u32, t.div_ceil(64) as u32))
                 }
                 _ => (format!("gemm2f32_{suffix}"), (n.div_ceil(128) as u32, t.div_ceil(64) as u32)),
@@ -1367,7 +1286,7 @@ impl Gpu {
         // (`attn_combine`, linear in the chunk count) cheap. Measured on a 780M:
         // decode attention at 1024 keys 129 -> 102 us per layer (2B), and the 0.8B (one
         // KV head) gains 11% at 256 keys over the per-head kernel.
-        let ch = if ctx <= 64 { 16 } else { 32 };
+        let ch = if ctx <= self.tuning.short_context { 16 } else { 32 };
         let nch = ctx.div_ceil(ch);
         // Query heads per workgroup: few workgroups (short contexts, one KV head) leave
         // the GPU idle, so the heads of a KV head are split over up to 64 workgroups in
@@ -1375,10 +1294,10 @@ impl Gpu {
         // keys 26 -> 8.6 us per layer; 2B and 8B at 1024 keys slower when split).
         let hg = [1usize, 2, 3, 4, 6, 8, 12, 16]
             .into_iter()
-            .find(|&h| g % h == 0 && t * hkv * (g / h) * nch <= ATTN_SPLIT_WGS)
+            .find(|&h| g % h == 0 && t * hkv * (g / h) * nch <= self.tuning.attn_split_wgs)
             .unwrap_or(g);
-        let split = t <= SPLIT_ATTN_MAX_ROWS
-            && self.subgroups
+        let split = t <= self.tuning.split_attn_max_rows
+            && self.caps.subgroups
             && self.kernels.contains_key(format!("attn_split{g}_{ch}_{hg}").as_str());
         if split {
             let part = self.tensor(t * hkv * nch * g, 128);
@@ -1395,12 +1314,15 @@ impl Gpu {
                 &[hq as u32, hkv as u32, nch as u32],
                 (hq as u32, t as u32),
             );
-        } else if t > SPLIT_ATTN_MAX_ROWS && self.tile_wgs > 0 && self.kernels.contains_key("attn_tile") {
+        } else if t > self.tuning.split_attn_max_rows
+            && self.tuning.tile_wgs > 0
+            && self.kernels.contains_key("attn_tile")
+        {
             let tiles = self.meta_buf(MetaBuf::Tiles);
             // Split the keys into chunks while there are few workgroups (short passes
             // over long contexts), merging the chunks with `attn_combine`.
             let wgs = self.pass_tiles * hq;
-            let target = self.tile_wgs;
+            let target = self.tuning.tile_wgs;
             // Keys a tile can span: its first row's window up to its last row.
             let span = match layer.window {
                 Some(w) => (self.pass_max_pos + 1).min(w + ATTN_TILE_ROWS - 1),
@@ -1455,7 +1377,7 @@ impl Gpu {
         let h = self.tensor(x.rows, x.cols);
         let xb = x.buf().clone();
         // (the subgroup kernel holds a row in registers, which bounds its width)
-        let name = if self.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS { "add_norm_sg" } else { "add_norm" };
+        let name = if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS { "add_norm_sg" } else { "add_norm" };
         self.dispatch(
             name,
             &[h.buf(), &xb, delta.buf(), w1, w2],
@@ -1539,7 +1461,7 @@ impl Gpu {
         let (t, k) = (x.rows, x.cols);
         if t == 1 {
             // A single row is rounded inside the kernel (no dispatch of its own).
-            let rw = GEMVI_ROWS;
+            let rw = self.tuning.gemvi_rows;
             let name =
                 self.int_kernel(gemvi_name(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
                     gemv_int::source(f, 1, planes, rw, glu, true)
@@ -1568,7 +1490,7 @@ impl Gpu {
         let mut r0 = 0;
         for i in 0..parts {
             let rows = (t - r0).div_ceil(parts - i);
-            let rw = GEMVI_ROWS;
+            let rw = self.tuning.gemvi_rows;
             let name = self.int_kernel(
                 gemvi_name(planes, rows, rw, glu, false, f.name),
                 &[false, true, true, true, true],
@@ -1595,7 +1517,7 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         self.add_kernel(name, &source(), read_only);
         // (`precompile` should have covered it; a line here means a stall mid-request)
-        if std::env::var_os("YAXUS_COMPILE_LOG").is_some() {
+        if self.diag.compile_log {
             eprintln!("[compile] {name} on first use, {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         name
@@ -1605,8 +1527,8 @@ impl Gpu {
         let m = w.matrix();
         let (n2, k) = (m.n, m.k);
         assert_eq!(x.cols, k);
-        if x.rows <= self.gemv_max_rows()
-            && self.subgroups
+        if x.rows <= self.tuning.gemv_max_rows(self.gemm)
+            && self.caps.subgroups
             && let Some(planes) = gemv.planes(x.rows)
             && let Some(f) = m.fmt.gemv_int()
         {
@@ -1931,15 +1853,21 @@ pub struct WgpuBackend {
 }
 
 impl WgpuBackend {
-    /// Opens the first non-CPU Vulkan adapter. `YAXUS_SOFTWARE_VULKAN=1` accepts a software
-    /// one too (lavapipe), so the kernel tests can run on machines without a GPU (CI).
+    /// Opens the platform's GPU (see [`Gpu::new`]), with the device's tuned kernels.
     pub fn new() -> Result<Self> {
-        Ok(WgpuBackend {
-            gpu: Arc::new(Mutex::new(Gpu::new()?)),
-            weight_bytes: 0,
-            gemv: Gemv::from_env(),
-            formats: Vec::new(),
-        })
+        let gpu = Gpu::new()?;
+        let gemv = gpu.tuning.gemv;
+        Ok(WgpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+    }
+
+    /// What the device can do.
+    pub fn caps(&self) -> DeviceCaps {
+        self.g().caps.clone()
+    }
+
+    /// The choices the kernels are run with on this device.
+    pub fn tuning(&self) -> Tuning {
+        self.g().tuning.clone()
     }
 
     /// Another handle to the same context (for a second model).
@@ -1977,26 +1905,13 @@ impl WgpuBackend {
     /// splitting keys until about `target_wgs` workgroups run (default 384), or the
     /// per-row kernel when `target_wgs` is 0.
     pub fn set_tiled_attention(&self, target_wgs: usize) {
-        self.g().tile_wgs = target_wgs;
+        self.g().tuning.tile_wgs = target_wgs;
     }
 
     /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
     #[doc(hidden)]
     pub fn gemm_uses_f16(&self) -> bool {
         self.g().gemm_uses_f16()
-    }
-
-    /// Whether the device has matrix cores (the `Coop` GEMM).
-    #[doc(hidden)]
-    pub fn has_matrix_cores(&self) -> bool {
-        self.g().coop
-    }
-
-    /// Whether the device has 32-lane subgroups, which the decode kernels (integer and
-    /// multi-row GEMVs, split attention) need; without them the plain f32 kernels run.
-    #[doc(hidden)]
-    pub fn has_subgroups(&self) -> bool {
-        self.g().subgroups
     }
 
     /// Test hook, see [`Gpu::debug_add_norm`].

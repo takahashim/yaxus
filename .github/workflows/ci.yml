@@ -73,6 +73,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
       - name: Kernel tests
         env:
-          YAXUS_SOFTWARE_VULKAN: "1"
+          YAXUS_SOFTWARE_GPU: "1"
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
         run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored

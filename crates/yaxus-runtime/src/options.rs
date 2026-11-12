@@ -9,9 +9,10 @@ use yaxus_model::{EngineConfig, Quant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// Vulkan when a GPU is available, otherwise CPU.
+    /// The GPU when one is available, otherwise the CPU.
     Auto,
-    Vulkan,
+    /// The platform's GPU: Vulkan, or Metal on macOS.
+    Gpu,
     Cpu,
 }
 
@@ -20,9 +21,9 @@ impl std::str::FromStr for BackendKind {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "auto" => Ok(BackendKind::Auto),
-            "vulkan" | "gpu" => Ok(BackendKind::Vulkan),
+            "gpu" => Ok(BackendKind::Gpu),
             "cpu" => Ok(BackendKind::Cpu),
-            _ => anyhow::bail!("unknown backend {s:?} (expected auto, vulkan or cpu)"),
+            _ => anyhow::bail!("unknown backend {s:?} (expected auto, gpu or cpu)"),
         }
     }
 }
@@ -43,8 +44,11 @@ pub struct DraftOptions {
 /// the logits of the first generated token move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefill {
-    /// Integer dot products, activations rounded to 15 bits per block of 32: 2.6x, 6e-3.
+    /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemm`]; `Int16` on the AMD GPUs
+    /// measured so far).
     #[default]
+    Auto,
+    /// Integer dot products, activations rounded to 15 bits per block of 32: 2.6x, 6e-3.
     Int16,
     /// The same with 7 bits, as llama.cpp does: 3.9x, 4e-1 to 6e-1.
     Int8,
@@ -55,13 +59,14 @@ pub enum Prefill {
 }
 
 impl Prefill {
-    /// The GPU kernels for it.
-    pub(crate) fn gemm_kind(self) -> GemmKind {
+    /// The GPU kernels for it; `None`: the device's choice.
+    pub(crate) fn gemm_kind(self) -> Option<GemmKind> {
         match self {
-            Prefill::Int16 => GemmKind::Int16,
-            Prefill::Int8 => GemmKind::Int8,
-            Prefill::F16 => GemmKind::Coop,
-            Prefill::F32 => GemmKind::F32,
+            Prefill::Auto => None,
+            Prefill::Int16 => Some(GemmKind::Int16),
+            Prefill::Int8 => Some(GemmKind::Int8),
+            Prefill::F16 => Some(GemmKind::Coop),
+            Prefill::F32 => Some(GemmKind::F32),
         }
     }
 }
@@ -70,11 +75,12 @@ impl std::str::FromStr for Prefill {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s {
+            "auto" => Ok(Prefill::Auto),
             "int16" => Ok(Prefill::Int16),
             "int8" => Ok(Prefill::Int8),
             "f16" => Ok(Prefill::F16),
             "f32" => Ok(Prefill::F32),
-            _ => anyhow::bail!("unknown prefill precision {s:?} (expected int16, int8, f16 or f32)"),
+            _ => anyhow::bail!("unknown prefill precision {s:?} (expected auto, int16, int8, f16 or f32)"),
         }
     }
 }
@@ -83,42 +89,45 @@ impl std::str::FromStr for Prefill {
 /// short prompts; see [`Prefill`] for when longer passes take the same kernels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Decode {
+    /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemv`]; `Int16` on the AMD GPUs
+    /// measured so far).
+    #[default]
+    Auto,
     /// Integer dot products, activations rounded to 15 bits per block of 32: logits move
     /// by about 6e-3 against `F32`; a 7-row pass is 1.4x (2B) to 1.6x (8B) faster on a
     /// 780M, single rows cost about 1% more. A row's logits do not depend on the other
     /// rows of its pass.
-    #[default]
     Int16,
     /// f32 throughout: the reference.
     F32,
 }
 
 impl Decode {
-    /// Requests one decode pass advances by default: 16 with `Int16`, where extra rows are
-    /// cheap, 8 with `F32`, where 8 rows is the cheapest per row.
-    pub fn default_rows(self) -> usize {
+    /// The GPU kernels for it (of the target model; see [`Gemv::for_draft`]), with
+    /// `device` the device's choice.
+    pub(crate) fn gemv(self, device: Gemv) -> Gemv {
         match self {
-            Decode::Int16 => 16,
-            Decode::F32 => 8,
-        }
-    }
-
-    /// The GPU kernels for it (of the target model; see [`Gemv::for_draft`]).
-    pub(crate) fn gemv(self) -> Gemv {
-        match self {
+            Decode::Auto => device,
             Decode::Int16 => Gemv::INT16,
             Decode::F32 => Gemv::F32,
         }
     }
 }
 
+/// Requests one decode pass advances by default with `gemv`: 16 with the integer kernels,
+/// where extra rows are cheap, 8 with f32, where 8 rows is the cheapest per row.
+pub fn default_decode_rows(gemv: Gemv) -> usize {
+    if gemv.planes.is_some() { 16 } else { 8 }
+}
+
 impl std::str::FromStr for Decode {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s {
+            "auto" => Ok(Decode::Auto),
             "int16" => Ok(Decode::Int16),
             "f32" => Ok(Decode::F32),
-            _ => anyhow::bail!("unknown decode precision {s:?} (expected int16 or f32)"),
+            _ => anyhow::bail!("unknown decode precision {s:?} (expected auto, int16 or f32)"),
         }
     }
 }
@@ -129,7 +138,7 @@ impl std::str::FromStr for Decode {
 pub struct Scheduling {
     /// Requests decoding or prefilling at once (the rest wait).
     pub max_streams: usize,
-    /// Most requests one decode pass advances; `None`: [`Decode::default_rows`].
+    /// Most requests one decode pass advances; `None`: [`default_decode_rows`].
     pub decode_rows: Option<usize>,
     /// Finished requests kept in the response cache (0: none).
     pub response_cache: usize,
@@ -174,12 +183,13 @@ impl Default for LoadOptions {
 }
 
 impl LoadOptions {
-    /// The engine's configuration, with or without the draft model.
-    pub(crate) fn engine_config(&self, draft: Option<&DraftOptions>) -> EngineConfig {
+    /// The engine's configuration, with or without the draft model, for the target's
+    /// decode kernels `gemv`.
+    pub(crate) fn engine_config(&self, draft: Option<&DraftOptions>, gemv: Gemv) -> EngineConfig {
         let s = &self.scheduling;
         let mut cfg = EngineConfig {
             max_streams: s.max_streams,
-            decode_rows: s.decode_rows.unwrap_or(self.decode.default_rows()),
+            decode_rows: s.decode_rows.unwrap_or(default_decode_rows(gemv)),
             response_cache: s.response_cache,
             ..EngineConfig::default()
         };

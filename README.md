@@ -121,7 +121,7 @@ A single stream without a draft model decodes at about the same speed as Ollama
 - **GPU and model tests:** `cargo test --release -p yaxus-backend-wgpu -- --ignored`.
   These need a GPU and the models in the Hugging Face cache.
 - **Software Vulkan:** the kernel tests also run on lavapipe, as in CI:
-  `YAXUS_SOFTWARE_VULKAN=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+  `YAXUS_SOFTWARE_GPU=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 - **CI:** runs `cargo fmt --check` and `cargo clippy` with warnings as errors, and the
   tests ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 
