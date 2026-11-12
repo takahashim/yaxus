@@ -7,8 +7,6 @@ use crate::plan::{self, GluPlan, MatmulCase, MatmulPlan, Piece};
 use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_int, gemv_int};
 
 impl Gpu {
-    /// `x · w^T`; passes of up to 16 rows (and more where the integer GEMVs win) take
-    /// the kernels `gemv` says.
     /// Whether `msl::gemv2` gives a row the same bits alone (the scalar kernel) and in
     /// passes of 8 and 16 rows (simdgroup matrices), on a Q8_0 matrix of varied values.
     /// The matrix kernel relies on the device multiplying 8x8 matrices as an `fma` chain
@@ -36,11 +34,13 @@ impl Gpu {
             })
             .collect();
         let Some(m) = self.load_ggml(yaxus_model::ggml::GgmlType::Q8_0, &bytes, n, k) else { return false };
-        let w = Weight::Matrix(m);
+        // (gemv2 itself, whatever the plan would take)
         let run = |g: &mut Gpu, r0: usize, rows: usize| {
             let xt = g.tensor(rows, k);
             g.dev.write(xt.buf(), 0, bytemuck::cast_slice(&x[r0 * k..(r0 + rows) * k]));
-            let y = g.matmul(&xt, &w, Gemv::F32);
+            let y = g.tensor(rows, n);
+            let pieces = plan::gemv2_pieces(0, rows, false, &g.tuning.apple);
+            g.run_pieces(&xt, &y, &m, n, false, &pieces);
             g.to_host(&y)
         };
         let all = run(self, 0, t);
@@ -51,6 +51,8 @@ impl Gpu {
             && [0, 9, 15].iter().enumerate().all(|(i, &r)| same(&ones[i * n..(i + 1) * n], &all[r * n..(r + 1) * n]))
     }
 
+    /// `x · w^T`; passes of up to 16 rows (and more where the integer GEMVs win) take
+    /// the kernels `gemv` says.
     pub(crate) fn matmul(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
         let (n, k) = (m.n, m.k);
@@ -96,6 +98,8 @@ impl Gpu {
         all.extend(if plan.is_gemm() && !coop8 { m.prefill_bufs() } else { m.decode_bufs() });
         let refs: Vec<&Buf> = all.iter().collect();
         let (n32, k32) = (n as u32, k as u32);
+        // The rows the dispatches below compute (gemv2 takes and accounts for a rest).
+        let mut rows = t;
         let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {
             MatmulPlan::GemvMulti { first } => [(0, first), (first, t - first)]
                 .into_iter()
@@ -111,6 +115,7 @@ impl Gpu {
             }
             MatmulPlan::GemmCoop { gemv2_rest } => {
                 let tiled = t - gemv2_rest;
+                rows = tiled;
                 let rest = plan::gemv2_pieces(tiled, gemv2_rest, false, &self.tuning.apple);
                 self.run_pieces(x, &y, m, n, false, &rest);
                 if tiled == 0 {
@@ -137,7 +142,7 @@ impl Gpu {
             }
             self.dispatch(&name, &refs, &params, groups);
         }
-        self.account(2.0 * (t * n * k) as f64);
+        self.account(2.0 * (rows * n * k) as f64);
         y
     }
 
