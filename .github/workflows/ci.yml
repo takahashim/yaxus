@@ -89,6 +89,26 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Metal's compiled shaders, kept from run to run: with the cache empty, compiling the
+      # kernels is most of the tests' time (M2: integer_rows 19.5 s cold, 0.5 s warm;
+      # matmul_kernels 47 s, 4.2 s). The cache's directory may differ between runners, so
+      # it is copied to and from a fixed one.
+      - name: Shader cache directory
+        id: shaders
+        run: echo "dir=$(getconf DARWIN_USER_CACHE_DIR)com.apple.metal" >> "$GITHUB_OUTPUT"
+      - name: Restore the shader cache
+        id: restore-shaders
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/metal-shaders
+          key: metal-shaders-${{ runner.os }}-${{ hashFiles('crates/yaxus-backend-gpu/src/**') }}
+          restore-keys: metal-shaders-${{ runner.os }}-
+      - name: Use the restored shader cache
+        run: |
+          if [ -d ~/metal-shaders ]; then
+            mkdir -p "${{ steps.shaders.outputs.dir }}"
+            cp -R ~/metal-shaders/. "${{ steps.shaders.outputs.dir }}/"
+          fi
       - name: Clippy
         run: cargo clippy -p yaxus-backend-gpu --all-targets
       - name: Device
@@ -97,3 +117,14 @@ jobs:
         run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored --nocapture reports_the_device
       - name: Kernel tests
         run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored
+      - name: Take the shader cache
+        if: always() && steps.restore-shaders.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/metal-shaders
+          if [ -d "${{ steps.shaders.outputs.dir }}" ]; then cp -R "${{ steps.shaders.outputs.dir }}" ~/metal-shaders; fi
+      - name: Save the shader cache
+        if: always() && steps.restore-shaders.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/metal-shaders
+          key: ${{ steps.restore-shaders.outputs.cache-primary-key }}

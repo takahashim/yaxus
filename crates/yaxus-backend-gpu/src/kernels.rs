@@ -307,10 +307,20 @@ impl Gpu {
             return;
         }
         let t0 = std::time::Instant::now();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
+        let n = jobs.len();
+        self.compile_all(&jobs);
+        if self.diag.compile_log {
+            eprintln!("[compile] {n} kernels ahead of use, {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    /// Compiles `jobs` on all cores and adds them in their order (a cold shader cache
+    /// makes a kernel cost a compiler run: on CI's virtual Apple GPUs, ~0.2 s each).
+    fn compile_all(&mut self, jobs: &[Job]) {
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len()).max(1);
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (compiler, jobs) = (self.dev.compiler(self.compile), &jobs);
-        let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
+        let compiler = self.dev.compiler(self.compile);
+        let mut built: Vec<(usize, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
                     s.spawn(|| {
@@ -319,7 +329,7 @@ impl Gpu {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
                             let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
-                            out.push((name.clone(), compiler.compile(name, &src, read_only)));
+                            out.push((i, compiler.compile(name, &src, read_only)));
                         }
                         out
                     })
@@ -327,19 +337,19 @@ impl Gpu {
                 .collect();
             workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
         });
-        if self.diag.compile_log {
-            eprintln!("[compile] {} kernels ahead of use, {:.0} ms", built.len(), t0.elapsed().as_secs_f64() * 1e3);
-        }
-        for (name, k) in built {
-            self.insert_kernel(name, k);
+        built.sort_by_key(|(i, _)| *i);
+        for (i, k) in built {
+            self.insert_kernel(jobs[i].0.clone(), k);
         }
     }
 
     pub(crate) fn build_kernels(&mut self) {
         let t0 = std::time::Instant::now();
-        for (name, src, read_only) in base_sources(&self.caps, &self.tuning) {
-            self.add_kernel(name, &src, read_only);
-        }
+        let jobs: Vec<Job> = base_sources(&self.caps, &self.tuning)
+            .into_iter()
+            .map(|(name, src, read_only)| (name, read_only.to_vec(), Box::new(move || src.clone()) as _))
+            .collect();
+        self.compile_all(&jobs);
         if self.diag.compile_log {
             eprintln!("[compile] {} base kernels, {:.0} ms", self.kernels.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
