@@ -102,7 +102,19 @@ impl Gpu {
                 vec![(name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
             }
             MatmulPlan::GemmCoop => {
-                vec![(name::gemm_coop(m.fmt), [n32, k32, t as u32, 0], ((n / 64) as u32, t.div_ceil(64) as u32))]
+                // A tile costs its 64 rows whatever it holds: a short rest goes to gemv2.
+                let rest = t % 64;
+                let tail = rest > 0
+                    && rest <= self.tuning.gemv2_tail_rows
+                    && crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k);
+                let tiled = if tail { t - rest } else { t };
+                if tail {
+                    self.gemv2(x, &y, m, n, false, tiled, rest);
+                }
+                if tiled == 0 {
+                    return y;
+                }
+                vec![(name::gemm_coop(m.fmt), [n32, k32, tiled as u32, 0], ((n / 64) as u32, tiled.div_ceil(64) as u32))]
             }
             MatmulPlan::GemmF32 => {
                 vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
@@ -156,6 +168,30 @@ impl Gpu {
         self.dispatch(&kernel, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
         self.account(2.0 * (n2 * k) as f64);
         y
+    }
+
+    /// `msl::gemv2` on rows `r0 .. r0 + rows` of `x` into the same rows of `y`, in
+    /// dispatches of at most `msl::gemv2_max_rows` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv2(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool, r0: usize, rows: usize) {
+        let k = x.cols;
+        if self.dev.timing() {
+            self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
+        }
+        let mut bufs = vec![y.buf().clone(), x.buf().clone()];
+        bufs.extend(m.decode_bufs());
+        let refs: Vec<&Buf> = bufs.iter().collect();
+        let max = crate::msl::gemv2_max_rows();
+        for start in (r0..r0 + rows).step_by(max) {
+            let t = max.min(r0 + rows - start);
+            let kernel = self.int_kernel(name::gemv2(t, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
+                crate::msl::gemv2(m.fmt, t, glu).unwrap()
+            });
+            let per = crate::msl::gemv2_outputs(t, glu);
+            let imm = [n as u32, k as u32, t as u32, start as u32];
+            self.dispatch(&kernel, &refs, &imm, grid(n.div_ceil(per) as u32));
+        }
+        self.account(2.0 * (rows * n * k) as f64 * if glu { 2.0 } else { 1.0 });
     }
 
     /// `y = x W^T` for more than 16 rows with integer dot products (`gemm_int`): the rows
@@ -282,24 +318,7 @@ impl Gpu {
     fn gemv_f32(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool) {
         let (t, k) = (x.rows, x.cols);
         if crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k) {
-            if self.dev.timing() {
-                self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
-            }
-            let mut bufs = vec![y.buf().clone(), x.buf().clone()];
-            bufs.extend(m.decode_bufs());
-            let refs: Vec<&Buf> = bufs.iter().collect();
-            let max = crate::msl::gemv2_max_rows();
-            for r0 in (0..t).step_by(max) {
-                let rows = max.min(t - r0);
-                let kernel =
-                    self.int_kernel(name::gemv2(rows, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
-                        crate::msl::gemv2(m.fmt, rows, glu).unwrap()
-                    });
-                let per = crate::msl::gemv2_outputs(rows, glu);
-                let imm = [n as u32, k as u32, rows as u32, r0 as u32];
-                self.dispatch(&kernel, &refs, &imm, grid(n.div_ceil(per) as u32));
-            }
-            self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
+            self.gemv2(x, y, m, n, glu, 0, t);
             return;
         }
         if crate::plan::gemv_q_takes(&self.caps, &self.tuning, m.fmt) {

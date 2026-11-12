@@ -154,6 +154,10 @@ pub struct Tuning {
     /// take it instead: a scalar kernel for 1 or 2 rows, simdgroup matrices for more, with
     /// the same arithmetic.
     pub gemv2: bool,
+    /// Passes of more than 16 rows on the matrix GEMM give a rest of at most this many
+    /// rows past the last whole 64-row tile to gemv2, in passes of up to 16 rows (M2,
+    /// 2B Q4_K_M, ms: a tile 166, gemv2 16 rows 56, 8 rows 35).
+    pub gemv2_tail_rows: usize,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -203,6 +207,7 @@ impl Tuning {
             gemv_q: false,
             msl_small: false,
             gemv2: false,
+            gemv2_tail_rows: 40,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -288,6 +293,9 @@ impl Tuning {
             Some("0") => self.gemv_f32 = false,
             Some("1") => self.gemv_f32 = true,
             _ => {}
+        }
+        if let Some(v) = var("YAXUS_GEMV2_TAIL").and_then(|v| v.parse().ok()) {
+            self.gemv2_tail_rows = v;
         }
         match var("YAXUS_GEMV2").as_deref() {
             Some("0") => self.gemv2 = false,

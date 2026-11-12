@@ -157,6 +157,72 @@ static inline void load32(device const uint* wq, device const uint* wsc, uint k,
 }
 "
         }
+        Format::Q3 => {
+            "// 3 u32 per 32 values (2 of low 2-bit fields, one per 16; 1 of high bits, 16 per
+// half); scales as for Q6: per row K / 256 f16 `d`, then K / 16 int8 scales.
+static inline float q3scale(device const uint* wsc, uint k, uint row, uint blk) {
+    const uint hb = k / 256u;
+    uint rs = (18u * hb + 3u) / 4u;
+    rs += ((rs * 4u) % 512u == 0u) ? 4u : 0u;
+    const uint base = row * rs;
+    const half2 d2 = as_type<half2>(wsc[base + blk / 32u]);
+    const float d = ((blk / 16u) & 1u) ? float(d2.y) : float(d2.x);
+    const uint off = 2u * hb + blk;
+    const char sc = as_type<char4>(wsc[base + off / 4u])[off % 4u];
+    return d * float(sc);
+}
+static inline float q3val(uint lo, uint h, uint e, float s) {
+    return (float(((lo >> (2u * e)) & 3u) | (((h >> e) & 1u) << 2u)) - 4.0f) * s;
+}
+static inline void load8(device const uint* wq, device const uint* wsc, uint k, uint row, uint kk, thread float* w) {
+    const uint c = kk / 32u;
+    const uint half_ = (kk % 32u) / 16u;
+    const uint e0 = kk % 16u;
+    const uint g = row * (3u * k / 32u) + 3u * c;
+    const uint lo = wq[g + half_];
+    const uint h = wq[g + 2u] >> (16u * half_);
+    const float s = q3scale(wsc, k, row, 2u * c + half_);
+    for (uint i = 0; i < 8; i++) { w[i] = q3val(lo, h, e0 + i, s); }
+}
+// The 32 values of chunk c, as `load8` gives them.
+static inline void load32(device const uint* wq, device const uint* wsc, uint k, uint row, uint c, thread float* w) {
+    const uint g = row * (3u * k / 32u) + 3u * c;
+    const uint l0 = wq[g];
+    const uint l1 = wq[g + 1u];
+    const uint h = wq[g + 2u];
+    const float s0 = q3scale(wsc, k, row, 2u * c);
+    const float s1 = q3scale(wsc, k, row, 2u * c + 1u);
+    for (uint e = 0; e < 16; e++) { w[e] = q3val(l0, h, e, s0); }
+    for (uint e = 0; e < 16; e++) { w[16 + e] = q3val(l1, h >> 16u, e, s1); }
+}
+"
+        }
+        Format::Q2 => {
+            "// 16 values per u32; per row K / 256 pairs of f16 (`d`, `dmin`), then K / 16 bytes of
+// scale | min << 4. A weight is `q * d * scale - dmin * min`.
+static inline float2 q2sm(device const uint* wsc, uint k, uint row, uint blk) {
+    const uint hb = k / 256u;
+    const uint base = row * 5u * hb;
+    const half2 dd = as_type<half2>(wsc[base + blk / 16u]);
+    const uint b = wsc[base + hb + blk / 4u] >> (8u * (blk % 4u));
+    return float2(float(dd.x) * float(b & 15u), float(dd.y) * float((b >> 4u) & 15u));
+}
+static inline void load8(device const uint* wq, device const uint* wsc, uint k, uint row, uint kk, thread float* w) {
+    const uint j = kk / 16u;
+    const uint u = wq[row * (k / 16u) + j] >> (2u * (kk % 16u));
+    const float2 sm = q2sm(wsc, k, row, j);
+    for (uint i = 0; i < 8; i++) { w[i] = fma(float((u >> (2u * i)) & 3u), sm.x, -sm.y); }
+}
+// The 32 values of chunk c, as `load8` gives them, in one read.
+static inline void load32(device const uint* wq, device const uint* wsc, uint k, uint row, uint c, thread float* w) {
+    const uint2 u = *(device const uint2*)(wq + row * (k / 16u) + 2u * c);
+    const float2 s0 = q2sm(wsc, k, row, 2u * c);
+    const float2 s1 = q2sm(wsc, k, row, 2u * c + 1u);
+    for (uint e = 0; e < 16; e++) { w[e] = fma(float((u.x >> (2u * e)) & 3u), s0.x, -s0.y); }
+    for (uint e = 0; e < 16; e++) { w[16 + e] = fma(float((u.y >> (2u * e)) & 3u), s1.x, -s1.y); }
+}
+"
+        }
         _ => return None,
     })
 }
