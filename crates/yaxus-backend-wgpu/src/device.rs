@@ -150,6 +150,10 @@ pub struct Tuning {
     /// The small per-row kernels (`rmsnorm`, `add_norm`, `qk_rope`) in MSL where the
     /// device takes it (`msl::small_kernels`).
     pub msl_small: bool,
+    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv2` reads
+    /// take it instead: a scalar kernel for 1 or 2 rows, simdgroup matrices for more, with
+    /// the same arithmetic.
+    pub gemv2: bool,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -198,6 +202,7 @@ impl Tuning {
             gemv_mma: false,
             gemv_q: false,
             msl_small: false,
+            gemv2: false,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -224,6 +229,10 @@ impl Tuning {
             t.gemv = Gemv::F32;
             t.gemv_f32 = true;
             t.msl_small = true;
+            // (M2, 2B Q4_K_M, ms per pass of 1 / 2 / 4 / 8 / 16 rows: gemv_f32 22.5 / 28.2 /
+            // 40.9 / 59.4 / 140, gemv2 21.1 / 26.4 / 34.0 / 34.9 / 55.8; checked at start,
+            // `Gpu::gemv2_rows_agree`)
+            t.gemv2 = true;
             // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
             // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
             // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
@@ -278,6 +287,11 @@ impl Tuning {
         match var("YAXUS_GEMV_F32").as_deref() {
             Some("0") => self.gemv_f32 = false,
             Some("1") => self.gemv_f32 = true,
+            _ => {}
+        }
+        match var("YAXUS_GEMV2").as_deref() {
+            Some("0") => self.gemv2 = false,
+            Some("1") => self.gemv2 = true,
             _ => {}
         }
         match var("YAXUS_MSL_SMALL").as_deref() {

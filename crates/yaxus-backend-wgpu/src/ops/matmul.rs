@@ -9,6 +9,48 @@ use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_i
 impl Gpu {
     /// `x · w^T`; passes of up to 16 rows (and more where the integer GEMVs win) take
     /// the kernels `gemv` says.
+    /// Whether `msl::gemv2` gives a row the same bits alone (the scalar kernel) and in
+    /// passes of 8 and 16 rows (simdgroup matrices), on a Q8_0 matrix of varied values.
+    /// The matrix kernel relies on the device multiplying 8x8 matrices as an `fma` chain
+    /// in order, measured on the M2 only; a device that does not is left without gemv2.
+    pub(crate) fn gemv2_rows_agree(&mut self) -> bool {
+        let (n, k, t) = (40, 512, 16);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut bytes = Vec::with_capacity(n * k / 32 * 34);
+        for _ in 0..n * k / 32 {
+            let d = half::f16::from_f32((1 + next() % 1000) as f32 * 1e-4);
+            bytes.extend_from_slice(&d.to_le_bytes());
+            bytes.extend((0..32).map(|_| next() as u8));
+        }
+        let x: Vec<f32> = (0..t * k)
+            .map(|_| {
+                let r = next();
+                let v = (r >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+                v * (1u64 << (r % 16)) as f32
+            })
+            .collect();
+        let Some(m) = self.load_ggml(yaxus_model::ggml::GgmlType::Q8_0, &bytes, n, k) else { return false };
+        let w = Weight::Matrix(m);
+        let run = |g: &mut Gpu, r0: usize, rows: usize| {
+            let xt = g.tensor(rows, k);
+            g.dev.write(xt.buf(), 0, bytemuck::cast_slice(&x[r0 * k..(r0 + rows) * k]));
+            let y = g.matmul(&xt, &w, Gemv::F32);
+            g.to_host(&y)
+        };
+        let all = run(self, 0, t);
+        let eight = run(self, 8, 8);
+        let ones: Vec<f32> = [0, 9, 15].iter().flat_map(|&r| run(self, r, 1)).collect();
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits());
+        same(&eight, &all[8 * n..])
+            && [0, 9, 15].iter().enumerate().all(|(i, &r)| same(&ones[i * n..(i + 1) * n], &all[r * n..(r + 1) * n]))
+    }
+
     pub(crate) fn matmul(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
         let (n, k) = (m.n, m.k);
@@ -239,6 +281,27 @@ impl Gpu {
     /// (`n` is then the intermediate size).
     fn gemv_f32(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool) {
         let (t, k) = (x.rows, x.cols);
+        if crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k) {
+            if self.dev.timing() {
+                self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
+            }
+            let mut bufs = vec![y.buf().clone(), x.buf().clone()];
+            bufs.extend(m.decode_bufs());
+            let refs: Vec<&Buf> = bufs.iter().collect();
+            let max = crate::msl::gemv2_max_rows();
+            for r0 in (0..t).step_by(max) {
+                let rows = max.min(t - r0);
+                let kernel =
+                    self.int_kernel(name::gemv2(rows, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
+                        crate::msl::gemv2(m.fmt, rows, glu).unwrap()
+                    });
+                let per = crate::msl::gemv2_outputs(rows, glu);
+                let imm = [n as u32, k as u32, rows as u32, r0 as u32];
+                self.dispatch(&kernel, &refs, &imm, grid(n.div_ceil(per) as u32));
+            }
+            self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
+            return;
+        }
         if crate::plan::gemv_q_takes(&self.caps, &self.tuning, m.fmt) {
             let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
             let stage = crate::msl::gemv_q_stages(t, rw, glu, wgmem);

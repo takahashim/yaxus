@@ -181,6 +181,43 @@ pub(crate) struct MetalDev {
     last: Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
     /// An allocation that failed since `take_failure` (a small buffer stood in for it).
     failed: std::cell::Cell<Option<u64>>,
+    /// `YAXUS_PROFILE=2`: each dispatch in a command buffer of its own, timed by the GPU.
+    pub(crate) timed: Option<Timed>,
+}
+
+/// Per-kernel GPU time: dispatches waiting to be read, and the totals by label.
+#[derive(Default)]
+pub(crate) struct Timed {
+    pending: Vec<(String, Retained<ProtocolObject<dyn MTLCommandBuffer>>)>,
+    totals: std::collections::HashMap<String, (f64, usize)>,
+}
+
+impl Timed {
+    fn collect(&mut self) {
+        for (label, c) in self.pending.drain(..) {
+            let e = self.totals.entry(label).or_default();
+            e.0 += c.GPUEndTime() - c.GPUStartTime();
+            e.1 += 1;
+        }
+    }
+
+    fn report(&self) {
+        if self.totals.is_empty() {
+            return;
+        }
+        let mut v: Vec<_> = self.totals.iter().collect();
+        v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let total: f64 = v.iter().map(|x| x.1.0).sum();
+        eprintln!("[metal kernels] total {:.1} ms (GPU time of each dispatch alone)", total * 1e3);
+        for (name, (s, n)) in v {
+            eprintln!(
+                "  {name:<34} {:>9.2} ms {:>5.1}%  {n:>6} calls  {:>8.1} us/call",
+                s * 1e3,
+                100.0 * s / total,
+                s * 1e6 / *n as f64
+            );
+        }
+    }
 }
 
 // SAFETY: the device, queue and command objects are only used under the `Gpu` mutex.
@@ -189,7 +226,7 @@ unsafe impl Send for MetalDev {}
 const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 
 impl MetalDev {
-    pub(crate) fn open() -> Result<(MetalDev, DeviceCaps)> {
+    pub(crate) fn open(timed: bool) -> Result<(MetalDev, DeviceCaps)> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
         let caps = DeviceCaps {
@@ -207,7 +244,8 @@ impl MetalDev {
             timestamps: false,
             max_workgroup_storage: (device.maxThreadgroupMemoryLength() as u32).min(65536),
         };
-        Ok((MetalDev { device, queue, cmd: None, enc: None, last: None, failed: Default::default() }, caps))
+        let timed = timed.then(Timed::default);
+        Ok((MetalDev { device, queue, cmd: None, enc: None, last: None, failed: Default::default(), timed }, caps))
     }
 
     pub(crate) fn compiler(&self, settings: CompileSettings) -> MetalCompiler {
@@ -321,7 +359,18 @@ impl MetalDev {
         blit.endEncoding();
     }
 
-    pub(crate) fn dispatch(&mut self, k: &MetalKernel, bufs: &[&Buf], imm: &[u32; 8], groups: (u32, u32)) {
+    pub(crate) fn dispatch(
+        &mut self,
+        k: &MetalKernel,
+        bufs: &[&Buf],
+        imm: &[u32; 8],
+        groups: (u32, u32),
+        label: Option<String>,
+    ) {
+        // (timed: the work so far in its own command buffer, then this dispatch alone)
+        if self.timed.is_some() {
+            self.submit();
+        }
         if self.enc.is_none() {
             let e = self.cmd().computeCommandEncoder().expect("a compute encoder");
             self.enc = Some(e);
@@ -346,6 +395,13 @@ impl MetalDev {
         let grid = MTLSize { width: groups.0 as usize, height: groups.1 as usize, depth: 1 };
         let tg = MTLSize { width: k.threads, height: 1, depth: 1 };
         e.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        if self.timed.is_some() {
+            self.end_compute();
+            let c = self.cmd.take().unwrap();
+            c.commit();
+            self.last = Some(c.clone());
+            self.timed.as_mut().unwrap().pending.push((label.unwrap_or_default(), c));
+        }
     }
 
     pub(crate) fn submit(&mut self) {
@@ -359,6 +415,9 @@ impl MetalDev {
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         self.submit();
         self.wait();
+        if let Some(t) = &mut self.timed {
+            t.collect();
+        }
         let b = mb(src);
         assert!((offset + size) as usize <= b.length());
         // SAFETY: in bounds, and the GPU is idle.
@@ -372,5 +431,9 @@ impl Drop for MetalDev {
     fn drop(&mut self) {
         self.submit();
         self.wait();
+        if let Some(t) = &mut self.timed {
+            t.collect();
+            t.report();
+        }
     }
 }

@@ -111,6 +111,12 @@ pub(crate) fn gemv_mma_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format, k:
     tuning.gemv_mma && caps.msl && crate::msl::gemv_mma_reads(fmt) && k.is_multiple_of(32)
 }
 
+/// Whether a `GemvF32` pass over a matrix of `fmt` with `k` columns runs `msl::gemv2` (for
+/// every row count alike).
+pub(crate) fn gemv2_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format, k: usize) -> bool {
+    tuning.gemv2 && caps.msl && crate::msl::gemv2_reads(fmt) && k.is_multiple_of(256)
+}
+
 /// Whether a `GemvF32` pass over a matrix of `fmt` runs `msl::gemv_q` (for every row count
 /// alike).
 pub(crate) fn gemv_q_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format) -> bool {

@@ -80,7 +80,7 @@ impl Dev {
     pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
         #[cfg(target_os = "macos")]
         if std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal") {
-            let (d, caps) = metal::MetalDev::open()?;
+            let (d, caps) = metal::MetalDev::open(diag.profile == Some(2))?;
             return Ok((Dev::Metal(d), caps));
         }
         let (d, caps) = wgpu::WgpuDev::open(diag)?;
@@ -105,6 +105,7 @@ impl Dev {
     }
 
     /// The largest buffer the device allocates.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub(crate) fn max_buffer(&self) -> u64 {
         match self {
             Dev::Wgpu(d) => d.device.limits().max_buffer_size,
@@ -173,7 +174,7 @@ impl Dev {
         match (self, &k.imp) {
             (Dev::Wgpu(d), KernelImpl::Wgpu(w)) => d.dispatch(k.id, w, bufs, imm, groups, label),
             #[cfg(target_os = "macos")]
-            (Dev::Metal(d), KernelImpl::Metal(m)) => d.dispatch(m, bufs, imm, groups),
+            (Dev::Metal(d), KernelImpl::Metal(m)) => d.dispatch(m, bufs, imm, groups, label),
             #[cfg(target_os = "macos")]
             _ => panic!("a kernel of another device"),
         }
@@ -202,7 +203,7 @@ impl Dev {
         match self {
             Dev::Wgpu(d) => d.kernels_profile.is_some(),
             #[cfg(target_os = "macos")]
-            Dev::Metal(_) => false,
+            Dev::Metal(d) => d.timed.is_some(),
         }
     }
 
