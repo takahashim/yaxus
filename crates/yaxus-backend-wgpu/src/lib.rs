@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use yaxus_model::{Backend, Config, LayerMeta, PassMeta, Quant, TensorRef};
 
-use device::Diagnostics;
+use device::{CompileSettings, Diagnostics};
 pub use device::{DeviceCaps, Tuning, Vendor};
 use kernels::Kernel;
 use ops::{ARGMAX_ROWS, ARGMAX_SLICES};
@@ -92,6 +92,7 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     caps: DeviceCaps,
+    compile: CompileSettings,
     tuning: Tuning,
     diag: Diagnostics,
     kernels: HashMap<String, Kernel>,
@@ -249,6 +250,7 @@ impl Gpu {
         let timed = diag.profile == Some(2) && caps.timestamps;
         let (f16, coop, subgroups) = (caps.f16, caps.coop, caps.subgroups);
         let tuning = Tuning::for_device(&caps).with_env();
+        let compile = CompileSettings::for_device(&caps).with_env();
         let limits = wgpu::Limits {
             max_buffer_size: alimits.max_buffer_size,
             max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
@@ -339,6 +341,7 @@ impl Gpu {
             queue,
             gemm: tuning.gemm,
             tuning,
+            compile,
             caps,
             kernels: HashMap::new(),
             encoder: None,

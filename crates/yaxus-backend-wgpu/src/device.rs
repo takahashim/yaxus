@@ -1,5 +1,6 @@
-//! What the GPU can do ([`DeviceCaps`], detected from the adapter) and the measured
-//! choices the kernels are run with on it ([`Tuning`]).
+//! What the GPU can do ([`DeviceCaps`], detected from the adapter), how the kernels are
+//! compiled for it ([`CompileSettings`]) and the measured choices they are run with on
+//! it ([`Tuning`]).
 
 use crate::{GemmKind, Gemv};
 
@@ -230,6 +231,45 @@ impl Tuning {
             GemmKind::Int8 => self.gemv_int8_max_rows,
             GemmKind::Coop | GemmKind::Int16 => self.gemv_int_max_rows,
         }
+    }
+}
+
+/// The safety code naga and wgpu add to every kernel, where the kernels do without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompileSettings {
+    /// naga's counter on every loop against infinite loops. On Metal it keeps the
+    /// compiler from unrolling them: private arrays indexed by the loop (the f32 GEMM's
+    /// accumulators) then live in memory, and the 256-row f32 pass of the 2B took 15.4 s
+    /// instead of 1.7 s on an M2. The kernels' loops all end (their bounds are shapes).
+    pub loop_bounding: bool,
+    /// Zeroing workgroup memory on entry. Every kernel writes its workgroup memory before
+    /// reading it; on Metal naga zeroes it from one lane per workgroup (32 KiB in
+    /// `gemvm16`, an 8-row f32 pass of the 2B 1.8 s instead of 0.17 s on an M2).
+    pub zero_workgroup_memory: bool,
+}
+
+impl CompileSettings {
+    /// Off on Metal, where both were measured; wgpu's defaults elsewhere.
+    pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
+        let metal = caps.backend == wgpu::Backend::Metal;
+        CompileSettings { loop_bounding: !metal, zero_workgroup_memory: !metal }
+    }
+
+    /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`
+    /// and `YAXUS_ZERO_WGMEM=0|1`.
+    pub(crate) fn with_env(mut self) -> Self {
+        let flag = |name: &str| match std::env::var(name).as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        };
+        if let Some(v) = flag("YAXUS_LOOP_BOUNDING") {
+            self.loop_bounding = v;
+        }
+        if let Some(v) = flag("YAXUS_ZERO_WGMEM") {
+            self.zero_workgroup_memory = v;
+        }
+        self
     }
 }
 

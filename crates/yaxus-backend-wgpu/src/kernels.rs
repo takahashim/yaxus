@@ -1,6 +1,7 @@
 //! Compiling the kernels: the base set when the device opens, the integer kernels of a
 //! model's formats ahead of use, and the rest on first use.
 
+use crate::device::CompileSettings;
 use crate::shaders;
 use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
 
@@ -76,18 +77,21 @@ pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLay
     }
 }
 
-pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_only: &[bool]) -> Kernel {
+pub(crate) fn compile_kernel(
+    device: &wgpu::Device,
+    settings: CompileSettings,
+    name: &str,
+    src: &str,
+    read_only: &[bool],
+) -> Kernel {
     let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
     let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-    let metal = device.adapter_info().backend == wgpu::Backend::Metal;
-    // On Metal naga guards every loop with a counter against infinite loops, which keeps
-    // the compiler from unrolling them: private arrays indexed by the loop (the f32
-    // GEMM's accumulators) then live in memory, and the 256-row f32 pass of the 2B took
-    // 15.4 s instead of 1.7 s on an M2. The kernels' loops all end (their bounds are
-    // shapes), so the guard is left out there. (Vulkan keeps wgpu's checks until
-    // measured.)
-    let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: !metal, ..wgpu::ShaderRuntimeChecks::checked() };
-    // SAFETY: the loops of the kernels are bounded (see above); bounds checks stay on.
+    let checks = wgpu::ShaderRuntimeChecks {
+        force_loop_bounding: settings.loop_bounding,
+        ..wgpu::ShaderRuntimeChecks::checked()
+    };
+    // SAFETY: the kernels' loops are bounded by shapes (see `CompileSettings`); bounds
+    // checks stay on.
     let module = unsafe { device.create_shader_module_trusted(desc, checks) };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     let layout =
@@ -102,11 +106,8 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
         layout: Some(&pl),
         module: &module,
         entry_point: Some("main"),
-        // Every kernel writes its workgroup memory before reading it. On Metal naga would
-        // zero it from one lane per workgroup on entry (32 KiB in `gemvm16`, an 8-row
-        // f32 pass of the 2B 1.8 s instead of 0.17 s on an M2).
         compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: !metal,
+            zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
             ..Default::default()
         },
         cache: None,
@@ -116,7 +117,7 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
 
 impl Gpu {
     pub(crate) fn add_kernel(&mut self, name: String, src: &str, read_only: &[bool]) {
-        let k = compile_kernel(&self.device, &name, src, read_only);
+        let k = compile_kernel(&self.device, self.compile, &name, src, read_only);
         self.insert_kernel(name, k);
     }
 
@@ -191,7 +192,7 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (device, jobs) = (&self.device, &jobs);
+        let (device, settings, jobs) = (&self.device, self.compile, &jobs);
         let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -200,7 +201,7 @@ impl Gpu {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            out.push((name.clone(), compile_kernel(device, name, &source(), read_only)));
+                            out.push((name.clone(), compile_kernel(device, settings, name, &source(), read_only)));
                         }
                         out
                     })
