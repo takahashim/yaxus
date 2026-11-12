@@ -65,8 +65,8 @@ fn check_text(value: &str, name: &str, allow_empty: bool) -> Result<(), PromptEr
     Ok(())
 }
 
-/// Validates a PFML3 language code (`en`, `ja`, `zh-hans`, `ja-easy`, ...).
-pub fn validate_lang(value: &str, name: &str) -> Result<(), PromptError> {
+/// Checks a PFML3 language code (`en`, `ja`, `zh-hans`, `ja-easy`, ...).
+fn check_lang(value: &str, name: &str) -> Result<(), PromptError> {
     check_text(value, name, false)?;
     let parts: Vec<&str> = value.split('-').collect();
     let bad_shape = parts.len() > 2
@@ -88,9 +88,16 @@ fn alias(lang: &str) -> &str {
     if lang == "ja(easy)" { "ja-easy" } else { lang }
 }
 
-/// Checks a text to translate (or a history entry): not blank, no reserved tokens.
-pub fn validate_message(text: &str) -> Result<(), PromptError> {
+/// Checks a text to translate (or a side of a history pair): not blank, no reserved
+/// tokens. The template calls them all messages.
+fn check_message(text: &str) -> Result<(), PromptError> {
     check_text(text, "message content", false)
+}
+
+/// Checks a pair that a request may have in its history: both sides are messages.
+pub fn validate_history_pair(pair: &Pair) -> Result<(), PromptError> {
+    check_message(&pair.source)?;
+    check_message(&pair.target)
 }
 
 /// What [`TranslationRequest::validate_options`] checks, in normalized form.
@@ -109,10 +116,10 @@ impl TranslationRequest {
 
     fn options(&self) -> Result<Options, PromptError> {
         let target_lang = alias(&self.target_lang);
-        validate_lang(target_lang, "target_lang")?;
+        check_lang(target_lang, "target_lang")?;
         let source_lang = self.source_lang.as_deref().map(alias);
         if let Some(s) = source_lang {
-            validate_lang(s, "source_lang")?;
+            check_lang(s, "source_lang")?;
         }
         if let Some(c) = &self.context {
             check_text(c, "context", true)?;
@@ -133,11 +140,8 @@ impl TranslationRequest {
 
     /// Checks the whole request, normalizing the language aliases.
     pub fn validate(self) -> Result<ValidRequest, PromptError> {
-        for pair in &self.history {
-            validate_message(&pair.source)?;
-            validate_message(&pair.target)?;
-        }
-        validate_message(&self.text)?;
+        self.history.iter().try_for_each(validate_history_pair)?;
+        check_message(&self.text)?;
         let Options { target_lang, source_lang, form } = self.options()?;
         Ok(ValidRequest { req: TranslationRequest { target_lang, source_lang, ..self }, form })
     }
@@ -250,7 +254,7 @@ mod tests {
     #[test]
     fn language_codes() {
         for ok in ["en", "ja", "ceb", "zh-hans", "ja-easy"] {
-            assert!(validate_lang(ok, "lang").is_ok(), "{ok}");
+            assert!(check_lang(ok, "lang").is_ok(), "{ok}");
         }
         for (bad, why) in [
             ("", "must not be empty"),
@@ -263,7 +267,7 @@ mod tests {
             ("zh-Hans", "without region subtags"),
             ("e1", "without region subtags"),
         ] {
-            assert!(validate_lang(bad, "lang").unwrap_err().0.contains(why), "{bad}");
+            assert!(check_lang(bad, "lang").unwrap_err().0.contains(why), "{bad}");
         }
         // The model card's alias.
         assert!(render(&req("x", "ja(easy)")).contains("<|plamo:val|>ja-easy<|plamo:msg|>"));
@@ -310,6 +314,9 @@ mod tests {
         let mut r = req("x", "en");
         r.glossary = vec![Pair { source: "a".into(), target: " ".into() }];
         assert!(err(&r).contains("glossary target must not be empty"));
+        // A history pair needs both sides.
+        assert!(validate_history_pair(&Pair { source: "a".into(), target: "b".into() }).is_ok());
+        assert!(validate_history_pair(&Pair { source: "a".into(), target: "\n".into() }).is_err());
         // An empty context is left out of the prompt.
         let mut r = req("x", "en");
         r.context = Some(String::new());

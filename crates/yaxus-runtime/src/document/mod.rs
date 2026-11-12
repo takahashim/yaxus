@@ -5,7 +5,7 @@
 
 use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
 use yaxus_model::DEFAULT_MAX_POS;
-use yaxus_pfml::{PromptError, TranslationRequest, is_blank, validate_message};
+use yaxus_pfml::{PromptError, TranslationRequest, is_blank, validate_history_pair};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::prompt::Prompt;
@@ -87,10 +87,7 @@ impl SegmentPrompter {
     /// no blank segments or translations, and no translation with reserved tokens (a
     /// control token the model emitted).
     fn with_history(&mut self, segments: &[String], i: usize, chain: usize, earlier: Vec<Pair>) -> TranslationRequest {
-        let usable: Vec<Pair> = earlier
-            .into_iter()
-            .filter(|p| validate_message(&p.source).is_ok() && validate_message(&p.target).is_ok())
-            .collect();
+        let usable: Vec<Pair> = earlier.into_iter().filter(|p| validate_history_pair(p).is_ok()).collect();
         let history = self.windows[chain].select(&usable).to_vec();
         TranslationRequest { history, ..self.bare(segments, i) }
     }
