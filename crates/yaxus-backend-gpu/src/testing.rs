@@ -4,7 +4,7 @@
 use anyhow::Result;
 use yaxus_model::Quant;
 
-use crate::{GemmKind, Gemv, Gpu, Weight, WgpuBackend};
+use crate::{GemmKind, Gemv, Gpu, GpuBackend, Weight};
 
 impl Gpu {
     /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
@@ -97,7 +97,7 @@ impl Gpu {
     }
 }
 
-impl WgpuBackend {
+impl GpuBackend {
     /// For tests: the attention of passes with more than 16 rows uses the tiled kernel,
     /// splitting keys until about `target_wgs` workgroups run (default 384), or the
     /// per-row kernel when `target_wgs` is 0.

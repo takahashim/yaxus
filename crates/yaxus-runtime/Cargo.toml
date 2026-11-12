@@ -14,7 +14,7 @@ yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-pfml = { path = "../yaxus-pfml" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
-yaxus-backend-wgpu = { path = "../yaxus-backend-wgpu" }
+yaxus-backend-gpu = { path = "../yaxus-backend-gpu" }
 
 [dev-dependencies]
 yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }

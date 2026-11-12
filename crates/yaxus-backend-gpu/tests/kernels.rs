@@ -1,11 +1,11 @@
 //! Matmul kernels (every path: gemv1, gemvm2..8, gemm, glu) against a host reference
 //! computed from the same quantized weights. Needs a GPU (Vulkan, or Metal on macOS):
-//! `cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored`
+//! `cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored`
 //! or a software one (lavapipe, as in CI; without 32-lane subgroups only the f32 decode
 //! kernels and the prefill GEMMs run): `YAXUS_SOFTWARE_GPU=1
 //! VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` in front.
 
-use yaxus_backend_wgpu::{GemmKind, Gemv, WgpuBackend};
+use yaxus_backend_gpu::{GemmKind, Gemv, GpuBackend};
 use yaxus_model::Quant;
 use yaxus_model::ggml::GgmlType;
 use yaxus_model::quant::{Q8_BLOCK, quantize_q4, quantize_q8};
@@ -71,7 +71,7 @@ fn reference(x: &[f32], t: usize, w: &[f32], n: usize, k: usize, glu: bool) -> V
 
 /// The prefill GEMM kinds this device has, and the error each may add to a product
 /// relative to the largest output (operands rounded to f16, to 15 bits, to 7 bits).
-fn gemm_kinds(gpu: &WgpuBackend) -> Vec<(GemmKind, f32)> {
+fn gemm_kinds(gpu: &GpuBackend) -> Vec<(GemmKind, f32)> {
     let mut kinds = vec![(GemmKind::F32, 0.0), (GemmKind::Int16, 3e-3), (GemmKind::Int8, 3e-2)];
     if gpu.caps().coop {
         kinds.push((GemmKind::Coop, 3e-3)); // (the default where matrix cores exist)
@@ -88,7 +88,7 @@ const GEMV_KINDS: [(Option<usize>, f32); 3] = [(None, 0.0), (Some(2), 3e-3), (So
 #[test]
 #[ignore]
 fn reports_the_device() {
-    let gpu = WgpuBackend::new().unwrap();
+    let gpu = GpuBackend::new().unwrap();
     let caps = gpu.caps();
     eprintln!("{caps:#?}\n{:#?}", gpu.tuning());
     if std::env::var_os("YAXUS_EXPECT_SUBGROUPS").is_some_and(|v| v == "1") {
@@ -99,7 +99,7 @@ fn reports_the_device() {
 #[test]
 #[ignore]
 fn matmul_kernels_match_host() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     // K multiple of 512 (gemvm) and not (fallback); N a multiple of 64 (matrix-core GEMM)
     // and not (tile tails).
     for (n, k) in [(256, 1536), (200, 1536), (130, 320)] {
@@ -150,7 +150,7 @@ fn matmul_kernels_match_host() {
 #[test]
 #[ignore]
 fn add_norm_matches_host() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     let (o1, o2, eps) = (1.0f32, 1.0f32, 1e-6f32);
     let norm = |v: &[f32]| 1.0 / (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32 + eps).sqrt();
     for cols in [64, 1000, 2560, 4096, 4352, 6000] {
@@ -206,7 +206,7 @@ fn ggml_blocks(t: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8> {
 #[test]
 #[ignore]
 fn ggml_matmul_kernels_match_host() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     // K a multiple of 256 (K-quant super-blocks); K = 4096 and 8192 pad the per-16 scale
     // rows, K = 8192 and 16384 the Q4_K header rows.
     for (n, k) in [(256, 1536), (200, 1536), (128, 8192), (64, 4096), (64, 16384)] {
@@ -250,7 +250,7 @@ fn ggml_matmul_kernels_match_host() {
 #[test]
 #[ignore]
 fn integer_rows_do_not_depend_on_the_pass() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     if !gpu.caps().subgroups {
         eprintln!("no 32-lane subgroups (the integer decode kernels need them); skipping");
         return;
@@ -288,7 +288,7 @@ fn integer_rows_do_not_depend_on_the_pass() {
 #[test]
 #[ignore]
 fn f32_rows_do_not_depend_on_the_pass() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     let strict = gpu.tuning().gemv_f32;
     gpu.set_gemm(GemmKind::F32);
     gpu.set_gemv(Gemv::F32);
@@ -320,7 +320,7 @@ fn f32_rows_do_not_depend_on_the_pass() {
 #[test]
 #[ignore]
 fn argmax_handles_a_whole_pass() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     let cols = 1000;
     // 1100: more than one dispatch's 512 rows, done in batches.
     for rows in [1, 64, 65, 300, 512, 1100] {
@@ -342,7 +342,7 @@ fn argmax_handles_a_whole_pass() {
 #[ignore]
 fn kv_cache_for_a_single_kind_of_layer() {
     use yaxus_model::{Backend, Config, LayerMeta, Rope};
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     let cfg: Config = serde_json::from_str(
         r#"{"hidden_size": 256, "num_hidden_layers": 2, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 128, "intermediate_size": 256,
@@ -363,7 +363,7 @@ fn kv_cache_for_a_single_kind_of_layer() {
 #[test]
 #[ignore]
 fn failed_allocations_are_errors() {
-    let mut gpu = WgpuBackend::new().unwrap();
+    let mut gpu = GpuBackend::new().unwrap();
     let too_big = gpu.max_buffer_size() + 4;
     assert!(gpu.debug_alloc(too_big).is_err());
     // The device is still usable afterwards.

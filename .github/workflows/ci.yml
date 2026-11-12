@@ -75,7 +75,7 @@ jobs:
         env:
           YAXUS_SOFTWARE_GPU: "1"
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
-        run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored
+        run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored
 
   metal:
     # The same kernel tests on Metal (the macOS runners' GPU is a virtual Apple GPU), and
@@ -90,10 +90,10 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy -p yaxus-backend-wgpu --all-targets
+        run: cargo clippy -p yaxus-backend-gpu --all-targets
       - name: Device
         env:
           YAXUS_EXPECT_SUBGROUPS: "1"
-        run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored --nocapture reports_the_device
+        run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored --nocapture reports_the_device
       - name: Kernel tests
-        run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored
+        run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored

@@ -1,4 +1,6 @@
-//! GPU backend: wgpu with hand-written WGSL kernels, on Vulkan (Metal on macOS). Weights
+//! GPU backend: hand-written WGSL kernels through wgpu, on Vulkan (Metal on macOS), and on
+//! Apple GPUs MSL kernels for the matrix products and the small per-row ops; Metal can also
+//! be reached without wgpu (`dev`, `YAXUS_DEVICE=metal`). Weights
 //! stay packed (Q8, Q4, the GGUF K-quants or bf16) and are decoded in the kernels;
 //! activations and the KV cache are f32. Matrix products round their input rows to 15 bits
 //! per block of 32 for integer dot products by default (`gemv_int`, `gemm_int`); with
@@ -13,7 +15,8 @@
 //!   how tensors are packed into them.
 //! - `commands`: recording, submission, uploads and read-backs; `kernels`: compilation;
 //!   `profile`: `YAXUS_PROFILE`.
-//! - `shaders`, `gemv_int`, `gemm_int`: the WGSL sources.
+//! - `dev`: the device layer (wgpu, or Metal directly); `msl`: the MSL sources.
+//! - `shaders`, `gemv_int`, `gemm_int`, `gemv_f32`: the WGSL sources.
 
 mod commands;
 mod dev;
@@ -91,7 +94,7 @@ pub struct Kv {
 }
 
 /// The GPU context: device, queue, kernels, the open command encoder and buffer pool.
-/// Shared by every model on the device through [`WgpuBackend`] handles.
+/// Shared by every model on the device through [`GpuBackend`] handles.
 pub struct Gpu {
     dev: Dev,
     caps: DeviceCaps,
@@ -258,7 +261,7 @@ impl Gpu {
 /// A handle to a shared [`Gpu`] context. Every model loaded through a handle shares the
 /// device, kernels and command encoder with the other handles of the same context, so
 /// work of several models (e.g. target and draft) can be recorded into one submission.
-pub struct WgpuBackend {
+pub struct GpuBackend {
     gpu: Arc<Mutex<Gpu>>,
     /// Bytes of weights loaded through this handle.
     weight_bytes: usize,
@@ -268,12 +271,12 @@ pub struct WgpuBackend {
     formats: Vec<Format>,
 }
 
-impl WgpuBackend {
+impl GpuBackend {
     /// Opens the platform's GPU (see [`Gpu::new`]), with the device's tuned kernels.
     pub fn new() -> Result<Self> {
         let gpu = Gpu::new()?;
         let gemv = gpu.tuning.gemv;
-        Ok(WgpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+        Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
     }
 
     /// What the device can do.
@@ -288,13 +291,13 @@ impl WgpuBackend {
 
     /// Another handle to the same context (for a second model).
     pub fn share(&self) -> Self {
-        WgpuBackend { gpu: self.gpu.clone(), weight_bytes: 0, gemv: self.gemv, formats: Vec::new() }
+        GpuBackend { gpu: self.gpu.clone(), weight_bytes: 0, gemv: self.gemv, formats: Vec::new() }
     }
 
     /// A handle on the same device for the draft model of a speculative pair, with the
     /// draft's counterpart of this handle's kernels ([`Gemv::for_draft`]).
     pub fn share_for_draft(&self) -> Self {
-        WgpuBackend { gemv: self.gemv.for_draft(), ..self.share() }
+        GpuBackend { gemv: self.gemv.for_draft(), ..self.share() }
     }
 
     fn g(&self) -> std::sync::MutexGuard<'_, Gpu> {
@@ -323,7 +326,7 @@ impl WgpuBackend {
     }
 }
 
-impl Backend for WgpuBackend {
+impl Backend for GpuBackend {
     type Tensor = Tensor;
     type Weight = Weight;
     type Kv = Kv;

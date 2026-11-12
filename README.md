@@ -5,7 +5,7 @@
 yaxus runs [PLaMo 3 Translate](https://huggingface.co/pfnet/plamo-3-translate-2b) as a
 translation server and command-line tool, written in Rust. It does not use llama.cpp or
 Python. It has its own model code, tokenizer and GPU kernels (WGSL through wgpu, on Vulkan or
-Metal) in one process.
+Metal, and MSL on Apple GPUs) in one process.
 
 - **Server:** `yaxus serve` serves HTTPS with a bearer token. It provides a JSON/SSE API
   and a web UI, and other machines connect through `yaxus client` or a browser.
@@ -122,7 +122,7 @@ A single stream without a draft model decodes at about the same speed as Ollama
 
 - **Default tests:** `cargo test --workspace`. Tests that need model files are ignored, or
   skip themselves when the files are missing.
-- **GPU and model tests:** `cargo test --release -p yaxus-backend-wgpu -- --ignored`.
+- **GPU and model tests:** `cargo test --release -p yaxus-backend-gpu -- --ignored`.
   These need a GPU and the models in the Hugging Face cache.
 - **Software Vulkan:** the kernel tests also run on lavapipe, as in CI:
   `YAXUS_SOFTWARE_GPU=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
