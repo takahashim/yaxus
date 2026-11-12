@@ -1,6 +1,6 @@
 //! Requests of the HTTP API as prompts.
 
-use yaxus_api::TranslateRequest;
+use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, TranslateRequest};
 use yaxus_pfml::{PromptError, TranslationRequest, ValidRequest};
 use yaxus_tokenizer::Tokenizer;
 
@@ -36,6 +36,18 @@ impl Prompt {
         Prompt { ids: tok.encode(&req.render(), false), memo: memory::key(req) }
     }
 
+    /// The prompt of an API request and its generation budget (`max_new_tokens`, cut to
+    /// what the prompt leaves of `max_context`). Its history is kept: a request that does
+    /// not fit is an error.
+    pub fn for_request(
+        tok: &Tokenizer,
+        r: &TranslateRequest,
+        max_context: usize,
+    ) -> Result<(Self, usize), PromptError> {
+        let req = prompt_request(r).validate()?;
+        Prompt::new(tok, &req).within(max_context, r.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS))
+    }
+
     /// The prompt of `req` such that it and the generation budget fit in `max_context`
     /// tokens: the budget is cut to what the prompt leaves, and the history is dropped
     /// only when that would leave less than `MIN_BUDGET` (or `max_new`, if smaller).
@@ -51,11 +63,17 @@ impl Prompt {
         if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.request().history.is_empty() {
             prompt = Prompt::new(tok, &req.without_history());
         }
-        if prompt.len() >= max_context {
-            return Err(PromptError(format!("prompt is {} tokens; the limit is {max_context}", prompt.len())));
+        prompt.within(max_context, max_new)
+    }
+
+    /// This prompt with the budget `max_new` cut to what it leaves of `max_context` (at
+    /// least 1), or an error when the prompt alone does not fit.
+    fn within(self, max_context: usize, max_new: usize) -> Result<(Self, usize), PromptError> {
+        if self.len() >= max_context {
+            return Err(PromptError(format!("prompt is {} tokens; the limit is {max_context}", self.len())));
         }
-        let max_new = max_new.min(max_context - prompt.len()).max(1);
-        Ok((prompt, max_new))
+        let max_new = max_new.min(max_context - self.len()).max(1);
+        Ok((self, max_new))
     }
 
     /// The token ids, for callers that build engine requests themselves (benchmarks).
@@ -79,5 +97,30 @@ impl Prompt {
 
     pub(crate) fn into_parts(self) -> (Vec<u32>, u64) {
         (self.ids, self.memo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_keeps_its_history_and_gets_the_budget_left() {
+        let tok = yaxus_tokenizer::testing::plamo_like(&[("x", 0.0)]);
+        let mut r = TranslateRequest {
+            text: "x".into(),
+            target_lang: "en".into(),
+            history: vec![yaxus_api::Pair { source: "x".into(), target: "x".into() }],
+            max_new_tokens: Some(1000),
+            ..Default::default()
+        };
+        let full = Prompt::new(&tok, &prompt_request(&r).validate().unwrap()).len();
+        let (p, max_new) = Prompt::for_request(&tok, &r, full + 10).unwrap();
+        assert_eq!((p.len(), max_new), (full, 10));
+        // No room left: an error, not a prompt without the history.
+        let e = Prompt::for_request(&tok, &r, full).unwrap_err();
+        assert!(e.0.contains("the limit is"), "{e:?}");
+        r.target_lang.clear();
+        assert!(Prompt::for_request(&tok, &r, full + 10).is_err());
     }
 }
