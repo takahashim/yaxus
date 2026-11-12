@@ -178,7 +178,8 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
             let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
             add(name::gemm_coop(f), &c, layout(f));
         } else if caps.coop_size == 8 {
-            let c = format!("enable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{}", gemm_coop8());
+            // (the decode loader: `gemm_coop8` decodes 16 weights at a time)
+            let c = format!("enable wgpu_cooperative_matrix;\n{MM_PARAMS}{}{}", w16(f), gemm_coop8());
             add(name::gemm_coop(f), &c, layout(f));
         }
         add(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));

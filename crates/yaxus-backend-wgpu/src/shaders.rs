@@ -1053,16 +1053,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 /// quarter in 4 x 4 accumulators. K goes through workgroup memory 32 at a time, in f32:
 /// Apple GPUs multiply f32 matrices at the rate of f16 ones, so nothing is rounded.
 /// Stores whole 64-token tiles (the output is padded) and needs N % 64 == 0.
+///
+/// The weights come through a format's decode loader (`W_*_16`, the decode layout of
+/// the weights): a lane decodes 16 of them at once, as llama.cpp's `kernel_mul_mm` does,
+/// rather than 4 at a time with a scale lookup each. They are stored k-major, so the
+/// matrix B loads without a transpose (naga's column-major `coopLoad` is a transposed
+/// `simdgroup_load`). M2, 2B Q4_K_M, 256-row pass: 809 -> 770 ms (16 at a time) -> 757
+/// ms (no transpose). Padding the rows to 36 or 40 f32 was 12% slower; 8x8-blocked tiles,
+/// 128-output tiles and reading the next step into registers early were no faster. (f16
+/// tiles would take 757 -> 698 ms, rounding the activations to 11 bits.)
 pub fn gemm_coop8() -> String {
     use std::fmt::Write;
-    // Row stride of the staged tiles, in f32. Measured on an M2 (2B Q4_K_M, 256-row
-    // pass): padding the rows to 36 or 40 was 12% slower, tiles of 128 outputs (8
-    // subgroups) no faster, and reading the next step into registers before this one's
-    // products no faster either.
+    // Row stride of the staged activations, in f32.
     const LD: usize = 32;
     let mut s = format!(
         "var<workgroup> xs: array<f32, {sz}>;  // [64 tokens][32 k]
-var<workgroup> wsm: array<f32, {sz}>; // [64 outputs][32 k]
+var<workgroup> wsm: array<f32, {sz}>; // [32 k][64 outputs]
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32,
@@ -1090,16 +1096,24 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
             let c = idx % 8u;
             var v = vec4<f32>(0.0);
             if (t0 + row < p.t) {{ v = x[(t0 + row) * k4 + kb / 4u + c]; }}
-            let w = load4(n0 + row, kb / 4u + c);
             let o = row * {LD}u + c * 4u;
             xs[o] = v.x;
             xs[o + 1u] = v.y;
             xs[o + 2u] = v.z;
             xs[o + 3u] = v.w;
-            wsm[o] = w.x;
-            wsm[o + 1u] = w.y;
-            wsm[o + 2u] = w.z;
-            wsm[o + 3u] = w.w;
+        }}
+        {{
+            // 16 weights of a row a lane
+            let row = li / 2u;
+            let h = li % 2u;
+            let w = load16(n0 + row, kb / 16u + h);
+            let o = (h * 16u) * 64u + row;
+            for (var q = 0u; q < 4u; q++) {{
+                wsm[o + (4u * q) * 64u] = w[q].x;
+                wsm[o + (4u * q + 1u) * 64u] = w[q].y;
+                wsm[o + (4u * q + 2u) * 64u] = w[q].z;
+                wsm[o + (4u * q + 3u) * 64u] = w[q].w;
+            }}
         }}
         workgroupBarrier();
         for (var kk = 0u; kk < 32u; kk += 8u) {{
@@ -1112,9 +1126,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         writeln!(w, "            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&xs[ia{i}], {LD}u);").unwrap();
     }
     for j in 0..4 {
-        // B[k][n] = W[n][k]: column-major.
-        writeln!(w, "            let ib{j} = (tn + {}u) * {LD}u + kk;", 8 * j).unwrap();
-        writeln!(w, "            let b{j} = coopLoad<coop_mat8x8<f32, B>>(&wsm[ib{j}], {LD}u);").unwrap();
+        // B[k][n] = W[n][k]: row-major as staged.
+        writeln!(w, "            let ib{j} = kk * 64u + tn + {}u;", 8 * j).unwrap();
+        writeln!(w, "            let b{j} = coopLoadT<coop_mat8x8<f32, B>>(&wsm[ib{j}], 64u);").unwrap();
     }
     for i in 0..4 {
         for j in 0..4 {
