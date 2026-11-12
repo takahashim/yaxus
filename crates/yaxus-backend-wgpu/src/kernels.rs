@@ -3,7 +3,7 @@
 
 use crate::device::{CompileSettings, DeviceCaps, Tuning};
 use crate::shaders;
-use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
+use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_f32, gemv_int, plan};
 
 pub(crate) struct Kernel {
     /// Its number in the device's kernel set (bind groups are cached by it).
@@ -28,6 +28,10 @@ pub(crate) mod name {
     /// The multi-row f32 GEMV of exactly `t` rows.
     pub(crate) fn gemvm(t: usize, f: Format) -> String {
         format!("gemvm{t}_{}", f.suffix())
+    }
+    /// `gemv_f32` for `t` rows with `rw` weight rows per lane group.
+    pub(crate) fn gemv_f32(t: usize, rw: usize, glu: bool, f: Format) -> String {
+        format!("gemvf{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
     }
     /// The single-row f32 GEMV with SwiGLU.
     pub(crate) fn glu(f: Format) -> String {
@@ -64,13 +68,30 @@ pub(crate) mod name {
     }
 }
 
-/// An integer kernel compiled ahead of use: (name, read-only bindings, source).
+/// A kernel compiled ahead of use: (name, read-only bindings, source).
 pub(crate) type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
 
-/// The integer kernels a model with weights of `formats` can use with `gemv` and `gemm`.
+/// The kernels compiled ahead of use for a model with weights of `formats`, with `gemv`
+/// and `gemm`: the integer ones, and `gemv_f32` where the tuning takes it.
 pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, formats: &[Format], gemv: Gemv) -> Vec<Job> {
     let rw = tuning.gemvi_rows;
     let mut jobs: Vec<Job> = Vec::new();
+    // (`gemv_f32` in place of the f32 GEMVs: the base set does not hold it, since a
+    // model compiles its formats only)
+    if gemv.planes.is_none() && tuning.gemv_f32 {
+        let (rf, wgmem) = (tuning.gemv_f32_rows, caps.max_workgroup_storage);
+        for &f in formats {
+            for glu in [false, true] {
+                for t in 1..=GEMVM_MAX_T {
+                    jobs.push((
+                        name::gemv_f32(t, rf, glu, f),
+                        decode_layout(f).to_vec(),
+                        Box::new(move || gemv_f32_source(f, t, rf, glu, wgmem)),
+                    ));
+                }
+            }
+        }
+    }
     if let Some(planes) = gemv.planes {
         jobs.push((
             name::xquant_rows(planes),
@@ -196,6 +217,33 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
     add("swiglu".into(), SWIGLU, &[false, true]);
     add("add".into(), ADD, &[false, true]);
     out
+}
+
+/// The decode kernels' weight access for `f` (16 values at a time).
+pub(crate) fn w16(f: Format) -> &'static str {
+    use shaders::*;
+    match f {
+        Format::Q8 => W_Q8_16,
+        Format::Q4 => W_Q4_16,
+        Format::Bf16 => W_BF16_16,
+        Format::Q4K => W_Q4K_16,
+        Format::Q6 => W_Q6_16,
+        Format::Q3 => W_Q3_16,
+        Format::Q2 => W_Q2_16,
+    }
+}
+
+/// The weight bindings of the decode kernels for `f` (values and scales, or the bf16
+/// matrix alone), after the output and the activations.
+pub(crate) fn decode_layout(f: Format) -> &'static [bool] {
+    if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
+}
+
+/// The source of `gemv_f32` for `f`, on a device with `max_storage` bytes of workgroup
+/// memory.
+pub(crate) fn gemv_f32_source(f: Format, t: usize, rw: usize, glu: bool, max_storage: u32) -> String {
+    let stage = gemv_f32::stages(t, rw, glu, max_storage);
+    format!("{}{}{}", shaders::MM_PARAMS, w16(f), gemv_f32::source(t, rw, glu, stage))
 }
 
 pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -467,9 +515,24 @@ mod tests {
         let mut sources = Vec::new();
         // (Vulkan with matrix cores, Metal with its 8x8 matrices, no subgroups)
         for (subgroups, fast_math, coop_size) in [(true, false, 16), (true, true, 8), (false, false, 0)] {
-            let caps = DeviceCaps { subgroups, coop: coop_size != 0, coop_size, fast_math, ..caps.clone() };
+            // (Apple's 32 KiB of workgroup memory: `gemv_f32` both staged and not)
+            let max_workgroup_storage = if coop_size == 8 { 32768 } else { 65536 };
+            let caps = DeviceCaps {
+                subgroups,
+                coop: coop_size != 0,
+                coop_size,
+                fast_math,
+                max_workgroup_storage,
+                ..caps.clone()
+            };
             for rows in [1, 4] {
-                let tuning = Tuning { gemvm_rows: rows, gemvi_rows: rows, ..Tuning::for_device(&caps) };
+                let tuning = Tuning {
+                    gemvm_rows: rows,
+                    gemvi_rows: rows,
+                    gemv_f32: true,
+                    gemv_f32_rows: rows,
+                    ..Tuning::for_device(&caps)
+                };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));
                 for gemm in [GemmKind::Int16, GemmKind::Int8] {
                     for gemv in gemvs.into_iter().chain([Gemv::F32]) {

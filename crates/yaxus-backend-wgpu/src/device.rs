@@ -132,6 +132,12 @@ pub struct Tuning {
     pub multi_split_max_rows: usize,
     /// Weight rows per 32-lane group in the multi-row f32 GEMV.
     pub gemvm_rows: usize,
+    /// f32 passes of up to 16 rows take `gemv_f32` (one kernel family for every row
+    /// count, a row's result the same whatever the pass) rather than `gemv1`, `gemvm`
+    /// and the single-row GLU kernel.
+    pub gemv_f32: bool,
+    /// Weight rows per 32-lane group in `gemv_f32`.
+    pub gemv_f32_rows: usize,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -175,6 +181,8 @@ impl Tuning {
             gemv_int8_max_rows: 24,
             multi_split_max_rows: 20,
             gemvm_rows: 2,
+            gemv_f32: false,
+            gemv_f32_rows: 2,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -199,6 +207,7 @@ impl Tuning {
             // 3450 / 39900, f32 30 / 56 / 305 / 1681).
             t.gemm = GemmKind::F32;
             t.gemv = Gemv::F32;
+            t.gemv_f32 = true;
             if caps.coop_size == 8 {
                 // The 8x8 matrix GEMM in f32: 2.1x the f32 GEMM (256 rows 1744 -> 809 ms),
                 // and a whole 64-row tile (32 rows: 197 ms) costs less than two 16-row
@@ -234,6 +243,14 @@ impl Tuning {
         }
         if let Some(v) = var("YAXUS_GEMVM_R").and_then(|v| v.parse().ok()) {
             self.gemvm_rows = v;
+        }
+        match var("YAXUS_GEMV_F32").as_deref() {
+            Some("0") => self.gemv_f32 = false,
+            Some("1") => self.gemv_f32 = true,
+            _ => {}
+        }
+        if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
+            self.gemv_f32_rows = v;
         }
         self
     }

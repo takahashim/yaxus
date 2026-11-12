@@ -16,6 +16,8 @@ pub(crate) enum MatmulPlan {
     /// Multi-row f32 GEMVs (`gemvm`): the first `first` rows in one dispatch, the rest
     /// (if any) in a second; each reads the weights once.
     GemvMulti { first: usize },
+    /// The f32 GEMV of `gemv_f32` for up to 16 rows, in one dispatch.
+    GemvF32,
     /// The single-row f32 GEMV.
     Gemv1,
     /// The f32 GEMV for up to `GEMV_MAX_T` rows, without subgroups.
@@ -63,6 +65,9 @@ impl MatmulCase {
         {
             return MatmulPlan::GemmInt { planes };
         }
+        if t <= GEMVM_MAX_T && tuning.gemv_f32 && caps.subgroups && k.is_multiple_of(16) {
+            return MatmulPlan::GemvF32;
+        }
         // The multi-row GEMVs reduce with subgroup shuffles over blocks of 512 values.
         let multi = caps.subgroups && k.is_multiple_of(512);
         if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || t <= tuning.multi_split_max_rows) {
@@ -84,6 +89,7 @@ impl MatmulCase {
     pub(crate) fn plan_glu(&self, caps: &DeviceCaps, tuning: &Tuning) -> GluPlan {
         match self.plan(caps, tuning) {
             MatmulPlan::GemvInt { planes, inline } => GluPlan::GemvInt { planes, inline },
+            MatmulPlan::GemvF32 => GluPlan::GemvF32,
             _ if self.t == 1 => GluPlan::Glu1,
             _ => GluPlan::MatmulThenSwiglu,
         }
@@ -104,6 +110,8 @@ pub(crate) fn gemv_int_inline(caps: &DeviceCaps, t: usize) -> bool {
 pub(crate) enum GluPlan {
     /// Integer GEMVs that store `silu(gate) * up` themselves.
     GemvInt { planes: usize, inline: bool },
+    /// `gemv_f32` storing `silu(gate) * up` itself.
+    GemvF32,
     /// The single-row f32 GLU kernel.
     Glu1,
     /// The matrix product's plan, then the `swiglu` kernel.

@@ -18,6 +18,7 @@
 mod commands;
 mod device;
 mod gemm_int;
+mod gemv_f32;
 mod gemv_int;
 mod kernels;
 mod ops;

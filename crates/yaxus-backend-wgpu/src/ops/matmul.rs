@@ -27,6 +27,10 @@ impl Gpu {
             self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
             return y;
         }
+        if plan == MatmulPlan::GemvF32 {
+            self.gemv_f32(x, &y, m, n, false);
+            return y;
+        }
         if let MatmulPlan::GemmInt { planes } = plan {
             // The integer GEMM reads the per-16 scale arrays where a format has them.
             let [wq, scales] = <[wgpu::Buffer; 2]>::try_from(m.prefill_bufs()).unwrap();
@@ -58,7 +62,7 @@ impl Gpu {
             MatmulPlan::GemmF32 => {
                 vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
             }
-            MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } => unreachable!(),
+            MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } | MatmulPlan::GemvF32 => unreachable!(),
         };
         for (name, params, groups) in dispatches {
             if self.kernels_profile.is_some() {
@@ -80,6 +84,11 @@ impl Gpu {
                 let y = self.tensor(x.rows, n2 / 2);
                 let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
                 self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), (planes, inline), true);
+                return y;
+            }
+            GluPlan::GemvF32 => {
+                let y = self.tensor(x.rows, n2 / 2);
+                self.gemv_f32(x, &y, m, n2 / 2, true);
                 return y;
             }
             GluPlan::MatmulThenSwiglu => {
@@ -220,6 +229,25 @@ impl Gpu {
             self.dispatch(&kernel, &[y.buf(), xq.buf(), wq, wsc, xs.buf()], &params, groups);
             r0 += rows;
         }
+        self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
+    }
+
+    /// `y = x W^T` for up to 16 rows in f32 (`gemv_f32`), or `swiglu` of it with `glu`
+    /// (`n` is then the intermediate size).
+    fn gemv_f32(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, n: usize, glu: bool) {
+        let (t, k) = (x.rows, x.cols);
+        let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
+        let kernel = self.int_kernel(name::gemv_f32(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
+            crate::kernels::gemv_f32_source(m.fmt, t, rw, glu, wgmem)
+        });
+        if self.kernels_profile.is_some() {
+            self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
+        }
+        let mut bufs = vec![y.buf().clone(), x.buf().clone()];
+        bufs.extend(m.decode_bufs());
+        let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+        let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
+        self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
         self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
     }
 
