@@ -364,40 +364,6 @@ impl Gpu {
             self.gemv2(x, y, m, n, glu, 0, t);
             return;
         }
-        if crate::plan::gemv_q_takes(&self.caps, &self.tuning, m.fmt) {
-            let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
-            let stage = crate::msl::gemv_q_stages(t, rw, glu, wgmem);
-            let kernel = self.int_kernel(name::gemv_q(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
-                crate::msl::gemv_q(m.fmt, t, rw, glu, stage).unwrap()
-            });
-            if self.dev.timing() {
-                self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
-            }
-            let mut bufs = vec![y.buf().clone(), x.buf().clone()];
-            bufs.extend(m.decode_bufs());
-            let refs: Vec<&Buf> = bufs.iter().collect();
-            let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
-            self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
-            self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
-            return;
-        }
-        if crate::plan::gemv_mma_takes(&self.caps, &self.tuning, m.fmt, k) {
-            let tiles = t.div_ceil(8);
-            let kernel =
-                self.int_kernel(name::gemv_mma(tiles, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
-                    crate::msl::gemv_mma(m.fmt, tiles, glu).unwrap()
-                });
-            if self.dev.timing() {
-                self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
-            }
-            let mut bufs = vec![y.buf().clone(), x.buf().clone()];
-            bufs.extend(m.decode_bufs());
-            let refs: Vec<&Buf> = bufs.iter().collect();
-            let groups = grid(n.div_ceil(crate::msl::gemv_mma_outputs(glu)) as u32);
-            self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
-            self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
-            return;
-        }
         let (rw, wgmem) = (self.tuning.gemv_f32_rows, self.caps.max_workgroup_storage);
         let kernel = self.int_kernel(name::gemv_f32(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
             crate::kernels::gemv_f32_source(m.fmt, t, rw, glu, wgmem)

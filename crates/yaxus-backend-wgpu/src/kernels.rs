@@ -31,14 +31,6 @@ pub(crate) mod name {
     pub(crate) fn gemv2(t: usize, glu: bool, f: Format) -> String {
         format!("gemv2_{t}{}_{}", if glu { "g" } else { "" }, f.suffix())
     }
-    /// `msl::gemv_q` for `t` rows with `rw` weight rows per lane group.
-    pub(crate) fn gemv_q(t: usize, rw: usize, glu: bool, f: Format) -> String {
-        format!("gemvq{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
-    }
-    /// `msl::gemv_mma` with `tiles` 8-row tiles.
-    pub(crate) fn gemv_mma(tiles: usize, glu: bool, f: Format) -> String {
-        format!("gemvmma{tiles}{}_{}", if glu { "g" } else { "" }, f.suffix())
-    }
     /// The single-row f32 GEMV with SwiGLU.
     pub(crate) fn glu(f: Format) -> String {
         format!("glu_{}", f.suffix())
@@ -87,8 +79,6 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
     if gemv.planes.is_none() && tuning.gemv_f32 {
         let (rf, wgmem) = (tuning.gemv_f32_rows, caps.max_workgroup_storage);
         for &f in formats {
-            // (`msl::gemv_mma` for the formats it reads; K is known only at use, so both
-            // families of a format are listed)
             if tuning.gemm_msl && caps.msl && crate::msl::gemm_reads(f) {
                 let f16 = gemm == GemmKind::CoopF16;
                 for rb in [1, 2] {
@@ -110,30 +100,6 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
                     }
                 }
                 continue;
-            }
-            if tuning.gemv_q && caps.msl && crate::msl::gemv_q_reads(f) {
-                for glu in [false, true] {
-                    for t in 1..=GEMVM_MAX_T {
-                        let stage = crate::msl::gemv_q_stages(t, rf, glu, wgmem);
-                        jobs.push((
-                            name::gemv_q(t, rf, glu, f),
-                            decode_layout(f).to_vec(),
-                            Box::new(move || crate::msl::gemv_q(f, t, rf, glu, stage).unwrap()),
-                        ));
-                    }
-                }
-                continue;
-            }
-            if tuning.gemv_mma && caps.msl && crate::msl::gemv_mma_reads(f) {
-                for glu in [false, true] {
-                    for tiles in [1, 2] {
-                        jobs.push((
-                            name::gemv_mma(tiles, glu, f),
-                            decode_layout(f).to_vec(),
-                            Box::new(move || crate::msl::gemv_mma(f, tiles, glu).unwrap()),
-                        ));
-                    }
-                }
             }
             for glu in [false, true] {
                 for t in 1..=GEMVM_MAX_T {
@@ -401,6 +367,10 @@ mod tests {
     /// constant (`s <<= 1u` from a positive start while `s < C`).
     fn unbounded_loop(src: &str) -> Option<String> {
         let code: String = src.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        // (MSL: no string literals, which hold only `_Pragma` arguments; the unrolled loops
+        // are loops too; `constant constexpr uint` is a module-scope constant)
+        let code: String = code.split('"').step_by(2).collect();
+        let code = code.replace("FOR_UNROLL (", "for (").replace("constant constexpr uint ", "const ");
         let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
         let words = || code.split(|c: char| !is_word(c));
         if let Some(w) = words().find(|&w| w == "loop" || w == "while") {
@@ -426,7 +396,13 @@ mod tests {
         let mut rest = code.as_str();
         while let Some(i) = rest.find("for (") {
             let after = &rest[i + "for (".len()..];
-            let header = &after[..after.find(')')?];
+            // (to the `)` that closes the header: conditions may hold parentheses)
+            let mut open = 1;
+            let close = after.char_indices().find_map(|(j, c)| {
+                open += (c == '(') as i32 - (c == ')') as i32;
+                (open == 0).then_some(j)
+            })?;
+            let header = &after[..close];
             // The body: from the `{` after the header to its matching `}`.
             let body = after[header.len() + 1..].trim_start();
             if !body.starts_with('{') {
@@ -538,15 +514,15 @@ mod tests {
                 max_workgroup_storage,
                 ..caps.clone()
             };
-            // (the MSL GEMVs, opt-in, each in place of `gemv_f32` for the formats it reads)
-            for (rows, gemv_q, gemv_mma) in [(1, false, false), (4, false, false), (2, true, false), (2, false, true)] {
+            // (with and without the MSL kernels where the device takes them)
+            for (rows, msl) in [(1, false), (4, false), (2, true)] {
                 let tuning = Tuning {
                     gemvm_rows: rows,
                     gemvi_rows: rows,
                     gemv_f32: true,
                     gemv_f32_rows: rows,
-                    gemv_q,
-                    gemv_mma,
+                    gemv2: msl,
+                    gemm_msl: msl,
                     ..Tuning::for_device(&caps)
                 };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));

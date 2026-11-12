@@ -141,12 +141,6 @@ pub struct Tuning {
     pub gemv_f32: bool,
     /// Weight rows per 32-lane group in `gemv_f32`.
     pub gemv_f32_rows: usize,
-    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv_mma`
-    /// reads take it instead: every pass of up to 16 rows on simdgroup matrices.
-    pub gemv_mma: bool,
-    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv_q`
-    /// reads take it instead: the same kernels in MSL, the scales applied after the sums.
-    pub gemv_q: bool,
     /// The small per-row kernels (`rmsnorm`, `add_norm`, `qk_rope`) in MSL where the
     /// device takes it (`msl::small_kernels`).
     pub msl_small: bool,
@@ -207,8 +201,6 @@ impl Tuning {
             gemvm_rows: 2,
             gemv_f32: false,
             gemv_f32_rows: 2,
-            gemv_mma: false,
-            gemv_q: false,
             msl_small: false,
             gemv2: false,
             gemv2_tail_rows: 40,
@@ -264,8 +256,7 @@ impl Tuning {
     /// The tuning with the overrides of the environment, for experiments and tests:
     /// `YAXUS_GEMM=f32|coop|coop16|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
     /// `YAXUS_TILE_WGS`, `YAXUS_GEMVM_R`, `YAXUS_EARLY_SUBMIT`, `YAXUS_ATTN_SPLIT_WGS`,
-    /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`, `YAXUS_GEMV_MMA=0|1`
-    /// and `YAXUS_GEMV_Q=0|1`.
+    /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`.
     pub fn with_env(mut self) -> Self {
         let var = |name: &str| std::env::var(name).ok();
         match var("YAXUS_GEMM").as_deref() {
@@ -323,16 +314,6 @@ impl Tuning {
         match var("YAXUS_MSL_SMALL").as_deref() {
             Some("0") => self.msl_small = false,
             Some("1") => self.msl_small = true,
-            _ => {}
-        }
-        match var("YAXUS_GEMV_Q").as_deref() {
-            Some("0") => self.gemv_q = false,
-            Some("1") => self.gemv_q = true,
-            _ => {}
-        }
-        match var("YAXUS_GEMV_MMA").as_deref() {
-            Some("0") => self.gemv_mma = false,
-            Some("1") => self.gemv_mma = true,
             _ => {}
         }
         if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
