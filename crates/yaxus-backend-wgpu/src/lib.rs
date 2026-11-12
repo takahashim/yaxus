@@ -9,6 +9,7 @@
 mod device;
 mod gemm_int;
 mod gemv_int;
+mod plan;
 mod shaders;
 
 use std::collections::HashMap;
@@ -20,9 +21,10 @@ use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef};
 
 use device::Diagnostics;
 pub use device::{DeviceCaps, Tuning, Vendor};
+use plan::{AttentionCase, AttentionPlan, GluPlan, MatmulCase, MatmulPlan};
 
 /// Activation rows up to which the GEMV kernel (weights read once) is used.
-const GEMV_MAX_T: usize = 8;
+pub(crate) const GEMV_MAX_T: usize = 8;
 /// Rows up to which the multi-row GEMV (activations staged in workgroup memory) is
 /// compiled; passes of up to twice this many rows run it twice on halves of the rows.
 pub(crate) const GEMVM_MAX_T: usize = 16;
@@ -369,9 +371,6 @@ fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> Vec<u16> {
 /// Weight bytes uploaded between flushes of the staging memory.
 const UPLOAD_FLUSH_BYTES: usize = 512 << 20;
 
-/// Rows per attention tile (`ATTN_TILE`'s `BM`).
-const ATTN_TILE_ROWS: usize = 32;
-
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 const ARGMAX_SLICES: usize = 64;
 /// Rows of logits one argmax dispatch handles (one per stream of a pass, or the rows of
@@ -379,14 +378,11 @@ const ARGMAX_SLICES: usize = 64;
 const ARGMAX_ROWS: usize = 512;
 /// Workgroup memory of `attn_tile`: the `var<workgroup>` arrays of `ATTN_TILE` in
 /// shaders.rs (`qs`, `kv`, `ss`, `rm`, `rl`, `rc`, `kslot`); keep the two in step.
-const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
+pub(crate) const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4 * 4;
 
 /// Columns `add_norm_sg` keeps in registers (16 per lane of its 256); wider rows take the
 /// plain `add_norm`.
 const ADD_NORM_SG_MAX_COLS: usize = 16 * 256;
-/// Keys per chunk of the split attention kernels.
-const SPLIT_CHUNKS: [usize; 2] = [16, 32];
-
 /// The name of a `gemv_int` kernel (`inline`: the single-row one that rounds its row).
 fn gemvi_name(planes: usize, t: usize, rw: usize, glu: bool, inline: bool, format: &str) -> String {
     let g = if glu { "g" } else { "" };
@@ -746,9 +742,9 @@ impl Gpu {
         // (the split attention reduces with subgroup shuffles; without them the per-row
         // kernel takes every pass)
         let sg = self.caps.subgroups;
-        for g in [1usize, 2, 4, 6, 8, 12, 16].into_iter().filter(|_| sg) {
-            for ch in SPLIT_CHUNKS {
-                for hg in [1usize, 2, 3, 4, 6, 8, 12, 16].into_iter().filter(|h| g % h == 0) {
+        for g in plan::SPLIT_GROUPS.into_iter().filter(|_| sg) {
+            for ch in plan::SPLIT_CHUNKS {
+                for hg in plan::SPLIT_HEAD_GROUPS.into_iter().filter(|h| g % h == 0) {
                     let name: &'static str = Box::leak(format!("attn_split{g}_{ch}_{hg}").into_boxed_str());
                     let src = ATTN_SPLIT
                         .replace("{GF}", &g.to_string())
@@ -762,7 +758,7 @@ impl Gpu {
         self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
         // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
         // without it, prefill attention takes the per-row kernel.
-        if self.caps.subgroups && self.device.limits().max_compute_workgroup_storage_size >= ATTN_TILE_SHARED_BYTES {
+        if plan::tile_compiled(&self.caps) {
             self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
         }
         self.add_kernel("swiglu", SWIGLU, &[false, true]);
@@ -1133,7 +1129,7 @@ impl Gpu {
         for i in 0..rows {
             let joins = tiles.last().is_some_and(|t: &[u32; 4]| {
                 let (r0, n) = (t[0] as usize, t[1] as usize);
-                n < ATTN_TILE_ROWS && pass.pt_off[r0] == pass.pt_off[i] && pass.pos[r0] + n as u32 == pass.pos[i]
+                n < plan::ATTN_TILE_ROWS && pass.pt_off[r0] == pass.pt_off[i] && pass.pos[r0] + n as u32 == pass.pos[i]
             });
             match tiles.last_mut() {
                 Some(t) if joins => t[1] += 1,
@@ -1181,71 +1177,58 @@ impl Gpu {
         } else {
             self.tensor(t, n)
         };
-        if t <= self.tuning.gemv_max_rows(self.gemm)
-            && self.caps.subgroups
-            && let Some(planes) = gemv.planes(t)
-            && let Some(f) = m.fmt.gemv_int()
-        {
+        let case = MatmulCase { t, n, k, fmt: m.fmt, gemm: self.gemm, gemv };
+        let plan = case.plan(&self.caps, &self.tuning);
+        if let MatmulPlan::GemvInt { planes } = plan {
             let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
-            self.gemv_int(x, &y, &wq, &wsc, n, f, planes, false);
+            self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), planes, false);
             return y;
         }
-        if t > GEMVM_MAX_T
-            && let Some(planes) = self.gemm.planes()
-            && let Some(f) = m.fmt.gemm_int()
-        {
+        if let MatmulPlan::GemmInt { planes } = plan {
             // The integer GEMM reads the per-16 scale arrays where a format has them.
             let [wq, scales] = <[wgpu::Buffer; 2]>::try_from(m.prefill_bufs()).unwrap();
-            self.gemm_int(x, &y, &wq, &scales, n, f, planes);
+            self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
             return y;
         }
+        // The f32 kernels: the GEMVs read the decode layout, the GEMMs the per-16 scales
+        // (see `W_Q6`).
         let mut all = vec![y.buf().clone(), x.buf().clone()];
-        let multi = self.caps.subgroups && k % 512 == 0;
-        if multi && t > 1 && t <= 2 * GEMVM_MAX_T && (t <= GEMVM_MAX_T || t <= self.tuning.multi_split_max_rows) {
-            // Up to 16 rows in one dispatch, up to 32 in two (each reads the weights once).
-            all.extend(m.decode_bufs());
-            let refs: Vec<&wgpu::Buffer> = all.iter().collect();
-            let first = t.div_ceil(2).min(GEMVM_MAX_T).max(if t <= GEMVM_MAX_T { t } else { 0 });
-            for (r0, rows) in [(0, first), (first, t - first)] {
-                if rows == 0 {
-                    continue;
-                }
-                if self.kernels_profile.is_some() {
-                    self.prof_detail = Some(format!("{n}x{k}"));
-                }
-                let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
-                self.dispatch(
-                    &format!("gemvm{rows}_{suffix}"),
-                    &refs,
-                    &[n as u32, k as u32, rows as u32, r0 as u32],
-                    groups,
-                );
-            }
-            self.account(2.0 * (t * n * k) as f64);
-            return y;
-        }
-        let params = [n as u32, k as u32, t as u32, 0];
-        // The prefill GEMMs read the per-16 f16 scales (see `W_Q6`).
-        all.extend(if t <= GEMV_MAX_T { m.decode_bufs() } else { m.prefill_bufs() });
-        let (name, groups) = if t == 1 {
-            (format!("gemv1_{suffix}"), grid(n.div_ceil(8) as u32))
-        } else if t <= GEMV_MAX_T && self.caps.subgroups && k % 512 == 0 {
-            (format!("gemvm{t}_{suffix}"), grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32))
-        } else if t <= GEMV_MAX_T {
-            (format!("gemv8_{suffix}"), grid(n.div_ceil(8) as u32))
+        all.extend(if t <= GEMVM_MAX_T || matches!(plan, MatmulPlan::GemvMulti { .. }) {
+            m.decode_bufs()
         } else {
-            match self.gemm {
-                GemmKind::Coop | GemmKind::Int8 | GemmKind::Int16 if n % 64 == 0 && self.caps.coop => {
-                    (format!("gemmcoop_{suffix}"), ((n / 64) as u32, t.div_ceil(64) as u32))
-                }
-                _ => (format!("gemm2f32_{suffix}"), (n.div_ceil(128) as u32, t.div_ceil(64) as u32)),
-            }
-        };
+            m.prefill_bufs()
+        });
         let refs: Vec<&wgpu::Buffer> = all.iter().collect();
-        if self.kernels_profile.is_some() {
-            self.prof_detail = Some(format!("{n}x{k}"));
+        let (n32, k32) = (n as u32, k as u32);
+        let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {
+            MatmulPlan::GemvMulti { first } => [(0, first), (first, t - first)]
+                .into_iter()
+                .filter(|&(_, rows)| rows > 0)
+                .map(|(r0, rows)| {
+                    let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
+                    (format!("gemvm{rows}_{suffix}"), [n32, k32, rows as u32, r0 as u32], groups)
+                })
+                .collect(),
+            MatmulPlan::Gemv1 => vec![(format!("gemv1_{suffix}"), [n32, k32, 1, 0], grid(n.div_ceil(8) as u32))],
+            MatmulPlan::Gemv8 => {
+                vec![(format!("gemv8_{suffix}"), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
+            }
+            MatmulPlan::GemmCoop => {
+                vec![(format!("gemmcoop_{suffix}"), [n32, k32, t as u32, 0], ((n / 64) as u32, t.div_ceil(64) as u32))]
+            }
+            MatmulPlan::GemmF32 => vec![(
+                format!("gemm2f32_{suffix}"),
+                [n32, k32, t as u32, 0],
+                (n.div_ceil(128) as u32, t.div_ceil(64) as u32),
+            )],
+            MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } => unreachable!(),
+        };
+        for (name, params, groups) in dispatches {
+            if self.kernels_profile.is_some() {
+                self.prof_detail = Some(format!("{n}x{k}"));
+            }
+            self.dispatch(&name, &refs, &params, groups);
         }
-        self.dispatch(&name, &refs, &params, groups);
         self.account(2.0 * (t * n * k) as f64);
         y
     }
@@ -1277,29 +1260,17 @@ impl Gpu {
         let o = self.tensor(t, hq * 128);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let window = layer.window.unwrap_or(0) as u32;
-        let g = hq / hkv;
-        let ctx = match layer.window {
-            Some(w) => (self.pass_max_pos + 1).min(w),
-            None => self.pass_max_pos + 1,
+        let case = AttentionCase {
+            rows: t,
+            hq,
+            hkv,
+            window: layer.window,
+            max_pos: self.pass_max_pos,
+            tiles: self.pass_tiles,
         };
-        // Short chunks give short contexts more workgroups; longer ones keep the merge
-        // (`attn_combine`, linear in the chunk count) cheap. Measured on a 780M:
-        // decode attention at 1024 keys 129 -> 102 us per layer (2B), and the 0.8B (one
-        // KV head) gains 11% at 256 keys over the per-head kernel.
-        let ch = if ctx <= self.tuning.short_context { 16 } else { 32 };
-        let nch = ctx.div_ceil(ch);
-        // Query heads per workgroup: few workgroups (short contexts, one KV head) leave
-        // the GPU idle, so the heads of a KV head are split over up to 64 workgroups in
-        // all. More would reread the keys for little gain (measured on a 780M: 0.8B at 64
-        // keys 26 -> 8.6 us per layer; 2B and 8B at 1024 keys slower when split).
-        let hg = [1usize, 2, 3, 4, 6, 8, 12, 16]
-            .into_iter()
-            .find(|&h| g % h == 0 && t * hkv * (g / h) * nch <= self.tuning.attn_split_wgs)
-            .unwrap_or(g);
-        let split = t <= self.tuning.split_attn_max_rows
-            && self.caps.subgroups
-            && self.kernels.contains_key(format!("attn_split{g}_{ch}_{hg}").as_str());
-        if split {
+        let g = hq / hkv;
+        let plan = case.plan(&self.caps, &self.tuning);
+        if let AttentionPlan::Split { g, hg, ch, nch } = plan {
             let part = self.tensor(t * hkv * nch * g, 128);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
@@ -1314,23 +1285,8 @@ impl Gpu {
                 &[hq as u32, hkv as u32, nch as u32],
                 (hq as u32, t as u32),
             );
-        } else if t > self.tuning.split_attn_max_rows
-            && self.tuning.tile_wgs > 0
-            && self.kernels.contains_key("attn_tile")
-        {
+        } else if let AttentionPlan::Tile { nch, ch } = plan {
             let tiles = self.meta_buf(MetaBuf::Tiles);
-            // Split the keys into chunks while there are few workgroups (short passes
-            // over long contexts), merging the chunks with `attn_combine`.
-            let wgs = self.pass_tiles * hq;
-            let target = self.tuning.tile_wgs;
-            // Keys a tile can span: its first row's window up to its last row.
-            let span = match layer.window {
-                Some(w) => (self.pass_max_pos + 1).min(w + ATTN_TILE_ROWS - 1),
-                None => self.pass_max_pos + 1,
-            };
-            let nch = target.div_ceil(wgs).clamp(1, span.div_ceil(128));
-            let ch = span.div_ceil(nch).next_multiple_of(32);
-            let nch = span.div_ceil(ch);
             let (part, ml) = if nch > 1 {
                 (self.tensor(t * hkv * nch * g, 128), self.tensor(t * hkv * nch * g, 2))
             } else {
@@ -1527,24 +1483,23 @@ impl Gpu {
         let m = w.matrix();
         let (n2, k) = (m.n, m.k);
         assert_eq!(x.cols, k);
-        if x.rows <= self.tuning.gemv_max_rows(self.gemm)
-            && self.caps.subgroups
-            && let Some(planes) = gemv.planes(x.rows)
-            && let Some(f) = m.fmt.gemv_int()
-        {
-            let y = self.tensor(x.rows, n2 / 2);
-            let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
-            self.gemv_int(x, &y, &q, &s, n2 / 2, f, planes, true);
-            return y;
-        }
-        if x.rows != 1 {
-            let gu = self.matmul(x, w, gemv);
-            return self.swiglu(&gu);
+        let case = MatmulCase { t: x.rows, n: n2, k, fmt: m.fmt, gemm: self.gemm, gemv };
+        match case.plan_glu(&self.caps, &self.tuning) {
+            GluPlan::GemvInt { planes } => {
+                let y = self.tensor(x.rows, n2 / 2);
+                let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
+                self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), planes, true);
+                return y;
+            }
+            GluPlan::MatmulThenSwiglu => {
+                let gu = self.matmul(x, w, gemv);
+                return self.swiglu(&gu);
+            }
+            GluPlan::Glu1 => {}
         }
         // (for Q4 the block variant `GLU_32` measured slower: 174 vs 138 us on 12288x1536)
         let name = format!("glu_{}", m.fmt.suffix());
         let bufs = m.decode_bufs();
-        assert_eq!(x.cols, k);
         let inter = n2 / 2;
         let y = self.tensor(1, inter);
         let mut all = vec![y.buf().clone(), x.buf().clone()];
