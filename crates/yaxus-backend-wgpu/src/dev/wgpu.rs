@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use wgpu::util::DeviceExt;
 
 use super::Buf;
-use crate::device::{self, CompileSettings, DeviceCaps, Diagnostics};
+use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Diagnostics, Vendor};
 use crate::profile::{KernelProfile, MAX_TIMED};
 
 /// Weight bytes uploaded between flushes of the staging memory.
@@ -69,7 +69,7 @@ impl WgpuDev {
     /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
     /// can run on machines without a GPU (CI).
     pub(crate) fn open(diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
-        let backends = device::platform_backends();
+        let backends = platform_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -88,7 +88,7 @@ impl WgpuDev {
                 format!("no {backends:?} GPU found (only a software renderer, if any){hint}")
             })?;
         let alimits = adapter.limits();
-        let caps = DeviceCaps::detect(&adapter);
+        let caps = detect(&adapter);
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             bail!("{} does not support push constants (wgpu IMMEDIATES)", caps.name);
         }
@@ -441,4 +441,73 @@ pub(crate) fn compile(
         cache: None,
     });
     WgpuKernel { pipeline, layout }
+}
+
+/// The wgpu backends of the platform: Metal on macOS, Vulkan elsewhere.
+fn platform_backends() -> wgpu::Backends {
+    if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN }
+}
+
+/// The vendor of `info`'s adapter (PCI vendor ids; Apple's on Metal).
+fn vendor_of(info: &wgpu::AdapterInfo) -> Vendor {
+    match info.vendor {
+        0x1002 => Vendor::Amd,
+        0x106b => Vendor::Apple,
+        0x8086 => Vendor::Intel,
+        0x10de => Vendor::Nvidia,
+        _ if info.backend == wgpu::Backend::Metal => Vendor::Apple,
+        _ => Vendor::Other,
+    }
+}
+
+/// What the adapter can do.
+pub(crate) fn detect(adapter: &wgpu::Adapter) -> DeviceCaps {
+    let info = adapter.get_info();
+    let features = adapter.features();
+    let vendor = vendor_of(&info);
+    let f16 = features.contains(wgpu::Features::SHADER_F16);
+    // Metal reports subgroup sizes of 4..=64 whatever the GPU, but Apple GPUs run
+    // SIMD-groups of 32 threads, as the kernels need.
+    let lanes32 = info.subgroup_min_size >= 32 || (info.backend == wgpu::Backend::Metal && vendor == Vendor::Apple);
+    let subgroups = features.contains(wgpu::Features::SUBGROUP) && lanes32;
+    let props = adapter.cooperative_matrix_properties();
+    let has = |size: u32, ab: wgpu::CooperativeScalarType| {
+        props.iter().any(|c| {
+            (c.m_size, c.n_size, c.k_size) == (size, size, size)
+                && c.ab_type == ab
+                && c.cr_type == wgpu::CooperativeScalarType::F32
+        })
+    };
+    let matrices = subgroups && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    let coop_size = if matrices && f16 && has(16, wgpu::CooperativeScalarType::F16) {
+        16
+    } else if matrices && info.backend == wgpu::Backend::Metal && has(8, wgpu::CooperativeScalarType::F32) {
+        8
+    } else {
+        0
+    };
+    let coop = coop_size != 0;
+    DeviceCaps {
+        name: info.name.clone(),
+        api: match info.backend {
+            wgpu::Backend::Vulkan => Api::Vulkan,
+            wgpu::Backend::Metal => Api::Metal,
+            _ => Api::Other,
+        },
+        vendor,
+        kind: match info.device_type {
+            wgpu::DeviceType::IntegratedGpu => DeviceKind::Integrated,
+            wgpu::DeviceType::DiscreteGpu => DeviceKind::Discrete,
+            wgpu::DeviceType::Cpu => DeviceKind::Software,
+            _ => DeviceKind::Other,
+        },
+        f16,
+        subgroups,
+        coop,
+        fast_math: info.backend == wgpu::Backend::Metal,
+        msl: info.backend == wgpu::Backend::Metal && features.contains(wgpu::Features::PASSTHROUGH_SHADERS),
+        coop_size,
+        timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
+        max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
+    }
 }

@@ -496,9 +496,9 @@ mod tests {
     fn every_kernel_loop_ends() {
         let caps = DeviceCaps {
             name: "test".into(),
-            backend: wgpu::Backend::Vulkan,
+            api: crate::device::Api::Vulkan,
             vendor: Vendor::Amd,
-            device_type: wgpu::DeviceType::IntegratedGpu,
+            kind: crate::device::DeviceKind::Integrated,
             f16: true,
             subgroups: true,
             coop: true,

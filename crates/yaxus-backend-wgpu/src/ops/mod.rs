@@ -26,7 +26,7 @@ pub(crate) fn grid(groups: u32) -> (u32, u32) {
 
 impl Gpu {
     pub(crate) fn name(&self) -> String {
-        format!("{}: {}", format!("{:?}", self.caps.backend).to_lowercase(), self.caps.name)
+        format!("{}: {}", self.caps.api, self.caps.name)
     }
 
     /// Pre-creates pooled buffers for the tensors of a `rows`-row pass (see the trait).

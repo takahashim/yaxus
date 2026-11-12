@@ -1,13 +1,8 @@
-//! What the GPU can do ([`DeviceCaps`], detected from the adapter), how the kernels are
-//! compiled for it ([`CompileSettings`]) and the measured choices they are run with on
-//! it ([`Tuning`]).
+//! What the GPU can do ([`DeviceCaps`], detected by the device layer, `dev`), how the
+//! kernels are compiled for it ([`CompileSettings`]) and the measured choices they are run
+//! with on it ([`Tuning`]). Nothing here depends on wgpu.
 
 use crate::{GemmKind, Gemv};
-
-/// The graphics API the backend runs on: Vulkan on Linux and Windows, Metal on macOS.
-pub(crate) fn platform_backends() -> wgpu::Backends {
-    if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN }
-}
 
 /// GPU vendors the tuning distinguishes (PCI vendor ids; Apple's on Metal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,17 +14,44 @@ pub enum Vendor {
     Other,
 }
 
-impl Vendor {
-    fn of(info: &wgpu::AdapterInfo) -> Self {
-        match info.vendor {
-            0x1002 => Vendor::Amd,
-            0x106b => Vendor::Apple,
-            0x8086 => Vendor::Intel,
-            0x10de => Vendor::Nvidia,
-            _ if info.backend == wgpu::Backend::Metal => Vendor::Apple,
-            _ => Vendor::Other,
-        }
+/// How the GPU is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    /// Vulkan through wgpu.
+    Vulkan,
+    /// Metal through wgpu.
+    Metal,
+    /// Metal without wgpu (`dev::metal`, `YAXUS_DEVICE=metal`).
+    MetalDirect,
+    /// Another wgpu backend.
+    Other,
+}
+
+impl Api {
+    pub fn is_metal(self) -> bool {
+        matches!(self, Api::Metal | Api::MetalDirect)
     }
+}
+
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Api::Vulkan => "vulkan",
+            Api::Metal => "metal",
+            Api::MetalDirect => "metal (direct)",
+            Api::Other => "other",
+        })
+    }
+}
+
+/// What kind of device the GPU is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Integrated,
+    Discrete,
+    /// A software rasterizer (lavapipe, llvmpipe).
+    Software,
+    Other,
 }
 
 /// Features of the device the kernels depend on.
@@ -37,10 +59,11 @@ impl Vendor {
 pub struct DeviceCaps {
     /// The adapter's name, e.g. `AMD Radeon 780M Graphics (RADV PHOENIX)`.
     pub name: String,
-    pub backend: wgpu::Backend,
+    /// How the device is reached.
+    pub api: Api,
     pub vendor: Vendor,
-    /// Integrated (sharing the host's memory) or discrete.
-    pub device_type: wgpu::DeviceType,
+    /// Integrated (sharing the host's memory), discrete or software.
+    pub kind: DeviceKind,
     /// `shader-f16`.
     pub f16: bool,
     /// Subgroups of at least 32 lanes: the multi-row and integer GEMVs, the split
@@ -49,10 +72,11 @@ pub struct DeviceCaps {
     /// Cooperative matrices for the `Coop` GEMM (see `coop_size`).
     pub coop: bool,
     /// The shader compiler may reassociate float arithmetic and contract it into FMAs
-    /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
-    /// it off). Kernels that must agree to the bit then may not.
+    /// (Metal through wgpu: it leaves `MTLCompileOptions` at their defaults and offers no
+    /// way to turn it off). Kernels that must agree to the bit then may not.
     pub fast_math: bool,
-    /// Kernels in Metal Shading Language through wgpu's passthrough (`msl`).
+    /// Kernels in Metal Shading Language (`msl`): through wgpu's passthrough, or compiled
+    /// directly.
     pub msl: bool,
     /// Their size: 16 (16x16x16, f16 operands and f32 accumulators: matrix cores on
     /// Vulkan) or 8 (8x8x8 in f32: Metal's simdgroup matrices); 0 without.
@@ -60,50 +84,6 @@ pub struct DeviceCaps {
     /// Timestamp queries (`YAXUS_PROFILE=2`).
     pub timestamps: bool,
     pub max_workgroup_storage: u32,
-}
-
-impl DeviceCaps {
-    pub(crate) fn detect(adapter: &wgpu::Adapter) -> Self {
-        let info = adapter.get_info();
-        let features = adapter.features();
-        let vendor = Vendor::of(&info);
-        let f16 = features.contains(wgpu::Features::SHADER_F16);
-        // Metal reports subgroup sizes of 4..=64 whatever the GPU, but Apple GPUs run
-        // SIMD-groups of 32 threads, as the kernels need.
-        let lanes32 = info.subgroup_min_size >= 32 || (info.backend == wgpu::Backend::Metal && vendor == Vendor::Apple);
-        let subgroups = features.contains(wgpu::Features::SUBGROUP) && lanes32;
-        let props = adapter.cooperative_matrix_properties();
-        let has = |size: u32, ab: wgpu::CooperativeScalarType| {
-            props.iter().any(|c| {
-                (c.m_size, c.n_size, c.k_size) == (size, size, size)
-                    && c.ab_type == ab
-                    && c.cr_type == wgpu::CooperativeScalarType::F32
-            })
-        };
-        let matrices = subgroups && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
-        let coop_size = if matrices && f16 && has(16, wgpu::CooperativeScalarType::F16) {
-            16
-        } else if matrices && info.backend == wgpu::Backend::Metal && has(8, wgpu::CooperativeScalarType::F32) {
-            8
-        } else {
-            0
-        };
-        let coop = coop_size != 0;
-        DeviceCaps {
-            name: info.name.clone(),
-            backend: info.backend,
-            vendor,
-            device_type: info.device_type,
-            f16,
-            subgroups,
-            coop,
-            fast_math: info.backend == wgpu::Backend::Metal,
-            msl: info.backend == wgpu::Backend::Metal && features.contains(wgpu::Features::PASSTHROUGH_SHADERS),
-            coop_size,
-            timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
-            max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
-        }
-    }
 }
 
 /// Choices that depend on the device's speeds rather than its features: when to submit,
@@ -395,7 +375,7 @@ pub(crate) struct CompileSettings {
 impl CompileSettings {
     /// No loop counters anywhere; workgroup memory zeroed except on Metal.
     pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
-        CompileSettings { loop_bounding: false, zero_workgroup_memory: caps.backend != wgpu::Backend::Metal }
+        CompileSettings { loop_bounding: false, zero_workgroup_memory: !caps.api.is_metal() }
     }
 
     /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`

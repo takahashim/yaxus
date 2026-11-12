@@ -39,8 +39,8 @@ use yaxus_model::{Backend, Config, LayerMeta, PassMeta, Quant, TensorRef};
 
 pub use dev::Buf;
 use dev::{Dev, Kernel};
+pub use device::{Api, AppleTuning, DeviceCaps, DeviceKind, Tuning, Vendor};
 use device::{CompileSettings, Diagnostics};
-pub use device::{DeviceCaps, Tuning, Vendor};
 use ops::{ARGMAX_ROWS, ARGMAX_SLICES};
 use profile::Profile;
 pub(crate) use weights::SCALE_PAD;

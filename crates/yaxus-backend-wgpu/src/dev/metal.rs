@@ -19,7 +19,7 @@ use objc2_metal::{
 };
 
 use super::Buf;
-use crate::device::{CompileSettings, DeviceCaps, Vendor};
+use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
 
 type Device = ProtocolObject<dyn MTLDevice>;
 type Buffer = ProtocolObject<dyn MTLBuffer>;
@@ -231,9 +231,9 @@ impl MetalDev {
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
         let caps = DeviceCaps {
             name: device.name().to_string(),
-            backend: wgpu::Backend::Metal,
+            api: Api::MetalDirect,
             vendor: Vendor::Apple,
-            device_type: wgpu::DeviceType::IntegratedGpu,
+            kind: DeviceKind::Integrated,
             f16: true,
             subgroups: true,
             coop: true,

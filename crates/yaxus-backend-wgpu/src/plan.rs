@@ -305,9 +305,9 @@ mod tests {
     fn caps(subgroups: bool, coop: bool) -> DeviceCaps {
         DeviceCaps {
             name: "test".into(),
-            backend: wgpu::Backend::Vulkan,
+            api: crate::device::Api::Vulkan,
             vendor: Vendor::Amd,
-            device_type: wgpu::DeviceType::IntegratedGpu,
+            kind: crate::device::DeviceKind::Integrated,
             f16: true,
             subgroups,
             coop,
