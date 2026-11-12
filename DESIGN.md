@@ -20,7 +20,7 @@ llama.cpp や Python に依存せず、単一プロセスで動作し、HTTPS �
 | Rust | 1.97.1 |
 | wgpu/Vulkan 確認済み | `shader_f16`、32 レーンの subgroup、cooperative matrix (16×16×16 f16)、整数ドット積、1 バッファ上限 2047 MiB |
 
-GPU 経路は **wgpu + 手書きの WGSL コンピュートシェーダ**。Linux/Windows では Vulkan、macOS では Metal で動く (Metal は Apple M2 で確認、経緯 11.39)。Vulkan を選んだ理由:
+GPU 経路は **wgpu + 手書きの WGSL コンピュートシェーダ**。Linux/Windows では Vulkan、macOS では Metal で動く (Metal は Apple M2 で確認、経緯 11.39)。Apple GPU では、行列積と小さなカーネルを MSL で書いたものに置き換える (4.2)。Vulkan を選んだ理由:
 
 - ROCm は未導入で、gfx1103 は ROCm の公式サポート外 (動かすには `HSA_OVERRIDE_GFX_VERSION` などの回避が必要)。
 - Mesa RADV は標準パッケージで動作確認済み。f16 演算と subgroup 命令が使えるので、推論カーネルを書くには十分。
@@ -227,7 +227,9 @@ yaxus/
 
 ### 4.1 構成
 
-- `Gpu` がデバイス、キュー、カーネル、開いているコマンドエンコーダ、バッファプールを持つ。本体と下書きは `WgpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
+- `Gpu` がデバイス、カーネル、バッファプールを持つ。本体と下書きは `WgpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
+- `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。
+- `msl.rs`: Apple GPU 用に MSL で書いたカーネル (1〜16 行の GEMV `gemv2`、prefill の GEMM `gemm`、`rmsnorm`・`add_norm`・`qk_rope`)。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
 - `device.rs`:
   - `DeviceCaps`: アダプタから調べる機能 (バックエンド、ベンダー、f16、32 レーン以上の subgroup、16×16×16 の cooperative matrix、fast math、タイムスタンプ、workgroup メモリの大きさ)。
   - `CompileSettings`: naga と wgpu が足す安全装置のうち外すもの。ループのカウンタはすべてのバックエンドで外し、workgroup メモリのゼロ初期化は Metal だけで外す (経緯 11.39、11.40)。外す前提 (どのループも必ず終わる) は `every_kernel_loop_ends` が全カーネルのソースで検査する。範囲チェックは残す。
@@ -241,26 +243,28 @@ yaxus/
 
 **行列積** (`MatmulPlan`):
 
-| 行数 | 整数 (AMD の既定) | f32 (Apple GPU の既定、`--prefill-precision f32 --decode-precision f32`) |
-|---|---|---|
-| 1〜16 | 整数 GEMV `gemv_int` (活性値を `xquantr` で int8 の 2 プレーンに丸め、`dot4I8Packed`。行数ごとに生成。SwiGLU 融合版あり) | 1 行は `gemv1` (SwiGLU 融合の `glu`)、2〜16 行は複数行 GEMV `gemvm` (subgroup なしは `gemv8`) |
-| 17〜48 | 整数 GEMV を 16 行ずつ | 17〜20 行は `gemvm` を 2 回、それより上は f32 GEMM |
-| 49〜 | 整数 GEMM `gemm_int` (活性値を `xquant` で丸め、128 トークンのタイル、端は 64 か 32) | f32 GEMM (64×128 タイル) |
+| 行数 | 整数 (AMD の既定) | f32 (`--prefill-precision f32 --decode-precision f32`) | Apple GPU の既定 |
+|---|---|---|---|
+| 1〜16 | 整数 GEMV `gemv_int` (活性値を `xquantr` で int8 の 2 プレーンに丸め、`dot4I8Packed`。行数ごとに生成。SwiGLU 融合版あり) | 1 行は `gemv1` (SwiGLU 融合の `glu`)、2〜16 行は複数行 GEMV `gemvm` (subgroup なしは `gemv8`) | `msl::gemv2` (1〜2 行はスカラー、3〜16 行は 8×8 の simdgroup 行列。算術は同じ) |
+| 17〜48 | 整数 GEMV を 16 行ずつ | 17〜20 行は `gemvm` を 2 回、それより上は f32 GEMM | `msl::gemm` (下記) |
+| 49〜 | 整数 GEMM `gemm_int` (活性値を `xquant` で丸め、128 トークンのタイル、端は 64 か 32) | f32 GEMM (64×128 タイル) | `msl::gemm` |
 
 - prefill と decode の精度は別々に選べる。16 行以下は decode の、それより上は prefill の設定に従う (decode だけ f32 なら 17 行以上は整数 GEMM)。
 - 整数の経路は、活性値を 32 個ごとに `max|x|` で正規化した 15 bit + 符号 (int16、`128·hi + lo` の 2 プレーン) で計算する。`int8` (1 プレーン、llama.cpp と同じ 7 bit) も選べる。
 - 整数の GEMV では、行の結果は同じパスの他の行に依存せず、ビット単位で同じになる (`integer_rows_do_not_depend_on_the_pass`)。fast math でコンパイルされる Metal では、1 行も `xquant` を通して丸めることでこれを保つ (`plan::gemv_int_inline`)。
 - f16 の行列演算ユニット (cooperative matrix) の GEMM `gemm_coop` も残している (`--prefill-precision f16`)。
+- Apple GPU の `gemv2` は Q8、Q4_K、Q6_K、Q3_K、Q2_K を読む。K を 32 値の区間に切り、区間 `c` をスライス `c % 8` に割り当てる。スライスごとに 4 本のアキュムレータを `fma` で進め、最後に決まった木の形で足す。M2 では 8×8 の行列演算が k の順の `fma` の鎖とビット単位で一致するので、スカラーと行列の 2 つのカーネルで同じ値になる (経緯 12.8)。起動時に 1 行・8 行・16 行のパスを比べ (`Gpu::gemv2_rows_agree`)、違えば `gemv_f32` (同じ性質を持つ WGSL の f32 GEMV) に戻す。ほかの形式 (Q4_0、bf16) も `gemv_f32` を使う。
+- Apple GPU の prefill は `msl::gemm` (llama.cpp の `kernel_mul_mm` と同じ形)。重み 64 行 × パスの 64 行のタイルで、threadgroup メモリに 8×8 の塊を置く。既定は f32 のタイル (何も丸めない) で、`--prefill-precision f16` で重みと活性値を half に丸める (`GemmKind::CoopF16`)。最後の 64 行タイルの後の残りは、16 行以下なら `gemv2`、32 行以下なら 32 行のタイルで計算する。MSL 版が読まない形式は WGSL の `gemm_coop8` (8×8 の f32 行列)。
 - bf16 の重みは f32 のカーネルだけで読む。
 
 **attention** (`AttentionPlan`):
 
 - 16 行以下のパス: 分割版 (flash-decoding)。(行, KV ヘッド, 16 または 32 キーのチャンク) ごとに 1 ワークグループで、KV ヘッドを共有するクエリヘッドをまとめて処理し、`attn_combine` で合成する。
-- それより大きいパス: タイル版 `attn_tile`。同じ系列で位置が連続する行を 32 行のタイルにまとめ、K/V を LDS に載せてタイルの全行で共有する。ワークグループが少ないときはキーをチャンクに分けて合成する。workgroup メモリが 38 KB に満たないデバイス (Apple GPU の 32 KiB など) では使えない。
+- それより大きいパス: タイル版 `attn_tile`。同じ系列で位置が連続する行を 32 行のタイルにまとめ、K/V を LDS に載せてタイルの全行で共有する。ワークグループが少ないときはキーをチャンクに分けて合成する。workgroup メモリが 38 KB に満たないデバイス (Apple GPU の 32 KiB) では、クエリを LDS に置かない版を使う。
 - subgroup がない、またはタイル版が使えないとき: 行ごとの `attention`。
 - 計算はすべて f32。
 
-**その他**: `embed`、`qk_rope`、`rmsnorm`、`add_norm` / `add_norm_sg`、`swiglu`、`add`、2 段の `argmax1` / `argmax2`。
+**その他**: `embed`、`qk_rope`、`rmsnorm`、`add_norm` / `add_norm_sg`、`swiglu`、`add`、2 段の `argmax1` / `argmax2`。Apple GPU では `rmsnorm`、`add_norm`、`qk_rope` を MSL 版 (`*_msl`) で動かす。
 
 ### 4.3 投入
 
@@ -273,18 +277,18 @@ yaxus/
 - **Radeon 780M (RADV)**: 基準のデバイス。整数ドット積、32 レーンの subgroup、cooperative matrix がそろう。
 - **Apple GPU (Metal)**:
   - Metal は workgroup メモリの vec4 の成分を別々のレーンから書くと値が消えるので、カーネルは workgroup メモリに vec4 をまるごと書く。
-  - Metal は fast math でコンパイルされ (wgpu から止められない)、`DeviceCaps::fast_math` で扱う。整数 GEMV の積算は明示的な `fma`、スケールは `keep` で包んで、行の結果がパスの大きさによらないようにしている。
-  - 整数ドット積の命令がないので、既定は prefill も decode も f32。
-  - cooperative matrix は 8×8 だけなので `gemm_coop` は使えない。
+  - wgpu は WGSL を fast math でコンパイルし、止められない (`DeviceCaps::fast_math`)。整数 GEMV の積算は明示的な `fma`、スケールは `keep` で包んで、行の結果がパスの大きさによらないようにしている。MSL のカーネルは `math_mode(safe)` で、Metal 直接のときは全カーネルを fast math なしでコンパイルする。
+  - 整数ドット積の命令がないので、既定は prefill も decode も f32。行列積は MSL のカーネル (4.2) で、cooperative matrix は 8×8 だけなので `gemm_coop` (16×16) は使えない。
+  - llama.cpp b11972 との比較 (M2、19 件の翻訳): 2B は下書きありで 1 件あたり 4〜20% 速く、下書きなしでは 5〜12% 遅い。0.8B はほぼ同じ (経緯 12.11)。
 - **ソフトウェア (lavapipe)**: 32 レーンの subgroup がないので、f32 の単純なカーネルだけで動く。CI のカーネルテストで使う (`YAXUS_SOFTWARE_GPU=1`)。
 
 ---
 
 ## 5. 精度と再現性
 
-- 既定 (`auto`) はデバイスが選ぶ。AMD では prefill・decode とも int16、Apple GPU では f32。
+- 既定 (`auto`) はデバイスが選ぶ。AMD では prefill・decode とも int16、Apple GPU では f32。Apple GPU で `--prefill-precision f16` を選ぶと、prefill の GEMM が重みと活性値を half に丸める (llama.cpp と同じ。256 行で約 9% 速い)。
 - `--prefill-precision int16|int8|f16|f32` と `--decode-precision int16|f32` で明示できる。int16 の logits は f32 と 5e-3 程度違う。int8 はその約 100 倍動く。
-- 行の結果は、同じパスに他の行があってもなくても同じ (整数 GEMV はビット単位、f32 は 1e-5 程度)。そのため、同時実行や投機の有無では出力が変わらない。
+- 行の結果は、同じパスに他の行があってもなくても同じ (整数 GEMV と、Apple GPU の `gemv2`・`gemv_f32` はビット単位、ほかの f32 は 1e-5 程度)。そのため、同時実行や投機の有無では出力が変わらない。
 - KV の再利用や同時実行では、同じリクエストでも KV が「デコードで作られた値」か「プリフィルで作られた値」かが変わり得る。差は上の範囲で、greedy の結果が変わるのは上位 2 候補がほぼ同点のときだけ。
 - 完全に再現したいとき (テスト、CPU の f32 参照との比較) は `--prefill-precision f32 --decode-precision f32 --no-kv-cache --max-streams 1`。
 - 投機の下書きの精度は出力に影響しない (採用率が変わるだけ)。
@@ -370,7 +374,7 @@ cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-thr
 
 - **トークナイザ**: Python の `Plamo3Tokenizer` で作ったゴールデン (パブリックドメイン作品の抜粋を含む約 1,700 件) の encode/decode、プロンプトテンプレート、ストリーミングデコードが完全一致。GGUF のトークナイザも同じ結果になる。
 - **モデル (CPU)**: transformers (f32) の logits と比べ、最大誤差 3e-5、greedy 一致。0.8B と 8B のゴールデンも持つ (`YAXUS_MODEL_DIR`、`YAXUS_GOLDEN`)。
-- **カーネル**: 全形式 × 全経路 (1〜16 行の GEMV、GEMM、GLU) をホストの参照と比べる。整数 GEMV の行がパスによらずビット単位で同じことも確かめる。
+- **カーネル**: 全形式 × 全経路 (1〜16 行の GEMV、GEMM、GLU) をホストの参照と比べる。整数 GEMV と、Apple GPU の f32 GEMV (`gemv2`、`gemv_f32`) の行が、パスによらずビット単位で同じことも確かめる (`f32_rows_do_not_depend_on_the_pass`)。`YAXUS_DEVICE=metal` で、Metal 直接のデバイスでも同じテストを回せる。
 - **GPU と CPU**: 同じ入力の logits、分割・タイルの attention、同時実行と投機とヒントが単独実行と同じ出力になること。
 - **ソースの検査**: 全カーネルのループが必ず終わる形であること (`every_kernel_loop_ends`)。
 
@@ -383,7 +387,8 @@ cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-thr
 - `yaxus bench doc`: モデル同梱の `README_ja.md` から散文 14 段落を取り出して訳す文書シナリオ (`--edit N` で再翻訳)。
 - `yaxus bench streams N`: 同時リクエスト。
 - `tests/bench/compare/compare.py`: Ollama との比較。
-- `YAXUS_PROFILE=1|2` で記録と待ちの時間、カーネルごとの GPU 時間を出す。
+- `YAXUS_PROFILE=1|2` で記録と待ちの時間、カーネルごとの GPU 時間を出す (Metal 直接では、2 のとき dispatch ごとにコマンドバッファを分けて測る)。
+- llama.cpp との比較は、同じ GGUF で `llama-bench` (pp、tg) と `llama-server` (19 件、同じプロンプト書式) を使い、交互に測った (経緯 12.10、12.11)。
 
 ### 8.3 CI (`.github/workflows/ci.yml`)
 
@@ -398,7 +403,7 @@ cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-thr
 
 | 用途 | クレート |
 |---|---|
-| GPU | `wgpu` 30 (Linux/Windows は Vulkan、macOS は Metal。実験的機能 cooperative matrix を使用), `pollster`, `bytemuck`, `half` |
+| GPU | `wgpu` 30 (Linux/Windows は Vulkan、macOS は Metal。実験的機能 cooperative matrix を使用), `pollster`, `bytemuck`, `half`。macOS では `objc2`、`objc2-metal`、`objc2-foundation` と `naga` (Metal 直接のデバイス) |
 | CPU 並列 | `rayon` |
 | 重み | `safetensors`, `memmap2` (GGUF は自前で読む) |
 | HTTP | `axum` 0.8, `axum-server` (rustls), `tokio` |
@@ -412,7 +417,8 @@ cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-thr
 
 決定:
 
-- GPU 経路は wgpu で自前カーネル (ROCm も MLX も使わない)。Metal は wgpu の上で対応する。
+- GPU 経路は wgpu で自前カーネル (ROCm も MLX も使わない)。Metal は wgpu の上で対応し、Apple GPU 向けのカーネルは MSL で書く。Metal を直接使うデバイス (`YAXUS_DEVICE=metal`) も同じ ops とカーネルで動く。
+- Apple GPU の prefill の既定は f32 のタイル。f16 (llama.cpp と同じ丸め) は `--prefill-precision f16` で選ぶ (経緯 12.9)。
 - 既定モデルは 2B。safetensors の既定の重み形式は Q8、GGUF はファイルの形式のまま。
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
 - 認証はトークン必須、TLS はローカル CA を自動生成。
@@ -427,6 +433,8 @@ cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-thr
 
 残課題:
 
-- Apple GPU 向けの `Tuning` の値 (いまは 780M の値のまま) と、simdgroup 行列 (8×8) を使う GEMM (経緯 11.39)。
+- Apple GPU の 1 行のパス (M2 の 2B で 21〜24 ms。llama.cpp は約 21 ms)。行列積はほぼ帯域の上限なので、残りは小さなカーネルの融合 (経緯 12.10)。
+- Metal 直接のデバイスを macOS の既定にするか (いまは wgpu と同じ速さ)。GPU に閉じたデコードループは、ホストの時間が 2% ほどなので後回し (経緯 12.10)。
+- 8×8 の行列演算が `fma` の鎖と一致する性質は M2 でしか測っていない。M1、M3 以降で `gemv2` が起動時の検査に通るか。
 - 16 並列のデコードの合計速度 (経緯 11.17 で 220 tok/s に届かなかった)。
 - 2B 本体の 4 ビット化の品質評価。
