@@ -374,6 +374,14 @@ impl<B: Backend> Engine<B> {
         })
     }
 
+    /// Turns prefix reuse on or off in both models (see [`Model::set_prefix_cache`]).
+    pub fn set_prefix_cache(&mut self, on: bool) {
+        self.target.set_prefix_cache(on);
+        if let Some(d) = self.draft.as_mut() {
+            d.set_prefix_cache(on);
+        }
+    }
+
     /// A request id not used by callers that number their requests from 0.
     pub fn fresh_id(&mut self) -> ReqId {
         self.next_id += 1;

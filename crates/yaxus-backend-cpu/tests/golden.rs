@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_model::{Backend, Model, Quant};
+use yaxus_model::{Backend, Model, ModelOptions, Quant};
 
 fn model_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {
@@ -31,11 +31,11 @@ fn cases() -> Vec<Value> {
 #[ignore]
 fn q8_quality() {
     let dir = model_dir().expect("model dir");
-    let mut model = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
+    let mut model = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
     for c in &cases() {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let s = model.new_seq().unwrap();
+        let s = model.new_seq();
         let logits = model.prefill(s, &ids).unwrap();
         let logits = model.backend.to_host(&logits);
         model.free_seq(s);
@@ -64,11 +64,11 @@ fn q8_quality() {
 fn golden_logits_and_greedy() {
     let dir = model_dir().expect("model dir");
     let cases = cases();
-    let mut model = Model::load(&dir, CpuBackend::new(), Quant::Bf16).unwrap();
+    let mut model = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Bf16)).unwrap();
     for c in &cases {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let s = model.new_seq().unwrap();
+        let s = model.new_seq();
         let logits = model.prefill(s, &ids).unwrap();
         let logits = model.backend.to_host(&logits);
         model.free_seq(s);
