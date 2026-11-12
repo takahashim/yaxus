@@ -92,7 +92,7 @@ pub struct Gpu {
     caps: DeviceCaps,
     tuning: Tuning,
     diag: Diagnostics,
-    kernels: HashMap<&'static str, Kernel>,
+    kernels: HashMap<String, Kernel>,
     encoder: Option<wgpu::CommandEncoder>,
     /// The compute pass being recorded into `encoder`, if any.
     pass: Option<wgpu::ComputePass<'static>>,
@@ -111,7 +111,7 @@ pub struct Gpu {
     argmax_part: wgpu::Buffer,
     /// Bind groups by (kernel, buffers). Pooled buffers recur every token, so most
     /// dispatches reuse one instead of creating it.
-    bind_groups: HashMap<(String, Vec<wgpu::Buffer>), wgpu::BindGroup>,
+    bind_groups: HashMap<(usize, Vec<wgpu::Buffer>), wgpu::BindGroup>,
     /// Matmul FLOPs recorded since the last submission.
     pending_flops: f64,
     /// Dispatches recorded since the pass began (early submission of small passes).

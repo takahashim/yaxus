@@ -1,7 +1,7 @@
 //! Matrix products: the f32 kernels, the integer GEMVs and GEMM, and the fused GLU.
 
 use super::grid;
-use crate::kernels::gemvi_name;
+use crate::kernels::name;
 use crate::plan::{GluPlan, MatmulCase, MatmulPlan};
 use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_int, gemv_int};
 
@@ -10,7 +10,7 @@ impl Gpu {
     /// the kernels `gemv` says.
     pub(crate) fn matmul(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
-        let (n, k, suffix) = (m.n, m.k, m.fmt.suffix());
+        let (n, k) = (m.n, m.k);
         assert_eq!(x.cols, k, "matmul inner dim");
         let t = x.rows;
         // The matrix-core GEMM stores whole 64-token tiles.
@@ -49,21 +49,19 @@ impl Gpu {
                 .filter(|&(_, rows)| rows > 0)
                 .map(|(r0, rows)| {
                     let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
-                    (format!("gemvm{rows}_{suffix}"), [n32, k32, rows as u32, r0 as u32], groups)
+                    (name::gemvm(rows, m.fmt), [n32, k32, rows as u32, r0 as u32], groups)
                 })
                 .collect(),
-            MatmulPlan::Gemv1 => vec![(format!("gemv1_{suffix}"), [n32, k32, 1, 0], grid(n.div_ceil(8) as u32))],
+            MatmulPlan::Gemv1 => vec![(name::gemv1(m.fmt), [n32, k32, 1, 0], grid(n.div_ceil(8) as u32))],
             MatmulPlan::Gemv8 => {
-                vec![(format!("gemv8_{suffix}"), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
+                vec![(name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
             }
             MatmulPlan::GemmCoop => {
-                vec![(format!("gemmcoop_{suffix}"), [n32, k32, t as u32, 0], ((n / 64) as u32, t.div_ceil(64) as u32))]
+                vec![(name::gemm_coop(m.fmt), [n32, k32, t as u32, 0], ((n / 64) as u32, t.div_ceil(64) as u32))]
             }
-            MatmulPlan::GemmF32 => vec![(
-                format!("gemm2f32_{suffix}"),
-                [n32, k32, t as u32, 0],
-                (n.div_ceil(128) as u32, t.div_ceil(64) as u32),
-            )],
+            MatmulPlan::GemmF32 => {
+                vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
+            }
             MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } => unreachable!(),
         };
         for (name, params, groups) in dispatches {
@@ -95,7 +93,7 @@ impl Gpu {
             GluPlan::Glu1 => {}
         }
         // (for Q4 the block variant `GLU_32` measured slower: 174 vs 138 us on 12288x1536)
-        let name = format!("glu_{}", m.fmt.suffix());
+        let kernel = name::glu(m.fmt);
         let bufs = m.decode_bufs();
         let inter = n2 / 2;
         let y = self.tensor(1, inter);
@@ -105,7 +103,7 @@ impl Gpu {
         if self.kernels_profile.is_some() {
             self.prof_detail = Some(format!("{n2}x{k}"));
         }
-        self.dispatch(&name, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
+        self.dispatch(&kernel, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
         self.account(2.0 * (n2 * k) as f64);
         y
     }
@@ -128,11 +126,10 @@ impl Gpu {
         let tp = t.div_ceil(128) * 128;
         let xq = self.tensor(tp, planes * k / 4);
         let xs = self.tensor(tp, k / 8);
-        let xquant =
-            self.int_kernel(format!("xquant{planes}"), &[false, true, false], || gemm_int::xquant_source(planes));
+        let xquant = self.int_kernel(name::xquant(planes), &[false, true, false], || gemm_int::xquant_source(planes));
         let lanes = (tp / 4) * (k / 32);
         self.dispatch(
-            xquant,
+            &xquant,
             &[xq.buf(), x.buf(), xs.buf()],
             &[k as u32, t as u32, f.xmode, 0],
             grid(lanes.div_ceil(64) as u32),
@@ -150,15 +147,14 @@ impl Gpu {
             if tiles == 0 {
                 continue;
             }
-            let name =
-                self.int_kernel(format!("gemmint{planes}_{tn}_{}", f.name), &[false, true, true, true, true], || {
-                    gemm_int::source(f, tn, planes)
-                });
+            let kernel = self.int_kernel(name::gemm_int(planes, tn, f.name), &[false, true, true, true, true], || {
+                gemm_int::source(f, tn, planes)
+            });
             if self.kernels_profile.is_some() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
             self.dispatch(
-                name,
+                &kernel,
                 &refs,
                 &[n as u32, k as u32, t as u32, r0 as u32],
                 (n.div_ceil(64) as u32, tiles as u32),
@@ -185,25 +181,25 @@ impl Gpu {
         if t == 1 {
             // A single row is rounded inside the kernel (no dispatch of its own).
             let rw = self.tuning.gemvi_rows;
-            let name =
-                self.int_kernel(gemvi_name(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
+            let kernel =
+                self.int_kernel(name::gemv_int(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
                     gemv_int::source(f, 1, planes, rw, glu, true)
                 });
             if self.kernels_profile.is_some() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
-            self.dispatch(name, &[y.buf(), x.buf(), wq, wsc], &[n as u32, k as u32, 1, 0], groups);
+            self.dispatch(&kernel, &[y.buf(), x.buf(), wq, wsc], &[n as u32, k as u32, 1, 0], groups);
             self.account(2.0 * (n * k) as f64 * if glu { 2.0 } else { 1.0 });
             return;
         }
         let xq = self.tensor(t, planes * k / 4);
         let xs = self.tensor(t, k / 8);
         let xquant =
-            self.int_kernel(format!("xquantr{planes}"), &[false, true, false], || gemv_int::xquant_source(planes));
+            self.int_kernel(name::xquant_rows(planes), &[false, true, false], || gemv_int::xquant_source(planes));
         let lanes = t * (k / 32);
         self.dispatch(
-            xquant,
+            &xquant,
             &[xq.buf(), x.buf(), xs.buf()],
             &[k as u32, t as u32, f.xmode, 0],
             grid(lanes.div_ceil(64) as u32),
@@ -214,8 +210,8 @@ impl Gpu {
         for i in 0..parts {
             let rows = (t - r0).div_ceil(parts - i);
             let rw = self.tuning.gemvi_rows;
-            let name = self.int_kernel(
-                gemvi_name(planes, rows, rw, glu, false, f.name),
+            let kernel = self.int_kernel(
+                name::gemv_int(planes, rows, rw, glu, false, f.name),
                 &[false, true, true, true, true],
                 || gemv_int::source(f, rows, planes, rw, glu, false),
             );
@@ -224,7 +220,7 @@ impl Gpu {
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
             let params = [n as u32, k as u32, rows as u32, r0 as u32];
-            self.dispatch(name, &[y.buf(), xq.buf(), wq, wsc, xs.buf()], &params, groups);
+            self.dispatch(&kernel, &[y.buf(), xq.buf(), wq, wsc, xs.buf()], &params, groups);
             r0 += rows;
         }
         self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });

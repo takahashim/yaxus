@@ -5,8 +5,62 @@ use crate::shaders;
 use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
 
 pub(crate) struct Kernel {
+    /// Its number in the device's kernel set (bind groups are cached by it).
+    pub(crate) id: usize,
     pub(crate) pipeline: wgpu::ComputePipeline,
     pub(crate) layout: wgpu::BindGroupLayout,
+}
+
+/// Kernel names, the one place each family's name is spelt: `build_kernels` and
+/// `precompile` compile under them, the ops dispatch by them.
+pub(crate) mod name {
+    use crate::Format;
+
+    /// The single-row f32 GEMV.
+    pub(crate) fn gemv1(f: Format) -> String {
+        format!("gemv1_{}", f.suffix())
+    }
+    /// The f32 GEMV of up to `GEMV_MAX_T` rows (without subgroups).
+    pub(crate) fn gemv8(f: Format) -> String {
+        format!("gemv8_{}", f.suffix())
+    }
+    /// The multi-row f32 GEMV of exactly `t` rows.
+    pub(crate) fn gemvm(t: usize, f: Format) -> String {
+        format!("gemvm{t}_{}", f.suffix())
+    }
+    /// The single-row f32 GEMV with SwiGLU.
+    pub(crate) fn glu(f: Format) -> String {
+        format!("glu_{}", f.suffix())
+    }
+    pub(crate) fn gemm_coop(f: Format) -> String {
+        format!("gemmcoop_{}", f.suffix())
+    }
+    pub(crate) fn gemm_f32(f: Format) -> String {
+        format!("gemm2f32_{}", f.suffix())
+    }
+    /// The split attention for `g` query heads per KV head, `hg` of them per workgroup
+    /// and chunks of `ch` keys.
+    pub(crate) fn attn_split(g: usize, ch: usize, hg: usize) -> String {
+        format!("attn_split{g}_{ch}_{hg}")
+    }
+    /// The rounding of activation rows to `planes` int8 planes for the integer GEMM.
+    pub(crate) fn xquant(planes: usize) -> String {
+        format!("xquant{planes}")
+    }
+    /// The same for the integer GEMVs.
+    pub(crate) fn xquant_rows(planes: usize) -> String {
+        format!("xquantr{planes}")
+    }
+    /// The integer GEMM tile of `tn` lanes for the format named `fmt` (`IntFmt::name`).
+    pub(crate) fn gemm_int(planes: usize, tn: usize, fmt: &str) -> String {
+        format!("gemmint{planes}_{tn}_{fmt}")
+    }
+    /// The integer GEMV of `t` rows with `rw` weight rows per lane group (`inline`: the
+    /// single-row one that rounds its row).
+    pub(crate) fn gemv_int(planes: usize, t: usize, rw: usize, glu: bool, inline: bool, fmt: &str) -> String {
+        let g = if glu { "g" } else { "" };
+        if inline { format!("gemvi{planes}_1ix{rw}{g}_{fmt}") } else { format!("gemvi{planes}_{t}x{rw}{g}_{fmt}") }
+    }
 }
 
 pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -20,12 +74,6 @@ pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLay
         },
         count: None,
     }
-}
-
-/// The name of a `gemv_int` kernel (`inline`: the single-row one that rounds its row).
-pub(crate) fn gemvi_name(planes: usize, t: usize, rw: usize, glu: bool, inline: bool, format: &str) -> String {
-    let g = if glu { "g" } else { "" };
-    if inline { format!("gemvi{planes}_1ix{rw}{g}_{format}") } else { format!("gemvi{planes}_{t}x{rw}{g}_{format}") }
 }
 
 pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_only: &[bool]) -> Kernel {
@@ -50,12 +98,17 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
         compilation_options: Default::default(),
         cache: None,
     });
-    Kernel { pipeline, layout }
+    Kernel { id: 0, pipeline, layout }
 }
 
 impl Gpu {
-    pub(crate) fn add_kernel(&mut self, name: &'static str, src: &str, read_only: &[bool]) {
-        let k = compile_kernel(&self.device, name, src, read_only);
+    pub(crate) fn add_kernel(&mut self, name: String, src: &str, read_only: &[bool]) {
+        let k = compile_kernel(&self.device, &name, src, read_only);
+        self.insert_kernel(name, k);
+    }
+
+    fn insert_kernel(&mut self, name: String, mut k: Kernel) {
+        k.id = self.kernels.len();
         self.kernels.insert(name, k);
     }
 
@@ -74,7 +127,7 @@ impl Gpu {
         let mut jobs: Vec<Job> = Vec::new();
         if let Some(planes) = gemv.planes {
             jobs.push((
-                format!("xquantr{planes}"),
+                name::xquant_rows(planes),
                 vec![false, true, false],
                 Box::new(move || gemv_int::xquant_source(planes)),
             ));
@@ -83,7 +136,7 @@ impl Gpu {
                     if !gemv.single_f32 {
                         let rw = gemvi_rows;
                         jobs.push((
-                            gemvi_name(planes, 1, rw, glu, true, f.name),
+                            name::gemv_int(planes, 1, rw, glu, true, f.name),
                             vec![false, true, true, true],
                             Box::new(move || gemv_int::source(f, 1, planes, rw, glu, true)),
                         ));
@@ -91,7 +144,7 @@ impl Gpu {
                     for t in 2..=GEMVM_MAX_T {
                         let rw = gemvi_rows;
                         jobs.push((
-                            gemvi_name(planes, t, rw, glu, false, f.name),
+                            name::gemv_int(planes, t, rw, glu, false, f.name),
                             vec![false, true, true, true, true],
                             Box::new(move || gemv_int::source(f, t, planes, rw, glu, false)),
                         ));
@@ -101,14 +154,14 @@ impl Gpu {
         }
         if let Some(planes) = self.gemm.planes() {
             jobs.push((
-                format!("xquant{planes}"),
+                name::xquant(planes),
                 vec![false, true, false],
                 Box::new(move || gemm_int::xquant_source(planes)),
             ));
             for f in formats.iter().filter_map(|f| f.gemm_int()) {
                 for tn in [2, 4, 8] {
                     jobs.push((
-                        format!("gemmint{planes}_{tn}_{}", f.name),
+                        name::gemm_int(planes, tn, f.name),
                         vec![false, true, true, true, true],
                         Box::new(move || gemm_int::source(f, tn, planes)),
                     ));
@@ -123,7 +176,7 @@ impl Gpu {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let (device, jobs) = (&self.device, &jobs);
-        let built: Vec<(&'static str, Kernel)> = std::thread::scope(|s| {
+        let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
                     s.spawn(|| {
@@ -131,8 +184,7 @@ impl Gpu {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            let name: &'static str = Box::leak(name.clone().into_boxed_str());
-                            out.push((name, compile_kernel(device, name, &source(), read_only)));
+                            out.push((name.clone(), compile_kernel(device, name, &source(), read_only)));
                         }
                         out
                     })
@@ -143,7 +195,9 @@ impl Gpu {
         if self.diag.compile_log {
             eprintln!("[compile] {} kernels ahead of use, {:.0} ms", built.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
-        self.kernels.extend(built);
+        for (name, k) in built {
+            self.insert_kernel(name, k);
+        }
     }
 
     pub(crate) fn build_kernels(&mut self) {
@@ -159,45 +213,19 @@ impl Gpu {
             }
         };
         let gemv = |t: usize| GEMV.replace("{MAXT}", &t.to_string()).replace("{RED}", &(t * 256).to_string());
-        let q8 = [false, true, true, true];
-        let bf = [false, true, true];
-        self.add_kernel("gemv1_q8", &gemv1(W_Q8_16), &q8);
-        self.add_kernel("gemv1_q4", &gemv1(W_Q4_16), &q8);
-        self.add_kernel("gemv8_q4", &format!("{MM_PARAMS}{W_Q4_16}{}", gemv(GEMV_MAX_T)), &q8);
-        self.add_kernel("glu_q4", &format!("{MM_PARAMS}{W_Q4_16}{GEMV_GLU}"), &q8);
-        self.add_kernel("gemv8_q8", &format!("{MM_PARAMS}{W_Q8_16}{}", gemv(GEMV_MAX_T)), &q8);
-        if self.caps.subgroups {
-            for t in 2..=GEMVM_MAX_T {
-                let r = self.tuning.gemvm_rows;
-                let body = GEMV_MULTI
-                    .replace("{T}", &t.to_string())
-                    .replace("{R}", &r.to_string())
-                    .replace("{RT}", &(r * t).to_string())
-                    .replace("{T128}", &(128 * t).to_string());
-                let q8_name: &'static str = Box::leak(format!("gemvm{t}_q8").into_boxed_str());
-                let bf_name: &'static str = Box::leak(format!("gemvm{t}_bf16").into_boxed_str());
-                let q4_name: &'static str = Box::leak(format!("gemvm{t}_q4").into_boxed_str());
-                self.add_kernel(q4_name, &format!("{MM_PARAMS}{W_Q4_16}{body}"), &q8);
-                self.add_kernel(q8_name, &format!("{MM_PARAMS}{W_Q8_16}{body}"), &q8);
-                self.add_kernel(bf_name, &format!("{MM_PARAMS}{W_BF16_16}{body}"), &bf);
-            }
-        }
-        for (w, wsrc, layout) in [("q8", W_Q8, &q8[..]), ("q4", W_Q4, &q8[..]), ("bf16", W_BF16, &bf[..])] {
-            if self.caps.coop {
-                let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{wsrc}{GEMM_COOP}");
-                self.add_kernel(Box::leak(format!("gemmcoop_{w}").into_boxed_str()), &c, layout);
-            }
-            let f32src = format!("{MM_PARAMS}{wsrc}{GEMM2}");
-            self.add_kernel(Box::leak(format!("gemm2f32_{w}").into_boxed_str()), &f32src, layout);
-        }
-        // GGUF K-quants at their own bit widths.
-        for (w, w4, w16) in
-            [("q4k", W_Q4K, W_Q4K_16), ("q6", W_Q6, W_Q6_16), ("q3", W_Q3, W_Q3_16), ("q2", W_Q2, W_Q2_16)]
-        {
-            let name = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
-            self.add_kernel(name(format!("gemv1_{w}")), &gemv1(w16), &q8);
-            self.add_kernel(name(format!("gemv8_{w}")), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), &q8);
-            self.add_kernel(name(format!("glu_{w}")), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), &q8);
+        // (the weight bindings: values and scales, or the bf16 matrix alone)
+        let layout = |f: Format| -> &'static [bool] {
+            if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
+        };
+        // The decode kernels read the weights 16 at a time (`W_*_16`), the prefill GEMMs
+        // through `load4` (`W_*`).
+        let decode = [(Format::Q8, W_Q8_16), (Format::Q4, W_Q4_16), (Format::Bf16, W_BF16_16), (Format::Q4K, W_Q4K_16)]
+            .into_iter()
+            .chain([(Format::Q6, W_Q6_16), (Format::Q3, W_Q3_16), (Format::Q2, W_Q2_16)]);
+        for (f, w16) in decode {
+            self.add_kernel(name::gemv1(f), &gemv1(w16), layout(f));
+            self.add_kernel(name::gemv8(f), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), layout(f));
+            self.add_kernel(name::glu(f), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), layout(f));
             if self.caps.subgroups {
                 for t in 2..=GEMVM_MAX_T {
                     let r = self.tuning.gemvm_rows;
@@ -206,72 +234,66 @@ impl Gpu {
                         .replace("{R}", &r.to_string())
                         .replace("{RT}", &(r * t).to_string())
                         .replace("{T128}", &(128 * t).to_string());
-                    self.add_kernel(name(format!("gemvm{t}_{w}")), &format!("{MM_PARAMS}{w16}{body}"), &q8);
+                    self.add_kernel(name::gemvm(t, f), &format!("{MM_PARAMS}{w16}{body}"), layout(f));
                 }
             }
+        }
+        let prefill = [(Format::Q8, W_Q8), (Format::Q4, W_Q4), (Format::Bf16, W_BF16), (Format::Q4K, W_Q4K)]
+            .into_iter()
+            .chain([(Format::Q6, W_Q6), (Format::Q3, W_Q3), (Format::Q2, W_Q2)]);
+        for (f, w4) in prefill {
             if self.caps.coop {
                 let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
-                self.add_kernel(name(format!("gemmcoop_{w}")), &c, &q8);
+                self.add_kernel(name::gemm_coop(f), &c, layout(f));
             }
-            self.add_kernel(name(format!("gemm2f32_{w}")), &format!("{MM_PARAMS}{w4}{GEMM2}"), &q8);
+            self.add_kernel(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));
         }
-        self.add_kernel("gemv1_bf16", &gemv1(W_BF16_16), &bf);
-        self.add_kernel("gemv8_bf16", &format!("{MM_PARAMS}{W_BF16_16}{}", gemv(GEMV_MAX_T)), &bf);
-        self.add_kernel("rmsnorm", RMSNORM, &[false, true, true]);
-        self.add_kernel("add_norm", ADD_NORM, &[false, false, true, true, true]);
+        self.add_kernel("rmsnorm".into(), RMSNORM, &[false, true, true]);
+        self.add_kernel("add_norm".into(), ADD_NORM, &[false, false, true, true, true]);
         if sg {
-            self.add_kernel("add_norm_sg", ADD_NORM_SG, &[false, false, true, true, true]);
+            self.add_kernel("add_norm_sg".into(), ADD_NORM_SG, &[false, false, true, true, true]);
         }
-        self.add_kernel("glu_q8", &format!("{MM_PARAMS}{W_Q8_16}{GEMV_GLU}"), &q8);
-        self.add_kernel("glu_bf16", &format!("{MM_PARAMS}{W_BF16_16}{GEMV_GLU}"), &bf);
-        self.add_kernel("argmax1", ARGMAX1, &[false, true]);
-        self.add_kernel("argmax2", ARGMAX2, &[false, true]);
-        self.add_kernel("qk_rope", QK_ROPE, &[false, false, false, true, true, true, true, true]);
-        self.add_kernel("attention", ATTENTION, &[false, true, true, true, true, true]);
-        self.add_kernel("embed", EMBED, &[false, true, true]);
+        self.add_kernel("argmax1".into(), ARGMAX1, &[false, true]);
+        self.add_kernel("argmax2".into(), ARGMAX2, &[false, true]);
+        self.add_kernel("qk_rope".into(), QK_ROPE, &[false, false, false, true, true, true, true, true]);
+        self.add_kernel("attention".into(), ATTENTION, &[false, true, true, true, true, true]);
+        self.add_kernel("embed".into(), EMBED, &[false, true, true]);
         // (the split attention reduces with subgroup shuffles; without them the per-row
         // kernel takes every pass)
         let sg = self.caps.subgroups;
         for g in plan::SPLIT_GROUPS.into_iter().filter(|_| sg) {
             for ch in plan::SPLIT_CHUNKS {
                 for hg in plan::SPLIT_HEAD_GROUPS.into_iter().filter(|h| g % h == 0) {
-                    let name: &'static str = Box::leak(format!("attn_split{g}_{ch}_{hg}").into_boxed_str());
                     let src = ATTN_SPLIT
                         .replace("{GF}", &g.to_string())
                         .replace("{G}", &hg.to_string())
                         .replace("{CH}", &ch.to_string())
                         .replace("{GCH}", &(16 * ch).to_string());
-                    self.add_kernel(name, &src, &[false, false, true, true, true, true, true]);
+                    self.add_kernel(name::attn_split(g, ch, hg), &src, &[false, false, true, true, true, true, true]);
                 }
             }
         }
-        self.add_kernel("attn_combine", ATTN_COMBINE, &[false, true, true]);
+        self.add_kernel("attn_combine".into(), ATTN_COMBINE, &[false, true, true]);
         // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
         // without it, prefill attention takes the per-row kernel.
         if plan::tile_compiled(&self.caps) {
-            self.add_kernel("attn_tile", ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+            self.add_kernel("attn_tile".into(), ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
         }
-        self.add_kernel("swiglu", SWIGLU, &[false, true]);
-        self.add_kernel("add", ADD, &[false, true]);
+        self.add_kernel("swiglu".into(), SWIGLU, &[false, true]);
+        self.add_kernel("add".into(), ADD, &[false, true]);
         if self.diag.compile_log {
             eprintln!("[compile] {} base kernels, {:.0} ms", self.kernels.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
     }
 
-    /// The name of a `gemm_int` kernel, compiled on first use (their sources are long, and
-    /// a model uses two or three of the formats).
-    pub(crate) fn int_kernel(
-        &mut self,
-        name: String,
-        read_only: &[bool],
-        source: impl FnOnce() -> String,
-    ) -> &'static str {
-        if let Some((k, _)) = self.kernels.get_key_value(name.as_str()) {
-            return k;
+    /// The kernel `name` (an integer kernel), compiled on first use if `precompile` did
+    /// not (their sources are long, and a model uses two or three of the formats).
+    pub(crate) fn int_kernel(&mut self, name: String, read_only: &[bool], source: impl FnOnce() -> String) -> String {
+        if self.kernels.contains_key(&name) {
+            return name;
         }
-        let name: &'static str = Box::leak(name.into_boxed_str());
         let t0 = std::time::Instant::now();
-        self.add_kernel(name, &source(), read_only);
+        self.add_kernel(name.clone(), &source(), read_only);
         // (`precompile` should have covered it; a line here means a stall mid-request)
         if self.diag.compile_log {
             eprintln!("[compile] {name} on first use, {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);

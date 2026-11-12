@@ -48,7 +48,7 @@ impl Gpu {
             let part = self.tensor(t * hkv * nch * g, 128);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
-                &format!("attn_split{g}_{ch}_{hg}"),
+                &crate::kernels::name::attn_split(g, ch, hg),
                 &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
                 &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
                 ((hkv * (g / hg) * nch) as u32, t as u32),

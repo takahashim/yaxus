@@ -37,7 +37,7 @@ impl Gpu {
 
     pub(crate) fn dispatch(&mut self, name: &str, bufs: &[&wgpu::Buffer], params: &[u32], groups: (u32, u32)) {
         let k = &self.kernels[name];
-        let key = (name.to_string(), bufs.iter().map(|b| (*b).clone()).collect::<Vec<_>>());
+        let key = (k.id, bufs.iter().map(|b| (*b).clone()).collect::<Vec<_>>());
         let bg = match self.bind_groups.get(&key) {
             Some(bg) => bg.clone(),
             None => {
