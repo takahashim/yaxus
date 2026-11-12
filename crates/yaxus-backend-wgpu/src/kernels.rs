@@ -89,7 +89,8 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
         for &f in formats {
             // (`msl::gemv_mma` for the formats it reads; K is known only at use, so both
             // families of a format are listed)
-            if let Some(f16) = tuning.gemm_msl.filter(|_| caps.msl && crate::msl::gemm_reads(f)) {
+            if tuning.gemm_msl && caps.msl && crate::msl::gemm_reads(f) {
+                let f16 = gemm == GemmKind::CoopF16;
                 for rb in [1, 2] {
                     jobs.push((
                         format!("gemm{}{rb}_{}", if f16 { "h" } else { "f" }, f.suffix()),

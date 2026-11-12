@@ -158,10 +158,10 @@ pub struct Tuning {
     /// rows past the last whole 64-row tile to gemv2, in passes of up to 16 rows (M2,
     /// 2B Q4_K_M, ms: a tile 166, gemv2 16 rows 56, 8 rows 35).
     pub gemv2_tail_rows: usize,
-    /// The matrix GEMM (`GemmKind::Coop`) in MSL where the device takes it (`msl::gemm`):
-    /// `Some(false)` with f32 tiles, `Some(true)` with the weights and activations rounded
-    /// to f16 (`YAXUS_GEMM_MSL=wgsl|f32|f16`).
-    pub gemm_msl: Option<bool>,
+    /// The matrix GEMM (`GemmKind::Coop`, `CoopF16`) in MSL where the device takes it
+    /// (`msl::gemm`), instead of `gemm_coop8` (`YAXUS_GEMM_MSL=wgsl|f32|f16`; `f16` also
+    /// selects `CoopF16`).
+    pub gemm_msl: bool,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -212,7 +212,7 @@ impl Tuning {
             msl_small: false,
             gemv2: false,
             gemv2_tail_rows: 40,
-            gemm_msl: None,
+            gemm_msl: false,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -245,7 +245,7 @@ impl Tuning {
             t.gemv2 = true;
             // (M2, 2B Q4_K_M, ms per pass of 32 / 64 / 256 rows: `gemm_coop8` 161 / 166 /
             // 648, MSL f32 tiles about 78 / 136 / 536; llama.cpp, f16 tiles, 71 / 140 / 515)
-            t.gemm_msl = Some(false);
+            t.gemm_msl = true;
             // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
             // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
             // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
@@ -262,7 +262,7 @@ impl Tuning {
     }
 
     /// The tuning with the overrides of the environment, for experiments and tests:
-    /// `YAXUS_GEMM=f32|coop|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
+    /// `YAXUS_GEMM=f32|coop|coop16|int16|int8`, `YAXUS_GEMV=f32|int16|int8|mixed`,
     /// `YAXUS_TILE_WGS`, `YAXUS_GEMVM_R`, `YAXUS_EARLY_SUBMIT`, `YAXUS_ATTN_SPLIT_WGS`,
     /// `YAXUS_SHORT_CONTEXT`, `YAXUS_GEMV_F32=0|1`, `YAXUS_GEMV_F32_R`, `YAXUS_GEMV_MMA=0|1`
     /// and `YAXUS_GEMV_Q=0|1`.
@@ -271,6 +271,7 @@ impl Tuning {
         match var("YAXUS_GEMM").as_deref() {
             Some("f32") => self.gemm = GemmKind::F32,
             Some("coop") => self.gemm = GemmKind::Coop,
+            Some("coop16") => self.gemm = GemmKind::CoopF16,
             Some("int8") => self.gemm = GemmKind::Int8,
             Some("int16") => self.gemm = GemmKind::Int16,
             _ => {}
@@ -303,9 +304,12 @@ impl Tuning {
             _ => {}
         }
         match var("YAXUS_GEMM_MSL").as_deref() {
-            Some("wgsl") => self.gemm_msl = None,
-            Some("f32") => self.gemm_msl = Some(false),
-            Some("f16") => self.gemm_msl = Some(true),
+            Some("wgsl") => self.gemm_msl = false,
+            Some("f32") => self.gemm_msl = true,
+            Some("f16") => {
+                self.gemm_msl = true;
+                self.gemm = GemmKind::CoopF16;
+            }
             _ => {}
         }
         if let Some(v) = var("YAXUS_GEMV2_TAIL").and_then(|v| v.parse().ok()) {
@@ -343,7 +347,7 @@ impl Tuning {
         match gemm {
             GemmKind::F32 => crate::GEMVM_MAX_T,
             GemmKind::Int8 => self.gemv_int8_max_rows,
-            GemmKind::Coop | GemmKind::Int16 => self.gemv_int_max_rows,
+            GemmKind::Coop | GemmKind::CoopF16 | GemmKind::Int16 => self.gemv_int_max_rows,
         }
     }
 }

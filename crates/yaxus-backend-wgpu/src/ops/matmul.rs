@@ -103,7 +103,8 @@ impl Gpu {
             }
             MatmulPlan::GemmCoop => {
                 let gemv2 = crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k);
-                if let Some(f16) = self.tuning.gemm_msl.filter(|_| self.caps.msl && crate::msl::gemm_reads(m.fmt)) {
+                if self.tuning.gemm_msl && self.caps.msl && crate::msl::gemm_reads(m.fmt) {
+                    let f16 = self.gemm == GemmKind::CoopF16;
                     self.gemm_msl(x, &y, m, f16, gemv2);
                     return y;
                 }
@@ -117,7 +118,11 @@ impl Gpu {
                 if tiled == 0 {
                     return y;
                 }
-                vec![(name::gemm_coop(m.fmt), [n32, k32, tiled as u32, 0], ((n / 64) as u32, tiled.div_ceil(64) as u32))]
+                vec![(
+                    name::gemm_coop(m.fmt),
+                    [n32, k32, tiled as u32, 0],
+                    ((n / 64) as u32, tiled.div_ceil(64) as u32),
+                )]
             }
             MatmulPlan::GemmF32 => {
                 vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
@@ -200,8 +205,8 @@ impl Gpu {
                 continue;
             }
             let kname = format!("gemm{}{rb}_{}", if f16 { "h" } else { "f" }, m.fmt.suffix());
-            let kernel =
-                self.int_kernel(kname, crate::kernels::decode_layout(m.fmt), || crate::msl::gemm(m.fmt, f16, rb).unwrap());
+            let kernel = self
+                .int_kernel(kname, crate::kernels::decode_layout(m.fmt), || crate::msl::gemm(m.fmt, f16, rb).unwrap());
             let imm = [n as u32, k as u32, (r0 + rows) as u32, r0 as u32];
             self.dispatch(&kernel, &refs, &imm, (rows.div_ceil(32 * rb) as u32, (n / 64) as u32));
         }

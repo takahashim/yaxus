@@ -140,9 +140,13 @@ pub enum GemmKind {
     F32,
     /// Matrix cores (cooperative matrices): f16 operands, f32 accumulation. Logits move by
     /// ~5e-3 instead of ~5e-5 against the CPU; prefill is ~1.35x faster on a 780M. On
-    /// Metal the matrices are Apple's 8x8 simdgroup matrices in f32 (`gemm_coop8`), and
-    /// nothing is rounded.
+    /// Metal the matrices are Apple's 8x8 simdgroup matrices in f32 (`msl::gemm`, or
+    /// `gemm_coop8`), and nothing is rounded.
     Coop,
+    /// Matrix cores with the operands rounded to f16 on every device: on Vulkan the same
+    /// as `Coop`; on Metal `msl::gemm` with f16 tiles, the weights and the activations
+    /// rounded to half as llama.cpp does (M2, 2B Q4_K_M, 256 rows: 539 -> 492 ms).
+    CoopF16,
     /// Packed integer dot products on the weights' integer values, the activations
     /// rounded to 15 bits and a sign per block of 32 (`gemm_int`, two int8 planes). Logits
     /// move by ~6e-3 against the CPU (less than with `Coop`); 1.3x faster than `Coop`.
