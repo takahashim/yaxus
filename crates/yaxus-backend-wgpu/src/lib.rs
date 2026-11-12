@@ -953,6 +953,16 @@ impl Gpu {
         }
     }
 
+    /// Records that the commands just recorded do `flops` of matrix work, and submits
+    /// them once `SUBMIT_FLOPS` have accumulated (so that no submission runs long enough
+    /// for the driver to reset the GPU).
+    fn account(&mut self, flops: f64) {
+        self.pending_flops += flops;
+        if self.pending_flops >= SUBMIT_FLOPS {
+            self.submit();
+        }
+    }
+
     fn submit(&mut self) {
         self.pass = None;
         self.pending_flops = 0.0;
@@ -1292,10 +1302,7 @@ impl Gpu {
                     groups,
                 );
             }
-            self.pending_flops += 2.0 * (t * n * k) as f64;
-            if self.pending_flops >= SUBMIT_FLOPS {
-                self.submit();
-            }
+            self.account(2.0 * (t * n * k) as f64);
             return y;
         }
         let params = [n as u32, k as u32, t as u32, 0];
@@ -1320,10 +1327,7 @@ impl Gpu {
             self.prof_detail = Some(format!("{n}x{k}"));
         }
         self.dispatch(&name, &refs, &params, groups);
-        self.pending_flops += 2.0 * (t * n * k) as f64;
-        if self.pending_flops >= SUBMIT_FLOPS {
-            self.submit();
-        }
+        self.account(2.0 * (t * n * k) as f64);
         y
     }
 
@@ -1515,10 +1519,7 @@ impl Gpu {
                 (n.div_ceil(64) as u32, tiles as u32),
             );
         }
-        self.pending_flops += 2.0 * (t * n * k) as f64;
-        if self.pending_flops >= SUBMIT_FLOPS {
-            self.submit();
-        }
+        self.account(2.0 * (t * n * k) as f64);
     }
 
     /// `y = x W^T` for up to 16 rows with integer dot products (`gemv_int`), or
@@ -1548,7 +1549,7 @@ impl Gpu {
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
             self.dispatch(name, &[y.buf(), x.buf(), wq, wsc], &[n as u32, k as u32, 1, 0], groups);
-            self.pending_flops += 2.0 * (n * k) as f64 * if glu { 2.0 } else { 1.0 };
+            self.account(2.0 * (n * k) as f64 * if glu { 2.0 } else { 1.0 });
             return;
         }
         let xq = self.tensor(t, planes * k / 4);
@@ -1581,10 +1582,7 @@ impl Gpu {
             self.dispatch(name, &[y.buf(), xq.buf(), wq, wsc, xs.buf()], &params, groups);
             r0 += rows;
         }
-        self.pending_flops += 2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 };
-        if self.pending_flops >= SUBMIT_FLOPS {
-            self.submit();
-        }
+        self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
     }
 
     /// The name of a `gemm_int` kernel, compiled on first use (their sources are long, and
@@ -1634,7 +1632,7 @@ impl Gpu {
             self.prof_detail = Some(format!("{n2}x{k}"));
         }
         self.dispatch(&name, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
-        self.pending_flops += 2.0 * (n2 * k) as f64;
+        self.account(2.0 * (n2 * k) as f64);
         y
     }
 
