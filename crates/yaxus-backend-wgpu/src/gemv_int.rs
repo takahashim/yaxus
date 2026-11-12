@@ -225,6 +225,11 @@ fn pk(v: vec4<i32>) -> u32 {{
     let u = bitcast<vec4<u32>>(v) & vec4<u32>(255u);
     return u.x | (u.y << 8u) | (u.z << 16u) | (u.w << 24u);
 }}
+// The weights' (scale, min) as computed, whatever their uses. Metal compiles with fast
+// math, which may reassociate `(d * sc) * unit` (`d * sc` is exact) in one kernel and not
+// in another, and a row's result would then depend on the size of its pass. A select on
+// a value the kernel does not otherwise read (`p.t`, never 0) keeps the product whole.
+fn keep(v: vec2<f32>) -> vec2<f32> {{ return select(v, vec2<f32>(0.0), p.t == 0u); }}
 ",
         decl = f.decl,
         xdecl = if inline {
@@ -319,7 +324,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
             } else {
                 writeln!(w, "        let u{pl} = pk({e});").unwrap();
             }
-            writeln!(w, "        xq[qb * {np}u + {}u + qi / 4u][qi % 4u] = u{pl};", 2 * pl).unwrap();
+            // (lane `qi` holds component `qi % 4` of vector `qi / 4`: the first lane of
+            // each 4 gathers and stores the whole vector, since Metal loses concurrent
+            // stores to different components of one workgroup vector)
+            write!(
+                w,
+                "        let u{pl}a = subgroupShuffleXor(u{pl}, 1u);
+        let u{pl}b = subgroupShuffleXor(u{pl}, 2u);
+        let u{pl}c = subgroupShuffleXor(u{pl}, 3u);
+        if ((qi & 3u) == 0u) {{ xq[qb * {np}u + {}u + qi / 4u] = vec4<u32>(u{pl}, u{pl}a, u{pl}b, u{pl}c); }}
+",
+                2 * pl
+            )
+            .unwrap();
         }
         write!(
             w,
@@ -366,7 +383,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
         writeln!(w, "        {{\n        let r = rw{a};\n        {}", f.load).unwrap();
         writeln!(w, "        ea{a} = ea;\n        eb{a} = eb;").unwrap();
         for h in 0..ks {
-            writeln!(w, "        ws{a}_{h} = {};", f.scale.replace(" h)", &format!(" {h}u)"))).unwrap();
+            writeln!(w, "        ws{a}_{h} = keep({});", f.scale.replace(" h)", &format!(" {h}u)"))).unwrap();
         }
         writeln!(w, "        }}").unwrap();
     }
@@ -407,10 +424,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
                     } else {
                         "z"
                     };
-                    writeln!(w, "        r{a}_{j} += {sum} * (ws{a}_{h}.x * xv{j}.x) - ws{a}_{h}.y * xv{j}.{xm};")
-                        .unwrap();
+                    writeln!(
+                        w,
+                        "        r{a}_{j} = fma(-ws{a}_{h}.y, xv{j}.{xm}, fma({sum}, ws{a}_{h}.x * xv{j}.x, r{a}_{j}));"
+                    )
+                    .unwrap();
                 } else {
-                    writeln!(w, "        r{a}_{j} += {sum} * (ws{a}_{h}.x * xv{j}.x);").unwrap();
+                    writeln!(w, "        r{a}_{j} = fma({sum}, ws{a}_{h}.x * xv{j}.x, r{a}_{j});").unwrap();
                 }
             }
         }

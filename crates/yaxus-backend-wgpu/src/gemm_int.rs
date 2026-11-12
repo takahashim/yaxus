@@ -170,6 +170,11 @@ fn f16scale(b: u32) -> f32 {{
 }}
 // (scale, min) of `q * scale - min` for `q - c` in place of `q`.
 fn center(sm: vec2<f32>, c: f32) -> vec2<f32> {{ return vec2<f32>(sm.x, sm.y - c * sm.x); }}
+// (e0, e1): weights `8 c .. 8 c + 8` of block `kb` in row `wrow`.
+fn stage(wrow: u32, c: u32, kb: u32) -> vec2<u32> {{
+    {stage}
+    return vec2<u32>(e0, e1);
+}}
 var<workgroup> wl: array<vec4<u32>, 128>;  // [8 u32 of the block][16 groups of 4 outputs]
 var<workgroup> wsl: array<vec2<f32>, {wslen}>;  // [sub-block][64 outputs]
 
@@ -179,16 +184,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let t0 = p.r0 + wg.y * {nt}u;
     let sn = li % 16u;  // the lane's 4 outputs
     let st = li / 16u;  // the lane's tokens
-    // Staging: 4 lanes per weight row, 8 weights of the block each.
-    let row = li / 4u;
-    let c = li % 4u;
-    let wrow = min(n0 + row, p.n - 1u);
+    // Staging (lanes 128-191): 8 weights of the block in 4 rows each, stored transposed,
+    // a whole vector per u32 of K. (Metal loses concurrent stores to different components
+    // of one workgroup vector.)
+    let sc = (li - 128u) % 4u;
+    let sg = (li - 128u) / 4u;
     // Activations: [block][group of 4 tokens][plane][8 u32 of K], a vec4 holding the
     // u32 of the group's 4 tokens; token rows padded to 128 (`xquant`).
     let tp4 = ((p.t + 127u) / 128u) * 32u;
     let xg = t0 / 4u + {xgroup};
 ",
         loader = f.loader.replace("fn load4", "fn load4_unused"),
+        stage = f.stage,
         wslen = 64 * ks,
     )
     .unwrap();
@@ -201,9 +208,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     write!(
         w,
         "    for (var kb = 0u; kb < p.k / 32u; kb++) {{
-        {stage}
-        wl[(2u * c) * 16u + row / 4u][row % 4u] = e0;
-        wl[(2u * c + 1u) * 16u + row / 4u][row % 4u] = e1;
+        if (li >= 128u && li < 192u) {{
+            let s0 = stage(min(n0 + sg * 4u, p.n - 1u), sc, kb);
+            let s1 = stage(min(n0 + sg * 4u + 1u, p.n - 1u), sc, kb);
+            let s2 = stage(min(n0 + sg * 4u + 2u, p.n - 1u), sc, kb);
+            let s3 = stage(min(n0 + sg * 4u + 3u, p.n - 1u), sc, kb);
+            wl[(2u * sc) * 16u + sg] = vec4<u32>(s0.x, s1.x, s2.x, s3.x);
+            wl[(2u * sc + 1u) * 16u + sg] = vec4<u32>(s0.y, s1.y, s2.y, s3.y);
+        }}
         if (li < {wn}u) {{
             let wr = min(n0 + li % 64u, p.n - 1u);
             let h = li / 64u;
@@ -211,7 +223,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         }}
         workgroupBarrier();
 ",
-        stage = f.stage,
         wn = 64 * ks,
         scale = f.scale,
     )

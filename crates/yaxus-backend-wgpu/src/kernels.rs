@@ -122,6 +122,7 @@ impl Gpu {
             return;
         }
         let gemvi_rows = self.tuning.gemvi_rows;
+        let inline = self.tuning.gemvi_inline;
         // (name, bindings, source)
         type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
         let mut jobs: Vec<Job> = Vec::new();
@@ -133,7 +134,7 @@ impl Gpu {
             ));
             for f in formats.iter().filter_map(|f| f.gemv_int()) {
                 for glu in [false, true] {
-                    if !gemv.single_f32 {
+                    if !gemv.single_f32 && inline {
                         let rw = gemvi_rows;
                         jobs.push((
                             name::gemv_int(planes, 1, rw, glu, true, f.name),
@@ -141,7 +142,9 @@ impl Gpu {
                             Box::new(move || gemv_int::source(f, 1, planes, rw, glu, true)),
                         ));
                     }
-                    for t in 2..=GEMVM_MAX_T {
+                    // (single rows take the 1-row kernel of these without `inline`)
+                    let first = if inline || gemv.single_f32 { 2 } else { 1 };
+                    for t in first..=GEMVM_MAX_T {
                         let rw = gemvi_rows;
                         jobs.push((
                             name::gemv_int(planes, t, rw, glu, false, f.name),
