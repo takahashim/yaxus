@@ -237,22 +237,24 @@ impl Tuning {
 /// The safety code naga and wgpu add to every kernel, where the kernels do without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CompileSettings {
-    /// naga's counter on every loop against infinite loops. On Metal it keeps the
-    /// compiler from unrolling them: private arrays indexed by the loop (the f32 GEMM's
+    /// naga's counter on every loop against infinite loops. It keeps the compilers from
+    /// unrolling loops: on Metal private arrays indexed by the loop (the f32 GEMM's
     /// accumulators) then live in memory, and the 256-row f32 pass of the 2B took 15.4 s
-    /// instead of 1.7 s on an M2. The kernels' loops all end (their bounds are shapes).
+    /// instead of 1.7 s on an M2. On a 780M without it, ms per pass of the 2B: int16 256
+    /// rows 477 -> 465, f32 9 / 16 rows 57.4 / 111.7 -> 46.7 / 101.4; the document
+    /// bench 47.9 -> 49.2 tok/s. The kernels' loops all end (their bounds are shapes).
     pub loop_bounding: bool,
     /// Zeroing workgroup memory on entry. Every kernel writes its workgroup memory before
     /// reading it; on Metal naga zeroes it from one lane per workgroup (32 KiB in
-    /// `gemvm16`, an 8-row f32 pass of the 2B 1.8 s instead of 0.17 s on an M2).
+    /// `gemvm16`, an 8-row f32 pass of the 2B 1.8 s instead of 0.17 s on an M2). (No
+    /// difference measured on a 780M, so Vulkan keeps it.)
     pub zero_workgroup_memory: bool,
 }
 
 impl CompileSettings {
-    /// Off on Metal, where both were measured; wgpu's defaults elsewhere.
+    /// No loop counters anywhere; workgroup memory zeroed except on Metal.
     pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
-        let metal = caps.backend == wgpu::Backend::Metal;
-        CompileSettings { loop_bounding: !metal, zero_workgroup_memory: !metal }
+        CompileSettings { loop_bounding: false, zero_workgroup_memory: caps.backend != wgpu::Backend::Metal }
     }
 
     /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`
