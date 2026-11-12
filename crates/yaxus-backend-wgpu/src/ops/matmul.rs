@@ -102,11 +102,14 @@ impl Gpu {
                 vec![(name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
             }
             MatmulPlan::GemmCoop => {
+                let gemv2 = crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k);
+                if let Some(f16) = self.tuning.gemm_msl.filter(|_| self.caps.msl && crate::msl::gemm_reads(m.fmt)) {
+                    self.gemm_msl(x, &y, m, f16, gemv2);
+                    return y;
+                }
                 // A tile costs its 64 rows whatever it holds: a short rest goes to gemv2.
                 let rest = t % 64;
-                let tail = rest > 0
-                    && rest <= self.tuning.gemv2_tail_rows
-                    && crate::plan::gemv2_takes(&self.caps, &self.tuning, m.fmt, k);
+                let tail = rest > 0 && rest <= self.tuning.gemv2_tail_rows && gemv2;
                 let tiled = if tail { t - rest } else { t };
                 if tail {
                     self.gemv2(x, &y, m, n, false, tiled, rest);
@@ -168,6 +171,41 @@ impl Gpu {
         self.dispatch(&kernel, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
         self.account(2.0 * (n2 * k) as f64);
         y
+    }
+
+    /// `y = x W^T` for more than 16 rows on `msl::gemm`: 64-row tiles, then the rest past
+    /// the last whole one by what costs least (M2, 2B Q4_K_M, ms: a 64-row tile 136, a
+    /// 32-row one about 78, gemv2 16 rows 56): up to 16 rows by gemv2 (with `gemv2`), up
+    /// to 32 by a 32-row tile, more by another 64-row one.
+    fn gemm_msl(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, f16: bool, gemv2: bool) {
+        let (t, n, k) = (x.rows, m.n, m.k);
+        let whole = t / 64 * 64;
+        let rest = t - whole;
+        let (wide, narrow) = match rest {
+            0 => (whole, 0),
+            1..=16 if gemv2 => {
+                self.gemv2(x, y, m, n, false, whole, rest);
+                (whole, 0)
+            }
+            1..=32 => (whole, rest),
+            _ => (t, 0),
+        };
+        if self.dev.timing() {
+            self.prof_detail = Some(format!("{n}x{k}"));
+        }
+        let bufs = [y.buf().clone(), x.buf().clone()].into_iter().chain(m.decode_bufs()).collect::<Vec<_>>();
+        let refs: Vec<&Buf> = bufs.iter().collect();
+        for (r0, rows, rb) in [(0, wide, 2), (wide, narrow, 1)] {
+            if rows == 0 {
+                continue;
+            }
+            let kname = format!("gemm{}{rb}_{}", if f16 { "h" } else { "f" }, m.fmt.suffix());
+            let kernel =
+                self.int_kernel(kname, crate::kernels::decode_layout(m.fmt), || crate::msl::gemm(m.fmt, f16, rb).unwrap());
+            let imm = [n as u32, k as u32, (r0 + rows) as u32, r0 as u32];
+            self.dispatch(&kernel, &refs, &imm, (rows.div_ceil(32 * rb) as u32, (n / 64) as u32));
+        }
+        self.account(2.0 * ((wide + narrow) * n * k) as f64);
     }
 
     /// `msl::gemv2` on rows `r0 .. r0 + rows` of `x` into the same rows of `y`, in

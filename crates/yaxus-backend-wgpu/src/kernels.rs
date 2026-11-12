@@ -89,6 +89,15 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
         for &f in formats {
             // (`msl::gemv_mma` for the formats it reads; K is known only at use, so both
             // families of a format are listed)
+            if let Some(f16) = tuning.gemm_msl.filter(|_| caps.msl && crate::msl::gemm_reads(f)) {
+                for rb in [1, 2] {
+                    jobs.push((
+                        format!("gemm{}{rb}_{}", if f16 { "h" } else { "f" }, f.suffix()),
+                        decode_layout(f).to_vec(),
+                        Box::new(move || crate::msl::gemm(f, f16, rb).unwrap()),
+                    ));
+                }
+            }
             if tuning.gemv2 && caps.msl && crate::msl::gemv2_reads(f) {
                 for glu in [false, true] {
                     for t in 1..=GEMVM_MAX_T {

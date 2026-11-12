@@ -158,6 +158,10 @@ pub struct Tuning {
     /// rows past the last whole 64-row tile to gemv2, in passes of up to 16 rows (M2,
     /// 2B Q4_K_M, ms: a tile 166, gemv2 16 rows 56, 8 rows 35).
     pub gemv2_tail_rows: usize,
+    /// The matrix GEMM (`GemmKind::Coop`) in MSL where the device takes it (`msl::gemm`):
+    /// `Some(false)` with f32 tiles, `Some(true)` with the weights and activations rounded
+    /// to f16 (`YAXUS_GEMM_MSL=wgsl|f32|f16`).
+    pub gemm_msl: Option<bool>,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -208,6 +212,7 @@ impl Tuning {
             msl_small: false,
             gemv2: false,
             gemv2_tail_rows: 40,
+            gemm_msl: None,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -238,6 +243,9 @@ impl Tuning {
             // 40.9 / 59.4 / 140, gemv2 21.1 / 26.4 / 34.0 / 34.9 / 55.8; checked at start,
             // `Gpu::gemv2_rows_agree`)
             t.gemv2 = true;
+            // (M2, 2B Q4_K_M, ms per pass of 32 / 64 / 256 rows: `gemm_coop8` 161 / 166 /
+            // 648, MSL f32 tiles about 78 / 136 / 536; llama.cpp, f16 tiles, 71 / 140 / 515)
+            t.gemm_msl = Some(false);
             // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
             // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
             // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
@@ -292,6 +300,12 @@ impl Tuning {
         match var("YAXUS_GEMV_F32").as_deref() {
             Some("0") => self.gemv_f32 = false,
             Some("1") => self.gemv_f32 = true,
+            _ => {}
+        }
+        match var("YAXUS_GEMM_MSL").as_deref() {
+            Some("wgsl") => self.gemm_msl = None,
+            Some("f32") => self.gemm_msl = Some(false),
+            Some("f16") => self.gemm_msl = Some(true),
             _ => {}
         }
         if let Some(v) = var("YAXUS_GEMV2_TAIL").and_then(|v| v.parse().ok()) {
