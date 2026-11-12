@@ -33,6 +33,14 @@ pub(crate) mod name {
     pub(crate) fn gemv_f32(t: usize, rw: usize, glu: bool, f: Format) -> String {
         format!("gemvf{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
     }
+    /// `msl::gemv_q` for `t` rows with `rw` weight rows per lane group.
+    pub(crate) fn gemv_q(t: usize, rw: usize, glu: bool, f: Format) -> String {
+        format!("gemvq{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
+    }
+    /// `msl::gemv_mma` with `tiles` 8-row tiles.
+    pub(crate) fn gemv_mma(tiles: usize, glu: bool, f: Format) -> String {
+        format!("gemvmma{tiles}{}_{}", if glu { "g" } else { "" }, f.suffix())
+    }
     /// The single-row f32 GEMV with SwiGLU.
     pub(crate) fn glu(f: Format) -> String {
         format!("glu_{}", f.suffix())
@@ -81,6 +89,32 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
     if gemv.planes.is_none() && tuning.gemv_f32 {
         let (rf, wgmem) = (tuning.gemv_f32_rows, caps.max_workgroup_storage);
         for &f in formats {
+            // (`msl::gemv_mma` for the formats it reads; K is known only at use, so both
+            // families of a format are listed)
+            if tuning.gemv_q && caps.msl && crate::msl::gemv_q_reads(f) {
+                for glu in [false, true] {
+                    for t in 1..=GEMVM_MAX_T {
+                        let stage = crate::msl::gemv_q_stages(t, rf, glu, wgmem);
+                        jobs.push((
+                            name::gemv_q(t, rf, glu, f),
+                            decode_layout(f).to_vec(),
+                            Box::new(move || crate::msl::gemv_q(f, t, rf, glu, stage).unwrap()),
+                        ));
+                    }
+                }
+                continue;
+            }
+            if tuning.gemv_mma && caps.msl && crate::msl::gemv_mma_reads(f) {
+                for glu in [false, true] {
+                    for tiles in [1, 2] {
+                        jobs.push((
+                            name::gemv_mma(tiles, glu, f),
+                            decode_layout(f).to_vec(),
+                            Box::new(move || crate::msl::gemv_mma(f, tiles, glu).unwrap()),
+                        ));
+                    }
+                }
+            }
             for glu in [false, true] {
                 for t in 1..=GEMVM_MAX_T {
                     jobs.push((
@@ -268,15 +302,32 @@ pub(crate) fn compile_kernel(
     read_only: &[bool],
 ) -> Kernel {
     let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
-    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-    let checks = wgpu::ShaderRuntimeChecks {
-        force_loop_bounding: settings.loop_bounding,
-        ..wgpu::ShaderRuntimeChecks::checked()
+    let (module, entry) = if let Some(size) = crate::msl::workgroup_size(src) {
+        // SAFETY: the source is ours (`msl`), its loops end (`every_kernel_loop_ends`) and
+        // its bindings are those of `read_only` at the buffer indices wgpu gives them.
+        let module = unsafe {
+            device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
+                label: Some(name),
+                entry_points: std::borrow::Cow::Owned(vec![wgpu::PassthroughShaderEntryPoint {
+                    name: "k0".into(),
+                    workgroup_size: (size, 1, 1),
+                }]),
+                msl: Some(src.as_str().into()),
+                ..Default::default()
+            })
+        };
+        (module, "k0")
+    } else {
+        let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
+        let checks = wgpu::ShaderRuntimeChecks {
+            force_loop_bounding: settings.loop_bounding,
+            ..wgpu::ShaderRuntimeChecks::checked()
+        };
+        // SAFETY: without loop counters wgpu requires that no loop runs forever. The
+        // kernels' loops count to shapes or halve to zero, which `every_kernel_loop_ends`
+        // checks for every source; bounds checks stay on.
+        (unsafe { device.create_shader_module_trusted(desc, checks) }, "main")
     };
-    // SAFETY: without loop counters wgpu requires that no loop runs forever. The kernels'
-    // loops count to shapes or halve to zero, which `every_kernel_loop_ends` checks for
-    // every source; bounds checks stay on.
-    let module = unsafe { device.create_shader_module_trusted(desc, checks) };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     let layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
@@ -289,7 +340,7 @@ pub(crate) fn compile_kernel(
         label: Some(name),
         layout: Some(&pl),
         module: &module,
-        entry_point: Some("main"),
+        entry_point: Some(entry),
         compilation_options: wgpu::PipelineCompilationOptions {
             zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
             ..Default::default()
@@ -433,7 +484,8 @@ mod tests {
             let [init, cond, step] = parts[..] else { return fail() };
             // (the variable is declared in the header, or before the loop when the header
             // leaves it out: `for (; k < n; k++)`)
-            let v = match init.strip_prefix("var ") {
+            // (`var` in WGSL; `uint` and `int` in the MSL kernels)
+            let v = match init.strip_prefix("var ").or(init.strip_prefix("uint ")).or(init.strip_prefix("int ")) {
                 Some(r) => r.split('=').next().unwrap().trim(),
                 None if init.is_empty() => step.split([' ', '+']).next().unwrap(),
                 None => return fail(),
@@ -508,6 +560,7 @@ mod tests {
             coop: true,
             coop_size: 16,
             fast_math: false,
+            msl: true,
             timestamps: false,
             max_workgroup_storage: 65536,
         };
@@ -526,12 +579,15 @@ mod tests {
                 max_workgroup_storage,
                 ..caps.clone()
             };
-            for rows in [1, 4] {
+            // (the MSL GEMVs, opt-in, each in place of `gemv_f32` for the formats it reads)
+            for (rows, gemv_q, gemv_mma) in [(1, false, false), (4, false, false), (2, true, false), (2, false, true)] {
                 let tuning = Tuning {
                     gemvm_rows: rows,
                     gemvi_rows: rows,
                     gemv_f32: true,
                     gemv_f32_rows: rows,
+                    gemv_q,
+                    gemv_mma,
                     ..Tuning::for_device(&caps)
                 };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));

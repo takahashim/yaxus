@@ -21,6 +21,7 @@ mod gemm_int;
 mod gemv_f32;
 mod gemv_int;
 mod kernels;
+mod msl;
 mod ops;
 mod plan;
 mod profile;
@@ -269,6 +270,9 @@ impl Gpu {
             label: Some("yaxus"),
             required_features: {
                 let mut f = wgpu::Features::IMMEDIATES;
+                if caps.msl {
+                    f |= wgpu::Features::PASSTHROUGH_SHADERS;
+                }
                 if f16 {
                     f |= wgpu::Features::SHADER_F16;
                 }

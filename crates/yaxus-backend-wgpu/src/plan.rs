@@ -105,6 +105,18 @@ pub(crate) fn gemv_int_inline(caps: &DeviceCaps, t: usize) -> bool {
     t == 1 && !caps.fast_math
 }
 
+/// Whether a `GemvF32` pass over a matrix of `fmt` with `k` columns runs `msl::gemv_mma`
+/// (the same kernel for every row count, so a row's bits never depend on its pass).
+pub(crate) fn gemv_mma_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format, k: usize) -> bool {
+    tuning.gemv_mma && caps.msl && crate::msl::gemv_mma_reads(fmt) && k.is_multiple_of(32)
+}
+
+/// Whether a `GemvF32` pass over a matrix of `fmt` runs `msl::gemv_q` (for every row count
+/// alike).
+pub(crate) fn gemv_q_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format) -> bool {
+    tuning.gemv_q && caps.msl && crate::msl::gemv_q_reads(fmt)
+}
+
 /// The kernels of `swiglu(x · w^T)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GluPlan {
@@ -218,6 +230,7 @@ mod tests {
             subgroups,
             coop,
             fast_math: false,
+            msl: false,
             coop_size: if coop { 16 } else { 0 },
             timestamps: false,
             max_workgroup_storage: 65536,

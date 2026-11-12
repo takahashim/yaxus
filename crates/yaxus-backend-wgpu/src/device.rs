@@ -52,6 +52,8 @@ pub struct DeviceCaps {
     /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
     /// it off). Kernels that must agree to the bit then may not.
     pub fast_math: bool,
+    /// Kernels in Metal Shading Language through wgpu's passthrough (`msl`).
+    pub msl: bool,
     /// Their size: 16 (16x16x16, f16 operands and f32 accumulators: matrix cores on
     /// Vulkan) or 8 (8x8x8 in f32: Metal's simdgroup matrices); 0 without.
     pub coop_size: u32,
@@ -96,6 +98,7 @@ impl DeviceCaps {
             subgroups,
             coop,
             fast_math: info.backend == wgpu::Backend::Metal,
+            msl: info.backend == wgpu::Backend::Metal && features.contains(wgpu::Features::PASSTHROUGH_SHADERS),
             coop_size,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
@@ -138,6 +141,12 @@ pub struct Tuning {
     pub gemv_f32: bool,
     /// Weight rows per 32-lane group in `gemv_f32`.
     pub gemv_f32_rows: usize,
+    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv_mma`
+    /// reads take it instead: every pass of up to 16 rows on simdgroup matrices.
+    pub gemv_mma: bool,
+    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv_q`
+    /// reads take it instead: the same kernels in MSL, the scales applied after the sums.
+    pub gemv_q: bool,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -183,6 +192,8 @@ impl Tuning {
             gemvm_rows: 2,
             gemv_f32: false,
             gemv_f32_rows: 2,
+            gemv_mma: false,
+            gemv_q: false,
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -251,6 +262,16 @@ impl Tuning {
         match var("YAXUS_GEMV_F32").as_deref() {
             Some("0") => self.gemv_f32 = false,
             Some("1") => self.gemv_f32 = true,
+            _ => {}
+        }
+        match var("YAXUS_GEMV_Q").as_deref() {
+            Some("0") => self.gemv_q = false,
+            Some("1") => self.gemv_q = true,
+            _ => {}
+        }
+        match var("YAXUS_GEMV_MMA").as_deref() {
+            Some("0") => self.gemv_mma = false,
+            Some("1") => self.gemv_mma = true,
             _ => {}
         }
         if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
