@@ -858,6 +858,14 @@ pub const GEMM2: &str = r#"
 var<workgroup> xs: array<vec4<f32>, 256>; // [16 k][16 groups of 4 tokens]
 var<workgroup> ws: array<vec4<f32>, 512>; // [16 k][32 groups of 4 outputs]
 
+// Values `4i..4i+4` of token row `t` and weight row `n` (zero past the end).
+fn xrow(t: u32, i: u32) -> vec4<f32> {
+    return select(vec4<f32>(0.0), x[min(t, p.t - 1u) * (p.k / 4u) + i], t < p.t);
+}
+fn wrow(n: u32, i: u32) -> vec4<f32> {
+    return select(vec4<f32>(0.0), load4(min(n, p.n - 1u), i), n < p.n);
+}
+
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let n0 = wg.x * 128u;
@@ -868,20 +876,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     var acc: array<vec4<f32>, 8>; // [4 tokens][2 halves]
     for (var i = 0u; i < 8u; i++) { acc[i] = vec4<f32>(0.0); }
     for (var kb = 0u; kb < p.k; kb += 16u) {
-        {
-            let t = li / 4u;
+        // Staging: a lane takes 4 k of 4 tokens (lanes 0-63) or of 4 outputs (64-191)
+        // and stores them transposed, a whole vector per k. (Metal loses concurrent
+        // stores to different components of one workgroup vector.)
+        if (li < 64u) {
             let c = li % 4u;
-            var v = vec4<f32>(0.0);
-            if (t0 + t < p.t) { v = x[(t0 + t) * k4 + kb / 4u + c]; }
-            for (var e = 0u; e < 4u; e++) { xs[(c * 4u + e) * 16u + t / 4u][t % 4u] = v[e]; }
-        }
-        for (var r = 0u; r < 2u; r++) {
-            let idx = li + 256u * r;
-            let n = idx / 4u;
-            let c = idx % 4u;
-            var w = vec4<f32>(0.0);
-            if (n0 + n < p.n) { w = load4(n0 + n, kb / 4u + c); }
-            for (var e = 0u; e < 4u; e++) { ws[(c * 4u + e) * 32u + n / 4u][n % 4u] = w[e]; }
+            let g = li / 4u;
+            let i = kb / 4u + c;
+            let v0 = xrow(t0 + g * 4u, i);
+            let v1 = xrow(t0 + g * 4u + 1u, i);
+            let v2 = xrow(t0 + g * 4u + 2u, i);
+            let v3 = xrow(t0 + g * 4u + 3u, i);
+            xs[(c * 4u) * 16u + g] = vec4<f32>(v0.x, v1.x, v2.x, v3.x);
+            xs[(c * 4u + 1u) * 16u + g] = vec4<f32>(v0.y, v1.y, v2.y, v3.y);
+            xs[(c * 4u + 2u) * 16u + g] = vec4<f32>(v0.z, v1.z, v2.z, v3.z);
+            xs[(c * 4u + 3u) * 16u + g] = vec4<f32>(v0.w, v1.w, v2.w, v3.w);
+        } else if (li < 192u) {
+            let c = (li - 64u) % 4u;
+            let g = (li - 64u) / 4u;
+            let i = kb / 4u + c;
+            let w0 = wrow(n0 + g * 4u, i);
+            let w1 = wrow(n0 + g * 4u + 1u, i);
+            let w2 = wrow(n0 + g * 4u + 2u, i);
+            let w3 = wrow(n0 + g * 4u + 3u, i);
+            ws[(c * 4u) * 32u + g] = vec4<f32>(w0.x, w1.x, w2.x, w3.x);
+            ws[(c * 4u + 1u) * 32u + g] = vec4<f32>(w0.y, w1.y, w2.y, w3.y);
+            ws[(c * 4u + 2u) * 32u + g] = vec4<f32>(w0.z, w1.z, w2.z, w3.z);
+            ws[(c * 4u + 3u) * 32u + g] = vec4<f32>(w0.w, w1.w, w2.w, w3.w);
         }
         workgroupBarrier();
         // Accumulating each 16-step slice separately and then adding it is measurably

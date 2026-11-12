@@ -1,5 +1,5 @@
 //! Matmul kernels (every path: gemv1, gemvm2..8, gemm, glu) against a host reference
-//! computed from the same quantized weights. Needs a Vulkan GPU:
+//! computed from the same quantized weights. Needs a GPU (Vulkan, or Metal on macOS):
 //! `cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored`
 //! or a software one (lavapipe, as in CI; without 32-lane subgroups only the f32 decode
 //! kernels and the prefill GEMMs run): `YAXUS_SOFTWARE_GPU=1

@@ -174,7 +174,7 @@ impl Gpu {
         glu: bool,
     ) {
         let (t, k) = (x.rows, x.cols);
-        if t == 1 {
+        if t == 1 && self.tuning.gemvi_inline {
             // A single row is rounded inside the kernel (no dispatch of its own).
             let rw = self.tuning.gemvi_rows;
             let kernel =

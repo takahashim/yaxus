@@ -45,7 +45,7 @@ pub struct DraftOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefill {
     /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemm`]; `Int16` on the AMD GPUs
-    /// measured so far).
+    /// measured so far, `F32` on Apple GPUs).
     #[default]
     Auto,
     /// Integer dot products, activations rounded to 15 bits per block of 32: 2.6x, 6e-3.
@@ -90,7 +90,7 @@ impl std::str::FromStr for Prefill {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Decode {
     /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemv`]; `Int16` on the AMD GPUs
-    /// measured so far).
+    /// measured so far, `F32` on Apple GPUs).
     #[default]
     Auto,
     /// Integer dot products, activations rounded to 15 bits per block of 32: logits move

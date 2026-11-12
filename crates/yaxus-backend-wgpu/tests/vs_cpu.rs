@@ -1,4 +1,4 @@
-//! Compares the Vulkan backend with the CPU reference on the golden prompts.
+//! Compares the GPU backend with the CPU reference on the golden prompts.
 //! Needs a GPU and the 2B model: `cargo test --release -p yaxus-backend-wgpu -- --ignored --nocapture`
 //! (in a session without the `render` group, run it under `sg render -c '...'`).
 
