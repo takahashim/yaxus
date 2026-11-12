@@ -82,31 +82,46 @@ jobs:
         run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored
 
   metal:
-    # The same kernel tests on Metal (the macOS runners' GPU is a virtual Apple GPU), and
-    # clippy over the macOS-only paths.
-    name: GPU kernels (Metal)
+    # The kernel tests on Metal (the macOS runners' GPU is a virtual Apple GPU), through
+    # wgpu and without it (YAXUS_DEVICE=metal) side by side; with the first, clippy over the
+    # macOS-only paths and the macOS-only unit tests (the WGSL-to-MSL translation).
+    name: GPU kernels (Metal, ${{ matrix.device }})
     runs-on: macos-15
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        device: [wgpu, metal]
+    env:
+      YAXUS_DEVICE: ${{ matrix.device == 'metal' && 'metal' || '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Metal's compiled shaders, kept from run to run: with the cache empty, compiling the
-      # kernels is most of the tests' time (M2: integer_rows 19.5 s cold, 0.5 s warm;
-      # matmul_kernels 47 s, 4.2 s). The cache's directory may differ between runners, so
-      # it is copied to and from a fixed one.
+      # Metal's compiled shaders, kept from run to run. Through wgpu the cache takes about a
+      # quarter off the kernel tests (295 s without it, 221 s with it); with
+      # YAXUS_DEVICE=metal, little (306 s, 301 s). The cache's directory may differ between
+      # runners, so it is copied to and from a fixed one. The key holds what the compiled
+      # shaders depend on besides the sources (the device, whose kernels are translated
+      # differently; macOS's Metal compiler, by the OS build, which not every image update
+      # changes; the toolchain that names the test binaries; naga's translation in
+      # Cargo.lock): an exact hit is not saved again, so a change there would otherwise
+      # leave every run cold.
       - name: Shader cache directory
         id: shaders
-        run: echo "dir=$(getconf DARWIN_USER_CACHE_DIR)com.apple.metal" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "dir=$(getconf DARWIN_USER_CACHE_DIR)com.apple.metal" >> "$GITHUB_OUTPUT"
+          echo "prefix=metal-shaders-${{ runner.os }}-${{ matrix.device }}-$(sw_vers -buildVersion)-${{ steps.toolchain.outputs.cachekey }}-" >> "$GITHUB_OUTPUT"
       - name: Restore the shader cache
         id: restore-shaders
         uses: actions/cache/restore@v6
         with:
           path: ~/metal-shaders
-          key: metal-shaders-${{ runner.os }}-${{ hashFiles('crates/yaxus-backend-gpu/src/**') }}
-          restore-keys: metal-shaders-${{ runner.os }}-
+          key: ${{ steps.shaders.outputs.prefix }}${{ hashFiles('Cargo.lock', 'crates/yaxus-backend-gpu/src/**') }}
+          restore-keys: ${{ steps.shaders.outputs.prefix }}
       - name: Use the restored shader cache
         run: |
           if [ -d ~/metal-shaders ]; then
@@ -114,6 +129,7 @@ jobs:
             cp -R ~/metal-shaders/. "${{ steps.shaders.outputs.dir }}/"
           fi
       - name: Clippy
+        if: matrix.device == 'wgpu'
         run: cargo clippy -p yaxus-backend-gpu --all-targets
       - name: Device
         env:
@@ -121,6 +137,9 @@ jobs:
         run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored --nocapture reports_the_device
       - name: Kernel tests
         run: cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored
+      - name: Unit tests
+        if: matrix.device == 'wgpu'
+        run: cargo test --release -p yaxus-backend-gpu --lib
       - name: Take the shader cache
         if: always() && steps.restore-shaders.outputs.cache-hit != 'true'
         run: |
