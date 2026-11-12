@@ -154,10 +154,10 @@ enum Source {
 }
 
 pub struct Engine<B: Backend> {
-    pub target: Model<B>,
-    pub draft: Option<Model<B>>,
-    pub cfg: EngineConfig,
-    pub spec: SpecStats,
+    target: Model<B>,
+    draft: Option<Model<B>>,
+    cfg: EngineConfig,
+    spec: SpecStats,
     waiting: VecDeque<Request>,
     streams: Vec<Stream>,
     /// Round-robin start for decode passes.
@@ -205,6 +205,28 @@ impl<B: Backend> Engine<B> {
             tuner: DraftTuner::default(),
             end_token: None,
         })
+    }
+
+    /// Speculative decoding and response cache counts so far.
+    pub fn spec_stats(&self) -> &SpecStats {
+        &self.spec
+    }
+
+    /// Free KV pages of the target and the draft model.
+    pub fn free_pages(&self) -> (usize, Option<usize>) {
+        (self.target.free_pages(), self.draft.as_ref().map(Model::free_pages))
+    }
+
+    /// Changes the longest draft run (1..=16), as [`EngineConfig::draft_k`].
+    pub fn set_draft_k(&mut self, k: usize) -> Result<()> {
+        anyhow::ensure!((1..=16).contains(&k), "draft length must be 1..=16");
+        self.cfg.draft_k = k;
+        Ok(())
+    }
+
+    /// Changes the response cache size, as [`EngineConfig::response_cache`] (0: off).
+    pub fn set_response_cache(&mut self, entries: usize) {
+        self.cfg.response_cache = entries;
     }
 
     /// Turns prefix reuse on or off in both models (see [`Model::set_prefix_cache`]).

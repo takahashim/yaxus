@@ -424,7 +424,9 @@ impl<B: Backend> Model<B> {
         Ok(logits.unwrap())
     }
 
-    /// Greedy generation. `on_token` returns `false` to stop early.
+    /// Greedy generation of one request directly on the model, without the engine's
+    /// scheduling, speculation or caches: the reference the engine's outputs are tested
+    /// against. `on_token` returns `false` to stop early.
     pub fn generate(
         &mut self,
         prompt: &[u32],

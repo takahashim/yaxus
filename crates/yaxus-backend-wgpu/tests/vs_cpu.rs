@@ -143,7 +143,7 @@ fn speculative_matches_plain() {
     for c in &cases() {
         let ids = u32s(&c["ids"]);
         for k in [1, 3, 5, 7] {
-            spec.cfg.draft_k = k;
+            spec.set_draft_k(k).unwrap();
             let a = plain.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
             let b = spec.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
             assert_eq!(a, b, "{} k={k}", c["name"]);
@@ -153,7 +153,7 @@ fn speculative_matches_plain() {
             assert_eq!(a, b, "{} k={k} max_new=7", c["name"]);
         }
     }
-    eprintln!("speculative: {:?}", spec.spec);
+    eprintln!("speculative: {:?}", spec.spec_stats());
 }
 
 /// Requests run together (batched decode passes, interleaved prefill) must produce what
@@ -202,7 +202,7 @@ fn concurrent_matches_solo() {
     for i in 0..prompts.len() {
         assert_eq!(outs[i], solo[i], "request {i} differs when run together");
     }
-    eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec);
+    eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec_stats());
 }
 
 /// After `abort_all` (the server's recovery from a failed step) the engine holds nothing:
@@ -220,7 +220,7 @@ fn abort_all_leaves_a_clean_engine() {
     let prompt = u32s(&cases()[0]["ids"]);
     let before = eng.generate(&prompt, 16, &[1, 16], &mut |_| true).unwrap();
     // (the KV arena exists from the first request on)
-    let free = (eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages()));
+    let free = eng.free_pages();
     // Two running (one decoding, one prefilling or decoding) and one waiting.
     for i in 0..3 {
         eng.submit(Request::new(i, prompt.clone(), 64, vec![1, 16]));
@@ -231,7 +231,7 @@ fn abort_all_leaves_a_clean_engine() {
     assert!(eng.active() > 0 && eng.waiting() > 0);
     eng.abort_all();
     assert!(eng.is_idle());
-    assert_eq!((eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages())), free);
+    assert_eq!(eng.free_pages(), free);
     let mut events = 0;
     eng.step(&mut |_| {
         events += 1;
@@ -299,16 +299,16 @@ fn hints_and_response_cache_keep_output() {
                 assert_eq!(run(&mut eng, &ids, 6, hint), solo[..6.min(solo.len())], "{} hint {name} max 6", c["name"]);
             }
         }
-        eprintln!("draft {with_draft}: {:?}", eng.spec);
+        eprintln!("draft {with_draft}: {:?}", eng.spec_stats());
         // The response cache: a repeated request gives the same tokens without a pass.
-        eng.cfg.response_cache = 8;
+        eng.set_response_cache(8);
         let ids = u32s(&cases()[0]["ids"]);
         let first = run(&mut eng, &ids, 40, vec![]);
-        let rounds = eng.spec.rounds;
+        let rounds = eng.spec_stats().rounds;
         assert_eq!(run(&mut eng, &ids, 40, vec![]), first);
         assert_eq!(run(&mut eng, &ids, 5, vec![]), first[..5.min(first.len())]);
-        assert_eq!(eng.spec.cache_hits, 2);
-        assert_eq!(eng.spec.rounds, rounds);
+        assert_eq!(eng.spec_stats().cache_hits, 2);
+        assert_eq!(eng.spec_stats().rounds, rounds);
     }
 }
 
