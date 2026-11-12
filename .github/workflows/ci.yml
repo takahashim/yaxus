@@ -82,6 +82,7 @@ jobs:
     # clippy over the macOS-only paths.
     name: GPU kernels (Metal)
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -90,5 +91,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy -p yaxus-backend-wgpu --all-targets
+      - name: Device
+        env:
+          YAXUS_EXPECT_SUBGROUPS: "1"
+        run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored --nocapture reports_the_device
       - name: Kernel tests
         run: cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored

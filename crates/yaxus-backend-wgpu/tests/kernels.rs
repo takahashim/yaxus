@@ -82,6 +82,20 @@ fn gemm_kinds(gpu: &WgpuBackend) -> Vec<(GemmKind, f32)> {
 /// The kernels for up to 16 rows (`set_gemv`) and the error each may add.
 const GEMV_KINDS: [(Option<usize>, f32); 3] = [(None, 0.0), (Some(2), 3e-3), (Some(1), 3e-2)];
 
+/// The device the tests run on and what it supports (CI prints it with `--nocapture`).
+/// The other tests skip what the device lacks; `YAXUS_EXPECT_SUBGROUPS=1` makes their
+/// absence an error instead, so a runner whose device lost them does not pass silently.
+#[test]
+#[ignore]
+fn reports_the_device() {
+    let gpu = WgpuBackend::new().unwrap();
+    let caps = gpu.caps();
+    eprintln!("{caps:#?}\n{:#?}", gpu.tuning());
+    if std::env::var_os("YAXUS_EXPECT_SUBGROUPS").is_some_and(|v| v == "1") {
+        assert!(caps.subgroups, "{}: no 32-lane subgroups, so the integer decode kernels went untested", caps.name);
+    }
+}
+
 #[test]
 #[ignore]
 fn matmul_kernels_match_host() {

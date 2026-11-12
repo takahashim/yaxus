@@ -22,9 +22,9 @@ impl Gpu {
         };
         let case = MatmulCase { t, n, k, fmt: m.fmt, gemm: self.gemm, gemv };
         let plan = case.plan(&self.caps, &self.tuning);
-        if let MatmulPlan::GemvInt { planes } = plan {
+        if let MatmulPlan::GemvInt { planes, inline } = plan {
             let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
-            self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), planes, false);
+            self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
             return y;
         }
         if let MatmulPlan::GemmInt { planes } = plan {
@@ -76,10 +76,10 @@ impl Gpu {
         assert_eq!(x.cols, k);
         let case = MatmulCase { t: x.rows, n: n2, k, fmt: m.fmt, gemm: self.gemm, gemv };
         match case.plan_glu(&self.caps, &self.tuning) {
-            GluPlan::GemvInt { planes } => {
+            GluPlan::GemvInt { planes, inline } => {
                 let y = self.tensor(x.rows, n2 / 2);
                 let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
-                self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), planes, true);
+                self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), (planes, inline), true);
                 return y;
             }
             GluPlan::MatmulThenSwiglu => {
@@ -160,7 +160,8 @@ impl Gpu {
     }
 
     /// `y = x W^T` for up to 16 rows with integer dot products (`gemv_int`), or
-    /// `swiglu` of it with `glu` (`n` is then the intermediate size).
+    /// `swiglu` of it with `glu` (`n` is then the intermediate size); activations in
+    /// `planes` int8 planes, rounded inside the kernel with `inline` (a single row).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn gemv_int(
         &mut self,
@@ -170,12 +171,12 @@ impl Gpu {
         wsc: &wgpu::Buffer,
         n: usize,
         f: &'static gemv_int::IntFmt,
-        planes: usize,
+        (planes, inline): (usize, bool),
         glu: bool,
     ) {
         let (t, k) = (x.rows, x.cols);
-        if t == 1 && self.tuning.gemvi_inline {
-            // A single row is rounded inside the kernel (no dispatch of its own).
+        if inline {
+            debug_assert_eq!(t, 1);
             let rw = self.tuning.gemvi_rows;
             let kernel =
                 self.int_kernel(name::gemv_int(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {

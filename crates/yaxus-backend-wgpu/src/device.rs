@@ -1,5 +1,6 @@
-//! What the GPU can do ([`DeviceCaps`], detected from the adapter) and the measured
-//! choices the kernels are run with on it ([`Tuning`]).
+//! What the GPU can do ([`DeviceCaps`], detected from the adapter), how the kernels are
+//! compiled for it ([`CompileSettings`]) and the measured choices they are run with on
+//! it ([`Tuning`]).
 
 use crate::{GemmKind, Gemv};
 
@@ -48,6 +49,10 @@ pub struct DeviceCaps {
     /// Cooperative matrices of 16x16x16 with f16 operands and f32 accumulators (the
     /// `Coop` GEMM).
     pub coop: bool,
+    /// The shader compiler may reassociate float arithmetic and contract it into FMAs
+    /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
+    /// it off). Kernels that must agree to the bit then may not.
+    pub fast_math: bool,
     /// Timestamp queries (`YAXUS_PROFILE=2`).
     pub timestamps: bool,
     pub max_workgroup_storage: u32,
@@ -80,6 +85,7 @@ impl DeviceCaps {
             f16,
             subgroups,
             coop,
+            fast_math: info.backend == wgpu::Backend::Metal,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
         }
@@ -122,12 +128,6 @@ pub struct Tuning {
     /// 16 rows 185 / 116 / 109 / 180; single-row decode in tok/s with 1 / 4 / 8: 2B Q4_K_M
     /// 44.1 / 44.6 / 43.6, 0.8B Q2_K 166 / 188 / 184.
     pub gemvi_rows: usize,
-    /// Single rows through the integer GEMV round their activations inside the kernel
-    /// (no `xquant` dispatch of their own, which costs more than its work when a pass is
-    /// bound by reading the weights). Off on Metal: it compiles with fast math, and the
-    /// rounding inside the kernel then need not give the bits of `xquant`'s, so a row's
-    /// result would depend on whether it ran alone.
-    pub gemvi_inline: bool,
     /// Passes with at most this many rows use the split-key attention (a workgroup per
     /// row and chunk of keys). Decode passes are rows of different requests, which the
     /// tiled attention of prompt passes handles badly: 16 requests in one pass took 74 ms
@@ -165,7 +165,6 @@ impl Tuning {
             multi_split_max_rows: 20,
             gemvm_rows: 2,
             gemvi_rows: 4,
-            gemvi_inline: true,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
             short_context: 64,
@@ -180,9 +179,8 @@ impl Tuning {
     /// as they are measured.
     pub fn for_device(caps: &DeviceCaps) -> Self {
         let mut t = Tuning::radeon_780m();
-        if caps.backend == wgpu::Backend::Metal {
-            t.gemvi_inline = false;
-        }
+        // (by vendor, not backend: an AMD GPU in an Intel Mac would keep the integer
+        // kernels on Metal, unmeasured)
         if caps.vendor == Vendor::Apple {
             // Apple GPUs have no integer dot product: `dot4I8Packed` is four multiplies
             // and the byte extractions, and the integer kernels lose to the f32 ones
@@ -230,6 +228,47 @@ impl Tuning {
             GemmKind::Int8 => self.gemv_int8_max_rows,
             GemmKind::Coop | GemmKind::Int16 => self.gemv_int_max_rows,
         }
+    }
+}
+
+/// The safety code naga and wgpu add to every kernel, where the kernels do without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompileSettings {
+    /// naga's counter on every loop against infinite loops. It keeps the compilers from
+    /// unrolling loops: on Metal private arrays indexed by the loop (the f32 GEMM's
+    /// accumulators) then live in memory, and the 256-row f32 pass of the 2B took 15.4 s
+    /// instead of 1.7 s on an M2. On a 780M without it, ms per pass of the 2B: int16 256
+    /// rows 477 -> 465, f32 9 / 16 rows 57.4 / 111.7 -> 46.7 / 101.4; the document
+    /// bench 47.9 -> 49.2 tok/s. The kernels' loops all end (their bounds are shapes).
+    pub loop_bounding: bool,
+    /// Zeroing workgroup memory on entry. Every kernel writes its workgroup memory before
+    /// reading it; on Metal naga zeroes it from one lane per workgroup (32 KiB in
+    /// `gemvm16`, an 8-row f32 pass of the 2B 1.8 s instead of 0.17 s on an M2). (No
+    /// difference measured on a 780M, so Vulkan keeps it.)
+    pub zero_workgroup_memory: bool,
+}
+
+impl CompileSettings {
+    /// No loop counters anywhere; workgroup memory zeroed except on Metal.
+    pub(crate) fn for_device(caps: &DeviceCaps) -> Self {
+        CompileSettings { loop_bounding: false, zero_workgroup_memory: caps.backend != wgpu::Backend::Metal }
+    }
+
+    /// With the overrides of the environment, for experiments: `YAXUS_LOOP_BOUNDING=0|1`
+    /// and `YAXUS_ZERO_WGMEM=0|1`.
+    pub(crate) fn with_env(mut self) -> Self {
+        let flag = |name: &str| match std::env::var(name).as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        };
+        if let Some(v) = flag("YAXUS_LOOP_BOUNDING") {
+            self.loop_bounding = v;
+        }
+        if let Some(v) = flag("YAXUS_ZERO_WGMEM") {
+            self.zero_workgroup_memory = v;
+        }
+        self
     }
 }
 

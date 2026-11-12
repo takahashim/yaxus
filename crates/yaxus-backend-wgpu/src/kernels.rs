@@ -1,8 +1,9 @@
 //! Compiling the kernels: the base set when the device opens, the integer kernels of a
 //! model's formats ahead of use, and the rest on first use.
 
+use crate::device::{CompileSettings, DeviceCaps, Tuning};
 use crate::shaders;
-use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
+use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_int, plan};
 
 pub(crate) struct Kernel {
     /// Its number in the device's kernel set (bind groups are cached by it).
@@ -63,6 +64,137 @@ pub(crate) mod name {
     }
 }
 
+/// An integer kernel compiled ahead of use: (name, read-only bindings, source).
+pub(crate) type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
+
+/// The integer kernels a model with weights of `formats` can use with `gemv` and `gemm`.
+pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, formats: &[Format], gemv: Gemv) -> Vec<Job> {
+    let rw = tuning.gemvi_rows;
+    let mut jobs: Vec<Job> = Vec::new();
+    if let Some(planes) = gemv.planes {
+        jobs.push((
+            name::xquant_rows(planes),
+            vec![false, true, false],
+            Box::new(move || gemv_int::xquant_source(planes)),
+        ));
+        for f in formats.iter().filter_map(|f| f.gemv_int()) {
+            for glu in [false, true] {
+                // (the row counts and the rounding as `MatmulCase::plan` picks them)
+                for t in (1..=GEMVM_MAX_T).filter(|&t| gemv.planes(t).is_some()) {
+                    let inline = plan::gemv_int_inline(caps, t);
+                    let bindings =
+                        if inline { vec![false, true, true, true] } else { vec![false, true, true, true, true] };
+                    jobs.push((
+                        name::gemv_int(planes, t, rw, glu, inline, f.name),
+                        bindings,
+                        Box::new(move || gemv_int::source(f, t, planes, rw, glu, inline)),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(planes) = gemm.planes() {
+        jobs.push((name::xquant(planes), vec![false, true, false], Box::new(move || gemm_int::xquant_source(planes))));
+        for f in formats.iter().filter_map(|f| f.gemm_int()) {
+            for tn in [2, 4, 8] {
+                jobs.push((
+                    name::gemm_int(planes, tn, f.name),
+                    vec![false, true, true, true, true],
+                    Box::new(move || gemm_int::source(f, tn, planes)),
+                ));
+            }
+        }
+    }
+    jobs
+}
+
+/// The kernels every model uses, compiled when the device is opened: (name, source,
+/// read-only bindings) for a device with `caps`.
+pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, String, &'static [bool])> {
+    use shaders::*;
+    let mut out = Vec::new();
+    let mut add = |name: String, src: &str, read_only: &'static [bool]| out.push((name, src.to_string(), read_only));
+    let sg = caps.subgroups;
+    // Decode GEMV: the subgroup kernel where available.
+    let gemv1 = move |w16: &str| -> String {
+        if sg {
+            format!("{MM_PARAMS}{w16}{GEMV_T1}")
+        } else {
+            format!("{MM_PARAMS}{w16}{}", GEMV.replace("{MAXT}", "1").replace("{RED}", "256"))
+        }
+    };
+    let gemv = |t: usize| GEMV.replace("{MAXT}", &t.to_string()).replace("{RED}", &(t * 256).to_string());
+    // (the weight bindings: values and scales, or the bf16 matrix alone)
+    let layout = |f: Format| -> &'static [bool] {
+        if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
+    };
+    // The decode kernels read the weights 16 at a time (`W_*_16`), the prefill GEMMs
+    // through `load4` (`W_*`).
+    let decode = [(Format::Q8, W_Q8_16), (Format::Q4, W_Q4_16), (Format::Bf16, W_BF16_16), (Format::Q4K, W_Q4K_16)]
+        .into_iter()
+        .chain([(Format::Q6, W_Q6_16), (Format::Q3, W_Q3_16), (Format::Q2, W_Q2_16)]);
+    for (f, w16) in decode {
+        add(name::gemv1(f), &gemv1(w16), layout(f));
+        add(name::gemv8(f), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), layout(f));
+        add(name::glu(f), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), layout(f));
+        if caps.subgroups {
+            for t in 2..=GEMVM_MAX_T {
+                let r = tuning.gemvm_rows;
+                let body = GEMV_MULTI
+                    .replace("{T}", &t.to_string())
+                    .replace("{R}", &r.to_string())
+                    .replace("{RT}", &(r * t).to_string())
+                    .replace("{T128}", &(128 * t).to_string());
+                add(name::gemvm(t, f), &format!("{MM_PARAMS}{w16}{body}"), layout(f));
+            }
+        }
+    }
+    let prefill = [(Format::Q8, W_Q8), (Format::Q4, W_Q4), (Format::Bf16, W_BF16), (Format::Q4K, W_Q4K)]
+        .into_iter()
+        .chain([(Format::Q6, W_Q6), (Format::Q3, W_Q3), (Format::Q2, W_Q2)]);
+    for (f, w4) in prefill {
+        if caps.coop {
+            let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
+            add(name::gemm_coop(f), &c, layout(f));
+        }
+        add(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));
+    }
+    add("rmsnorm".into(), RMSNORM, &[false, true, true]);
+    add("add_norm".into(), ADD_NORM, &[false, false, true, true, true]);
+    if sg {
+        add("add_norm_sg".into(), ADD_NORM_SG, &[false, false, true, true, true]);
+    }
+    add("argmax1".into(), ARGMAX1, &[false, true]);
+    add("argmax2".into(), ARGMAX2, &[false, true]);
+    add("qk_rope".into(), QK_ROPE, &[false, false, false, true, true, true, true, true]);
+    add("attention".into(), ATTENTION, &[false, true, true, true, true, true]);
+    add("embed".into(), EMBED, &[false, true, true]);
+    // (the split attention reduces with subgroup shuffles; without them the per-row
+    // kernel takes every pass)
+    let sg = caps.subgroups;
+    for g in plan::SPLIT_GROUPS.into_iter().filter(|_| sg) {
+        for ch in plan::SPLIT_CHUNKS {
+            for hg in plan::SPLIT_HEAD_GROUPS.into_iter().filter(|h| g % h == 0) {
+                let src = ATTN_SPLIT
+                    .replace("{GF}", &g.to_string())
+                    .replace("{G}", &hg.to_string())
+                    .replace("{CH}", &ch.to_string())
+                    .replace("{GCH}", &(16 * ch).to_string());
+                add(name::attn_split(g, ch, hg), &src, &[false, false, true, true, true, true, true]);
+            }
+        }
+    }
+    add("attn_combine".into(), ATTN_COMBINE, &[false, true, true]);
+    // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
+    // without it, prefill attention takes the per-row kernel.
+    if plan::tile_compiled(caps) {
+        add("attn_tile".into(), ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
+    }
+    add("swiglu".into(), SWIGLU, &[false, true]);
+    add("add".into(), ADD, &[false, true]);
+    out
+}
+
 pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -76,18 +208,22 @@ pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLay
     }
 }
 
-pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_only: &[bool]) -> Kernel {
+pub(crate) fn compile_kernel(
+    device: &wgpu::Device,
+    settings: CompileSettings,
+    name: &str,
+    src: &str,
+    read_only: &[bool],
+) -> Kernel {
     let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
     let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-    let metal = device.adapter_info().backend == wgpu::Backend::Metal;
-    // On Metal naga guards every loop with a counter against infinite loops, which keeps
-    // the compiler from unrolling them: private arrays indexed by the loop (the f32
-    // GEMM's accumulators) then live in memory, and the 256-row f32 pass of the 2B took
-    // 15.4 s instead of 1.7 s on an M2. The kernels' loops all end (their bounds are
-    // shapes), so the guard is left out there. (Vulkan keeps wgpu's checks until
-    // measured.)
-    let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: !metal, ..wgpu::ShaderRuntimeChecks::checked() };
-    // SAFETY: the loops of the kernels are bounded (see above); bounds checks stay on.
+    let checks = wgpu::ShaderRuntimeChecks {
+        force_loop_bounding: settings.loop_bounding,
+        ..wgpu::ShaderRuntimeChecks::checked()
+    };
+    // SAFETY: without loop counters wgpu requires that no loop runs forever. The kernels'
+    // loops count to shapes or halve to zero, which `every_kernel_loop_ends` checks for
+    // every source; bounds checks stay on.
     let module = unsafe { device.create_shader_module_trusted(desc, checks) };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     let layout =
@@ -102,11 +238,8 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
         layout: Some(&pl),
         module: &module,
         entry_point: Some("main"),
-        // Every kernel writes its workgroup memory before reading it. On Metal naga would
-        // zero it from one lane per workgroup on entry (32 KiB in `gemvm16`, an 8-row
-        // f32 pass of the 2B 1.8 s instead of 0.17 s on an M2).
         compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: !metal,
+            zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
             ..Default::default()
         },
         cache: None,
@@ -116,7 +249,7 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
 
 impl Gpu {
     pub(crate) fn add_kernel(&mut self, name: String, src: &str, read_only: &[bool]) {
-        let k = compile_kernel(&self.device, &name, src, read_only);
+        let k = compile_kernel(&self.device, self.compile, &name, src, read_only);
         self.insert_kernel(name, k);
     }
 
@@ -134,56 +267,7 @@ impl Gpu {
         if !self.caps.subgroups {
             return;
         }
-        let gemvi_rows = self.tuning.gemvi_rows;
-        let inline = self.tuning.gemvi_inline;
-        // (name, bindings, source)
-        type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
-        let mut jobs: Vec<Job> = Vec::new();
-        if let Some(planes) = gemv.planes {
-            jobs.push((
-                name::xquant_rows(planes),
-                vec![false, true, false],
-                Box::new(move || gemv_int::xquant_source(planes)),
-            ));
-            for f in formats.iter().filter_map(|f| f.gemv_int()) {
-                for glu in [false, true] {
-                    if !gemv.single_f32 && inline {
-                        let rw = gemvi_rows;
-                        jobs.push((
-                            name::gemv_int(planes, 1, rw, glu, true, f.name),
-                            vec![false, true, true, true],
-                            Box::new(move || gemv_int::source(f, 1, planes, rw, glu, true)),
-                        ));
-                    }
-                    // (single rows take the 1-row kernel of these without `inline`)
-                    let first = if inline || gemv.single_f32 { 2 } else { 1 };
-                    for t in first..=GEMVM_MAX_T {
-                        let rw = gemvi_rows;
-                        jobs.push((
-                            name::gemv_int(planes, t, rw, glu, false, f.name),
-                            vec![false, true, true, true, true],
-                            Box::new(move || gemv_int::source(f, t, planes, rw, glu, false)),
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(planes) = self.gemm.planes() {
-            jobs.push((
-                name::xquant(planes),
-                vec![false, true, false],
-                Box::new(move || gemm_int::xquant_source(planes)),
-            ));
-            for f in formats.iter().filter_map(|f| f.gemm_int()) {
-                for tn in [2, 4, 8] {
-                    jobs.push((
-                        name::gemm_int(planes, tn, f.name),
-                        vec![false, true, true, true, true],
-                        Box::new(move || gemm_int::source(f, tn, planes)),
-                    ));
-                }
-            }
-        }
+        let mut jobs = int_jobs(&self.caps, &self.tuning, self.gemm, formats, gemv);
         jobs.retain(|(name, ..)| !self.kernels.contains_key(name.as_str()));
         if jobs.is_empty() {
             return;
@@ -191,7 +275,7 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (device, jobs) = (&self.device, &jobs);
+        let (device, settings, jobs) = (&self.device, self.compile, &jobs);
         let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -200,7 +284,7 @@ impl Gpu {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            out.push((name.clone(), compile_kernel(device, name, &source(), read_only)));
+                            out.push((name.clone(), compile_kernel(device, settings, name, &source(), read_only)));
                         }
                         out
                     })
@@ -217,86 +301,10 @@ impl Gpu {
     }
 
     pub(crate) fn build_kernels(&mut self) {
-        use shaders::*;
         let t0 = std::time::Instant::now();
-        let sg = self.caps.subgroups;
-        // Decode GEMV: the subgroup kernel where available.
-        let gemv1 = move |w16: &str| -> String {
-            if sg {
-                format!("{MM_PARAMS}{w16}{GEMV_T1}")
-            } else {
-                format!("{MM_PARAMS}{w16}{}", GEMV.replace("{MAXT}", "1").replace("{RED}", "256"))
-            }
-        };
-        let gemv = |t: usize| GEMV.replace("{MAXT}", &t.to_string()).replace("{RED}", &(t * 256).to_string());
-        // (the weight bindings: values and scales, or the bf16 matrix alone)
-        let layout = |f: Format| -> &'static [bool] {
-            if f == Format::Bf16 { &[false, true, true] } else { &[false, true, true, true] }
-        };
-        // The decode kernels read the weights 16 at a time (`W_*_16`), the prefill GEMMs
-        // through `load4` (`W_*`).
-        let decode = [(Format::Q8, W_Q8_16), (Format::Q4, W_Q4_16), (Format::Bf16, W_BF16_16), (Format::Q4K, W_Q4K_16)]
-            .into_iter()
-            .chain([(Format::Q6, W_Q6_16), (Format::Q3, W_Q3_16), (Format::Q2, W_Q2_16)]);
-        for (f, w16) in decode {
-            self.add_kernel(name::gemv1(f), &gemv1(w16), layout(f));
-            self.add_kernel(name::gemv8(f), &format!("{MM_PARAMS}{w16}{}", gemv(GEMV_MAX_T)), layout(f));
-            self.add_kernel(name::glu(f), &format!("{MM_PARAMS}{w16}{GEMV_GLU}"), layout(f));
-            if self.caps.subgroups {
-                for t in 2..=GEMVM_MAX_T {
-                    let r = self.tuning.gemvm_rows;
-                    let body = GEMV_MULTI
-                        .replace("{T}", &t.to_string())
-                        .replace("{R}", &r.to_string())
-                        .replace("{RT}", &(r * t).to_string())
-                        .replace("{T128}", &(128 * t).to_string());
-                    self.add_kernel(name::gemvm(t, f), &format!("{MM_PARAMS}{w16}{body}"), layout(f));
-                }
-            }
+        for (name, src, read_only) in base_sources(&self.caps, &self.tuning) {
+            self.add_kernel(name, &src, read_only);
         }
-        let prefill = [(Format::Q8, W_Q8), (Format::Q4, W_Q4), (Format::Bf16, W_BF16), (Format::Q4K, W_Q4K)]
-            .into_iter()
-            .chain([(Format::Q6, W_Q6), (Format::Q3, W_Q3), (Format::Q2, W_Q2)]);
-        for (f, w4) in prefill {
-            if self.caps.coop {
-                let c = format!("enable f16;\nenable wgpu_cooperative_matrix;\n{MM_PARAMS}{w4}{GEMM_COOP}");
-                self.add_kernel(name::gemm_coop(f), &c, layout(f));
-            }
-            self.add_kernel(name::gemm_f32(f), &format!("{MM_PARAMS}{w4}{GEMM2}"), layout(f));
-        }
-        self.add_kernel("rmsnorm".into(), RMSNORM, &[false, true, true]);
-        self.add_kernel("add_norm".into(), ADD_NORM, &[false, false, true, true, true]);
-        if sg {
-            self.add_kernel("add_norm_sg".into(), ADD_NORM_SG, &[false, false, true, true, true]);
-        }
-        self.add_kernel("argmax1".into(), ARGMAX1, &[false, true]);
-        self.add_kernel("argmax2".into(), ARGMAX2, &[false, true]);
-        self.add_kernel("qk_rope".into(), QK_ROPE, &[false, false, false, true, true, true, true, true]);
-        self.add_kernel("attention".into(), ATTENTION, &[false, true, true, true, true, true]);
-        self.add_kernel("embed".into(), EMBED, &[false, true, true]);
-        // (the split attention reduces with subgroup shuffles; without them the per-row
-        // kernel takes every pass)
-        let sg = self.caps.subgroups;
-        for g in plan::SPLIT_GROUPS.into_iter().filter(|_| sg) {
-            for ch in plan::SPLIT_CHUNKS {
-                for hg in plan::SPLIT_HEAD_GROUPS.into_iter().filter(|h| g % h == 0) {
-                    let src = ATTN_SPLIT
-                        .replace("{GF}", &g.to_string())
-                        .replace("{G}", &hg.to_string())
-                        .replace("{CH}", &ch.to_string())
-                        .replace("{GCH}", &(16 * ch).to_string());
-                    self.add_kernel(name::attn_split(g, ch, hg), &src, &[false, false, true, true, true, true, true]);
-                }
-            }
-        }
-        self.add_kernel("attn_combine".into(), ATTN_COMBINE, &[false, true, true]);
-        // The tiled kernel needs more workgroup memory than some devices (32 KiB) have;
-        // without it, prefill attention takes the per-row kernel.
-        if plan::tile_compiled(&self.caps) {
-            self.add_kernel("attn_tile".into(), ATTN_TILE, &[false, false, false, true, true, true, true, true, true]);
-        }
-        self.add_kernel("swiglu".into(), SWIGLU, &[false, true]);
-        self.add_kernel("add".into(), ADD, &[false, true]);
         if self.diag.compile_log {
             eprintln!("[compile] {} base kernels, {:.0} ms", self.kernels.len(), t0.elapsed().as_secs_f64() * 1e3);
         }
@@ -315,5 +323,165 @@ impl Gpu {
             eprintln!("[compile] {name} on first use, {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::Vendor;
+
+    /// Why `src` may hold a loop that does not end, if it may: the kernels are compiled
+    /// without naga's loop counters (`CompileSettings::loop_bounding`), and wgpu then
+    /// requires that none loops forever. Every loop must be a `for` whose variable only
+    /// its header changes, either counting up (`i++`, `i += C` with a positive constant
+    /// `C`, to a bound) or halving to zero (`s >>= 1u` while `s > 0u`), or doubling to a
+    /// constant (`s <<= 1u` from a positive start while `s < C`).
+    fn unbounded_loop(src: &str) -> Option<String> {
+        let code: String = src.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let words = || code.split(|c: char| !is_word(c));
+        if let Some(w) = words().find(|&w| w == "loop" || w == "while") {
+            return Some(format!("a `{w}` loop"));
+        }
+        // A positive constant: a literal, or a `const` of the module set to one.
+        let positive = |c: &str| {
+            let lit = |v: &str| v.trim_end_matches('u').parse::<u64>().is_ok_and(|n| n > 0);
+            lit(c)
+                || code.lines().any(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("const ").and_then(|r| r.split_once('=')).is_some_and(|(name, v)| {
+                        name.split(':').next().unwrap().trim() == c && lit(v.trim().trim_end_matches(';').trim())
+                    })
+                })
+        };
+        // A module-scope `const` (a value fixed when the source is generated).
+        let constant = |c: &str| {
+            code.lines().any(|l| {
+                l.trim().strip_prefix("const ").is_some_and(|r| r.split([':', '=']).next().unwrap().trim() == c)
+            })
+        };
+        let mut rest = code.as_str();
+        while let Some(i) = rest.find("for (") {
+            let after = &rest[i + "for (".len()..];
+            let header = &after[..after.find(')')?];
+            // The body: from the `{` after the header to its matching `}`.
+            let body = after[header.len() + 1..].trim_start();
+            if !body.starts_with('{') {
+                return Some(format!("`for ({header})` without a block"));
+            }
+            let mut depth = 0;
+            let end = body.char_indices().find_map(|(j, c)| {
+                depth += (c == '{') as i32 - (c == '}') as i32;
+                (depth == 0).then_some(j)
+            })?;
+            let body = &body[..end];
+            let parts: Vec<&str> = header.split(';').map(str::trim).collect();
+            let fail = || Some(format!("`for ({header})`"));
+            let [init, cond, step] = parts[..] else { return fail() };
+            // (the variable is declared in the header, or before the loop when the header
+            // leaves it out: `for (; k < n; k++)`)
+            let v = match init.strip_prefix("var ") {
+                Some(r) => r.split('=').next().unwrap().trim(),
+                None if init.is_empty() => step.split([' ', '+']).next().unwrap(),
+                None => return fail(),
+            };
+            // `v < e`, `v <= e`, or `v + c <= e` with a positive constant `c`.
+            let up = cond.starts_with(&format!("{v} <"))
+                || cond
+                    .strip_prefix(&format!("{v} + "))
+                    .and_then(|r| r.split_once(" <"))
+                    .is_some_and(|(c, _)| positive(c));
+            let bounded = if step == format!("{v}++") {
+                up
+            } else if let Some(c) = step.strip_prefix(&format!("{v} += ")) {
+                positive(c) && up
+            } else if step == format!("{v} >>= 1u") {
+                cond == format!("{v} > 0u")
+            } else if step == format!("{v} <<= 1u") {
+                // (from a positive start to a small constant: all of them are lane counts)
+                let start = init.split('=').nth(1).map(str::trim).is_some_and(positive);
+                start && cond.strip_prefix(&format!("{v} < ")).is_some_and(|c| positive(c) || constant(c))
+            } else {
+                false
+            };
+            // (the body leaves the variable alone)
+            let ops = ["=", "+=", "-=", "*=", "/=", ">>=", "<<=", "++", "--"];
+            let assigned = body.match_indices(v).any(|(j, _)| {
+                let (head, tail) = (&body[..j], &body[j + v.len()..]);
+                let word_start = !head.ends_with(is_word) && !head.ends_with("let ") && !head.ends_with("var ");
+                let t = tail.trim_start();
+                word_start
+                    && !tail.starts_with(is_word)
+                    && ops.iter().any(|op| t.starts_with(op))
+                    && !t.starts_with("==")
+            });
+            if !bounded || assigned {
+                return fail();
+            }
+            rest = after;
+        }
+        None
+    }
+
+    #[test]
+    fn the_checker_finds_unbounded_loops() {
+        let ok = "const BN: u32 = 32u;\nfn main() {\n    for (var i = 0u; i < p.n; i += BN) { x[i] = 1.0; }\n    for (var s = 16u; s > 0u; s >>= 1u) { }\n    var k = 0u;\n    for (; k + 4u <= p.n; k += 4u) { }\n}";
+        assert_eq!(unbounded_loop(ok), None);
+        for bad in [
+            "fn main() {\n    loop { if (x[0] > 0.0) { break; } }\n}",
+            "fn main() {\n    while (x[0] > 0.0) { }\n}",
+            "fn main() {\n    for (var i = 0u; i < p.n; i += p.step) { }\n}",
+            "fn main() {\n    for (var i = 0u; i != p.n; i += 2u) { }\n}",
+            "fn main() {\n    for (var s = 16u; s > 0u; s <<= 1u) { }\n}",
+            "fn main() {\n    for (var i = 0u; i < p.n; i++) { i = 0u; }\n}",
+            "fn main() {\n    var k = 0u;\n    for (; k + 4u <= n; k += 0u) { }\n}",
+        ] {
+            assert!(unbounded_loop(bad).is_some(), "{bad}");
+        }
+        // (comments and words that merely contain the keywords do not count)
+        assert_eq!(unbounded_loop("// loop over the keys\nfn main() { let loops = 1u; }"), None);
+    }
+
+    /// Every kernel source, for every device and every option that changes the source.
+    #[test]
+    fn every_kernel_loop_ends() {
+        let caps = DeviceCaps {
+            name: "test".into(),
+            backend: wgpu::Backend::Vulkan,
+            vendor: Vendor::Amd,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            f16: true,
+            subgroups: true,
+            coop: true,
+            fast_math: false,
+            timestamps: false,
+            max_workgroup_storage: 65536,
+        };
+        let formats = [Format::Q8, Format::Q4, Format::Q4K, Format::Q6, Format::Q3, Format::Q2, Format::Bf16];
+        let gemvs = [Gemv::INT16, Gemv { planes: Some(1), single_f32: false }, Gemv::INT16.for_draft()];
+        let mut sources = Vec::new();
+        for (subgroups, fast_math) in [(true, false), (true, true), (false, false)] {
+            let caps = DeviceCaps { subgroups, coop: subgroups, fast_math, ..caps.clone() };
+            for rows in [1, 4] {
+                let tuning = Tuning { gemvm_rows: rows, gemvi_rows: rows, ..Tuning::for_device(&caps) };
+                sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));
+                for gemm in [GemmKind::Int16, GemmKind::Int8] {
+                    for gemv in gemvs.into_iter().chain([Gemv::F32]) {
+                        let jobs = int_jobs(&caps, &tuning, gemm, &formats, gemv);
+                        sources.extend(jobs.into_iter().map(|(name, _, source)| (name, source())));
+                    }
+                }
+            }
+        }
+        // (the same source comes from many of the combinations)
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|(_, src)| seen.insert(src.clone()));
+        assert!(sources.len() > 500, "{} sources", sources.len());
+        for (name, src) in &sources {
+            if let Some(why) = unbounded_loop(src) {
+                panic!("{name}: {why} may not end (the kernels are compiled without loop counters)");
+            }
+        }
     }
 }
