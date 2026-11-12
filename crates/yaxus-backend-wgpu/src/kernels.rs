@@ -221,8 +221,9 @@ pub(crate) fn compile_kernel(
         force_loop_bounding: settings.loop_bounding,
         ..wgpu::ShaderRuntimeChecks::checked()
     };
-    // SAFETY: the kernels' loops are bounded by shapes (see `CompileSettings`); bounds
-    // checks stay on.
+    // SAFETY: without loop counters wgpu requires that no loop runs forever. The kernels'
+    // loops count to shapes or halve to zero, which `every_kernel_loop_ends` checks for
+    // every source; bounds checks stay on.
     let module = unsafe { device.create_shader_module_trusted(desc, checks) };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     let layout =
@@ -322,5 +323,165 @@ impl Gpu {
             eprintln!("[compile] {name} on first use, {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::Vendor;
+
+    /// Why `src` may hold a loop that does not end, if it may: the kernels are compiled
+    /// without naga's loop counters (`CompileSettings::loop_bounding`), and wgpu then
+    /// requires that none loops forever. Every loop must be a `for` whose variable only
+    /// its header changes, either counting up (`i++`, `i += C` with a positive constant
+    /// `C`, to a bound) or halving to zero (`s >>= 1u` while `s > 0u`), or doubling to a
+    /// constant (`s <<= 1u` from a positive start while `s < C`).
+    fn unbounded_loop(src: &str) -> Option<String> {
+        let code: String = src.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let words = || code.split(|c: char| !is_word(c));
+        if let Some(w) = words().find(|&w| w == "loop" || w == "while") {
+            return Some(format!("a `{w}` loop"));
+        }
+        // A positive constant: a literal, or a `const` of the module set to one.
+        let positive = |c: &str| {
+            let lit = |v: &str| v.trim_end_matches('u').parse::<u64>().is_ok_and(|n| n > 0);
+            lit(c)
+                || code.lines().any(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("const ").and_then(|r| r.split_once('=')).is_some_and(|(name, v)| {
+                        name.split(':').next().unwrap().trim() == c && lit(v.trim().trim_end_matches(';').trim())
+                    })
+                })
+        };
+        // A module-scope `const` (a value fixed when the source is generated).
+        let constant = |c: &str| {
+            code.lines().any(|l| {
+                l.trim().strip_prefix("const ").is_some_and(|r| r.split([':', '=']).next().unwrap().trim() == c)
+            })
+        };
+        let mut rest = code.as_str();
+        while let Some(i) = rest.find("for (") {
+            let after = &rest[i + "for (".len()..];
+            let header = &after[..after.find(')')?];
+            // The body: from the `{` after the header to its matching `}`.
+            let body = after[header.len() + 1..].trim_start();
+            if !body.starts_with('{') {
+                return Some(format!("`for ({header})` without a block"));
+            }
+            let mut depth = 0;
+            let end = body.char_indices().find_map(|(j, c)| {
+                depth += (c == '{') as i32 - (c == '}') as i32;
+                (depth == 0).then_some(j)
+            })?;
+            let body = &body[..end];
+            let parts: Vec<&str> = header.split(';').map(str::trim).collect();
+            let fail = || Some(format!("`for ({header})`"));
+            let [init, cond, step] = parts[..] else { return fail() };
+            // (the variable is declared in the header, or before the loop when the header
+            // leaves it out: `for (; k < n; k++)`)
+            let v = match init.strip_prefix("var ") {
+                Some(r) => r.split('=').next().unwrap().trim(),
+                None if init.is_empty() => step.split([' ', '+']).next().unwrap(),
+                None => return fail(),
+            };
+            // `v < e`, `v <= e`, or `v + c <= e` with a positive constant `c`.
+            let up = cond.starts_with(&format!("{v} <"))
+                || cond
+                    .strip_prefix(&format!("{v} + "))
+                    .and_then(|r| r.split_once(" <"))
+                    .is_some_and(|(c, _)| positive(c));
+            let bounded = if step == format!("{v}++") {
+                up
+            } else if let Some(c) = step.strip_prefix(&format!("{v} += ")) {
+                positive(c) && up
+            } else if step == format!("{v} >>= 1u") {
+                cond == format!("{v} > 0u")
+            } else if step == format!("{v} <<= 1u") {
+                // (from a positive start to a small constant: all of them are lane counts)
+                let start = init.split('=').nth(1).map(str::trim).is_some_and(positive);
+                start && cond.strip_prefix(&format!("{v} < ")).is_some_and(|c| positive(c) || constant(c))
+            } else {
+                false
+            };
+            // (the body leaves the variable alone)
+            let ops = ["=", "+=", "-=", "*=", "/=", ">>=", "<<=", "++", "--"];
+            let assigned = body.match_indices(v).any(|(j, _)| {
+                let (head, tail) = (&body[..j], &body[j + v.len()..]);
+                let word_start = !head.ends_with(is_word) && !head.ends_with("let ") && !head.ends_with("var ");
+                let t = tail.trim_start();
+                word_start
+                    && !tail.starts_with(is_word)
+                    && ops.iter().any(|op| t.starts_with(op))
+                    && !t.starts_with("==")
+            });
+            if !bounded || assigned {
+                return fail();
+            }
+            rest = after;
+        }
+        None
+    }
+
+    #[test]
+    fn the_checker_finds_unbounded_loops() {
+        let ok = "const BN: u32 = 32u;\nfn main() {\n    for (var i = 0u; i < p.n; i += BN) { x[i] = 1.0; }\n    for (var s = 16u; s > 0u; s >>= 1u) { }\n    var k = 0u;\n    for (; k + 4u <= p.n; k += 4u) { }\n}";
+        assert_eq!(unbounded_loop(ok), None);
+        for bad in [
+            "fn main() {\n    loop { if (x[0] > 0.0) { break; } }\n}",
+            "fn main() {\n    while (x[0] > 0.0) { }\n}",
+            "fn main() {\n    for (var i = 0u; i < p.n; i += p.step) { }\n}",
+            "fn main() {\n    for (var i = 0u; i != p.n; i += 2u) { }\n}",
+            "fn main() {\n    for (var s = 16u; s > 0u; s <<= 1u) { }\n}",
+            "fn main() {\n    for (var i = 0u; i < p.n; i++) { i = 0u; }\n}",
+            "fn main() {\n    var k = 0u;\n    for (; k + 4u <= n; k += 0u) { }\n}",
+        ] {
+            assert!(unbounded_loop(bad).is_some(), "{bad}");
+        }
+        // (comments and words that merely contain the keywords do not count)
+        assert_eq!(unbounded_loop("// loop over the keys\nfn main() { let loops = 1u; }"), None);
+    }
+
+    /// Every kernel source, for every device and every option that changes the source.
+    #[test]
+    fn every_kernel_loop_ends() {
+        let caps = DeviceCaps {
+            name: "test".into(),
+            backend: wgpu::Backend::Vulkan,
+            vendor: Vendor::Amd,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            f16: true,
+            subgroups: true,
+            coop: true,
+            fast_math: false,
+            timestamps: false,
+            max_workgroup_storage: 65536,
+        };
+        let formats = [Format::Q8, Format::Q4, Format::Q4K, Format::Q6, Format::Q3, Format::Q2, Format::Bf16];
+        let gemvs = [Gemv::INT16, Gemv { planes: Some(1), single_f32: false }, Gemv::INT16.for_draft()];
+        let mut sources = Vec::new();
+        for (subgroups, fast_math) in [(true, false), (true, true), (false, false)] {
+            let caps = DeviceCaps { subgroups, coop: subgroups, fast_math, ..caps.clone() };
+            for rows in [1, 4] {
+                let tuning = Tuning { gemvm_rows: rows, gemvi_rows: rows, ..Tuning::for_device(&caps) };
+                sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));
+                for gemm in [GemmKind::Int16, GemmKind::Int8] {
+                    for gemv in gemvs.into_iter().chain([Gemv::F32]) {
+                        let jobs = int_jobs(&caps, &tuning, gemm, &formats, gemv);
+                        sources.extend(jobs.into_iter().map(|(name, _, source)| (name, source())));
+                    }
+                }
+            }
+        }
+        // (the same source comes from many of the combinations)
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|(_, src)| seen.insert(src.clone()));
+        assert!(sources.len() > 500, "{} sources", sources.len());
+        for (name, src) in &sources {
+            if let Some(why) = unbounded_loop(src) {
+                panic!("{name}: {why} may not end (the kernels are compiled without loop counters)");
+            }
+        }
     }
 }
