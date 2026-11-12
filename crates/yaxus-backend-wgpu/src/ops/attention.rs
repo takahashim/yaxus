@@ -4,7 +4,7 @@ use wgpu::util::DeviceExt;
 use yaxus_model::{Config, LayerMeta};
 
 use crate::plan::{AttentionCase, AttentionPlan};
-use crate::{Gpu, Kv, MetaBuf, Tensor, Weight};
+use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight};
 
 impl Gpu {
     pub(crate) fn attention(
@@ -22,16 +22,18 @@ impl Gpu {
         assert_eq!(t, self.pass_rows, "attention rows differ from the pass");
         let (kc, vc) = (kv.k[layer.index].clone(), kv.v[layer.index].clone());
         let rope = if layer.full_attn { kv.rope_full.clone() } else { kv.rope_sliding.clone() };
-        assert!((self.pass_max_pos as u64 + 1) * 64 * 4 * 2 <= rope.size(), "position beyond the rope table");
+        // (cos and sin, HEAD_DIM / 2 f32 each per position)
+        let rope_bytes = (self.pass_max_pos as u64 + 1) * (HEAD_DIM as u64 / 2) * 4 * 2;
+        assert!(rope_bytes <= rope.size(), "position beyond the rope table");
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
-        let q = self.tensor(t, hq * 128);
+        let q = self.tensor(t, hq * HEAD_DIM);
         self.dispatch(
             "qk_rope",
             &[q.buf(), &kc, &vc, qkv.buf(), qn, kn, &rope, &rows],
             &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits()],
             ((hq + hkv) as u32, t as u32),
         );
-        let o = self.tensor(t, hq * 128);
+        let o = self.tensor(t, hq * HEAD_DIM);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let window = layer.window.unwrap_or(0) as u32;
         let case = AttentionCase {
@@ -45,7 +47,7 @@ impl Gpu {
         let g = hq / hkv;
         let plan = case.plan(&self.caps, &self.tuning);
         if let AttentionPlan::Split { g, hg, ch, nch } = plan {
-            let part = self.tensor(t * hkv * nch * g, 128);
+            let part = self.tensor(t * hkv * nch * g, HEAD_DIM);
             let ml = self.tensor(t * hkv * nch * g, 2);
             self.dispatch(
                 &crate::kernels::name::attn_split(g, ch, hg),
@@ -62,9 +64,9 @@ impl Gpu {
         } else if let AttentionPlan::Tile { nch, ch } = plan {
             let tiles = self.meta_buf(MetaBuf::Tiles);
             let (part, ml) = if nch > 1 {
-                (self.tensor(t * hkv * nch * g, 128), self.tensor(t * hkv * nch * g, 2))
+                (self.tensor(t * hkv * nch * g, HEAD_DIM), self.tensor(t * hkv * nch * g, 2))
             } else {
-                (self.tensor(1, 128), self.tensor(1, 2))
+                (self.tensor(1, HEAD_DIM), self.tensor(1, 2))
             };
             self.dispatch(
                 "attn_tile",

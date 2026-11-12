@@ -6,7 +6,7 @@ mod matmul;
 use anyhow::{Context, Result};
 use yaxus_model::{Config, LayerMeta, PAGE, PassMeta};
 
-use crate::{Gpu, Kv, MetaBuf, Tensor, Weight, plan};
+use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight, plan};
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 pub(crate) const ARGMAX_SLICES: usize = 64;
@@ -43,7 +43,11 @@ impl Gpu {
     }
 
     pub(crate) fn new_kv(&mut self, cfg: &Config, metas: &[LayerMeta], pages: usize, max_pos: usize) -> Result<Kv> {
-        anyhow::ensure!(cfg.head_dim == 128, "the WGSL kernels assume head_dim = 128");
+        anyhow::ensure!(
+            cfg.head_dim == HEAD_DIM,
+            "head_dim is {}; the attention kernels are written for {HEAD_DIM}",
+            cfg.head_dim
+        );
         let kv_dim = cfg.kv_dim();
         let size = (pages * PAGE * kv_dim * 4) as u64;
         anyhow::ensure!(size <= self.device.limits().max_storage_buffer_binding_size, "KV arena too large per layer");

@@ -47,6 +47,8 @@ pub(crate) const GEMV_MAX_T: usize = 8;
 /// Rows up to which the multi-row GEMV (activations staged in workgroup memory) is
 /// compiled; passes of up to twice this many rows run it twice on halves of the rows.
 pub(crate) const GEMVM_MAX_T: usize = 16;
+/// The head size the attention kernels are written for (PLaMo 3's).
+pub(crate) const HEAD_DIM: usize = 128;
 
 type Pool = Arc<Mutex<HashMap<u64, Vec<wgpu::Buffer>>>>;
 
