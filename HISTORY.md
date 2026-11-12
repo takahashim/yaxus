@@ -1456,6 +1456,23 @@ dispatch を減らした分より、チャンクを並列に処理しなくな�
 - MSL での融合。atomic とデバイスのメモリフェンスで「最後のワークグループ」の形が書けるはず (未検証)。`attn_combine` を `attn_split` に、`add_norm` を直前の行列積に入れる。上限は 2B で約 1.7 ms (7%)。後者は 1 行と複数行で同じ行列積のカーネルを使い続ける必要がある。
 - 1 トークンで読むバイト数を減らす。`lm_head` (Q6、226 MB、全体の約 14%) を 4 ビットにすると約 1.1 ms。出力が変わる。
 
+### 11.47 小さなカーネルの MSL 版と、llama.cpp との差の内訳
+
+llama.cpp の Metal バックエンドの工夫 (並行モードの compute encoder とバッファのバリア、融合、グラフの並べ替え) は、それぞれ環境変数で止められる (`GGML_METAL_CONCURRENCY_DISABLE`、`GGML_METAL_FUSION_DISABLE`、`GGML_METAL_GRAPH_OPTIMIZE_DISABLE`)。M2 の 2B Q4_K_M の tg128 では、3 つとも止めても速さは変わらなかった (既定 43.3 / 47.8 / 43.3、止めて 44.8 / 47.7 / 45.2 tok/s、yaxus と交互に 3 回)。
+
+**dispatch の費用。** Swift で Metal を直接呼ぶと、依存のある空の dispatch 1 回は 2.3 µs (逐次の encoder、追跡ありでもなしでも同じ)、並行モードとバリアで 1.7 µs。wgpu を通すと 4.3 µs (11.45)。1 トークン約 220 回で、wgpu の上乗せは約 0.45 ms。
+
+**小さなカーネルの MSL 版** (`msl::small_kernels`、`Tuning::msl_small`、Apple で有効)。`rmsnorm`、`add_norm`、`qk_rope` を llama.cpp の `kernel_rms_norm` の作りで書いた (float4 の読み込み、`simd_sum`、サブグループの部分和を決まった順に足す、和ごとにバリア 2 回)。WGSL 版とバインディングと immediates が同じで、dispatch で選ぶ。
+
+- GPU だけで WGSL 版と比べるテスト `msl_small_kernels_match_wgsl`: 2B で 6.5e-5 (300 トークン後)、8.9e-5 (1300 トークン後)。
+- 交互に 3 回: 2B の 1 行のパス 23.3〜23.5 → 22.8〜23.1 ms、0.8B Q2_K の下書き 7.2〜7.3 → 7.0〜7.1 ms、デコード 41.0 → 42.0 tok/s (平均)。
+
+**残りの内訳。** MSL 版にした後で、小さなカーネルを全部外しても 2B の 1 行のパスは 0.2〜0.6 ms、下書きは 0.3〜0.4 ms しか縮まない (11.46 の約 2.3 ms という見積もりは揺れで大きく出ていた)。2B の 1 行のパスの残りの約 22.2 ms は行列積 (と、その dispatch)。llama.cpp の tg128 (43〜48 tok/s、21〜23 ms) と比べて、GPU 側は揺れの範囲で同等。
+
+- attention (`attn_split` と `attn_combine`) を外して縮むのは 0.3 ms 以下なので、MSL 版にするのは見送った。
+- バックエンドを Metal 直接に書き直して見込めるのは、wgpu の dispatch の上乗せ (約 0.45 ms、2%) と、行列積の残り。
+- このマシン (16 GB、スワップ 18 GB 前後) では同じ条件でも ±10% 揺れる。数 % の差は交互に何度か測って確かめる。
+
 ### 11.12 リスク
 
 - ページ表の間接参照で attention が遅くなる可能性 → P1 の合格条件 (±3%) で確認。デコードの attention は全体の 2% 程度なので影響は小さい見込み。
