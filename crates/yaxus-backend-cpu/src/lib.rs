@@ -9,11 +9,16 @@ use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef, 
 
 use yaxus_model::quant::Q8_BLOCK;
 
+mod threads;
+
+pub use threads::init_threads;
+
+/// A row-major `[rows, cols]` f32 activation.
 #[derive(Debug, Clone)]
 pub struct Tensor {
-    pub data: Vec<f32>,
-    pub rows: usize,
-    pub cols: usize,
+    data: Vec<f32>,
+    rows: usize,
+    cols: usize,
 }
 
 impl Tensor {
@@ -211,7 +216,7 @@ pub struct Kv {
 #[derive(Default)]
 pub struct CpuBackend {
     /// Total bytes of loaded weights.
-    pub weight_bytes: usize,
+    weight_bytes: usize,
     pass: PassMeta,
 }
 
@@ -221,35 +226,9 @@ impl CpuBackend {
     }
 }
 
-/// Number of physical cores (SMT siblings counted once), if it can be determined.
-pub fn physical_cores() -> Option<usize> {
-    let mut seen = std::collections::HashSet::new();
-    for e in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("cpu")
-            && name[3..].chars().all(|c| c.is_ascii_digit())
-            && let Ok(s) = std::fs::read_to_string(e.path().join("topology/thread_siblings_list"))
-        {
-            seen.insert(s.trim().to_string());
-        }
-    }
-    (!seen.is_empty()).then_some(seen.len())
-}
-
-/// Sets up the global rayon pool. Decoding is memory-bound, and one thread per physical
-/// core is slightly faster than using SMT siblings. `RAYON_NUM_THREADS` overrides this.
-pub fn init_threads() {
-    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
-        return;
-    }
-    if let Some(n) = physical_cores() {
-        // The host's cores are not all ours under a cgroup CPU quota (containers) or an
-        // affinity mask (taskset); available_parallelism accounts for both.
-        let n = std::thread::available_parallelism().map_or(n, |a| n.min(a.get()));
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global();
-    }
-}
+// The dot products below accumulate in 16 lanes, in this order: their results are the
+// reference the GPU kernels are compared with, so they are kept apart rather than shared
+// at the cost of a different summation order.
 
 /// Dot product of bf16 weights with f32 activations, without a temporary buffer.
 fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
