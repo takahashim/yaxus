@@ -251,8 +251,11 @@ GET  /v1/languages          対応言語コード一覧
 }
 ```
 
-- `stream: false` → `{"text": "...", "usage": {"prompt_tokens": n, "completion_tokens": m, "elapsed_ms": t}}`。
-- `stream: true` → `text/event-stream`。`data: {"delta":"..."}` を逐次送り、最後に `data: {"done":true,"usage":{...}}`。
+- `form` は `polite` / `plain` のどちらか (それ以外は解析の時点で 400)。省略は「指定なし」で、空文字列は受け付けない。
+- `stream: false` → `{"text": "...", "usage": {...}}`。`usage` は `prompt_tokens`、`reused_tokens`、`completion_tokens`、`queue_ms`、`prefill_ms`、`elapsed_ms`。
+- `stream: true` → `text/event-stream`。各 `data:` は `type` で種類を表す: `{"type":"delta","text":"..."}` を逐次送り、最後に `{"type":"done","usage":{...}}` か `{"type":"error","error":{...}}`。
+- 文書 (`POST /v1/translate/document`) のイベントは `{"type":"delta","segment":i,"text":".."}`、`{"type":"segment_done","segment":i}`、最後に `done` (`usage` は上の項目に `segments` と `chains` を足したもの) か `error`。
+- エラーは本文もストリームも `{"error": {"code": "...", "message": "...", "segment": i}}` の形 (`segment` は文書の段落を指すときだけ)。`code` と HTTP ステータスは 1 対 1: `invalid_request` / `prompt_too_long` (400)、`unauthorized` (401)、`queue_full` (429)、`unavailable` (503、推論スレッドの停止)、`internal` (500、生成の失敗)。
 - 入力に `<|plamo:` を含む場合は 400。言語コードは chat_template と同じ正規表現で検証。
 - 同時接続は受け付けるが、推論は直列実行。キュー長上限 (既定 16) を超えたら 429。
 

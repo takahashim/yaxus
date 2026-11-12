@@ -11,8 +11,8 @@ pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
     TranslationRequest {
         text: r.text.clone(),
         target_lang: r.target_lang.clone(),
-        source_lang: r.requested_source_lang().map(String::from),
-        form: r.requested_form().map(String::from),
+        source_lang: r.source_lang.clone(),
+        form: r.form,
         context: r.context.clone(),
         glossary: r.glossary.clone(),
         history: r.history.clone(),
@@ -70,7 +70,7 @@ impl Prompt {
     /// least 1), or an error when the prompt alone does not fit.
     fn within(self, max_context: usize, max_new: usize) -> Result<(Self, usize), PromptError> {
         if self.len() >= max_context {
-            return Err(PromptError(format!("prompt is {} tokens; the limit is {max_context}", self.len())));
+            return Err(PromptError::too_long(format!("prompt is {} tokens; the limit is {max_context}", self.len())));
         }
         let max_new = max_new.min(max_context - self.len()).max(1);
         Ok((self, max_new))
@@ -119,7 +119,7 @@ mod tests {
         assert_eq!((p.len(), max_new), (full, 10));
         // No room left: an error, not a prompt without the history.
         let e = Prompt::for_request(&tok, &r, full).unwrap_err();
-        assert!(e.0.contains("the limit is"), "{e:?}");
+        assert!(e.message.contains("the limit is") && e.kind == yaxus_pfml::PromptErrorKind::TooLong, "{e:?}");
         r.target_lang.clear();
         assert!(Prompt::for_request(&tok, &r, full + 10).is_err());
     }

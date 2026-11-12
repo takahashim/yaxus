@@ -5,47 +5,46 @@
 
 use yaxus_tokenizer::{SPECIAL_PREFIX, py_isspace};
 
-/// Glossary entries and history pairs (source, translation) are the API's pairs.
-pub use yaxus_api::Pair;
+/// Glossary entries and history pairs (source, translation) are the API's pairs, and
+/// the form is the API's.
+pub use yaxus_api::{Form, Pair};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranslationRequest {
     pub text: String,
     pub target_lang: String,
     pub source_lang: Option<String>,
-    /// `polite` or `plain`; only valid when `target_lang == "ja"`.
-    pub form: Option<String>,
+    /// Only valid when `target_lang == "ja"`.
+    pub form: Option<Form>,
     pub context: Option<String>,
     pub glossary: Vec<Pair>,
     /// Earlier source/translation pairs, oldest first.
     pub history: Vec<Pair>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct PromptError(pub String);
-
-/// The Japanese politeness a translation into `ja` may ask for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Form {
-    Polite,
-    Plain,
+/// Why a request has no prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptErrorKind {
+    /// A field the template does not accept.
+    Invalid,
+    /// The prompt does not fit the context it is for.
+    TooLong,
 }
 
-impl Form {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Form::Polite => "polite",
-            Form::Plain => "plain",
-        }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct PromptError {
+    pub kind: PromptErrorKind,
+    pub message: String,
+}
+
+impl PromptError {
+    pub fn invalid(message: impl Into<String>) -> Self {
+        PromptError { kind: PromptErrorKind::Invalid, message: message.into() }
     }
 
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "polite" => Some(Form::Polite),
-            "plain" => Some(Form::Plain),
-            _ => None,
-        }
+    pub fn too_long(message: impl Into<String>) -> Self {
+        PromptError { kind: PromptErrorKind::TooLong, message: message.into() }
     }
 }
 
@@ -57,10 +56,12 @@ pub fn is_blank(s: &str) -> bool {
 
 fn check_text(value: &str, name: &str, allow_empty: bool) -> Result<(), PromptError> {
     if !allow_empty && is_blank(value) {
-        return Err(PromptError(format!("{name} must not be empty.")));
+        return Err(PromptError::invalid(format!("{name} must not be empty.")));
     }
     if value.contains(SPECIAL_PREFIX) {
-        return Err(PromptError(format!("{name} must not contain reserved PFML tokens ({SPECIAL_PREFIX}...).")));
+        return Err(PromptError::invalid(format!(
+            "{name} must not contain reserved PFML tokens ({SPECIAL_PREFIX}...)."
+        )));
     }
     Ok(())
 }
@@ -73,12 +74,12 @@ fn check_lang(value: &str, name: &str) -> Result<(), PromptError> {
         || !(2..=3).contains(&parts[0].chars().count())
         || (parts.len() == 2 && parts[1].chars().count() != 4);
     if bad_shape {
-        return Err(PromptError(format!(
+        return Err(PromptError::invalid(format!(
             "{name} must be a lowercase language code, e.g. en, ja, zh-hans, or ja-easy."
         )));
     }
     if !value.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
-        return Err(PromptError(format!("{name} must use lowercase language codes without region subtags.")));
+        return Err(PromptError::invalid(format!("{name} must use lowercase language codes without region subtags.")));
     }
     Ok(())
 }
@@ -104,7 +105,6 @@ pub fn validate_history_pair(pair: &Pair) -> Result<(), PromptError> {
 struct Options {
     target_lang: String,
     source_lang: Option<String>,
-    form: Option<Form>,
 }
 
 impl TranslationRequest {
@@ -124,37 +124,30 @@ impl TranslationRequest {
         if let Some(c) = &self.context {
             check_text(c, "context", true)?;
         }
-        let form = match self.form.as_deref() {
-            None => None,
-            Some(f) => match Form::parse(f) {
-                Some(form) if target_lang == "ja" => Some(form),
-                _ => return Err(PromptError("form must be polite or plain and requires target_lang=\"ja\".".into())),
-            },
-        };
+        if self.form.is_some() && target_lang != "ja" {
+            return Err(PromptError::invalid("form requires target_lang=\"ja\"."));
+        }
         for term in &self.glossary {
             check_text(&term.source, "glossary source", false)?;
             check_text(&term.target, "glossary target", false)?;
         }
-        Ok(Options { target_lang: target_lang.into(), source_lang: source_lang.map(String::from), form })
+        Ok(Options { target_lang: target_lang.into(), source_lang: source_lang.map(String::from) })
     }
 
     /// Checks the whole request, normalizing the language aliases.
     pub fn validate(self) -> Result<ValidRequest, PromptError> {
         self.history.iter().try_for_each(validate_history_pair)?;
         check_message(&self.text)?;
-        let Options { target_lang, source_lang, form } = self.options()?;
-        Ok(ValidRequest { req: TranslationRequest { target_lang, source_lang, ..self }, form })
+        let Options { target_lang, source_lang } = self.options()?;
+        Ok(ValidRequest { req: TranslationRequest { target_lang, source_lang, ..self } })
     }
 }
 
 /// A request that passed [`TranslationRequest::validate`]: its language aliases are
-/// normalized and its form is parsed.
+/// normalized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidRequest {
-    /// The request as validated (its `form` is the unparsed one; [`form`](Self::form) is
-    /// what counts).
     req: TranslationRequest,
-    form: Option<Form>,
 }
 
 impl ValidRequest {
@@ -173,7 +166,7 @@ impl ValidRequest {
     }
 
     pub fn form(&self) -> Option<Form> {
-        self.form
+        self.req.form
     }
 
     /// Earlier source/translation pairs, oldest first.
@@ -226,7 +219,7 @@ impl ValidRequest {
         p += &r.text;
         p += "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>";
         p += &r.target_lang;
-        if let Some(form) = self.form {
+        if let Some(form) = r.form {
             p += "<|plamo:key|>form<|plamo:val|>";
             p += form.as_str();
         }
@@ -244,7 +237,7 @@ mod tests {
     }
 
     fn err(r: &TranslationRequest) -> String {
-        r.clone().validate().unwrap_err().0
+        r.clone().validate().unwrap_err().message
     }
 
     fn render(r: &TranslationRequest) -> String {
@@ -267,7 +260,7 @@ mod tests {
             ("zh-Hans", "without region subtags"),
             ("e1", "without region subtags"),
         ] {
-            assert!(check_lang(bad, "lang").unwrap_err().0.contains(why), "{bad}");
+            assert!(check_lang(bad, "lang").unwrap_err().message.contains(why), "{bad}");
         }
         // The model card's alias.
         assert!(render(&req("x", "ja(easy)")).contains("<|plamo:val|>ja-easy<|plamo:msg|>"));
@@ -276,12 +269,12 @@ mod tests {
     #[test]
     fn form_needs_japanese() {
         let mut r = req("x", "ja");
-        r.form = Some("polite".into());
+        r.form = Some(Form::Polite);
         assert!(render(&r).ends_with("<|plamo:key|>form<|plamo:val|>polite<|plamo:msg|>"));
-        for (target, form) in [("ja-easy", "polite"), ("en", "plain"), ("ja", "casual")] {
+        for (target, form) in [("ja-easy", Form::Polite), ("en", Form::Plain)] {
             let mut r = req("x", target);
-            r.form = Some(form.into());
-            assert!(err(&r).starts_with("form must be"), "{target} {form}");
+            r.form = Some(form);
+            assert!(err(&r).starts_with("form requires"), "{target} {form}");
         }
     }
 
@@ -327,7 +320,7 @@ mod tests {
     fn validation_normalizes_and_parses() {
         let mut r = req("x", "ja");
         r.source_lang = Some("ja(easy)".into());
-        r.form = Some("plain".into());
+        r.form = Some(Form::Plain);
         r.history = vec![Pair { source: "a".into(), target: "b".into() }];
         let v = r.validate().unwrap();
         assert_eq!((v.source_lang(), v.target_lang()), (Some("ja-easy"), "ja"));

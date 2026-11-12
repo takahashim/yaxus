@@ -5,10 +5,9 @@
 use anyhow::Result;
 use yaxus_api::DocumentUsage;
 use yaxus_model::{Finish, Generator};
-use yaxus_pfml::PromptError;
 use yaxus_tokenizer::Tokenizer;
 
-use super::DocJob;
+use super::{DocJob, SegmentError};
 use crate::memory::Memory;
 use crate::session::{Finished, Session, Update};
 
@@ -37,7 +36,7 @@ pub struct DocRun {
 
 impl DocRun {
     pub fn new(job: DocJob) -> Self {
-        let usage = DocumentUsage { segments: job.len(), chains: job.chains(), ..Default::default() };
+        let usage = DocumentUsage { segments: job.len(), chains: job.chains(), total: Default::default() };
         DocRun { job, live: 0, stopped: false, usage }
     }
 
@@ -55,12 +54,12 @@ impl DocRun {
     }
 
     /// Submits the segments that can start, each tagged with `tag(segment)`. A prompt that
-    /// cannot be built stops the document and is returned (as `segment N: ...`).
+    /// cannot be built stops the document and is returned.
     pub fn submit_ready<T>(
         &mut self,
         session: &mut Session<'_, T>,
         tag: impl Fn(usize) -> T,
-    ) -> Result<(), PromptError> {
+    ) -> Result<(), SegmentError> {
         if self.stopped {
             return Ok(());
         }
@@ -70,9 +69,9 @@ impl DocRun {
                     self.live += 1;
                     session.submit(prompt, max_new, tag(segment));
                 }
-                Err(e) => {
+                Err(error) => {
                     self.stopped = true;
-                    return Err(PromptError(format!("segment {segment}: {}", e.0)));
+                    return Err(SegmentError { segment, error });
                 }
             }
         }
@@ -102,21 +101,18 @@ impl DocRun {
             reused: done.start.reused,
             generated: done.generated,
         };
-        self.usage.prompt_tokens += end.prompt_tokens;
-        self.usage.reused_tokens += end.reused;
-        self.usage.completion_tokens += end.generated;
+        self.usage.total.prompt_tokens += end.prompt_tokens;
+        self.usage.total.reused_tokens += end.reused;
+        self.usage.total.completion_tokens += end.generated;
         self.job.finished(segment, done.text);
         Some(end)
     }
 
-    /// Records the failure of `segment`'s request, which stops the document; returns the
-    /// error to report (`segment N: ...`), unless the document was stopped already.
-    pub fn on_failed(&mut self, segment: usize, message: &str) -> Option<String> {
+    /// Records the failure of a segment's request, which stops the document; returns
+    /// whether to report it (not when the document was stopped already).
+    pub fn on_failed(&mut self) -> bool {
         self.live -= 1;
-        if std::mem::replace(&mut self.stopped, true) {
-            return None;
-        }
-        Some(format!("segment {segment}: {message}"))
+        !std::mem::replace(&mut self.stopped, true)
     }
 
     /// No segment is in flight and none will be submitted.
@@ -155,7 +151,7 @@ pub fn run_document(
     let mut run = DocRun::new(job);
     let mut failure: Option<String> = None;
     if let Err(e) = run.submit_ready(&mut session, |s| s) {
-        failure = Some(e.0);
+        failure = Some(e.to_string());
     }
     while !run.is_over() {
         let worked = session.step(&mut |u| {
@@ -177,15 +173,15 @@ pub fn run_document(
                     }
                 }
                 Update::Failed { tag, message } => {
-                    if let Some(e) = run.on_failed(tag, &message) {
-                        failure.get_or_insert(e);
+                    if run.on_failed() {
+                        failure.get_or_insert(format!("segment {tag}: {message}"));
                     }
                 }
             }
             true
         })?;
         if let Err(e) = run.submit_ready(&mut session, |s| s) {
-            failure.get_or_insert(e.0);
+            failure.get_or_insert(e.to_string());
         }
         anyhow::ensure!(worked || run.is_over() || !session.is_idle(), "engine idle with segments left");
     }

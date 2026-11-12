@@ -19,10 +19,11 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 tracing = "0.1"
 yaxus-api = { path = "../yaxus-api" }
+yaxus-pfml = { path = "../yaxus-pfml" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-runtime = { path = "../yaxus-runtime" }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }
-yaxus-pfml = { path = "../yaxus-pfml" }

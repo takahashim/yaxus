@@ -18,16 +18,18 @@ fn pairs(v: &Value, k: &str) -> Vec<Pair> {
         .unwrap_or_default()
 }
 
-fn request(v: &Value) -> TranslationRequest {
-    TranslationRequest {
+/// The request of a case, or an error when its form is none the API accepts (the API
+/// rejects those when it parses the request, before any prompt is built).
+fn request(v: &Value) -> Result<TranslationRequest, String> {
+    Ok(TranslationRequest {
         text: s(v, "text").unwrap(),
         target_lang: s(v, "target_lang").unwrap(),
         source_lang: s(v, "source_lang"),
-        form: s(v, "form"),
+        form: s(v, "form").map(|f| f.parse()).transpose()?,
         context: s(v, "context"),
         glossary: pairs(v, "glossary"),
         history: pairs(v, "history"),
-    }
+    })
 }
 
 #[test]
@@ -38,12 +40,13 @@ fn golden_prompts() {
         let c: Value = serde_json::from_str(line).unwrap();
         match c["kind"].as_str().unwrap() {
             "prompt" => {
-                let prompt = request(&c["request"]).validate().unwrap().render();
+                let prompt = request(&c["request"]).unwrap().validate().unwrap().render();
                 assert_eq!(prompt, c["prompt"].as_str().unwrap());
             }
             "prompt_error" => {
-                let req = request(&c["request"]);
-                assert!(req.clone().validate().is_err(), "expected error for {req:?}");
+                if let Ok(req) = request(&c["request"]) {
+                    assert!(req.clone().validate().is_err(), "expected error for {req:?}");
+                }
             }
             _ => continue,
         }
