@@ -16,6 +16,7 @@
 //! - `shaders`, `gemv_int`, `gemm_int`: the WGSL sources.
 
 mod commands;
+mod dev;
 mod device;
 mod gemm_int;
 mod gemv_f32;
@@ -33,14 +34,15 @@ mod weights;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use yaxus_model::{Backend, Config, LayerMeta, PassMeta, Quant, TensorRef};
 
+pub use dev::Buf;
+use dev::{Dev, Kernel};
 use device::{CompileSettings, Diagnostics};
 pub use device::{DeviceCaps, Tuning, Vendor};
-use kernels::Kernel;
 use ops::{ARGMAX_ROWS, ARGMAX_SLICES};
-use profile::{KernelProfile, MAX_TIMED, Profile};
+use profile::Profile;
 pub(crate) use weights::SCALE_PAD;
 pub use weights::{Format, Matrix, Weight};
 
@@ -52,18 +54,18 @@ pub(crate) const GEMVM_MAX_T: usize = 16;
 /// The head size the attention kernels are written for (PLaMo 3's).
 pub(crate) const HEAD_DIM: usize = 128;
 
-type Pool = Arc<Mutex<HashMap<u64, Vec<wgpu::Buffer>>>>;
+type Pool = Arc<Mutex<HashMap<u64, Vec<Buf>>>>;
 
 /// A `[rows, cols]` f32 tensor on the GPU. Its buffer returns to the pool on drop.
 pub struct Tensor {
-    buf: Option<wgpu::Buffer>,
+    buf: Option<Buf>,
     pub rows: usize,
     pub cols: usize,
     pool: Pool,
 }
 
 impl Tensor {
-    fn buf(&self) -> &wgpu::Buffer {
+    fn buf(&self) -> &Buf {
         self.buf.as_ref().unwrap()
     }
 }
@@ -78,31 +80,27 @@ impl Drop for Tensor {
 
 /// Paged KV storage of one model: slot `s` of a layer holds `kv_dim` floats at `s * kv_dim`.
 pub struct Kv {
-    k: Vec<wgpu::Buffer>,
-    v: Vec<wgpu::Buffer>,
+    k: Vec<Buf>,
+    v: Vec<Buf>,
     kv_dim: usize,
     /// One page of scratch: WebGPU forbids copies within a buffer, so pages move through it.
-    scratch: wgpu::Buffer,
+    scratch: Buf,
     /// cos/sin tables `[2][max_pos][head_dim/2]` for sliding and full-attention layers.
-    rope_sliding: wgpu::Buffer,
-    rope_full: wgpu::Buffer,
+    rope_sliding: Buf,
+    rope_full: Buf,
 }
 
 /// The GPU context: device, queue, kernels, the open command encoder and buffer pool.
 /// Shared by every model on the device through [`WgpuBackend`] handles.
 pub struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    dev: Dev,
     caps: DeviceCaps,
     compile: CompileSettings,
     tuning: Tuning,
     diag: Diagnostics,
     kernels: HashMap<String, Kernel>,
-    encoder: Option<wgpu::CommandEncoder>,
-    /// The compute pass being recorded into `encoder`, if any.
-    pass: Option<wgpu::ComputePass<'static>>,
     /// Row metadata of the current forward pass (see [`MetaBuf`]).
-    meta_bufs: [Option<wgpu::Buffer>; 4],
+    meta_bufs: [Option<Buf>; 4],
     pass_rows: usize,
     pass_max_pos: usize,
     /// Attention tiles of the pass (see `ATTN_TILE`).
@@ -110,24 +108,17 @@ pub struct Gpu {
     pool: Pool,
     /// Total bytes of uploaded weights.
     pub weight_bytes: usize,
-    readback: wgpu::Buffer,
-    argmax_out: wgpu::Buffer,
+    argmax_out: Buf,
     /// Per-slice argmax partials `[rows][ARGMAX_SLICES]` of (value bits, index).
-    argmax_part: wgpu::Buffer,
-    /// Bind groups by (kernel, buffers). Pooled buffers recur every token, so most
-    /// dispatches reuse one instead of creating it.
-    bind_groups: HashMap<(usize, Vec<wgpu::Buffer>), wgpu::BindGroup>,
+    argmax_part: Buf,
     /// Matmul FLOPs recorded since the last submission.
     pending_flops: f64,
     /// Dispatches recorded since the pass began (early submission of small passes).
     pass_dispatches: usize,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
-    /// Bytes uploaded since the staging memory was last released.
-    unflushed_upload: usize,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
     oversized: Option<(String, usize)>,
-    kernels_profile: Option<KernelProfile>,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
     /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
@@ -136,11 +127,6 @@ pub struct Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        // End the open pass before the encoder it was recorded into goes away.
-        self.pass = None;
-        if let Some(k) = &self.kernels_profile {
-            k.report();
-        }
         if let Some(p) = &self.profile {
             p.report();
         }
@@ -226,147 +212,32 @@ pub(crate) const ATTN_TILE_SHARED_BYTES: u32 = 1056 * 16 * 2 + 1056 * 4 + 32 * 4
 pub(crate) const ATTN_TILE_SHARED_BYTES_NO_QS: u32 = ATTN_TILE_SHARED_BYTES - 1056 * 16;
 
 impl Gpu {
-    /// Opens the first GPU of the platform's API (Vulkan; Metal on macOS).
-    /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
-    /// can run on machines without a GPU (CI).
+    /// Opens the GPU (see `dev::Dev::open`).
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
-        let backends = device::platform_backends();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
-        let adapter = adapters
-            .into_iter()
-            .find(|a| diag.software || a.get_info().device_type != wgpu::DeviceType::Cpu)
-            .with_context(|| {
-                let hint = if cfg!(target_os = "linux") {
-                    ". Check that the user is in the `render` group and that the session has it \
-                     (re-login, or run under `sg render`)"
-                } else {
-                    ""
-                };
-                format!("no {backends:?} GPU found (only a software renderer, if any){hint}")
-            })?;
-        let alimits = adapter.limits();
-        let caps = DeviceCaps::detect(&adapter);
-        if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
-            bail!("{} does not support push constants (wgpu IMMEDIATES)", caps.name);
-        }
-        let timed = diag.profile == Some(2) && caps.timestamps;
-        let (f16, coop, subgroups) = (caps.f16, caps.coop, caps.subgroups);
+        let (dev, caps) = Dev::open(&diag)?;
         let tuning = Tuning::for_device(&caps).with_env();
         let compile = CompileSettings::for_device(&caps).with_env();
-        let limits = wgpu::Limits {
-            max_buffer_size: alimits.max_buffer_size,
-            max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
-            max_storage_buffers_per_shader_stage: 10,
-            max_compute_workgroup_storage_size: caps.max_workgroup_storage,
-            max_immediate_size: 32,
-            ..wgpu::Limits::default()
-        };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("yaxus"),
-            required_features: {
-                let mut f = wgpu::Features::IMMEDIATES;
-                if caps.msl {
-                    f |= wgpu::Features::PASSTHROUGH_SHADERS;
-                }
-                if f16 {
-                    f |= wgpu::Features::SHADER_F16;
-                }
-                if coop {
-                    f |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
-                }
-                if subgroups {
-                    f |= wgpu::Features::SUBGROUP;
-                }
-                if timed {
-                    f |= wgpu::Features::TIMESTAMP_QUERY;
-                }
-                f
-            },
-            required_limits: limits,
-            // SAFETY: only the cooperative-matrix feature is experimental here; its kernel is
-            // checked against the f32 GEMM and the CPU reference by the test suite.
-            experimental_features: if coop {
-                unsafe { wgpu::ExperimentalFeatures::enabled() }
-            } else {
-                wgpu::ExperimentalFeatures::disabled()
-            },
-            ..Default::default()
-        }))
-        .context("creating the wgpu device")?;
-
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: 256,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let argmax_out = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("argmax"),
-            size: (ARGMAX_ROWS * 8) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let kernels_profile = timed.then(|| {
-            let size = (MAX_TIMED * 2 * 8) as u64;
-            KernelProfile {
-                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("timestamps"),
-                    ty: wgpu::QueryType::Timestamp,
-                    count: (MAX_TIMED * 2) as u32,
-                }),
-                resolve: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size,
-                    usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                    mapped_at_creation: false,
-                }),
-                staging: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                pending: Vec::new(),
-                totals: HashMap::new(),
-                period_ns: queue.get_timestamp_period() as f64,
-            }
-        });
-        let argmax_part = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("argmax-part"),
-            size: (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);
+        let argmax_part = dev.storage("argmax-part", (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64);
         let mut b = Gpu {
             argmax_part,
-            bind_groups: HashMap::new(),
-            kernels_profile,
             prof_detail: None,
-            device,
-            queue,
+            dev,
             gemm: tuning.gemm,
             tuning,
             compile,
             caps,
             kernels: HashMap::new(),
-            encoder: None,
-            pass: None,
             meta_bufs: [None, None, None, None],
             pass_tiles: 0,
             pass_rows: 0,
             pass_max_pos: 0,
             pool: Arc::new(Mutex::new(HashMap::new())),
             weight_bytes: 0,
-            readback,
             argmax_out,
             pending_flops: 0.0,
             pass_dispatches: 0,
-            unflushed_upload: 0,
             oversized: None,
             profile: diag.profile.map(|_| Profile::default()),
             diag,

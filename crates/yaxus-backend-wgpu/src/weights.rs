@@ -4,6 +4,7 @@
 use anyhow::Result;
 use yaxus_model::{Quant, TensorRef};
 
+use crate::dev::Buf;
 use crate::{Gpu, gemm_int, gemv_int};
 
 /// How a weight matrix is stored on the GPU (and which kernels read it).
@@ -55,23 +56,23 @@ pub struct Matrix {
     pub(crate) n: usize,
     pub(crate) k: usize,
     /// The values (for `Bf16`, the whole matrix).
-    pub(crate) q: wgpu::Buffer,
+    pub(crate) q: Buf,
     /// The scales as the decode kernels read them (none for `Bf16`; for `Q4K` the same
     /// buffer as `q`, read through a second binding).
-    pub(crate) s: Option<wgpu::Buffer>,
+    pub(crate) s: Option<Buf>,
     /// For `Q6`, `Q3`: an f16 scale per 16 values; for `Q2`, a pair of f16 per 16 (the
     /// prefill GEMMs read these instead of `s`).
-    pub(crate) s16: Option<wgpu::Buffer>,
+    pub(crate) s16: Option<Buf>,
 }
 
 impl Matrix {
     /// The weight bindings of the decode kernels (GEMVs).
-    pub(crate) fn decode_bufs(&self) -> Vec<wgpu::Buffer> {
+    pub(crate) fn decode_bufs(&self) -> Vec<Buf> {
         std::iter::once(&self.q).chain(&self.s).cloned().collect()
     }
 
     /// The weight bindings of the prefill GEMMs: the per-16 scales where there are some.
-    pub(crate) fn prefill_bufs(&self) -> Vec<wgpu::Buffer> {
+    pub(crate) fn prefill_bufs(&self) -> Vec<Buf> {
         std::iter::once(&self.q).chain(self.s16.as_ref().or(self.s.as_ref())).cloned().collect()
     }
 }
@@ -79,10 +80,10 @@ impl Matrix {
 pub enum Weight {
     Matrix(Matrix),
     /// 1-D weights (norms), converted to f32.
-    Vector(wgpu::Buffer),
+    Vector(Buf),
     /// Embedding table `[V, H]` in bf16 (two values per u32).
     Embedding {
-        table: wgpu::Buffer,
+        table: Buf,
         h: usize,
     },
 }

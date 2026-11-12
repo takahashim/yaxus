@@ -50,27 +50,15 @@ impl Gpu {
         );
         let kv_dim = cfg.kv_dim();
         let size = (pages * PAGE * kv_dim * 4) as u64;
-        anyhow::ensure!(size <= self.device.limits().max_storage_buffer_binding_size, "KV arena too large per layer");
-        let mk = |label| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
+        anyhow::ensure!(size <= self.dev.max_binding(), "KV arena too large per layer");
+        let mk = |label| self.dev.storage(label, size);
         let k = metas.iter().map(|_| mk("k")).collect();
         let v = metas.iter().map(|_| mk("v")).collect();
         // A model may have only one kind of layer: the other table is then unused.
         let any = metas.first().context("a model without layers")?;
         let sliding = metas.iter().find(|m| !m.full_attn).unwrap_or(any);
         let full = metas.iter().find(|m| m.full_attn).unwrap_or(any);
-        let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("kv-page-scratch"),
-            size: (PAGE * kv_dim * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let scratch = self.dev.storage("kv-page-scratch", (PAGE * kv_dim * 4) as u64);
         Ok(Kv {
             k,
             v,
@@ -83,10 +71,9 @@ impl Gpu {
 
     pub(crate) fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
         let bytes = (PAGE * kv.kv_dim * 4) as u64;
-        let enc = self.encoder();
         for b in kv.k.iter().chain(&kv.v) {
-            enc.copy_buffer_to_buffer(b, src as u64 * bytes, &kv.scratch, 0, bytes);
-            enc.copy_buffer_to_buffer(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
+            self.dev.copy(b, src as u64 * bytes, &kv.scratch, 0, bytes);
+            self.dev.copy(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
         }
     }
 
@@ -179,7 +166,6 @@ impl Gpu {
         let y = self.tensor(rows.len(), x.cols);
         let bytes = (x.cols * 4) as u64;
         let (src, dst) = (x.buf().clone(), y.buf().clone());
-        let enc = self.encoder();
         // Copy runs of consecutive rows at once.
         let mut i = 0;
         while i < rows.len() {
@@ -187,7 +173,7 @@ impl Gpu {
             while j < rows.len() && rows[j] == rows[j - 1] + 1 {
                 j += 1;
             }
-            enc.copy_buffer_to_buffer(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
+            self.dev.copy(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
             i = j;
         }
         y

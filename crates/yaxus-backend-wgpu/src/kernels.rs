@@ -1,16 +1,10 @@
 //! Compiling the kernels: the base set when the device opens, the integer kernels of a
 //! model's formats ahead of use, and the rest on first use.
 
-use crate::device::{CompileSettings, DeviceCaps, Tuning};
+use crate::dev::Kernel;
+use crate::device::{DeviceCaps, Tuning};
 use crate::shaders;
 use crate::{Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, SCALE_PAD, gemm_int, gemv_f32, gemv_int, plan};
-
-pub(crate) struct Kernel {
-    /// Its number in the device's kernel set (bind groups are cached by it).
-    pub(crate) id: usize,
-    pub(crate) pipeline: wgpu::ComputePipeline,
-    pub(crate) layout: wgpu::BindGroupLayout,
-}
 
 /// Kernel names, the one place each family's name is spelt: `build_kernels` and
 /// `precompile` compile under them, the ops dispatch by them.
@@ -287,78 +281,10 @@ pub(crate) fn gemv_f32_source(f: Format, t: usize, rw: usize, glu: bool, max_sto
     format!("{}{}{}", shaders::MM_PARAMS, w16(f), gemv_f32::source(t, rw, glu, stage))
 }
 
-pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-pub(crate) fn compile_kernel(
-    device: &wgpu::Device,
-    settings: CompileSettings,
-    name: &str,
-    src: &str,
-    read_only: &[bool],
-) -> Kernel {
-    let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
-    let (module, entry) = if let Some(size) = crate::msl::workgroup_size(src) {
-        // SAFETY: the source is ours (`msl`), its loops end (`every_kernel_loop_ends`) and
-        // its bindings are those of `read_only` at the buffer indices wgpu gives them.
-        let module = unsafe {
-            device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
-                label: Some(name),
-                entry_points: std::borrow::Cow::Owned(vec![wgpu::PassthroughShaderEntryPoint {
-                    name: "k0".into(),
-                    workgroup_size: (size, 1, 1),
-                }]),
-                msl: Some(src.as_str().into()),
-                ..Default::default()
-            })
-        };
-        (module, "k0")
-    } else {
-        let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-        let checks = wgpu::ShaderRuntimeChecks {
-            force_loop_bounding: settings.loop_bounding,
-            ..wgpu::ShaderRuntimeChecks::checked()
-        };
-        // SAFETY: without loop counters wgpu requires that no loop runs forever. The
-        // kernels' loops count to shapes or halve to zero, which `every_kernel_loop_ends`
-        // checks for every source; bounds checks stay on.
-        (unsafe { device.create_shader_module_trusted(desc, checks) }, "main")
-    };
-    let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
-    let layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
-    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(name),
-        bind_group_layouts: &[Some(&layout)],
-        immediate_size: 32,
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(name),
-        layout: Some(&pl),
-        module: &module,
-        entry_point: Some(entry),
-        compilation_options: wgpu::PipelineCompilationOptions {
-            zero_initialize_workgroup_memory: settings.zero_workgroup_memory,
-            ..Default::default()
-        },
-        cache: None,
-    });
-    Kernel { id: 0, pipeline, layout }
-}
-
 impl Gpu {
     pub(crate) fn add_kernel(&mut self, name: String, src: &str, read_only: &[bool]) {
-        let k = compile_kernel(&self.device, self.compile, &name, src, read_only);
+        let src = src.replace("{SPAD}", &SCALE_PAD.to_string());
+        let k = self.dev.compiler(self.compile).compile(&name, &src, read_only);
         self.insert_kernel(name, k);
     }
 
@@ -384,7 +310,7 @@ impl Gpu {
         let t0 = std::time::Instant::now();
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let (device, settings, jobs) = (&self.device, self.compile, &jobs);
+        let (compiler, jobs) = (self.dev.compiler(self.compile), &jobs);
         let built: Vec<(String, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -393,7 +319,8 @@ impl Gpu {
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            out.push((name.clone(), compile_kernel(device, settings, name, &source(), read_only)));
+                            let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                            out.push((name.clone(), compiler.compile(name, &src, read_only)));
                         }
                         out
                     })

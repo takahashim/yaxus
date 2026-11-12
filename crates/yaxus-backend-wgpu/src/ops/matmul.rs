@@ -1,6 +1,7 @@
 //! Matrix products: the f32 kernels, the integer GEMVs and GEMM, and the fused GLU.
 
 use super::grid;
+use crate::dev::Buf;
 use crate::kernels::name;
 use crate::plan::{GluPlan, MatmulCase, MatmulPlan};
 use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_int, gemv_int};
@@ -23,7 +24,7 @@ impl Gpu {
         let case = MatmulCase { t, n, k, fmt: m.fmt, gemm: self.gemm, gemv };
         let plan = case.plan(&self.caps, &self.tuning);
         if let MatmulPlan::GemvInt { planes, inline } = plan {
-            let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
+            let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
             self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
             return y;
         }
@@ -33,7 +34,7 @@ impl Gpu {
         }
         if let MatmulPlan::GemmInt { planes } = plan {
             // The integer GEMM reads the per-16 scale arrays where a format has them.
-            let [wq, scales] = <[wgpu::Buffer; 2]>::try_from(m.prefill_bufs()).unwrap();
+            let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
             self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
             return y;
         }
@@ -43,7 +44,7 @@ impl Gpu {
         // (`gemm_coop8` reads the decode layout too: it decodes through `load16`)
         let coop8 = plan == MatmulPlan::GemmCoop && self.caps.coop_size == 8;
         all.extend(if plan.is_gemm() && !coop8 { m.prefill_bufs() } else { m.decode_bufs() });
-        let refs: Vec<&wgpu::Buffer> = all.iter().collect();
+        let refs: Vec<&Buf> = all.iter().collect();
         let (n32, k32) = (n as u32, k as u32);
         let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {
             MatmulPlan::GemvMulti { first } => [(0, first), (first, t - first)]
@@ -67,7 +68,7 @@ impl Gpu {
             MatmulPlan::GemvInt { .. } | MatmulPlan::GemmInt { .. } | MatmulPlan::GemvF32 => unreachable!(),
         };
         for (name, params, groups) in dispatches {
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
             self.dispatch(&name, &refs, &params, groups);
@@ -84,7 +85,7 @@ impl Gpu {
         match case.plan_glu(&self.caps, &self.tuning) {
             GluPlan::GemvInt { planes, inline } => {
                 let y = self.tensor(x.rows, n2 / 2);
-                let [q, s] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
+                let [q, s] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
                 self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), (planes, inline), true);
                 return y;
             }
@@ -106,8 +107,8 @@ impl Gpu {
         let y = self.tensor(1, inter);
         let mut all = vec![y.buf().clone(), x.buf().clone()];
         all.extend(bufs);
-        let refs: Vec<&wgpu::Buffer> = all.iter().collect();
-        if self.kernels_profile.is_some() {
+        let refs: Vec<&Buf> = all.iter().collect();
+        if self.dev.timing() {
             self.prof_detail = Some(format!("{n2}x{k}"));
         }
         self.dispatch(&kernel, &refs, &[inter as u32, k as u32, 1], grid(inter.div_ceil(4) as u32));
@@ -123,8 +124,8 @@ impl Gpu {
         &mut self,
         x: &Tensor,
         y: &Tensor,
-        wq: &wgpu::Buffer,
-        scales: &wgpu::Buffer,
+        wq: &Buf,
+        scales: &Buf,
         n: usize,
         f: &'static gemm_int::IntFmt,
         planes: usize,
@@ -142,7 +143,7 @@ impl Gpu {
             grid(lanes.div_ceil(64) as u32),
         );
         let bufs = [y.buf().clone(), xq.buf().clone(), wq.clone(), scales.clone(), xs.buf().clone()];
-        let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+        let refs: Vec<&Buf> = bufs.iter().collect();
         let rest = t % 128;
         let wide = t / 128 + usize::from(rest > 64);
         let tail = match rest {
@@ -157,7 +158,7 @@ impl Gpu {
             let kernel = self.int_kernel(name::gemm_int(planes, tn, f.name), &[false, true, true, true, true], || {
                 gemm_int::source(f, tn, planes)
             });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{n}x{k}"));
             }
             self.dispatch(
@@ -178,8 +179,8 @@ impl Gpu {
         &mut self,
         x: &Tensor,
         y: &Tensor,
-        wq: &wgpu::Buffer,
-        wsc: &wgpu::Buffer,
+        wq: &Buf,
+        wsc: &Buf,
         n: usize,
         f: &'static gemv_int::IntFmt,
         (planes, inline): (usize, bool),
@@ -193,7 +194,7 @@ impl Gpu {
                 self.int_kernel(name::gemv_int(planes, 1, rw, glu, true, f.name), &[false, true, true, true], || {
                     gemv_int::source(f, 1, planes, rw, glu, true)
                 });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
@@ -223,7 +224,7 @@ impl Gpu {
                 &[false, true, true, true, true],
                 || gemv_int::source(f, rows, planes, rw, glu, false),
             );
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
@@ -244,12 +245,12 @@ impl Gpu {
             let kernel = self.int_kernel(name::gemv_q(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
                 crate::msl::gemv_q(m.fmt, t, rw, glu, stage).unwrap()
             });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let mut bufs = vec![y.buf().clone(), x.buf().clone()];
             bufs.extend(m.decode_bufs());
-            let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+            let refs: Vec<&Buf> = bufs.iter().collect();
             let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
             self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
             self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
@@ -261,12 +262,12 @@ impl Gpu {
                 self.int_kernel(name::gemv_mma(tiles, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
                     crate::msl::gemv_mma(m.fmt, tiles, glu).unwrap()
                 });
-            if self.kernels_profile.is_some() {
+            if self.dev.timing() {
                 self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
             }
             let mut bufs = vec![y.buf().clone(), x.buf().clone()];
             bufs.extend(m.decode_bufs());
-            let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+            let refs: Vec<&Buf> = bufs.iter().collect();
             let groups = grid(n.div_ceil(crate::msl::gemv_mma_outputs(glu)) as u32);
             self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
             self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
@@ -276,12 +277,12 @@ impl Gpu {
         let kernel = self.int_kernel(name::gemv_f32(t, rw, glu, m.fmt), crate::kernels::decode_layout(m.fmt), || {
             crate::kernels::gemv_f32_source(m.fmt, t, rw, glu, wgmem)
         });
-        if self.kernels_profile.is_some() {
+        if self.dev.timing() {
             self.prof_detail = Some(format!("{}x{k}", if glu { 2 * n } else { n }));
         }
         let mut bufs = vec![y.buf().clone(), x.buf().clone()];
         bufs.extend(m.decode_bufs());
-        let refs: Vec<&wgpu::Buffer> = bufs.iter().collect();
+        let refs: Vec<&Buf> = bufs.iter().collect();
         let groups = grid(n.div_ceil(rw * if glu { 4 } else { 8 }) as u32);
         self.dispatch(&kernel, &refs, &[n as u32, k as u32, t as u32, 0], groups);
         self.account(2.0 * (t * n * k) as f64 * if glu { 2.0 } else { 1.0 });
