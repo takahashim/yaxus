@@ -183,6 +183,14 @@ impl Tuning {
         if caps.backend == wgpu::Backend::Metal {
             t.gemvi_inline = false;
         }
+        if caps.vendor == Vendor::Apple {
+            // Apple GPUs have no integer dot product: `dot4I8Packed` is four multiplies
+            // and the byte extractions, and the integer kernels lose to the f32 ones
+            // (M2, 2B Q4_K_M, ms per pass of 1 / 4 / 16 / 256 rows: integer 48 / 382 /
+            // 3450 / 39900, f32 30 / 56 / 305 / 1681).
+            t.gemm = GemmKind::F32;
+            t.gemv = Gemv::F32;
+        }
         t
     }
 

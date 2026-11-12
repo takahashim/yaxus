@@ -78,10 +78,17 @@ pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLay
 
 pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_only: &[bool]) -> Kernel {
     let src = &src.replace("{SPAD}", &SCALE_PAD.to_string());
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(name),
-        source: wgpu::ShaderSource::Wgsl(src.into()),
-    });
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
+    let metal = device.adapter_info().backend == wgpu::Backend::Metal;
+    // On Metal naga guards every loop with a counter against infinite loops, which keeps
+    // the compiler from unrolling them: private arrays indexed by the loop (the f32
+    // GEMM's accumulators) then live in memory, and the 256-row f32 pass of the 2B took
+    // 15.4 s instead of 1.7 s on an M2. The kernels' loops all end (their bounds are
+    // shapes), so the guard is left out there. (Vulkan keeps wgpu's checks until
+    // measured.)
+    let checks = wgpu::ShaderRuntimeChecks { force_loop_bounding: !metal, ..wgpu::ShaderRuntimeChecks::checked() };
+    // SAFETY: the loops of the kernels are bounded (see above); bounds checks stay on.
+    let module = unsafe { device.create_shader_module_trusted(desc, checks) };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     let layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
@@ -95,7 +102,13 @@ pub(crate) fn compile_kernel(device: &wgpu::Device, name: &str, src: &str, read_
         layout: Some(&pl),
         module: &module,
         entry_point: Some("main"),
-        compilation_options: Default::default(),
+        // Every kernel writes its workgroup memory before reading it. On Metal naga would
+        // zero it from one lane per workgroup on entry (32 KiB in `gemvm16`, an 8-row
+        // f32 pass of the 2B 1.8 s instead of 0.17 s on an M2).
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: !metal,
+            ..Default::default()
+        },
         cache: None,
     });
     Kernel { id: 0, pipeline, layout }
