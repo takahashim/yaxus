@@ -414,7 +414,7 @@ fn prefill_kinds_against_f32() {
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
     let base = logits(&mut gpu, GemmKind::F32);
     let mut kinds = vec![(GemmKind::Int16, 5e-2), (GemmKind::Int8, 3.0)];
-    if gpu.backend.has_matrix_cores() {
+    if gpu.backend.caps().coop {
         kinds.insert(0, (GemmKind::Coop, 3e-1));
     }
     for (kind, bound) in kinds {

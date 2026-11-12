@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_backend_wgpu::WgpuBackend;
+use yaxus_backend_wgpu::{Gemv, WgpuBackend};
 use yaxus_model::{Backend, Engine, Generator, Model, ModelOptions, Quant};
 use yaxus_tokenizer::Tokenizer;
 
@@ -28,11 +28,14 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
     match gpu(o.backend)? {
         Some(mut gpu) => {
             // One device for the target and the draft model, with their own kernels.
-            gpu.set_gemm(o.prefill.gemm_kind());
-            gpu.set_gemv(o.decode.gemv());
+            // (the device's kernels unless the options choose)
+            let tuning = gpu.tuning();
+            gpu.set_gemm(o.prefill.gemm_kind().unwrap_or(tuning.gemm));
+            let gemv = o.decode.gemv(tuning.gemv);
+            gpu.set_gemv(gemv);
             let draft_gpu = gpu.share_for_draft();
             let draft = o.draft.as_ref().map(|d| (d, draft_gpu));
-            load_engine(dir, o, gpu, draft, |b: &WgpuBackend| b.precompile())
+            load_engine(dir, o, gpu, draft, gemv, |b: &WgpuBackend| b.precompile())
         }
         None => {
             if o.draft.is_some() {
@@ -41,7 +44,8 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
                 tracing::warn!("speculative decoding is disabled on the CPU backend (it is slower there)");
             }
             yaxus_backend_cpu::init_threads();
-            load_engine(dir, o, CpuBackend::new(), None, |_: &CpuBackend| {})
+            // (`gemv` only sets the default decode rows: 16 as with the integer kernels)
+            load_engine(dir, o, CpuBackend::new(), None, Gemv::INT16, |_: &CpuBackend| {})
         }
     }
 }
@@ -50,11 +54,11 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
 fn gpu(kind: BackendKind) -> Result<Option<WgpuBackend>> {
     Ok(match kind {
         BackendKind::Cpu => None,
-        BackendKind::Vulkan => Some(WgpuBackend::new()?),
+        BackendKind::Gpu => Some(WgpuBackend::new()?),
         BackendKind::Auto => match WgpuBackend::new() {
             Ok(g) => Some(g),
             Err(e) => {
-                tracing::warn!("Vulkan unavailable, using the CPU: {e:#}");
+                tracing::warn!("no GPU available, using the CPU: {e:#}");
                 None
             }
         },
@@ -68,6 +72,7 @@ fn load_engine<B>(
     o: &LoadOptions,
     target: B,
     draft: Option<(&DraftOptions, B)>,
+    gemv: Gemv,
     warm: impl Fn(&B),
 ) -> Result<Box<dyn Generator>>
 where
@@ -81,7 +86,7 @@ where
         warm(&m.backend);
         Ok(m)
     };
-    let cfg = o.engine_config(draft.as_ref().map(|(d, _)| *d));
+    let cfg = o.engine_config(draft.as_ref().map(|(d, _)| *d), gemv);
     let target = load(dir, target, o.quant)?;
     let draft = match draft {
         Some((d, backend)) => Some(load(&d.dir, backend, d.quant)?),

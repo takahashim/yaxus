@@ -7,12 +7,24 @@ description = "Vulkan (wgpu) backend for yaxus with hand-written WGSL kernels"
 
 [dependencies]
 anyhow.workspace = true
-wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl"] }
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
 yaxus-model = { path = "../yaxus-model" }
 
+# The platform's GPU API (see `device::platform_backends`).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal"] }
+
+[features]
+# Single ops on given data for the integration tests (`debug_*`).
+test-hooks = []
+
 [dev-dependencies]
+yaxus-backend-wgpu = { path = ".", features = ["test-hooks"] }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 serde_json.workspace = true

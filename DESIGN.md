@@ -269,7 +269,7 @@ GET  /v1/languages          対応言語コード一覧
 ## 5. CLI
 
 ```
-yaxus serve   --model ~/.cache/huggingface/hub/... [--backend vulkan|cpu] [--listen 0.0.0.0:8443] [--token ...]
+yaxus serve   --model ~/.cache/huggingface/hub/... [--backend auto|gpu|cpu] [--listen 0.0.0.0:8443] [--token ...]
 yaxus translate --to en [--from ja] [--form polite] "テキスト"   # サーバを立てずローカルで実行
 yaxus client  --server https://host:8443 --to en  < input.txt    # 標準入力を段落単位で送る
 yaxus quantize --model ... --scheme q8|q4 --out ...

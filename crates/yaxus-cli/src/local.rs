@@ -26,18 +26,20 @@ pub struct ModelArgs {
     /// safetensors: q8), q8, q4 or bf16 (lossless for safetensors).
     #[arg(long, default_value = "auto")]
     quant: Quant,
-    /// auto (Vulkan GPU if available, else CPU), vulkan or cpu.
+    /// auto (the GPU if available, else the CPU), gpu (Vulkan, or Metal on macOS) or cpu.
     #[arg(long, default_value = "auto")]
     backend: BackendKind,
-    /// Arithmetic of GPU prompt processing (long passes): int16 (integer dot products,
-    /// activations rounded to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than
-    /// int16, logits move ~100x more), f16 (matrix cores) or f32 (reference).
-    #[arg(long, default_value = "int16")]
+    /// Arithmetic of GPU prompt processing (long passes): auto (the device's choice: int16
+    /// on AMD GPUs), int16 (integer dot products, activations rounded to 15 bits), int8
+    /// (7 bits as llama.cpp does: 1.5x faster than int16, logits move ~100x more), f16
+    /// (matrix cores) or f32 (reference).
+    #[arg(long, default_value = "auto")]
     prefill_precision: yaxus_runtime::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
-    /// drafts, short prompts): int16 (integer dot products, activations rounded to
-    /// 15 bits; several rows cost little more than one) or f32 (reference).
-    #[arg(long, default_value = "int16")]
+    /// drafts, short prompts): auto (the device's choice: int16 on AMD GPUs), int16
+    /// (integer dot products, activations rounded to 15 bits; several rows cost little
+    /// more than one) or f32 (reference).
+    #[arg(long, default_value = "auto")]
     decode_precision: yaxus_runtime::Decode,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
     /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
@@ -61,8 +63,8 @@ pub struct ModelArgs {
     /// Requests processed at once (more wait in the queue).
     #[arg(long, default_value_t = 16)]
     max_streams: usize,
-    /// Most requests advanced by one decode pass [default: 16 with --decode-precision
-    /// int16 (rows are cheap there), else 8].
+    /// Most requests advanced by one decode pass [default: 16 with the integer decode
+    /// kernels (rows are cheap there), 8 with f32].
     #[arg(long)]
     decode_rows: Option<usize>,
     /// Weight format of the draft model: auto4 (GGUF tensors of up to 4 bits as in the file,

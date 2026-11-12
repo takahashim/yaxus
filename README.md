@@ -89,9 +89,9 @@ In a browser, open `https://host.example:8443/` and enter the token. The API is
 
 ### Speed and precision
 
-By default, matrix products round their input rows to 15 bits per block of 32 values and
-use packed integer dot products (`--prefill-precision int16`, `--decode-precision
-int16`). The logits differ from an all-f32 computation by about 6e-3. In the tests so far,
+By default (`--prefill-precision auto`, `--decode-precision auto`: the device's choice,
+`int16` on the AMD GPUs measured so far), matrix products round their input rows to
+15 bits per block of 32 values and use packed integer dot products. The logits differ from an all-f32 computation by about 6e-3. In the tests so far,
 the translations were identical.
 
 - **Reference:** `--prefill-precision f32 --decode-precision f32 --draft none
@@ -121,7 +121,7 @@ A single stream without a draft model decodes at about the same speed as Ollama
 - **GPU and model tests:** `cargo test --release -p yaxus-backend-wgpu -- --ignored`.
   These need a GPU and the models in the Hugging Face cache.
 - **Software Vulkan:** the kernel tests also run on lavapipe, as in CI:
-  `YAXUS_SOFTWARE_VULKAN=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+  `YAXUS_SOFTWARE_GPU=1 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
 - **CI:** runs `cargo fmt --check` and `cargo clippy` with warnings as errors, and the
   tests ([.github/workflows/ci.yml](.github/workflows/ci.yml)).
 

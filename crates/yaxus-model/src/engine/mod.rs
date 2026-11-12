@@ -78,7 +78,7 @@ pub struct EngineConfig {
     /// Most requests advanced by one decode pass. With f32 kernels 8 rows are the
     /// cheapest per row on a Radeon 780M (2B: 38 ms for 8 rows, 108 ms for 16); with the
     /// integer kernels 16 are (26 and 38 ms). The default here is 8; callers that load
-    /// through `yaxus-runtime` get the precision's own (`Decode::default_rows`).
+    /// through `yaxus-runtime` get the precision's own (`default_decode_rows`).
     pub decode_rows: usize,
     /// Prompt rows per pass while other requests are decoding.
     pub busy_prefill_rows: usize,

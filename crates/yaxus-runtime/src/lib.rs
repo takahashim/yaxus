@@ -15,7 +15,7 @@ mod run;
 mod session;
 
 pub use load::{load_generator, load_tokenizer};
-pub use options::{BackendKind, Decode, DraftOptions, LoadOptions, Prefill, Scheduling};
+pub use options::{BackendKind, Decode, DraftOptions, LoadOptions, Prefill, Scheduling, default_decode_rows};
 pub use prompt::{Prompt, prompt_request};
 pub use resolve::{DraftSpec, ResolvedModel, quant_label, resolve_draft, resolve_model};
 pub use run::{RunStats, run_request};
