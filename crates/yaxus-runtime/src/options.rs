@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use yaxus_backend_wgpu::{GemmKind, Gemv};
+use yaxus_backend_gpu::{GemmKind, Gemv};
 use yaxus_model::{EngineConfig, Quant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub struct DraftOptions {
 /// the logits of the first generated token move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefill {
-    /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemm`]; `Int16` on the AMD GPUs
+    /// The device's choice ([`yaxus_backend_gpu::Tuning::gemm`]; `Int16` on the AMD GPUs
     /// measured so far; on Apple GPUs their 8x8 matrices in f32, nothing rounded).
     #[default]
     Auto,
@@ -91,7 +91,7 @@ impl std::str::FromStr for Prefill {
 /// short prompts; see [`Prefill`] for when longer passes take the same kernels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Decode {
-    /// The device's choice ([`yaxus_backend_wgpu::Tuning::gemv`]; `Int16` on the AMD GPUs
+    /// The device's choice ([`yaxus_backend_gpu::Tuning::gemv`]; `Int16` on the AMD GPUs
     /// measured so far, `F32` on Apple GPUs).
     #[default]
     Auto,

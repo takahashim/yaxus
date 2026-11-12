@@ -143,7 +143,7 @@ yaxus/
     yaxus-pfml/            # PFML3 プロンプト (chat_template.jinja の移植) と翻訳リクエストの検証
     yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・KV アリーナ・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32、rayon)。正しさの基準とフォールバック
-    yaxus-backend-wgpu/    # GPU バックエンド (wgpu on Vulkan / Metal、手書き WGSL カーネル)
+    yaxus-backend-gpu/     # GPU バックエンド (wgpu で Vulkan / Metal、または Metal 直接。手書きの WGSL と MSL のカーネル)
     yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
@@ -223,11 +223,11 @@ yaxus/
 
 ---
 
-## 4. GPU バックエンド (`yaxus-backend-wgpu`)
+## 4. GPU バックエンド (`yaxus-backend-gpu`)
 
 ### 4.1 構成
 
-- `Gpu` がデバイス、カーネル、バッファプールを持つ。本体と下書きは `WgpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
+- `Gpu` がデバイス、カーネル、バッファプールを持つ。本体と下書きは `GpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
 - `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。
 - `msl/`: Apple GPU 用に MSL で書いたカーネル。`access` (形式ごとの重みの展開)、`gemv2` (1〜16 行の GEMV)、`gemm` (prefill の GEMM)、`small` (`rmsnorm`・`add_norm`・`qk_rope`)。カーネルは値 (`msl::Gemv2 { t, glu, tiles }`、`msl::Gemm { f16, rb }`) で表し、名前は `kernels::name`、ソースは値から作る。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
 - `dev/metal/translate.rs`: Metal 直接のときに、WGSL のカーネルを naga で MSL に変換する。immediates を `buffer(0)`、binding `i` を `buffer(i + 1)` に置き、MSL のカーネルと同じ形でディスパッチできるようにする (単体テストで固定)。
@@ -370,8 +370,8 @@ yaxus bench      rows | decode | set | streams | doc               # 計測 (§8
 ```
 YAXUS_REQUIRE_GOLDEN=1 cargo test --workspace                                  # 単体テスト、トークナイザのゴールデン
 cargo test --release -p yaxus-backend-cpu -- --ignored                         # HF の logits と比較 (2B)
-cargo test --release -p yaxus-backend-wgpu --test kernels -- --ignored         # カーネルをホスト参照と比較
-cargo test --release -p yaxus-backend-wgpu --test vs_cpu -- --ignored --test-threads=1   # GPU と CPU の比較 (2B)
+cargo test --release -p yaxus-backend-gpu --test kernels -- --ignored         # カーネルをホスト参照と比較
+cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-threads=1   # GPU と CPU の比較 (2B)
 ```
 
 - **トークナイザ**: Python の `Plamo3Tokenizer` で作ったゴールデン (パブリックドメイン作品の抜粋を含む約 1,700 件) の encode/decode、プロンプトテンプレート、ストリーミングデコードが完全一致。GGUF のトークナイザも同じ結果になる。

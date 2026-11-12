@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_backend_wgpu::{Gemv, WgpuBackend};
+use yaxus_backend_gpu::{Gemv, GpuBackend};
 use yaxus_model::{Backend, Engine, Generator, Model, ModelOptions, Quant};
 use yaxus_tokenizer::Tokenizer;
 
@@ -35,7 +35,7 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
             gpu.set_gemv(gemv);
             let draft_gpu = gpu.share_for_draft();
             let draft = o.draft.as_ref().map(|d| (d, draft_gpu));
-            load_engine(dir, o, gpu, draft, gemv, |b: &WgpuBackend| b.precompile())
+            load_engine(dir, o, gpu, draft, gemv, |b: &GpuBackend| b.precompile())
         }
         None => {
             if o.draft.is_some() {
@@ -51,11 +51,11 @@ pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>>
 }
 
 /// The GPU backend `kind` asks for; `None` for the CPU.
-fn gpu(kind: BackendKind) -> Result<Option<WgpuBackend>> {
+fn gpu(kind: BackendKind) -> Result<Option<GpuBackend>> {
     Ok(match kind {
         BackendKind::Cpu => None,
-        BackendKind::Gpu => Some(WgpuBackend::new()?),
-        BackendKind::Auto => match WgpuBackend::new() {
+        BackendKind::Gpu => Some(GpuBackend::new()?),
+        BackendKind::Auto => match GpuBackend::new() {
             Ok(g) => Some(g),
             Err(e) => {
                 tracing::warn!("no GPU available, using the CPU: {e:#}");

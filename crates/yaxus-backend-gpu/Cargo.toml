@@ -1,9 +1,9 @@
 [package]
-name = "yaxus-backend-wgpu"
+name = "yaxus-backend-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GPU backend for yaxus (wgpu on Vulkan or Metal) with hand-written WGSL kernels"
+description = "GPU backend for yaxus (wgpu on Vulkan or Metal, or Metal directly) with hand-written WGSL and MSL kernels"
 
 [dependencies]
 anyhow.workspace = true
@@ -31,6 +31,6 @@ naga = { version = "30", default-features = false, features = ["wgsl-in", "msl-o
 test-hooks = []
 
 [dev-dependencies]
-yaxus-backend-wgpu = { path = ".", features = ["test-hooks"] }
+yaxus-backend-gpu = { path = ".", features = ["test-hooks"] }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 serde_json.workspace = true

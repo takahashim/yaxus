@@ -1,5 +1,5 @@
 //! Compares the GPU backend with the CPU reference on the golden prompts.
-//! Needs a GPU and the 2B model: `cargo test --release -p yaxus-backend-wgpu -- --ignored --nocapture`
+//! Needs a GPU and the 2B model: `cargo test --release -p yaxus-backend-gpu -- --ignored --nocapture`
 //! (in a session without the `render` group, run it under `sg render -c '...'`).
 
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_backend_wgpu::WgpuBackend;
+use yaxus_backend_gpu::GpuBackend;
 use yaxus_model::{Backend, Engine, EngineConfig, Event, Generator, Model, ModelOptions, Quant, Request};
 
 fn model_dir() -> PathBuf {
@@ -33,7 +33,7 @@ fn compare(quant: Quant) {
     let dir = model_dir();
     let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(quant)).unwrap();
     let t0 = Instant::now();
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
+    let mut gpu = Model::load(&dir, GpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
     eprintln!("[{quant:?}] {} loaded in {:.2?}", gpu.backend.name(), t0.elapsed());
     for c in &cases() {
         let name = c["name"].as_str().unwrap();
@@ -69,7 +69,7 @@ fn compare(quant: Quant) {
 fn gpu_matches_cpu_long_prompt() {
     let dir = model_dir();
     let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(Quant::Q8)).unwrap();
+    let mut gpu = Model::load(&dir, GpuBackend::new().unwrap(), &ModelOptions::new(Quant::Q8)).unwrap();
     let ids: Vec<u32> = (0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect();
     let sc = cpu.new_seq();
     let lc = cpu.prefill(sc, &ids).unwrap();
@@ -127,7 +127,7 @@ fn speculative_matches_plain() {
         eprintln!("0.8B model not found; skipping");
         return;
     };
-    let gpu = WgpuBackend::new().unwrap();
+    let gpu = GpuBackend::new().unwrap();
     let mut plain = Engine::new(
         Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(),
         None,
@@ -162,10 +162,10 @@ fn speculative_matches_plain() {
 #[ignore]
 fn concurrent_matches_solo() {
     let dir = model_dir();
-    let gpu = WgpuBackend::new().unwrap();
+    let gpu = GpuBackend::new().unwrap();
     // f32 prefill: the f16 prefill of a prompt run together with others could take a
     // different kernel than alone (64-row tiles vs. multi-row GEMV).
-    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
+    gpu.set_gemm(yaxus_backend_gpu::GemmKind::F32);
     let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap());
     // No response cache: the requests run again after running alone.
     let cfg = EngineConfig { decode_rows: 4, busy_prefill_rows: 16, response_cache: 0, ..EngineConfig::default() };
@@ -211,7 +211,7 @@ fn concurrent_matches_solo() {
 #[ignore]
 fn abort_all_leaves_a_clean_engine() {
     let dir = model_dir();
-    let gpu = WgpuBackend::new().unwrap();
+    let gpu = GpuBackend::new().unwrap();
     let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap());
     let cfg = EngineConfig { max_streams: 2, response_cache: 0, ..EngineConfig::default() };
     let mut eng =
@@ -248,8 +248,8 @@ fn abort_all_leaves_a_clean_engine() {
 #[ignore]
 fn hints_and_response_cache_keep_output() {
     let dir = model_dir();
-    let gpu = WgpuBackend::new().unwrap();
-    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
+    let gpu = GpuBackend::new().unwrap();
+    gpu.set_gemm(yaxus_backend_gpu::GemmKind::F32);
     for with_draft in [false, true] {
         let draft = if with_draft {
             draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap())
@@ -263,7 +263,7 @@ fn hints_and_response_cache_keep_output() {
         let mut eng =
             Engine::new(Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(), draft, cfg).unwrap();
         eng.set_prefix_cache(false);
-        let run = |eng: &mut Engine<WgpuBackend>, p: &[u32], max: usize, hint: Vec<u32>| {
+        let run = |eng: &mut Engine<GpuBackend>, p: &[u32], max: usize, hint: Vec<u32>| {
             let mut r = Request::new(7, p.to_vec(), max, vec![1, 16]);
             r.hint = hint;
             eng.submit(r);
@@ -320,8 +320,8 @@ fn hints_and_response_cache_keep_output() {
 fn tiled_attention_matches_cpu() {
     let dir = model_dir();
     let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
-    let gpu = WgpuBackend::new().unwrap();
-    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
+    let gpu = GpuBackend::new().unwrap();
+    gpu.set_gemm(yaxus_backend_gpu::GemmKind::F32);
     let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(Quant::Q8)).unwrap();
     gpu.set_prefix_cache(false);
     cpu.set_prefix_cache(false);
@@ -352,8 +352,8 @@ fn tiled_attention_matches_cpu() {
 fn tiled_attention_matches_per_row() {
     let dir = model_dir();
     let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
-    let gpu = WgpuBackend::new().unwrap();
-    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
+    let gpu = GpuBackend::new().unwrap();
+    gpu.set_gemm(yaxus_backend_gpu::GemmKind::F32);
     let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(quant)).unwrap();
     gpu.set_prefix_cache(false);
     let ids: Vec<u32> = (0..2640u32).map(|i| 1000 + (i * 7919) % 50000).collect();
@@ -382,7 +382,7 @@ fn tiled_attention_matches_per_row() {
 #[test]
 #[ignore]
 fn msl_small_kernels_match_wgsl() {
-    let backend = WgpuBackend::new().unwrap();
+    let backend = GpuBackend::new().unwrap();
     if !backend.caps().msl {
         eprintln!("no MSL on this device; skipping");
         return;
@@ -423,9 +423,9 @@ fn msl_small_kernels_match_wgsl() {
 fn decode_attention_matches_cpu() {
     let dir = model_dir();
     let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
-    let mut gpu = WgpuBackend::new().unwrap();
-    gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
-    gpu.set_gemv(yaxus_backend_wgpu::Gemv::F32);
+    let mut gpu = GpuBackend::new().unwrap();
+    gpu.set_gemm(yaxus_backend_gpu::GemmKind::F32);
+    gpu.set_gemv(yaxus_backend_gpu::Gemv::F32);
     let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(Quant::Q8)).unwrap();
     for n in [20u32, 600, 2100] {
         let ids: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 50000).collect();
@@ -455,16 +455,16 @@ fn decode_attention_matches_cpu() {
 #[test]
 #[ignore]
 fn prefill_kinds_against_f32() {
-    use yaxus_backend_wgpu::GemmKind;
+    use yaxus_backend_gpu::GemmKind;
     let dir = model_dir();
     let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
+    let mut gpu = Model::load(&dir, GpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
     gpu.set_prefix_cache(false);
     // (prompts of up to 16 rows would take the decode kernels)
-    gpu.backend.set_gemv(yaxus_backend_wgpu::Gemv::F32);
+    gpu.backend.set_gemv(yaxus_backend_gpu::Gemv::F32);
     let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
     prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
-    let logits = |gpu: &mut Model<WgpuBackend>, kind| -> Vec<Vec<f32>> {
+    let logits = |gpu: &mut Model<GpuBackend>, kind| -> Vec<Vec<f32>> {
         gpu.backend.set_gemm(kind);
         prompts
             .iter()
@@ -513,15 +513,15 @@ fn prefill_kinds_against_f32() {
 #[test]
 #[ignore]
 fn decode_kinds_against_f32() {
-    use yaxus_backend_wgpu::{GemmKind, Gemv};
+    use yaxus_backend_gpu::{GemmKind, Gemv};
     let dir = model_dir();
     let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
+    let mut gpu = Model::load(&dir, GpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
     gpu.set_prefix_cache(false);
     gpu.backend.set_gemm(GemmKind::F32);
     let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
     prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
-    let logits = |gpu: &mut Model<WgpuBackend>, gemv: Gemv| -> Vec<Vec<f32>> {
+    let logits = |gpu: &mut Model<GpuBackend>, gemv: Gemv| -> Vec<Vec<f32>> {
         let mut out = Vec::new();
         for ids in &prompts {
             gpu.backend.set_gemv(Gemv::F32);
