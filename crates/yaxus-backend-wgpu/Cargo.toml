@@ -20,6 +20,11 @@ wgpu = { version = "30", default-features = false, features = ["vulkan"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"] }
 
+[features]
+# Single ops on given data for the integration tests (`debug_*`).
+test-hooks = []
+
 [dev-dependencies]
+yaxus-backend-wgpu = { path = ".", features = ["test-hooks"] }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 serde_json.workspace = true
