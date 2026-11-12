@@ -448,6 +448,18 @@ impl LayerPass<'_> {
     }
 }
 
+/// The index of the largest value, the first of equal ones; NaNs are skipped (as on the
+/// GPU), and a row without any number gives 0.
+fn argmax(row: &[f32]) -> u32 {
+    let (mut best, mut best_v) = (0, f32::NEG_INFINITY);
+    for (i, &v) in row.iter().enumerate() {
+        if v > best_v {
+            (best, best_v) = (i, v);
+        }
+    }
+    best as u32
+}
+
 impl Backend for CpuBackend {
     type Tensor = Tensor;
     type Weight = Weight;
@@ -561,18 +573,7 @@ impl Backend for CpuBackend {
     }
 
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
-        (0..logits.rows)
-            .map(|r| {
-                let row = logits.row(r);
-                let mut best = 0;
-                for (i, &v) in row.iter().enumerate() {
-                    if v > row[best] {
-                        best = i;
-                    }
-                }
-                best as u32
-            })
-            .collect()
+        (0..logits.rows).map(|r| argmax(logits.row(r))).collect()
     }
 
     fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
@@ -758,5 +759,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn argmax_takes_the_first_maximum_and_skips_nans() {
+        assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
+        assert_eq!(argmax(&[f32::NAN, 1.0, 2.0]), 2);
+        assert_eq!(argmax(&[0.5, f32::NAN, 0.2]), 0);
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
     }
 }
