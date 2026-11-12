@@ -222,7 +222,7 @@ impl Gpu {
     /// Opens the GPU (see `dev::Dev::open`).
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
-        let (dev, caps) = Dev::open(&diag)?;
+        let (mut dev, caps) = Dev::open(&diag)?;
         let tuning = Tuning::for_device(&caps);
         let compile = CompileSettings::for_device(&caps);
         let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);

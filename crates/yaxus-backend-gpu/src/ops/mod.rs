@@ -51,9 +51,8 @@ impl Gpu {
         let kv_dim = cfg.kv_dim();
         let size = (pages * PAGE * kv_dim * 4) as u64;
         anyhow::ensure!(size <= self.dev.max_binding(), "KV arena too large per layer");
-        let mk = |label| self.dev.storage(label, size);
-        let k = metas.iter().map(|_| mk("k")).collect();
-        let v = metas.iter().map(|_| mk("v")).collect();
+        let k = metas.iter().map(|_| self.dev.storage("k", size)).collect();
+        let v = metas.iter().map(|_| self.dev.storage("v", size)).collect();
         // A model may have only one kind of layer: the other table is then unused.
         let any = metas.first().context("a model without layers")?;
         let sliding = metas.iter().find(|m| !m.full_attn).unwrap_or(any);
