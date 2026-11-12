@@ -179,6 +179,8 @@ impl Tuning {
     /// as they are measured.
     pub fn for_device(caps: &DeviceCaps) -> Self {
         let mut t = Tuning::radeon_780m();
+        // (by vendor, not backend: an AMD GPU in an Intel Mac would keep the integer
+        // kernels on Metal, unmeasured)
         if caps.vendor == Vendor::Apple {
             // Apple GPUs have no integer dot product: `dot4I8Packed` is four multiplies
             // and the byte extractions, and the integer kernels lose to the f32 ones

@@ -229,6 +229,9 @@ fn pk(v: vec4<i32>) -> u32 {{
 // math, which may reassociate `(d * sc) * unit` (`d * sc` is exact) in one kernel and not
 // in another, and a row's result would then depend on the size of its pass. A select on
 // a value the kernel does not otherwise read (`p.t`, never 0) keeps the product whole.
+// That the compiler does not see through it is observed, not promised: the kernel tests
+// on Metal in CI (`integer_rows_do_not_depend_on_the_pass`) are what would catch a
+// compiler that does.
 fn keep(v: vec2<f32>) -> vec2<f32> {{ return select(v, vec2<f32>(0.0), p.t == 0u); }}
 ",
         decl = f.decl,
@@ -326,7 +329,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nw: vec3<
             }
             // (lane `qi` holds component `qi % 4` of vector `qi / 4`: the first lane of
             // each 4 gathers and stores the whole vector, since Metal loses concurrent
-            // stores to different components of one workgroup vector)
+            // stores to different components of one workgroup vector. Metal does not run
+            // this kernel today (`plan::gemv_int_inline`: fast math); this keeps it right
+            // there should that change. No cost measured on a 780M.)
             write!(
                 w,
                 "        let u{pl}a = subgroupShuffleXor(u{pl}, 1u);
