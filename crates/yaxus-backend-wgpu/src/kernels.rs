@@ -27,9 +27,17 @@ pub(crate) mod name {
     pub(crate) fn gemv_f32(t: usize, rw: usize, glu: bool, f: Format) -> String {
         format!("gemvf{t}x{rw}{}_{}", if glu { "g" } else { "" }, f.suffix())
     }
-    /// `msl::gemv2` for `t` rows.
-    pub(crate) fn gemv2(t: usize, glu: bool, f: Format) -> String {
-        format!("gemv2_{t}{}_{}", if glu { "g" } else { "" }, f.suffix())
+    /// The `msl::gemv2` kernel `k`.
+    pub(crate) fn gemv2(k: crate::msl::Gemv2, f: Format) -> String {
+        let glu = if k.glu { "g" } else { "" };
+        match k.tiles {
+            None => format!("gemv2_{}{glu}_{}", k.t, f.suffix()),
+            Some(nt) => format!("gemv2m{nt}_{}{glu}_{}", k.t, f.suffix()),
+        }
+    }
+    /// The `msl::gemm` kernel `k`.
+    pub(crate) fn gemm_msl(k: crate::msl::Gemm, f: Format) -> String {
+        format!("gemm{}{}_{}", if k.f16 { "h" } else { "f" }, k.rb, f.suffix())
     }
     /// The single-row f32 GEMV with SwiGLU.
     pub(crate) fn glu(f: Format) -> String {
@@ -79,23 +87,24 @@ pub(crate) fn int_jobs(caps: &DeviceCaps, tuning: &Tuning, gemm: GemmKind, forma
     if gemv.planes.is_none() && tuning.gemv_f32 {
         let (rf, wgmem) = (tuning.gemv_f32_rows, caps.max_workgroup_storage);
         for &f in formats {
-            if tuning.gemm_msl && caps.msl && crate::msl::gemm_reads(f) {
-                let f16 = gemm == GemmKind::CoopF16;
-                for rb in [1, 2] {
+            if plan::gemm_msl_takes(caps, tuning, f) {
+                for rb in plan::GEMM_MSL_RB {
+                    let k = crate::msl::Gemm { f16: gemm == GemmKind::CoopF16, rb };
                     jobs.push((
-                        format!("gemm{}{rb}_{}", if f16 { "h" } else { "f" }, f.suffix()),
+                        name::gemm_msl(k, f),
                         decode_layout(f).to_vec(),
-                        Box::new(move || crate::msl::gemm(f, f16, rb).unwrap()),
+                        Box::new(move || k.source(f).unwrap()),
                     ));
                 }
             }
-            if tuning.gemv2 && caps.msl && crate::msl::gemv2_reads(f) {
+            if plan::gemv2_for(caps, tuning, f) {
                 for glu in [false, true] {
-                    for t in 1..=GEMVM_MAX_T {
+                    for t in 1..=tuning.apple.gemv2_max_rows.clamp(1, GEMVM_MAX_T) {
+                        let k = crate::msl::Gemv2::for_rows(t, glu, &tuning.apple);
                         jobs.push((
-                            name::gemv2(t, glu, f),
+                            name::gemv2(k, f),
                             decode_layout(f).to_vec(),
-                            Box::new(move || crate::msl::gemv2(f, t, glu).unwrap()),
+                            Box::new(move || k.source(f).unwrap()),
                         ));
                     }
                 }
@@ -235,7 +244,7 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
         let src = attn_tile(plan::tile_stages_queries(caps));
         add("attn_tile".into(), &src, &[false, false, false, true, true, true, true, true, true]);
     }
-    // (the MSL ones beside them, chosen at dispatch: `Tuning::msl_small`)
+    // (the MSL ones beside them, chosen at dispatch: `AppleTuning::msl_small`)
     if caps.msl {
         for (name, src, read_only) in crate::msl::small_kernels() {
             add(name.to_string(), &src, read_only);
@@ -521,8 +530,7 @@ mod tests {
                     gemvi_rows: rows,
                     gemv_f32: true,
                     gemv_f32_rows: rows,
-                    gemv2: msl,
-                    gemm_msl: msl,
+                    apple: crate::device::AppleTuning { gemv2: msl, gemm_msl: msl, ..Tuning::for_device(&caps).apple },
                     ..Tuning::for_device(&caps)
                 };
                 sources.extend(base_sources(&caps, &tuning).into_iter().map(|(name, src, _)| (name, src)));

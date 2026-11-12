@@ -1,7 +1,8 @@
 //! Which kernels run a matrix product or an attention, from the shapes, the device and
 //! its tuning only. The ops in `lib.rs` carry the plans out.
 
-use crate::device::{DeviceCaps, Tuning};
+use crate::device::{AppleTuning, DeviceCaps, Tuning};
+use crate::msl;
 use crate::{ATTN_TILE_SHARED_BYTES, ATTN_TILE_SHARED_BYTES_NO_QS, Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv};
 
 /// The kernels of `x [t, k] · w [n, k]^T`.
@@ -18,12 +19,18 @@ pub(crate) enum MatmulPlan {
     GemvMulti { first: usize },
     /// The f32 GEMV of `gemv_f32` for up to 16 rows, in one dispatch.
     GemvF32,
+    /// `msl::gemv2` for up to 16 rows ([`gemv2_pieces`]).
+    Gemv2,
+    /// `msl::gemm` for more than 16 rows ([`gemm_msl_pieces`]; `gemv2`: whether gemv2
+    /// may take a short rest). Reads the decode layout.
+    GemmMsl { f16: bool, gemv2: bool },
     /// The single-row f32 GEMV.
     Gemv1,
     /// The f32 GEMV for up to `GEMV_MAX_T` rows, without subgroups.
     Gemv8,
-    /// The matrix-core GEMM (f16 operands).
-    GemmCoop,
+    /// The matrix-core GEMM (f16 operands; f32 on Metal's 8x8 matrices), after the last
+    /// `gemv2_rest` rows, past the last whole 64-row tile, go to gemv2.
+    GemmCoop { gemv2_rest: usize },
     /// The f32 GEMM.
     GemmF32,
 }
@@ -32,7 +39,7 @@ impl MatmulPlan {
     /// Whether it runs a GEMM, which reads the prefill layout of the weights (the
     /// per-16 scales of Q6, Q3 and Q2); the GEMVs read the decode layout.
     pub(crate) fn is_gemm(self) -> bool {
-        matches!(self, MatmulPlan::GemmInt { .. } | MatmulPlan::GemmCoop | MatmulPlan::GemmF32)
+        matches!(self, MatmulPlan::GemmInt { .. } | MatmulPlan::GemmCoop { .. } | MatmulPlan::GemmF32)
     }
 }
 
@@ -66,7 +73,7 @@ impl MatmulCase {
             return MatmulPlan::GemmInt { planes };
         }
         if t <= GEMVM_MAX_T && tuning.gemv_f32 && caps.subgroups && k.is_multiple_of(16) {
-            return MatmulPlan::GemvF32;
+            return if gemv2_takes(caps, tuning, fmt, k) { MatmulPlan::Gemv2 } else { MatmulPlan::GemvF32 };
         }
         // The multi-row GEMVs reduce with subgroup shuffles over blocks of 512 values.
         let multi = caps.subgroups && k.is_multiple_of(512);
@@ -79,7 +86,14 @@ impl MatmulCase {
         } else if t <= GEMV_MAX_T {
             MatmulPlan::Gemv8
         } else if gemm != GemmKind::F32 && n.is_multiple_of(64) && caps.coop {
-            MatmulPlan::GemmCoop
+            let gemv2 = gemv2_takes(caps, tuning, fmt, k);
+            if gemm_msl_takes(caps, tuning, fmt) {
+                return MatmulPlan::GemmMsl { f16: gemm == GemmKind::CoopF16, gemv2 };
+            }
+            // A tile costs its 64 rows whatever it holds: a short rest goes to gemv2.
+            let rest = t % 64;
+            let gemv2_rest = if gemv2 && rest <= tuning.apple.gemv2_tail_rows { rest } else { 0 };
+            MatmulPlan::GemmCoop { gemv2_rest }
         } else {
             MatmulPlan::GemmF32
         }
@@ -90,6 +104,7 @@ impl MatmulCase {
         match self.plan(caps, tuning) {
             MatmulPlan::GemvInt { planes, inline } => GluPlan::GemvInt { planes, inline },
             MatmulPlan::GemvF32 => GluPlan::GemvF32,
+            MatmulPlan::Gemv2 => GluPlan::Gemv2,
             _ if self.t == 1 => GluPlan::Glu1,
             _ => GluPlan::MatmulThenSwiglu,
         }
@@ -105,10 +120,62 @@ pub(crate) fn gemv_int_inline(caps: &DeviceCaps, t: usize) -> bool {
     t == 1 && !caps.fast_math
 }
 
-/// Whether a `GemvF32` pass over a matrix of `fmt` with `k` columns runs `msl::gemv2` (for
-/// every row count alike).
+/// Whether the device runs `msl::gemv2` on matrices of `fmt` (with K a multiple of 256).
+pub(crate) fn gemv2_for(caps: &DeviceCaps, tuning: &Tuning, fmt: Format) -> bool {
+    tuning.apple.gemv2 && caps.msl && msl::gemv2_reads(fmt)
+}
+
+/// Whether passes of up to 16 rows over a matrix of `fmt` with `k` columns run
+/// `msl::gemv2` (every row count alike, so that a row's bits do not depend on the pass).
 pub(crate) fn gemv2_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format, k: usize) -> bool {
-    tuning.gemv2 && caps.msl && crate::msl::gemv2_reads(fmt) && k.is_multiple_of(256)
+    gemv2_for(caps, tuning, fmt) && k.is_multiple_of(256)
+}
+
+/// Whether the matrix GEMM over a matrix of `fmt` runs `msl::gemm`.
+pub(crate) fn gemm_msl_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format) -> bool {
+    tuning.apple.gemm_msl && caps.msl && msl::gemm_reads(fmt)
+}
+
+/// The tile sizes of `msl::gemm`, in 32 rows of the pass.
+pub(crate) const GEMM_MSL_RB: [usize; 2] = [1, 2];
+
+/// One dispatch of a matrix product split over the pass's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Piece {
+    /// Rows `r0 .. r0 + kernel.t` on gemv2.
+    Gemv2 { r0: usize, kernel: msl::Gemv2 },
+    /// Rows `r0 .. r0 + rows` on `msl::gemm`.
+    Gemm { r0: usize, rows: usize, kernel: msl::Gemm },
+}
+
+/// The gemv2 dispatches of rows `r0 .. r0 + rows`: up to `gemv2_max_rows` each.
+pub(crate) fn gemv2_pieces(r0: usize, rows: usize, glu: bool, apple: &AppleTuning) -> Vec<Piece> {
+    let max = apple.gemv2_max_rows.max(1);
+    (r0..r0 + rows)
+        .step_by(max)
+        .map(|start| Piece::Gemv2 { r0: start, kernel: msl::Gemv2::for_rows(max.min(r0 + rows - start), glu, apple) })
+        .collect()
+}
+
+/// The `msl::gemm` dispatches of a `t`-row pass: 64-row tiles, then the rest past the last
+/// whole one by what costs least (M2, 2B Q4_K_M, ms: a 64-row tile 136, a 32-row one
+/// about 78, gemv2 16 rows 56): up to 16 rows by gemv2 (where `gemv2`), up to 32 by a
+/// 32-row tile, more by another 64-row one.
+pub(crate) fn gemm_msl_pieces(t: usize, f16: bool, gemv2: bool, apple: &AppleTuning) -> Vec<Piece> {
+    let whole = t / 64 * 64;
+    let rest = t - whole;
+    let tile = |r0, rows, rb| Piece::Gemm { r0, rows, kernel: msl::Gemm { f16, rb } };
+    let mut pieces: Vec<Piece> = Vec::new();
+    let wide = if rest > 32 { t } else { whole };
+    if wide > 0 {
+        pieces.push(tile(0, wide, 2));
+    }
+    match rest {
+        1..=16 if gemv2 => pieces.extend(gemv2_pieces(whole, rest, false, apple)),
+        1..=32 => pieces.push(tile(whole, rest, 1)),
+        _ => {}
+    }
+    pieces
 }
 
 /// The kernels of `swiglu(x · w^T)`.
@@ -118,6 +185,8 @@ pub(crate) enum GluPlan {
     GemvInt { planes: usize, inline: bool },
     /// `gemv_f32` storing `silu(gate) * up` itself.
     GemvF32,
+    /// `msl::gemv2` storing `silu(gate) * up` itself.
+    Gemv2,
     /// The single-row f32 GLU kernel.
     Glu1,
     /// The matrix product's plan, then the `swiglu` kernel.
@@ -214,6 +283,25 @@ mod tests {
     use super::*;
     use crate::device::Vendor;
 
+    #[test]
+    fn msl_pieces_cover_the_pass() {
+        let apple = AppleTuning { gemv2_max_rows: 16, ..AppleTuning::default() };
+        let gemv = |r0, t| Piece::Gemv2 { r0, kernel: msl::Gemv2::for_rows(t, false, &apple) };
+        let gemm = |r0, rows, rb| Piece::Gemm { r0, rows, kernel: msl::Gemm { f16: false, rb } };
+        assert_eq!(gemv2_pieces(0, 16, false, &apple), vec![gemv(0, 16)]);
+        assert_eq!(gemv2_pieces(64, 22, false, &apple), vec![gemv(64, 16), gemv(80, 6)]);
+        // A rest of up to 16 rows by gemv2, up to 32 by a 32-row tile, more by a 64-row one.
+        assert_eq!(gemm_msl_pieces(140, false, true, &apple), vec![gemm(0, 128, 2), gemv(128, 12)]);
+        assert_eq!(gemm_msl_pieces(150, false, true, &apple), vec![gemm(0, 128, 2), gemm(128, 22, 1)]);
+        assert_eq!(gemm_msl_pieces(70, false, false, &apple), vec![gemm(0, 64, 2), gemm(64, 6, 1)]);
+        assert_eq!(gemm_msl_pieces(20, false, true, &apple), vec![gemm(0, 20, 1)]);
+        assert_eq!(gemm_msl_pieces(40, false, true, &apple), vec![gemm(0, 40, 2)]);
+        assert_eq!(gemm_msl_pieces(256, false, true, &apple), vec![gemm(0, 256, 2)]);
+        // The scalar kernel for up to `gemv2_scalar_max` rows, then 4 tiles to 8 rows, 2 to 16.
+        let tiles = |t| msl::Gemv2::for_rows(t, false, &apple).tiles;
+        assert_eq!((tiles(2), tiles(3), tiles(9)), (None, Some(4), Some(2)));
+    }
+
     fn caps(subgroups: bool, coop: bool) -> DeviceCaps {
         DeviceCaps {
             name: "test".into(),
@@ -255,7 +343,7 @@ mod tests {
         assert_eq!(int(1, Format::Bf16), MatmulPlan::Gemv1);
         assert_eq!(int(16, Format::Bf16), MatmulPlan::GemvMulti { first: 16 });
         assert_eq!(int(19, Format::Bf16), MatmulPlan::GemvMulti { first: 10 });
-        assert_eq!(int(21, Format::Bf16), MatmulPlan::GemmCoop);
+        assert_eq!(int(21, Format::Bf16), MatmulPlan::GemmCoop { gemv2_rest: 0 });
         // The f32 reference: GEMVs up to 16 rows, the f32 GEMM beyond.
         let f32 = |t| mm(t, Format::Q8, GemmKind::F32, Gemv::F32).plan(&c, &tu);
         assert_eq!(f32(8), MatmulPlan::GemvMulti { first: 8 });

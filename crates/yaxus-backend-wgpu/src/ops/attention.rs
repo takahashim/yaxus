@@ -28,7 +28,7 @@ impl Gpu {
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
         let q = self.tensor(t, hq * HEAD_DIM);
         // (the fourth immediate: the rope table's half length, which only the MSL kernel reads)
-        let msl = self.tuning.msl_small && self.caps.msl;
+        let msl = self.tuning.apple.msl_small && self.caps.msl;
         self.dispatch(
             if msl { "qk_rope_msl" } else { "qk_rope" },
             &[q.buf(), &kc, &vc, qkv.buf(), qn, kn, &rope, &rows],

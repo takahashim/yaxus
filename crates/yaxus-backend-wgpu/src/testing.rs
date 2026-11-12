@@ -105,9 +105,9 @@ impl WgpuBackend {
         self.g().tuning.tile_wgs = target_wgs;
     }
 
-    /// Whether the small per-row kernels run in MSL (`Tuning::msl_small`).
+    /// Whether the small per-row kernels run in MSL (`AppleTuning::msl_small`).
     pub fn set_msl_small(&self, on: bool) {
-        self.g().tuning.msl_small = on;
+        self.g().tuning.apple.msl_small = on;
     }
 
     /// Whether the prefill GEMM rounds its operands (to f16 or to integers).

@@ -247,9 +247,9 @@ impl Gpu {
             diag,
         };
         b.build_kernels();
-        if b.tuning.gemv2 && b.caps.msl && !b.gemv2_rows_agree() {
+        if b.tuning.apple.gemv2 && b.caps.msl && !b.gemv2_rows_agree() {
             eprintln!("[gemv2] rows differ between its kernels on this device; using gemv_f32");
-            b.tuning.gemv2 = false;
+            b.tuning.apple.gemv2 = false;
         }
         Ok(b)
     }

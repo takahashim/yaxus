@@ -141,21 +141,8 @@ pub struct Tuning {
     pub gemv_f32: bool,
     /// Weight rows per 32-lane group in `gemv_f32`.
     pub gemv_f32_rows: usize,
-    /// The small per-row kernels (`rmsnorm`, `add_norm`, `qk_rope`) in MSL where the
-    /// device takes it (`msl::small_kernels`).
-    pub msl_small: bool,
-    /// Where `gemv_f32` would run and the device takes MSL, the formats `msl::gemv2` reads
-    /// take it instead: a scalar kernel for 1 or 2 rows, simdgroup matrices for more, with
-    /// the same arithmetic.
-    pub gemv2: bool,
-    /// Passes of more than 16 rows on the matrix GEMM give a rest of at most this many
-    /// rows past the last whole 64-row tile to gemv2, in passes of up to 16 rows (M2,
-    /// 2B Q4_K_M, ms: a tile 166, gemv2 16 rows 56, 8 rows 35).
-    pub gemv2_tail_rows: usize,
-    /// The matrix GEMM (`GemmKind::Coop`, `CoopF16`) in MSL where the device takes it
-    /// (`msl::gemm`), instead of `gemm_coop8` (`YAXUS_GEMM_MSL=wgsl|f32|f16`; `f16` also
-    /// selects `CoopF16`).
-    pub gemm_msl: bool,
+    /// The MSL kernels of Apple GPUs and their sizes (used where `DeviceCaps::msl`).
+    pub apple: AppleTuning,
     /// Weight rows per 32-lane group in the integer GEMV: the loads of the activations are
     /// shared by more dot products, and a single row's rounding (done per workgroup) by
     /// more weights. Measured on a 780M with 1 / 2 / 4 / 8 weight rows, ms per pass: 2B
@@ -189,6 +176,85 @@ pub struct Tuning {
     pub gemv: Gemv,
 }
 
+/// The MSL kernels of Apple GPUs (`msl`), and their sizes. They run where the device
+/// takes MSL (`DeviceCaps::msl`) and the switch is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppleTuning {
+    /// `rmsnorm`, `add_norm` and `qk_rope` in MSL (`msl::small_kernels`).
+    pub msl_small: bool,
+    /// Passes of up to 16 rows on `msl::gemv2` (for the formats it reads), in place of
+    /// `gemv_f32`.
+    pub gemv2: bool,
+    /// The most rows gemv2 takes in its scalar kernel; more go to simdgroup matrices (M2,
+    /// 2B Q4_K_M, 2 rows: scalar 26.2 ms, matrices 34.7).
+    pub gemv2_scalar_max: usize,
+    /// Weight tiles of 8 rows a simdgroup of gemv2's matrix kernel takes, for passes of
+    /// up to 8 and up to 16 rows (16 rows with 4: 1470 ms, registers spill).
+    pub gemv2_tiles: [usize; 2],
+    /// Rows a gemv2 dispatch takes at most; more go to further dispatches.
+    pub gemv2_max_rows: usize,
+    /// On the WGSL matrix GEMM (`gemm_coop8`), a rest of at most this many rows past the
+    /// last whole 64-row tile goes to gemv2 (M2, 2B Q4_K_M, ms: a tile 166, gemv2 16 rows
+    /// 56, 8 rows 35).
+    pub gemv2_tail_rows: usize,
+    /// The matrix GEMM (`GemmKind::Coop`, `CoopF16`) on `msl::gemm` in place of
+    /// `gemm_coop8`.
+    pub gemm_msl: bool,
+}
+
+impl Default for AppleTuning {
+    fn default() -> Self {
+        AppleTuning {
+            msl_small: false,
+            gemv2: false,
+            gemv2_scalar_max: 2,
+            gemv2_tiles: [4, 2],
+            gemv2_max_rows: 16,
+            gemv2_tail_rows: 40,
+            gemm_msl: false,
+        }
+    }
+}
+
+impl AppleTuning {
+    /// With the environment's overrides: `YAXUS_MSL_SMALL=0|1`, `YAXUS_GEMV2=0|1`,
+    /// `YAXUS_GEMV2_SCALAR`, `YAXUS_GEMV2_NT`, `YAXUS_GEMV2_NT2`, `YAXUS_GEMV2_MAX_ROWS`,
+    /// `YAXUS_GEMV2_TAIL` and `YAXUS_GEMM_MSL=wgsl|f32|f16` (`f16` also selects
+    /// `GemmKind::CoopF16`, in `Tuning::with_env`).
+    fn with_env(mut self) -> Self {
+        let var = |name: &str| std::env::var(name).ok();
+        let num = |name: &str| var(name).and_then(|v| v.parse::<usize>().ok());
+        let switch = |name: &str, v: &mut bool| match var(name).as_deref() {
+            Some("0") => *v = false,
+            Some("1") => *v = true,
+            _ => {}
+        };
+        switch("YAXUS_MSL_SMALL", &mut self.msl_small);
+        switch("YAXUS_GEMV2", &mut self.gemv2);
+        if let Some(v) = num("YAXUS_GEMV2_SCALAR") {
+            self.gemv2_scalar_max = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_NT") {
+            self.gemv2_tiles[0] = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_NT2") {
+            self.gemv2_tiles[1] = v;
+        }
+        if let Some(v) = num("YAXUS_GEMV2_MAX_ROWS") {
+            self.gemv2_max_rows = v.clamp(1, crate::GEMVM_MAX_T);
+        }
+        if let Some(v) = num("YAXUS_GEMV2_TAIL") {
+            self.gemv2_tail_rows = v;
+        }
+        match var("YAXUS_GEMM_MSL").as_deref() {
+            Some("wgsl") => self.gemm_msl = false,
+            Some("f32" | "f16") => self.gemm_msl = true,
+            _ => {}
+        }
+        self
+    }
+}
+
 impl Tuning {
     /// The values measured on a Radeon 780M.
     fn radeon_780m() -> Self {
@@ -201,10 +267,7 @@ impl Tuning {
             gemvm_rows: 2,
             gemv_f32: false,
             gemv_f32_rows: 2,
-            msl_small: false,
-            gemv2: false,
-            gemv2_tail_rows: 40,
-            gemm_msl: false,
+            apple: AppleTuning::default(),
             gemvi_rows: 4,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
@@ -230,14 +293,11 @@ impl Tuning {
             t.gemm = GemmKind::F32;
             t.gemv = Gemv::F32;
             t.gemv_f32 = true;
-            t.msl_small = true;
             // (M2, 2B Q4_K_M, ms per pass of 1 / 2 / 4 / 8 / 16 rows: gemv_f32 22.5 / 28.2 /
-            // 40.9 / 59.4 / 140, gemv2 21.1 / 26.4 / 34.0 / 34.9 / 55.8; checked at start,
-            // `Gpu::gemv2_rows_agree`)
-            t.gemv2 = true;
-            // (M2, 2B Q4_K_M, ms per pass of 32 / 64 / 256 rows: `gemm_coop8` 161 / 166 /
-            // 648, MSL f32 tiles about 78 / 136 / 536; llama.cpp, f16 tiles, 71 / 140 / 515)
-            t.gemm_msl = true;
+            // 40.9 / 59.4 / 140, gemv2 21.1 / 26.4 / 34.0 / 34.9 / 55.8; gemv2 is checked
+            // at start, `Gpu::gemv2_rows_agree`. 32 / 64 / 256 rows: `gemm_coop8` 161 / 166
+            // / 648, MSL f32 tiles about 78 / 136 / 536; llama.cpp, f16 tiles, 71 / 140 / 515)
+            t.apple = AppleTuning { msl_small: true, gemv2: true, gemm_msl: true, ..t.apple };
             // (the tiled attention without staged queries: M2, 2B, ms per pass of 256 /
             // 512 / 1024 rows with 64 / 128 / 192 / 384 workgroups 677 / 686 / 678 / 716,
             // 1403 / 1399 / 1396 / 1427, 2931 / 2933 / 2933 / 2996; per-row 732 / 1628 / 3886)
@@ -294,28 +354,10 @@ impl Tuning {
             Some("1") => self.gemv_f32 = true,
             _ => {}
         }
-        match var("YAXUS_GEMM_MSL").as_deref() {
-            Some("wgsl") => self.gemm_msl = false,
-            Some("f32") => self.gemm_msl = true,
-            Some("f16") => {
-                self.gemm_msl = true;
-                self.gemm = GemmKind::CoopF16;
-            }
-            _ => {}
+        if var("YAXUS_GEMM_MSL").as_deref() == Some("f16") {
+            self.gemm = GemmKind::CoopF16;
         }
-        if let Some(v) = var("YAXUS_GEMV2_TAIL").and_then(|v| v.parse().ok()) {
-            self.gemv2_tail_rows = v;
-        }
-        match var("YAXUS_GEMV2").as_deref() {
-            Some("0") => self.gemv2 = false,
-            Some("1") => self.gemv2 = true,
-            _ => {}
-        }
-        match var("YAXUS_MSL_SMALL").as_deref() {
-            Some("0") => self.msl_small = false,
-            Some("1") => self.msl_small = true,
-            _ => {}
-        }
+        self.apple = self.apple.with_env();
         if let Some(v) = var("YAXUS_GEMV_F32_R").and_then(|v| v.parse().ok()) {
             self.gemv_f32_rows = v;
         }
