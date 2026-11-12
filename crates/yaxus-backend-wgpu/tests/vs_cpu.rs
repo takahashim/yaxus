@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::Value;
 use yaxus_backend_cpu::CpuBackend;
 use yaxus_backend_wgpu::WgpuBackend;
-use yaxus_model::{Backend, Engine, EngineConfig, Event, Generator, Model, Quant, Request};
+use yaxus_model::{Backend, Engine, EngineConfig, Event, Generator, Model, ModelOptions, Quant, Request};
 
 fn model_dir() -> PathBuf {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {
@@ -31,18 +31,18 @@ fn u32s(v: &Value) -> Vec<u32> {
 
 fn compare(quant: Quant) {
     let dir = model_dir();
-    let mut cpu = Model::load(&dir, CpuBackend::new(), quant).unwrap();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(quant)).unwrap();
     let t0 = Instant::now();
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
     eprintln!("[{quant:?}] {} loaded in {:.2?}", gpu.backend.name(), t0.elapsed());
     for c in &cases() {
         let name = c["name"].as_str().unwrap();
         let ids = u32s(&c["ids"]);
-        let sc = cpu.new_seq().unwrap();
+        let sc = cpu.new_seq();
         let lc = cpu.prefill(sc, &ids).unwrap();
         let lc = cpu.backend.to_host(&lc);
         cpu.free_seq(sc);
-        let sg = gpu.new_seq().unwrap();
+        let sg = gpu.new_seq();
         let lg = gpu.prefill(sg, &ids).unwrap();
         let lg = gpu.backend.to_host(&lg);
         gpu.free_seq(sg);
@@ -68,13 +68,13 @@ fn compare(quant: Quant) {
 #[ignore]
 fn gpu_matches_cpu_long_prompt() {
     let dir = model_dir();
-    let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), Quant::Q8).unwrap();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(Quant::Q8)).unwrap();
     let ids: Vec<u32> = (0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect();
-    let sc = cpu.new_seq().unwrap();
+    let sc = cpu.new_seq();
     let lc = cpu.prefill(sc, &ids).unwrap();
     let lc = cpu.backend.to_host(&lc);
-    let sg = gpu.new_seq().unwrap();
+    let sg = gpu.new_seq();
     let lt = gpu.prefill(sg, &ids).unwrap();
     let idx = gpu.backend.argmax(&lt);
     let lg = gpu.backend.to_host(&lt);
@@ -128,18 +128,22 @@ fn speculative_matches_plain() {
         return;
     };
     let gpu = WgpuBackend::new().unwrap();
-    let mut plain =
-        Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), None, EngineConfig::default()).unwrap();
+    let mut plain = Engine::new(
+        Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(),
+        None,
+        EngineConfig::default(),
+    )
+    .unwrap();
     let mut spec = Engine::new(
-        Model::load(&dir, gpu.share(), Quant::Q8).unwrap(),
-        Some(Model::load(&draft_dir, gpu.share(), Quant::Q4).unwrap()),
+        Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(),
+        Some(Model::load(&draft_dir, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap()),
         EngineConfig::default(),
     )
     .unwrap();
     for c in &cases() {
         let ids = u32s(&c["ids"]);
         for k in [1, 3, 5, 7] {
-            spec.cfg.draft_k = k;
+            spec.set_draft_k(k).unwrap();
             let a = plain.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
             let b = spec.generate(&ids, 40, &[1, 16], &mut |_| true).unwrap();
             assert_eq!(a, b, "{} k={k}", c["name"]);
@@ -149,7 +153,7 @@ fn speculative_matches_plain() {
             assert_eq!(a, b, "{} k={k} max_new=7", c["name"]);
         }
     }
-    eprintln!("speculative: {:?}", spec.spec);
+    eprintln!("speculative: {:?}", spec.spec_stats());
 }
 
 /// Requests run together (batched decode passes, interleaved prefill) must produce what
@@ -162,14 +166,12 @@ fn concurrent_matches_solo() {
     // f32 prefill: the f16 prefill of a prompt run together with others could take a
     // different kernel than alone (64-row tiles vs. multi-row GEMV).
     gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
-    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap());
+    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap());
     // No response cache: the requests run again after running alone.
     let cfg = EngineConfig { decode_rows: 4, busy_prefill_rows: 16, response_cache: 0, ..EngineConfig::default() };
-    let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
-    eng.target.prefix_cache = false;
-    if let Some(d) = eng.draft.as_mut() {
-        d.prefix_cache = false;
-    }
+    let mut eng =
+        Engine::new(Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(), draft, cfg).unwrap();
+    eng.set_prefix_cache(false);
     // The golden prompts plus truncated variants: 9 requests with different lengths.
     let mut prompts: Vec<Vec<u32>> = Vec::new();
     for c in &cases() {
@@ -200,7 +202,7 @@ fn concurrent_matches_solo() {
     for i in 0..prompts.len() {
         assert_eq!(outs[i], solo[i], "request {i} differs when run together");
     }
-    eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec);
+    eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec_stats());
 }
 
 /// After `abort_all` (the server's recovery from a failed step) the engine holds nothing:
@@ -210,17 +212,15 @@ fn concurrent_matches_solo() {
 fn abort_all_leaves_a_clean_engine() {
     let dir = model_dir();
     let gpu = WgpuBackend::new().unwrap();
-    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap());
+    let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap());
     let cfg = EngineConfig { max_streams: 2, response_cache: 0, ..EngineConfig::default() };
-    let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
-    eng.target.prefix_cache = false;
-    if let Some(d) = eng.draft.as_mut() {
-        d.prefix_cache = false;
-    }
+    let mut eng =
+        Engine::new(Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(), draft, cfg).unwrap();
+    eng.set_prefix_cache(false);
     let prompt = u32s(&cases()[0]["ids"]);
     let before = eng.generate(&prompt, 16, &[1, 16], &mut |_| true).unwrap();
     // (the KV arena exists from the first request on)
-    let free = (eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages()));
+    let free = eng.free_pages();
     // Two running (one decoding, one prefilling or decoding) and one waiting.
     for i in 0..3 {
         eng.submit(Request::new(i, prompt.clone(), 64, vec![1, 16]));
@@ -231,7 +231,7 @@ fn abort_all_leaves_a_clean_engine() {
     assert!(eng.active() > 0 && eng.waiting() > 0);
     eng.abort_all();
     assert!(eng.is_idle());
-    assert_eq!((eng.target.free_pages(), eng.draft.as_ref().map(|d| d.free_pages())), free);
+    assert_eq!(eng.free_pages(), free);
     let mut events = 0;
     eng.step(&mut |_| {
         events += 1;
@@ -251,17 +251,18 @@ fn hints_and_response_cache_keep_output() {
     let gpu = WgpuBackend::new().unwrap();
     gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
     for with_draft in [false, true] {
-        let draft =
-            if with_draft { draft_dir().map(|d| Model::load(&d, gpu.share(), Quant::Q4).unwrap()) } else { None };
+        let draft = if with_draft {
+            draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap())
+        } else {
+            None
+        };
         if with_draft && draft.is_none() {
             continue;
         }
         let cfg = EngineConfig { response_cache: 0, ..EngineConfig::default() };
-        let mut eng = Engine::new(Model::load(&dir, gpu.share(), Quant::Q8).unwrap(), draft, cfg).unwrap();
-        eng.target.prefix_cache = false;
-        if let Some(d) = eng.draft.as_mut() {
-            d.prefix_cache = false;
-        }
+        let mut eng =
+            Engine::new(Model::load(&dir, gpu.share(), &ModelOptions::new(Quant::Q8)).unwrap(), draft, cfg).unwrap();
+        eng.set_prefix_cache(false);
         let run = |eng: &mut Engine<WgpuBackend>, p: &[u32], max: usize, hint: Vec<u32>| {
             let mut r = Request::new(7, p.to_vec(), max, vec![1, 16]);
             r.hint = hint;
@@ -298,16 +299,16 @@ fn hints_and_response_cache_keep_output() {
                 assert_eq!(run(&mut eng, &ids, 6, hint), solo[..6.min(solo.len())], "{} hint {name} max 6", c["name"]);
             }
         }
-        eprintln!("draft {with_draft}: {:?}", eng.spec);
+        eprintln!("draft {with_draft}: {:?}", eng.spec_stats());
         // The response cache: a repeated request gives the same tokens without a pass.
-        eng.cfg.response_cache = 8;
+        eng.set_response_cache(8);
         let ids = u32s(&cases()[0]["ids"]);
         let first = run(&mut eng, &ids, 40, vec![]);
-        let rounds = eng.spec.rounds;
+        let rounds = eng.spec_stats().rounds;
         assert_eq!(run(&mut eng, &ids, 40, vec![]), first);
         assert_eq!(run(&mut eng, &ids, 5, vec![]), first[..5.min(first.len())]);
-        assert_eq!(eng.spec.cache_hits, 2);
-        assert_eq!(eng.spec.rounds, rounds);
+        assert_eq!(eng.spec_stats().cache_hits, 2);
+        assert_eq!(eng.spec_stats().rounds, rounds);
     }
 }
 
@@ -318,21 +319,21 @@ fn hints_and_response_cache_keep_output() {
 #[ignore]
 fn tiled_attention_matches_cpu() {
     let dir = model_dir();
-    let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
     let gpu = WgpuBackend::new().unwrap();
     gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
-    let mut gpu = Model::load(&dir, gpu, Quant::Q8).unwrap();
-    gpu.prefix_cache = false;
-    cpu.prefix_cache = false;
+    let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(Quant::Q8)).unwrap();
+    gpu.set_prefix_cache(false);
+    cpu.set_prefix_cache(false);
     let ids: Vec<u32> = (0..2640u32).map(|i| 1000 + (i * 7919) % 50000).collect();
     let (a, b) = ids.split_at(2600);
-    let sc = cpu.new_seq().unwrap();
+    let sc = cpu.new_seq();
     cpu.prefill(sc, a).unwrap();
     let l = cpu.forward(&[(sc, b)], true).unwrap();
     let lc = cpu.backend.to_host(&l);
     for (name, wgs) in [("per-row", 0), ("tiled", 384), ("tiled, split keys", 100_000)] {
         gpu.backend.set_tiled_attention(wgs);
-        let sg = gpu.new_seq().unwrap();
+        let sg = gpu.new_seq();
         gpu.prefill(sg, a).unwrap();
         let l = gpu.forward(&[(sg, b)], true).unwrap();
         let lg = gpu.backend.to_host(&l);
@@ -349,15 +350,15 @@ fn tiled_attention_matches_cpu() {
 #[ignore]
 fn decode_attention_matches_cpu() {
     let dir = model_dir();
-    let mut cpu = Model::load(&dir, CpuBackend::new(), Quant::Q8).unwrap();
+    let mut cpu = Model::load(&dir, CpuBackend::new(), &ModelOptions::new(Quant::Q8)).unwrap();
     let mut gpu = WgpuBackend::new().unwrap();
     gpu.set_gemm(yaxus_backend_wgpu::GemmKind::F32);
     gpu.set_gemv(yaxus_backend_wgpu::Gemv::F32);
-    let mut gpu = Model::load(&dir, gpu, Quant::Q8).unwrap();
+    let mut gpu = Model::load(&dir, gpu, &ModelOptions::new(Quant::Q8)).unwrap();
     for n in [20u32, 600, 2100] {
         let ids: Vec<u32> = (0..n).map(|i| 1000 + (i * 7919) % 50000).collect();
-        let sc = cpu.new_seq().unwrap();
-        let sg = gpu.new_seq().unwrap();
+        let sc = cpu.new_seq();
+        let sg = gpu.new_seq();
         cpu.prefill(sc, &ids).unwrap();
         gpu.prefill(sg, &ids).unwrap();
         let mut worst = 0f32;
@@ -385,8 +386,8 @@ fn prefill_kinds_against_f32() {
     use yaxus_backend_wgpu::GemmKind;
     let dir = model_dir();
     let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
-    gpu.prefix_cache = false;
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
+    gpu.set_prefix_cache(false);
     // (prompts of up to 16 rows would take the decode kernels)
     gpu.backend.set_gemv(yaxus_backend_wgpu::Gemv::F32);
     let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
@@ -396,7 +397,7 @@ fn prefill_kinds_against_f32() {
         prompts
             .iter()
             .map(|ids| {
-                let s = gpu.new_seq().unwrap();
+                let s = gpu.new_seq();
                 let l = gpu.prefill(s, ids).unwrap();
                 let l = gpu.backend.to_host(&l);
                 gpu.free_seq(s);
@@ -443,8 +444,8 @@ fn decode_kinds_against_f32() {
     use yaxus_backend_wgpu::{GemmKind, Gemv};
     let dir = model_dir();
     let quant = if yaxus_model::gguf::is_gguf(&dir) { Quant::Auto } else { Quant::Q8 };
-    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), quant).unwrap();
-    gpu.prefix_cache = false;
+    let mut gpu = Model::load(&dir, WgpuBackend::new().unwrap(), &ModelOptions::new(quant)).unwrap();
+    gpu.set_prefix_cache(false);
     gpu.backend.set_gemm(GemmKind::F32);
     let mut prompts: Vec<Vec<u32>> = cases().iter().map(|c| u32s(&c["ids"])).collect();
     prompts.push((0..600u32).map(|i| 1000 + (i * 7919) % 50000).collect());
@@ -452,7 +453,7 @@ fn decode_kinds_against_f32() {
         let mut out = Vec::new();
         for ids in &prompts {
             gpu.backend.set_gemv(Gemv::F32);
-            let s = gpu.new_seq().unwrap();
+            let s = gpu.new_seq();
             gpu.prefill(s, ids).unwrap();
             gpu.backend.set_gemv(gemv);
             for step in 0..8u32 {

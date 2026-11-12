@@ -42,21 +42,41 @@ pub struct RopeParameters {
     pub sliding_attention: RopeParam,
 }
 
+/// RoPE of one kind of layer (`rope_parameters.*` of `config.json`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeParam {
-    #[serde(default = "default_rope_type")]
-    pub rope_type: String,
     pub rope_theta: f64,
-    pub factor: Option<f64>,
-    pub original_max_position_embeddings: Option<usize>,
-    pub beta_fast: Option<f64>,
-    pub beta_slow: Option<f64>,
+    #[serde(flatten)]
+    pub scaling: RopeScaling,
+}
+
+/// `rope_type` and its parameters.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "rope_type", rename_all = "lowercase")]
+pub enum RopeScaling {
+    Default,
+    Yarn(Yarn),
+}
+
+/// YaRN context extension.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Yarn {
+    pub factor: f64,
+    pub original_max_position_embeddings: usize,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
     #[serde(default)]
     pub truncate: bool,
 }
 
-fn default_rope_type() -> String {
-    "default".into()
+impl RopeParam {
+    pub fn plain(rope_theta: f64) -> Self {
+        RopeParam { rope_theta, scaling: RopeScaling::Default }
+    }
+
+    pub fn yarn(rope_theta: f64, yarn: Yarn) -> Self {
+        RopeParam { rope_theta, scaling: RopeScaling::Yarn(yarn) }
+    }
 }
 
 impl Config {
@@ -115,26 +135,20 @@ impl Config {
         if let Some(p) = &self.rope_parameters {
             return if full { p.full_attention.clone() } else { p.sliding_attention.clone() };
         }
+        // Configurations without `rope_parameters`: YaRN on the full-attention layers.
         if full {
-            RopeParam {
-                rope_type: "yarn".into(),
-                rope_theta: self.rope_theta,
-                factor: Some(self.rope_scaling_factor),
-                original_max_position_embeddings: Some(self.initial_context_length),
-                beta_fast: Some(32.0),
-                beta_slow: Some(1.0),
-                truncate: false,
-            }
+            RopeParam::yarn(
+                self.rope_theta,
+                Yarn {
+                    factor: self.rope_scaling_factor,
+                    original_max_position_embeddings: self.initial_context_length,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    truncate: false,
+                },
+            )
         } else {
-            RopeParam {
-                rope_type: "default".into(),
-                rope_theta: self.rope_local_theta,
-                factor: None,
-                original_max_position_embeddings: None,
-                beta_fast: None,
-                beta_slow: None,
-                truncate: false,
-            }
+            RopeParam::plain(self.rope_local_theta)
         }
     }
 
@@ -168,14 +182,12 @@ impl Rope {
     pub fn new(dim: usize, p: &RopeParam) -> Result<Self> {
         let base = p.rope_theta;
         let freq: Vec<f32> = (0..dim).step_by(2).map(|i| (base as f32).powf(i as f32 / dim as f32)).collect();
-        match p.rope_type.as_str() {
-            "default" => Ok(Rope { inv_freq: freq.iter().map(|f| 1.0 / f).collect(), concentration: 1.0 }),
-            "yarn" => {
-                ensure!(!p.truncate, "yarn truncate=true is not supported");
-                let factor = p.factor.context("yarn factor")?;
-                let beta_fast = p.beta_fast.context("yarn beta_fast")?;
-                let beta_slow = p.beta_slow.context("yarn beta_slow")?;
-                let orig = p.original_max_position_embeddings.context("yarn original length")? as f64;
+        match &p.scaling {
+            RopeScaling::Default => Ok(Rope { inv_freq: freq.iter().map(|f| 1.0 / f).collect(), concentration: 1.0 }),
+            RopeScaling::Yarn(y) => {
+                ensure!(!y.truncate, "yarn truncate=true is not supported");
+                let (factor, beta_fast, beta_slow) = (y.factor, y.beta_fast, y.beta_slow);
+                let orig = y.original_max_position_embeddings as f64;
                 let d_h = (dim / 2) as f64;
                 let pi = std::f64::consts::PI;
                 let low = d_h * (orig / (beta_fast * 2.0 * pi)).ln() / base.ln();
@@ -194,7 +206,6 @@ impl Rope {
                     .collect();
                 Ok(Rope { inv_freq, concentration: (0.1 * factor.ln() + 1.0) as f32 })
             }
-            other => anyhow::bail!("unsupported rope_type {other}"),
         }
     }
 
@@ -205,5 +216,29 @@ impl Rope {
             cos[j] = (a as f64).cos() as f32 * self.concentration;
             sin[j] = (a as f64).sin() as f32 * self.concentration;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rope_parameters_as_in_the_checkpoints() {
+        let p: RopeParameters = serde_json::from_str(
+            r#"{"full_attention": {"rope_type": "yarn", "rope_theta": 1000000, "factor": 256.0,
+                    "original_max_position_embeddings": 4096, "beta_fast": 32.0, "beta_slow": 1.0,
+                    "truncate": false},
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&p.full_attention.scaling, RopeScaling::Yarn(y) if y.original_max_position_embeddings == 4096)
+        );
+        assert!(matches!(p.sliding_attention.scaling, RopeScaling::Default));
+        assert_eq!(p.sliding_attention.rope_theta, 10000.0);
+        assert!(Rope::new(128, &p.full_attention).unwrap().concentration > 1.0);
+        let other = serde_json::from_str::<RopeParam>(r#"{"rope_type": "linear", "rope_theta": 1.0}"#);
+        assert!(other.unwrap_err().to_string().contains("linear"));
     }
 }

@@ -5,16 +5,17 @@ pub mod engine;
 pub mod ggml;
 pub mod gguf;
 pub mod hub;
+pub mod kv;
 pub mod quant;
 pub mod weights;
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
 pub use config::{Config, LayerMeta, Rope};
 pub use engine::{Engine, EngineConfig, Event, Finish, Generator, ReqId, Request};
+pub use kv::{KvCache, MAX_CACHED, MIN_REUSE, PAGE, PageCopy, SeqId};
 pub use weights::{TensorRef, Weights, bf16_to_f32};
 
 /// Offsets of PLaMo 3's "sandwich" RMSNorms: `(offset + weight) * normalize(x)`.
@@ -56,10 +57,6 @@ impl std::str::FromStr for Quant {
         }
     }
 }
-
-/// KV cache page size in tokens. Sequences own lists of pages; a page can be shared by
-/// several sequences (common prefixes) and is copied before it is written while shared.
-pub const PAGE: usize = 128;
 
 /// Row metadata of one forward pass. Rows of the same sequence are consecutive and have
 /// consecutive positions; every row sees the keys of its own sequence at positions `<= pos`.
@@ -180,61 +177,6 @@ struct Layer<B: Backend> {
     post_mlp_norm: B::Weight,
 }
 
-/// Identifies a sequence in a model's KV cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SeqId(u64);
-
-#[derive(Debug, Clone, Default)]
-struct Seq {
-    pages: Vec<u32>,
-    len: usize,
-    /// The tokens consumed so far (`tokens.len() == len`), for prefix matching.
-    tokens: Vec<u32>,
-}
-
-/// Page allocation with reference counts (shared prefixes).
-struct PagePool {
-    refs: Vec<u32>,
-    free: Vec<u32>,
-}
-
-impl PagePool {
-    fn new(pages: usize) -> Self {
-        PagePool { refs: vec![0; pages], free: (0..pages as u32).rev().collect() }
-    }
-    fn alloc(&mut self) -> Option<u32> {
-        let p = self.free.pop()?;
-        self.refs[p as usize] = 1;
-        Some(p)
-    }
-    fn retain(&mut self, p: u32) {
-        self.refs[p as usize] += 1;
-    }
-    fn release(&mut self, p: u32) {
-        let r = &mut self.refs[p as usize];
-        *r -= 1;
-        if *r == 0 {
-            self.free.push(p);
-        }
-    }
-}
-
-struct KvState<B: Backend> {
-    kv: B::Kv,
-    pool: PagePool,
-    seqs: HashMap<SeqId, Seq>,
-    next_id: u64,
-    max_pos: usize,
-    /// Finished sequences kept for prefix reuse, with their last use (LRU).
-    cached: Vec<(SeqId, u64)>,
-    clock: u64,
-}
-
-/// Shortest common prefix worth reusing (shorter ones are recomputed).
-pub const MIN_REUSE: usize = 16;
-/// Finished sequences kept for reuse at most.
-pub const MAX_CACHED: usize = 32;
-
 /// How a prompt was started (for statistics and tests).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StartInfo {
@@ -250,6 +192,25 @@ pub struct StartInfo {
 pub const DEFAULT_KV_TOKENS: usize = 16384;
 pub const DEFAULT_MAX_POS: usize = 8192;
 
+/// How [`Model::load`] sets a model up.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelOptions {
+    pub quant: Quant,
+    /// KV arena size in tokens (rounded up to pages).
+    pub kv_tokens: usize,
+    /// Positions the KV's RoPE tables cover: the longest sequence.
+    pub max_pos: usize,
+    /// Keep finished sequences and reuse their KV for prompts sharing a prefix.
+    pub prefix_cache: bool,
+}
+
+impl ModelOptions {
+    /// Weights in `quant`, the default KV arena, prefix reuse on.
+    pub fn new(quant: Quant) -> Self {
+        ModelOptions { quant, kv_tokens: DEFAULT_KV_TOKENS, max_pos: DEFAULT_MAX_POS, prefix_cache: true }
+    }
+}
+
 pub struct Model<B: Backend> {
     pub cfg: Config,
     pub backend: B,
@@ -259,17 +220,16 @@ pub struct Model<B: Backend> {
     lm_head: B::Weight,
     /// Maximum rows per forward pass (prefill chunk).
     pub chunk: usize,
-    kv: Option<KvState<B>>,
-    /// Keep finished sequences and reuse their KV for prompts sharing a prefix.
-    pub prefix_cache: bool,
-    /// Statistics of the last `start`.
-    pub last_start: StartInfo,
+    /// The KV arena's contents (on the backend) and its sequences (on the host).
+    kv: B::Kv,
+    seqs: KvCache,
 }
 
 impl<B: Backend> Model<B> {
     /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
-    /// or a GGUF file.
-    pub fn load(path: &Path, mut backend: B, quant: Quant) -> Result<Self> {
+    /// or a GGUF file, and allocates its KV arena.
+    pub fn load(path: &Path, mut backend: B, opts: &ModelOptions) -> Result<Self> {
+        let quant = opts.quant;
         let (cfg, w) = if gguf::is_gguf(path) {
             let g = gguf::Gguf::open(path)?;
             (g.config()?, g.weights()?)
@@ -325,136 +285,45 @@ impl<B: Backend> Model<B> {
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
         let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;
-        Ok(Model {
-            cfg,
-            backend,
-            embed,
-            layers,
-            norm,
-            lm_head,
-            chunk,
-            kv: None,
-            prefix_cache: true,
-            last_start: StartInfo::default(),
-        })
+        let pages = opts.kv_tokens.div_ceil(PAGE);
+        let metas: Vec<LayerMeta> = layers.iter().map(|l| l.meta.clone()).collect();
+        let kv = backend.new_kv(&cfg, &metas, pages, opts.max_pos)?;
+        let mut seqs = KvCache::new(pages, opts.max_pos);
+        seqs.set_prefix_reuse(opts.prefix_cache);
+        Ok(Model { cfg, backend, embed, layers, norm, lm_head, chunk, kv, seqs })
     }
 
-    /// Allocates the KV arena (`tokens` rounded up to pages). Called implicitly with the
-    /// defaults by the first `new_seq` if not called before.
-    pub fn init_kv(&mut self, tokens: usize, max_pos: usize) -> Result<()> {
-        let pages = tokens.div_ceil(PAGE);
-        let metas: Vec<LayerMeta> = self.layers.iter().map(|l| l.meta.clone()).collect();
-        let kv = self.backend.new_kv(&self.cfg, &metas, pages, max_pos)?;
-        self.kv = Some(KvState {
-            kv,
-            pool: PagePool::new(pages),
-            seqs: HashMap::new(),
-            next_id: 0,
-            max_pos,
-            cached: Vec::new(),
-            clock: 0,
-        });
-        Ok(())
-    }
-
-    fn kv(&mut self) -> Result<&mut KvState<B>> {
-        if self.kv.is_none() {
-            let tokens = std::env::var("YAXUS_KV_TOKENS").ok().and_then(|v| v.parse().ok());
-            self.init_kv(tokens.unwrap_or(DEFAULT_KV_TOKENS), DEFAULT_MAX_POS)?;
+    /// Makes the page copies an operation on the sequences asked for.
+    fn copy_pages(&mut self, copies: Vec<PageCopy>) {
+        for c in copies {
+            self.backend.copy_page(&mut self.kv, c.src, c.dst);
         }
-        Ok(self.kv.as_mut().unwrap())
     }
 
-    pub fn new_seq(&mut self) -> Result<SeqId> {
-        let kv = self.kv()?;
-        let id = SeqId(kv.next_id);
-        kv.next_id += 1;
-        kv.seqs.insert(id, Seq::default());
-        Ok(id)
+    /// See [`KvCache::set_prefix_reuse`].
+    pub fn set_prefix_cache(&mut self, on: bool) {
+        self.seqs.set_prefix_reuse(on);
+    }
+
+    /// See [`KvCache::clear_prefix_cache`].
+    pub fn clear_prefix_cache(&mut self) {
+        self.seqs.clear_prefix_cache();
+    }
+
+    pub fn new_seq(&mut self) -> SeqId {
+        self.seqs.new_seq()
     }
 
     pub fn free_seq(&mut self, id: SeqId) {
-        if let Some(kv) = self.kv.as_mut() {
-            kv.cached.retain(|(c, _)| *c != id);
-            if let Some(s) = kv.seqs.remove(&id) {
-                for p in s.pages {
-                    kv.pool.release(p);
-                }
-            }
-        }
+        self.seqs.free_seq(id);
     }
 
-    /// Evicts least recently used cached sequences until `n` pages are free (or the
-    /// cache is empty). Pages shared with live sequences are freed only when their last
-    /// owner goes.
-    fn ensure_free(&mut self, n: usize) {
-        loop {
-            let kv = self.kv.as_mut().unwrap();
-            if kv.pool.free.len() >= n || kv.cached.is_empty() {
-                return;
-            }
-            let (i, _) = kv.cached.iter().enumerate().min_by_key(|(_, (_, t))| *t).unwrap();
-            let (id, _) = kv.cached.remove(i);
-            self.free_seq(id);
-        }
-    }
-
-    /// Drops every cached sequence.
-    pub fn clear_prefix_cache(&mut self) {
-        let ids: Vec<SeqId> = self.kv.as_ref().map_or(vec![], |k| k.cached.iter().map(|c| c.0).collect());
-        for id in ids {
-            self.free_seq(id);
-        }
-    }
-
-    /// Creates a sequence for `prompt` without processing it: with the prefix cache, the
-    /// sequence shares the KV of the longest common prefix with a cached sequence (always
-    /// leaving at least the last prompt token to compute). Returns the sequence and the
-    /// number of prompt tokens already in it.
+    /// See [`KvCache::begin`].
     pub fn begin(&mut self, prompt: &[u32]) -> Result<(SeqId, usize)> {
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
-        self.kv()?;
-        let mut best: Option<(SeqId, usize)> = None;
-        if self.prefix_cache {
-            let kv = self.kv.as_ref().unwrap();
-            for (id, _) in &kv.cached {
-                let t = &kv.seqs[id].tokens;
-                let lcp = t.iter().zip(prompt).take_while(|(a, b)| a == b).count();
-                if best.is_none_or(|(_, b)| lcp > b) {
-                    best = Some((*id, lcp));
-                }
-            }
-        }
-        let r = match best {
-            Some((src, lcp)) if lcp.min(prompt.len() - 1) >= MIN_REUSE => {
-                let mut keep = lcp.min(prompt.len() - 1);
-                let kv = self.kv.as_mut().unwrap();
-                kv.clock += 1;
-                let now = kv.clock;
-                // Whole pages are shared; only a partly used last page is copied, which
-                // needs a free page. Make room without evicting `src` itself (with the
-                // arena full of live sequences it would go last otherwise), and when no
-                // page can be had, reuse just the whole pages.
-                let entry = kv.cached.iter().position(|(c, _)| *c == src).map(|i| kv.cached.remove(i));
-                if !keep.is_multiple_of(PAGE) {
-                    self.ensure_free(1);
-                    if self.kv.as_ref().unwrap().pool.free.is_empty() {
-                        keep = keep / PAGE * PAGE;
-                    }
-                }
-                let kv = self.kv.as_mut().unwrap();
-                if let Some((c, _)) = entry {
-                    kv.cached.push((c, now));
-                }
-                match (keep >= MIN_REUSE).then(|| self.fork(src, keep)) {
-                    Some(Ok(s)) => (s, keep),
-                    _ => (self.new_seq()?, 0),
-                }
-            }
-            _ => (self.new_seq()?, 0),
-        };
-        self.last_start = StartInfo { reused: r.1, computed: prompt.len() - r.1, cached: false };
-        Ok(r)
+        let mut copies = Vec::new();
+        let r = self.seqs.begin(prompt, &mut copies);
+        self.copy_pages(copies);
+        r
     }
 
     /// [`Model::begin`] followed by processing the rest of the prompt: returns the
@@ -470,118 +339,36 @@ impl<B: Backend> Model<B> {
         }
     }
 
-    /// The tokens a sequence has consumed.
-    pub fn seq_tokens(&self, id: SeqId) -> &[u32] {
-        self.kv.as_ref().and_then(|k| k.seqs.get(&id)).map_or(&[], |s| &s.tokens)
-    }
-
-    /// Ends a sequence: keeps it for prefix reuse (LRU, at most `MAX_CACHED`) or frees it.
+    /// See [`KvCache::finish`].
     pub fn finish(&mut self, id: SeqId) {
-        if !self.prefix_cache || self.seq_len(id) < MIN_REUSE {
-            self.free_seq(id);
-            return;
-        }
-        let kv = self.kv.as_mut().unwrap();
-        kv.clock += 1;
-        let now = kv.clock;
-        kv.cached.push((id, now));
-        loop {
-            let kv = self.kv.as_mut().unwrap();
-            if kv.cached.len() <= MAX_CACHED {
-                break;
-            }
-            let (i, _) = kv.cached.iter().enumerate().min_by_key(|(_, (_, t))| *t).unwrap();
-            let (old, _) = kv.cached.remove(i);
-            self.free_seq(old);
-        }
+        self.seqs.finish(id);
     }
 
     pub fn seq_len(&self, id: SeqId) -> usize {
-        self.kv.as_ref().and_then(|k| k.seqs.get(&id)).map_or(0, |s| s.len)
+        self.seqs.seq_len(id)
     }
 
-    /// Forgets the tokens at positions `>= len` (their pages beyond `len` are released).
+    /// The tokens a sequence has consumed.
+    pub fn seq_tokens(&self, id: SeqId) -> &[u32] {
+        self.seqs.seq_tokens(id)
+    }
+
+    /// See [`KvCache::truncate`].
     pub fn truncate(&mut self, id: SeqId, len: usize) {
-        let Some(kv) = self.kv.as_mut() else { return };
-        let Some(s) = kv.seqs.get_mut(&id) else { return };
-        assert!(len <= s.len, "truncate beyond the end");
-        s.len = len;
-        s.tokens.truncate(len);
-        let keep = len.div_ceil(PAGE);
-        for p in s.pages.drain(keep..) {
-            kv.pool.release(p);
-        }
+        self.seqs.truncate(id, len);
     }
 
-    /// A new sequence sharing the first `len` tokens of `id` (whole pages are shared; a
-    /// partially used last page is copied).
+    /// See [`KvCache::fork`].
     pub fn fork(&mut self, id: SeqId, len: usize) -> Result<SeqId> {
-        // Check before creating the new sequence, which an early return would leak.
-        let src = self.kv()?.seqs.get(&id).context("unknown sequence")?.clone();
-        anyhow::ensure!(len <= src.len, "fork beyond the end");
-        let new = self.new_seq()?;
-        let kv = self.kv.as_mut().unwrap();
-        let full = len / PAGE;
-        let mut pages = src.pages[..full].to_vec();
-        for &p in &pages {
-            kv.pool.retain(p);
-        }
-        if !len.is_multiple_of(PAGE) {
-            let p = match kv.pool.alloc() {
-                Some(p) => p,
-                None => {
-                    for &p in &pages {
-                        kv.pool.release(p);
-                    }
-                    kv.seqs.remove(&new);
-                    anyhow::bail!("KV cache is full");
-                }
-            };
-            self.backend.copy_page(&mut kv.kv, src.pages[full], p);
-            pages.push(p);
-        }
-        kv.seqs.insert(new, Seq { pages, len, tokens: src.tokens[..len].to_vec() });
-        Ok(new)
+        let mut copies = Vec::new();
+        let r = self.seqs.fork(id, len, &mut copies);
+        self.copy_pages(copies);
+        r
     }
 
     /// Free pages left in the KV arena.
     pub fn free_pages(&self) -> usize {
-        self.kv.as_ref().map_or(0, |k| k.pool.free.len())
-    }
-
-    /// Makes positions `[len, len + n)` of `id` writable: allocates missing pages and
-    /// copies shared ones (copy on write).
-    fn reserve(&mut self, id: SeqId, n: usize) -> Result<()> {
-        // Pages that will be allocated: new ones plus shared ones to copy.
-        let need = {
-            let kv = self.kv.as_ref().unwrap();
-            let s = kv.seqs.get(&id).context("unknown sequence")?;
-            let end = s.len + n;
-            // Before evicting anything: a pass that cannot run should not flush the cache.
-            anyhow::ensure!(end <= kv.max_pos, "context length {end} exceeds the limit {}", kv.max_pos);
-            let (first, last) = (s.len / PAGE, end.div_ceil(PAGE));
-            (first..last).filter(|&pi| pi >= s.pages.len() || kv.pool.refs[s.pages[pi] as usize] > 1).count()
-        };
-        self.ensure_free(need);
-        let kv = self.kv.as_mut().unwrap();
-        let s = kv.seqs.get_mut(&id).context("unknown sequence")?;
-        let end = s.len + n;
-        let first = s.len / PAGE;
-        for pi in first..end.div_ceil(PAGE) {
-            if pi < s.pages.len() {
-                let p = s.pages[pi];
-                if kv.pool.refs[p as usize] > 1 {
-                    let q = kv.pool.alloc().context("KV cache is full")?;
-                    self.backend.copy_page(&mut kv.kv, p, q);
-                    kv.pool.release(p);
-                    s.pages[pi] = q;
-                }
-            } else {
-                let q = kv.pool.alloc().context("KV cache is full")?;
-                s.pages.push(q);
-            }
-        }
-        Ok(())
+        self.seqs.free_pages()
     }
 
     /// One forward pass over several sequences: `items[i] = (seq, tokens)` appends the
@@ -591,28 +378,10 @@ impl<B: Backend> Model<B> {
         let rows: usize = items.iter().map(|(_, t)| t.len()).sum();
         anyhow::ensure!(rows > 0, "empty pass");
         anyhow::ensure!(rows <= self.chunk, "pass of {rows} rows exceeds the chunk size {}", self.chunk);
-        self.kv()?;
-        for (id, t) in items {
-            self.reserve(*id, t.len())?;
-        }
-        let kv = self.kv.as_mut().unwrap();
-        let mut meta = PassMeta::default();
-        let mut last = Vec::with_capacity(items.len());
-        for (id, toks) in items {
-            let s = kv.seqs.get_mut(id).unwrap();
-            let off = meta.pages.len() as u32;
-            meta.pages.extend_from_slice(&s.pages);
-            for (j, &t) in toks.iter().enumerate() {
-                let pos = s.len + j;
-                meta.ids.push(t);
-                meta.pos.push(pos as u32);
-                meta.kv_slot.push(s.pages[pos / PAGE] * PAGE as u32 + (pos % PAGE) as u32);
-                meta.pt_off.push(off);
-            }
-            s.len += toks.len();
-            s.tokens.extend_from_slice(toks);
-            last.push(meta.ids.len() - 1);
-        }
+        let mut copies = Vec::new();
+        let appended = self.seqs.append(items, &mut copies);
+        self.copy_pages(copies);
+        let kv::PassRows { meta, last } = appended?;
         let b = &mut self.backend;
         let eps = self.cfg.rms_norm_eps;
         b.begin_pass(&meta);
@@ -624,7 +393,7 @@ impl<B: Backend> Model<B> {
         let n = self.layers.len();
         for (i, l) in self.layers.iter().enumerate() {
             let qkv = b.matmul(&h, &l.qkv_proj);
-            let a = b.attention(&qkv, &l.q_norm, &l.k_norm, &mut kv.kv, &self.cfg, &l.meta);
+            let a = b.attention(&qkv, &l.q_norm, &l.k_norm, &mut self.kv, &self.cfg, &l.meta);
             let o = b.matmul(&a, &l.o_proj);
             let hm = b.add_norm(
                 &mut x,
@@ -655,7 +424,9 @@ impl<B: Backend> Model<B> {
         Ok(logits.unwrap())
     }
 
-    /// Greedy generation. `on_token` returns `false` to stop early.
+    /// Greedy generation of one request directly on the model, without the engine's
+    /// scheduling, speculation or caches: the reference the engine's outputs are tested
+    /// against. `on_token` returns `false` to stop early.
     pub fn generate(
         &mut self,
         prompt: &[u32],
@@ -758,6 +529,11 @@ pub(crate) mod testing {
 
     /// A one-layer model whose KV arena holds `pages` pages.
     pub fn model(pages: usize) -> Model<NullBackend> {
+        model_with_max_pos(pages, DEFAULT_MAX_POS)
+    }
+
+    /// [`model`] for sequences of at most `max_pos` tokens.
+    pub fn model_with_max_pos(pages: usize, max_pos: usize) -> Model<NullBackend> {
         let cfg = config();
         let layer = Layer {
             meta: LayerMeta {
@@ -777,7 +553,7 @@ pub(crate) mod testing {
             down_proj: (),
             post_mlp_norm: (),
         };
-        let mut m = Model {
+        Model {
             cfg,
             backend: NullBackend { rows: 0 },
             embed: (),
@@ -785,12 +561,9 @@ pub(crate) mod testing {
             norm: (),
             lm_head: (),
             chunk: 512,
-            kv: None,
-            prefix_cache: true,
-            last_start: StartInfo::default(),
-        };
-        m.init_kv(pages * PAGE, DEFAULT_MAX_POS).unwrap();
-        m
+            kv: (),
+            seqs: KvCache::new(pages, max_pos),
+        }
     }
 }
 
@@ -840,8 +613,7 @@ mod tests {
     fn a_pass_beyond_max_pos_keeps_the_prefix_cache() {
         // Two pages: the 300-row pass would need more than the free one, so without the
         // early check making room would evict the cached sequence first.
-        let mut m = model(2);
-        m.init_kv(2 * PAGE, 200).unwrap();
+        let mut m = super::testing::model_with_max_pos(2, 200);
         let a: Vec<u32> = (0..100).collect();
         let (id, _) = m.start(&a).unwrap();
         m.finish(id);

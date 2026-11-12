@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
 use yaxus_backend_wgpu::WgpuBackend;
-use yaxus_model::{Backend, Engine, Generator, Model, Quant};
+use yaxus_model::{Backend, Engine, Generator, Model, ModelOptions, Quant};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::options::{BackendKind, DraftOptions, LoadOptions};
@@ -76,9 +76,8 @@ where
     B::Kv: Send,
 {
     let load = |dir: &Path, backend: B, quant: Quant| -> Result<Model<B>> {
-        let mut m = Model::load(dir, backend, quant)?;
-        m.prefix_cache = o.prefix_cache;
-        m.init_kv(o.kv_tokens, yaxus_model::DEFAULT_MAX_POS)?;
+        let opts = ModelOptions { kv_tokens: o.kv_tokens, prefix_cache: o.prefix_cache, ..ModelOptions::new(quant) };
+        let m = Model::load(dir, backend, &opts)?;
         warm(&m.backend);
         Ok(m)
     };
