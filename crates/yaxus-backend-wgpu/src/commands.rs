@@ -100,7 +100,7 @@ impl Gpu {
         self.oversized = None;
         let scope = self.dev.error_scope();
         let r = f(self);
-        if let Some(e) = scope.finish() {
+        if let Some(e) = scope.finish().or_else(|| self.dev.take_failure()) {
             anyhow::bail!("{what}: {e}");
         }
         if let Some((label, bytes)) = self.oversized.take() {

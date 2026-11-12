@@ -3,6 +3,8 @@
 //! wgpu (`wgpu`: Vulkan, or Metal through wgpu) and Metal directly (`metal`, macOS).
 //! Everything above it (the ops, the plans, the weights) is the same for both.
 
+#[cfg(target_os = "macos")]
+pub(crate) mod metal;
 pub(crate) mod wgpu;
 
 use anyhow::Result;
@@ -14,12 +16,17 @@ use crate::device::{CompileSettings, DeviceCaps, Diagnostics};
 pub enum Buf {
     #[doc(hidden)]
     Wgpu(::wgpu::Buffer),
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    Metal(metal::MBuf),
 }
 
 impl Buf {
     pub(crate) fn size(&self) -> u64 {
         match self {
             Buf::Wgpu(b) => b.size(),
+            #[cfg(target_os = "macos")]
+            Buf::Metal(b) => b.size(),
         }
     }
 }
@@ -33,12 +40,16 @@ pub(crate) struct Kernel {
 
 pub(crate) enum KernelImpl {
     Wgpu(wgpu::WgpuKernel),
+    #[cfg(target_os = "macos")]
+    Metal(metal::MetalKernel),
 }
 
 /// What compiles kernels, shareable with the threads of `Gpu::precompile`.
 #[derive(Clone)]
 pub(crate) enum Compiler {
     Wgpu(::wgpu::Device, CompileSettings),
+    #[cfg(target_os = "macos")]
+    Metal(metal::MetalCompiler),
 }
 
 impl Compiler {
@@ -49,6 +60,8 @@ impl Compiler {
             Compiler::Wgpu(device, settings) => {
                 KernelImpl::Wgpu(wgpu::compile(device, *settings, name, src, read_only))
             }
+            #[cfg(target_os = "macos")]
+            Compiler::Metal(c) => KernelImpl::Metal(c.compile(name, src, read_only)),
         };
         Kernel { id: 0, imp }
     }
@@ -56,19 +69,29 @@ impl Compiler {
 
 /// The device: one of the two implementations.
 pub(crate) enum Dev {
-    Wgpu(wgpu::WgpuDev),
+    Wgpu(Box<wgpu::WgpuDev>),
+    #[cfg(target_os = "macos")]
+    Metal(metal::MetalDev),
 }
 
 impl Dev {
-    /// Opens the device the environment asks for (see `Gpu::new`).
+    /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
+    /// without wgpu, else wgpu.
     pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
+        #[cfg(target_os = "macos")]
+        if std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal") {
+            let (d, caps) = metal::MetalDev::open()?;
+            return Ok((Dev::Metal(d), caps));
+        }
         let (d, caps) = wgpu::WgpuDev::open(diag)?;
-        Ok((Dev::Wgpu(d), caps))
+        Ok((Dev::Wgpu(Box::new(d)), caps))
     }
 
     pub(crate) fn compiler(&self, settings: CompileSettings) -> Compiler {
         match self {
             Dev::Wgpu(d) => Compiler::Wgpu(d.device.clone(), settings),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => Compiler::Metal(d.compiler(settings)),
         }
     }
 
@@ -76,6 +99,8 @@ impl Dev {
     pub(crate) fn max_binding(&self) -> u64 {
         match self {
             Dev::Wgpu(d) => d.device.limits().max_storage_buffer_binding_size,
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.max_buffer(),
         }
     }
 
@@ -83,6 +108,8 @@ impl Dev {
     pub(crate) fn max_buffer(&self) -> u64 {
         match self {
             Dev::Wgpu(d) => d.device.limits().max_buffer_size,
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.max_buffer(),
         }
     }
 
@@ -91,6 +118,8 @@ impl Dev {
     pub(crate) fn storage(&self, label: &str, size: u64) -> Buf {
         match self {
             Dev::Wgpu(d) => d.storage(label, size),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.storage(label, size),
         }
     }
 
@@ -98,6 +127,8 @@ impl Dev {
     pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {
         match self {
             Dev::Wgpu(d) => d.upload(label, bytes),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.upload(label, bytes),
         }
     }
 
@@ -105,6 +136,8 @@ impl Dev {
     pub(crate) fn write(&mut self, dst: &Buf, offset: u64, bytes: &[u8]) {
         match self {
             Dev::Wgpu(d) => d.write(dst, offset, bytes),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.write(dst, offset, bytes),
         }
     }
 
@@ -113,6 +146,8 @@ impl Dev {
     pub(crate) fn upload_meta(&mut self, slot: &mut Option<Buf>, data: &[u8]) {
         match self {
             Dev::Wgpu(d) => d.upload_meta(slot, data),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.upload_meta(slot, data),
         }
     }
 
@@ -120,6 +155,8 @@ impl Dev {
     pub(crate) fn copy(&mut self, src: &Buf, src_off: u64, dst: &Buf, dst_off: u64, size: u64) {
         match self {
             Dev::Wgpu(d) => d.copy(src, src_off, dst, dst_off, size),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.copy(src, src_off, dst, dst_off, size),
         }
     }
 
@@ -135,6 +172,10 @@ impl Dev {
     ) {
         match (self, &k.imp) {
             (Dev::Wgpu(d), KernelImpl::Wgpu(w)) => d.dispatch(k.id, w, bufs, imm, groups, label),
+            #[cfg(target_os = "macos")]
+            (Dev::Metal(d), KernelImpl::Metal(m)) => d.dispatch(m, bufs, imm, groups),
+            #[cfg(target_os = "macos")]
+            _ => panic!("a kernel of another device"),
         }
     }
 
@@ -142,6 +183,8 @@ impl Dev {
     pub(crate) fn submit(&mut self) {
         match self {
             Dev::Wgpu(d) => d.submit(),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.submit(),
         }
     }
 
@@ -149,6 +192,8 @@ impl Dev {
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         match self {
             Dev::Wgpu(d) => d.read(src, offset, size),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.read(src, offset, size),
         }
     }
 
@@ -156,6 +201,17 @@ impl Dev {
     pub(crate) fn timing(&self) -> bool {
         match self {
             Dev::Wgpu(d) => d.kernels_profile.is_some(),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(_) => false,
+        }
+    }
+
+    /// An allocation that failed since the last call (devices that report them so).
+    pub(crate) fn take_failure(&self) -> Option<String> {
+        match self {
+            Dev::Wgpu(_) => None,
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.take_failure(),
         }
     }
 
@@ -164,6 +220,8 @@ impl Dev {
     pub(crate) fn error_scope(&self) -> ErrorScope {
         match self {
             Dev::Wgpu(d) => ErrorScope::Wgpu(d.error_scope()),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(_) => ErrorScope::None,
         }
     }
 }
@@ -171,12 +229,16 @@ impl Dev {
 /// Errors captured since `Dev::error_scope`.
 pub(crate) enum ErrorScope {
     Wgpu(wgpu::ErrorScope),
+    /// (Metal reports a failed allocation at the call)
+    #[allow(dead_code)]
+    None,
 }
 
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         match self {
             ErrorScope::Wgpu(s) => s.finish(),
+            ErrorScope::None => None,
         }
     }
 }
