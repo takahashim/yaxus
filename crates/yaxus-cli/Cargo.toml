@@ -12,7 +12,7 @@ path = "src/main.rs"
 [features]
 default = ["server"]
 # `translate` and `bench`: the model runs in this process.
-local = ["dep:yaxus-runtime", "dep:yaxus-model", "dep:yaxus-tokenizer", "dep:tracing-subscriber"]
+local = ["dep:yaxus-runtime", "dep:yaxus-model", "dep:yaxus-tokenizer", "dep:yaxus-pfml", "dep:tracing-subscriber"]
 # `serve` as well. Build with --no-default-features for a client-only binary, or with
 # --no-default-features --features local for local translation without the server.
 server = ["local", "dep:yaxus-server"]
@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer", optional = true }
 yaxus-model = { path = "../yaxus-model", optional = true }
+yaxus-pfml = { path = "../yaxus-pfml", optional = true }
 yaxus-runtime = { path = "../yaxus-runtime", optional = true }
 yaxus-server = { path = "../yaxus-server", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

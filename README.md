@@ -66,6 +66,28 @@ yaxus translate --to ja --form polite < document.txt      # paragraphs separated
 yaxus translate --model 2b:Q4_K_M --to en < document.txt   # a GGUF file from the HF cache
 ```
 
+Proofreading help for Japanese: `yaxus polish` rewrites each paragraph and shows what
+changed (`[-removed-]{+added+}`). `--via direct` (the default) translates Japanese into
+Japanese, the closest to the source; `--via en` goes through English and back, freer but
+more prone to drift. Each paragraph keeps its politeness (`--form auto`), and a rewrite
+that loses a number, a Latin word or a quotation is marked for checking.
+
+```sh
+yaxus polish < draft.txt
+yaxus polish --via direct,en,zh-hans --show-pivot < draft.txt   # one candidate per route
+yaxus polish --format text < draft.txt                          # the rewritten text alone
+yaxus polish mark < draft.txt                                   # marks, no rewrite
+```
+
+`yaxus polish mark` rewrites nothing: the model reads each paragraph as the direct rewrite
+of itself, and the pieces it finds unlikely (below `--threshold`, 0.05) are marked with its
+own choice there, e.g. `彼は会議[?において、→で?]…`. It is one pass per paragraph, without
+generation. `yaxus bench polish` measures the marks against an annotated set
+(`tests/bench/polish.tsv`).
+
+`polish mark --via en` scores the wording alone (the text as the translation of its
+English). A high probability means typical wording, not necessarily human wording.
+
 Run a server:
 
 ```sh
