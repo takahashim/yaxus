@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 
-use crate::config::{Config, RopeParam, RopeParameters};
+use crate::config::{Config, RopeParam, RopeParameters, Yarn};
 use crate::ggml::GgmlType;
 use crate::weights::{TensorRef, Weights};
 use crate::{POST_MIXER_NORM_OFFSET, POST_MLP_NORM_OFFSET, PRE_NORM_OFFSET};
@@ -189,24 +189,16 @@ impl Gguf {
             Some(Value::Array(t)) => t.len(),
             _ => u("vocab_size")?,
         };
-        let full = RopeParam {
-            rope_type: "yarn".into(),
-            rope_theta: self.num("rope.freq_base")?,
-            factor: Some(self.num("rope.scaling.factor")?),
-            original_max_position_embeddings: Some(u("rope.scaling.original_context_length")?),
-            beta_fast: Some(self.num("rope.scaling.yarn_beta_fast")?),
-            beta_slow: Some(self.num("rope.scaling.yarn_beta_slow")?),
+        let yarn = Yarn {
+            factor: self.num("rope.scaling.factor")?,
+            original_max_position_embeddings: u("rope.scaling.original_context_length")?,
+            beta_fast: self.num("rope.scaling.yarn_beta_fast")?,
+            beta_slow: self.num("rope.scaling.yarn_beta_slow")?,
             truncate,
         };
-        let sliding = RopeParam {
-            rope_type: "default".into(),
-            rope_theta: self.num("rope.freq_base_swa")?,
-            factor: None,
-            original_max_position_embeddings: None,
-            beta_fast: None,
-            beta_slow: None,
-            truncate: false,
-        };
+        let (factor, original) = (yarn.factor, yarn.original_max_position_embeddings);
+        let full = RopeParam::yarn(self.num("rope.freq_base")?, yarn);
+        let sliding = RopeParam::plain(self.num("rope.freq_base_swa")?);
         let cfg = Config {
             hidden_size: u("embedding_length")?,
             num_hidden_layers: u("block_count")?,
@@ -222,8 +214,8 @@ impl Gguf {
             rope_local_theta: sliding.rope_theta,
             scale_embedding: false,
             tie_word_embeddings: false,
-            rope_scaling_factor: full.factor.unwrap(),
-            initial_context_length: full.original_max_position_embeddings.unwrap(),
+            rope_scaling_factor: factor,
+            initial_context_length: original,
             rope_parameters: Some(RopeParameters { full_attention: full, sliding_attention: sliding }),
         };
         cfg.validate()?;
