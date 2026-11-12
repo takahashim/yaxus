@@ -133,7 +133,9 @@ async function init() {
     setStatus("サーバに接続できません", true);
   }
   $("from").value = store.get("from", "");
+  if ($("from").selectedIndex < 0) $("from").value = "";
   $("to").value = store.get("to", "en");
+  if ($("to").selectedIndex < 0) $("to").value = "en";
   $("form").value = store.get("form", "");
   updateForm();
   updateCount();
@@ -147,14 +149,22 @@ function updateCount() {
   $("count").textContent = $("input").value ? `${$("input").value.length} 文字 · ${n} 段落` : "";
 }
 
+// The paragraphs yaxus_api::split_paragraphs (the CLI's) finds: runs of non-blank lines.
 function paragraphs(text) {
-  return text.split(/\r?\n[ \t　]*\r?\n\s*/).map((p) => p.replace(/\s+$/, "")).filter((p) => p.trim());
+  const out = [];
+  let cur = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim()) cur.push(line);
+    else if (cur.length) { out.push(cur.join("\n")); cur = []; }
+  }
+  if (cur.length) out.push(cur.join("\n"));
+  return out;
 }
 
 function glossary() {
   return $("glossary").value.split("\n").map((l) => {
-    const m = l.split(/\s*(?:=|\t)\s*/);
-    return m.length >= 2 && m[0].trim() && m[1].trim() ? { source: m[0].trim(), target: m.slice(1).join("=").trim() } : null;
+    const m = /^\s*(\S.*?)\s*(?:=|\t)\s*(\S.*?)\s*$/.exec(l);
+    return m ? { source: m[1], target: m[2] } : null;
   }).filter(Boolean);
 }
 
@@ -181,45 +191,48 @@ async function translateDocument(body, onEvent, signal) {
     signal,
   });
   if (!res.ok) {
-    let body = null;
-    try { body = await res.json(); } catch {}
-    throw body && body.error ? apiError(body.error) : new Error(`HTTP ${res.status}`);
+    let err = null;
+    try { err = await res.json(); } catch {}
+    throw err && err.error ? apiError(err.error) : new Error(`HTTP ${res.status}`);
   }
   const reader = res.body.getReader();
   const dec = new TextDecoder();
-  let buf = "", usage = null;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let i;
-    while ((i = buf.indexOf("\n\n")) >= 0) {
-      const chunk = buf.slice(0, i);
-      buf = buf.slice(i + 2);
-      for (const line of chunk.split("\n")) {
-        if (!line.startsWith("data:")) continue;
-        const ev = JSON.parse(line.slice(5));
-        switch (ev.type) {
-          case "delta":
-          case "segment_done":
-            onEvent(ev);
-            break;
-          case "done":
-            usage = ev.usage;
-            break;
-          case "error":
-            throw apiError(ev.error);
+  let buf = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error("ストリームが途中で終了しました");
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const ev = JSON.parse(line.slice(5));
+          switch (ev.type) {
+            case "delta":
+            case "segment_done":
+              onEvent(ev);
+              break;
+            case "done":
+              return ev.usage;
+            case "error":
+              throw apiError(ev.error);
+          }
         }
       }
     }
+  } finally {
+    // Releases the connection on every exit, so the server stops generating.
+    reader.cancel().catch(() => {});
   }
-  return usage;
 }
 
 async function run() {
   const paras = paragraphs($("input").value);
   if (!paras.length) return;
-  if (!$("token").value.trim()) { setStatus("トークンを入力してください", true); $("token").focus(); return; }
+  if (!$("token").value.trim()) { $("stats").textContent = "トークンを入力してください"; $("token").focus(); return; }
   store.set("token", $("token").value.trim());
   const body = {
     segments: paras,
@@ -230,19 +243,23 @@ async function run() {
     glossary: glossary(),
   };
   controller = new AbortController();
-  $("go").disabled = true;
+  $("go").disabled = $("swap").disabled = $("clear").disabled = true;
   $("stop").classList.remove("hidden");
   const out = $("output");
   out.value = "";
   const parts = paras.map(() => "");
-  let finished = 0;
+  let finished = 0, frame = 0;
+  const render = () => {
+    frame = 0;
+    out.value = parts.filter((p) => p).join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  };
   const t0 = performance.now();
   $("stats").textContent = `0 / ${paras.length} 段落`;
   try {
     const usage = await translateDocument(body, (ev) => {
       if (ev.type === "delta") {
         parts[ev.segment] += ev.text;
-        out.value = parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+        if (!frame) frame = requestAnimationFrame(render);
       } else if (ev.type === "segment_done") {
         finished++;
         $("stats").textContent = `${finished} / ${paras.length} 段落`;
@@ -254,8 +271,9 @@ async function run() {
   } catch (e) {
     $("stats").textContent = e.name === "AbortError" ? "停止しました" : "エラー: " + e.message;
   } finally {
+    if (frame) { cancelAnimationFrame(frame); render(); }
     controller = null;
-    $("go").disabled = false;
+    $("go").disabled = $("swap").disabled = $("clear").disabled = false;
     $("stop").classList.add("hidden");
   }
 }
@@ -264,7 +282,7 @@ $("go").onclick = run;
 $("stop").onclick = () => controller && controller.abort();
 $("input").addEventListener("input", updateCount);
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !controller) { e.preventDefault(); run(); }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing && !controller) { e.preventDefault(); run(); }
 });
 $("to").onchange = () => { store.set("to", $("to").value); updateForm(); };
 $("from").onchange = () => store.set("from", $("from").value);
