@@ -463,10 +463,11 @@ fn bench_set(mut m: ModelArgs, file: PathBuf, save: Option<PathBuf>, compare: Op
     let gen_after_first: usize = stats.iter().map(|s| s.generated.saturating_sub(1)).sum();
     let pf: f64 = stats.iter().map(|s| s.prefill.as_secs_f64()).sum::<f64>() / stats.len() as f64;
     println!(
-        "{} items, {generated_total} tokens: decode {:.2} tok/s, mean prefill {:.0} ms",
+        "{} items, {generated_total} tokens: decode {:.2} tok/s, mean prefill {:.0} ms, mean per item {:.0} ms",
         stats.len(),
         gen_after_first as f64 / dec,
-        pf * 1e3
+        pf * 1e3,
+        (pf + dec / stats.len() as f64) * 1e3
     );
     if let Some(s) = model.stats() {
         println!("speculative: {s}");
