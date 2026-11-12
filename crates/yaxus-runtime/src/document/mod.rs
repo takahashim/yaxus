@@ -16,6 +16,24 @@ mod schedule;
 pub use run::{DocEvent, DocRun, SegmentEnd, run_document};
 use schedule::ChainSchedule;
 
+/// Why a document cannot be translated: an option every segment shares, or one
+/// segment's prompt.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DocError {
+    #[error(transparent)]
+    Options(PromptError),
+    #[error(transparent)]
+    Segment(SegmentError),
+}
+
+/// A segment's prompt that cannot be built.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("segment {segment}: {error}")]
+pub struct SegmentError {
+    pub segment: usize,
+    pub error: PromptError,
+}
+
 /// Chains used when the caller does not choose: one per 4 segments, at most 8.
 pub fn auto_chains(segments: usize) -> usize {
     segments.div_ceil(4).clamp(1, 8)
@@ -114,8 +132,8 @@ impl DocJob {
     /// most half of that (and at least 1 token).
     pub fn from_request(r: DocumentRequest, max_context: usize) -> Self {
         let request = TranslationRequest {
-            source_lang: r.requested_source_lang().map(String::from),
-            form: r.requested_form().map(String::from),
+            source_lang: r.source_lang,
+            form: r.form,
             target_lang: r.target_lang,
             context: r.context,
             glossary: r.glossary,
@@ -124,7 +142,7 @@ impl DocJob {
         let opts = DocOptions {
             request,
             history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
-            chains: r.chains.unwrap_or(0),
+            chains: r.chains.map_or(0, |c| c.get()),
             neighbor_context: r.neighbor_context,
             max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS).min(max_context / 2).max(1),
         };
@@ -154,12 +172,12 @@ impl DocJob {
     /// they are the context), which must also fit the context (blank segments are allowed;
     /// they come back empty). History is earlier output; what does not fit is dropped
     /// when the segment is submitted.
-    pub fn validate(&self, tok: &Tokenizer) -> Result<(), PromptError> {
-        self.prompter.base.validate_options()?;
+    pub fn validate(&self, tok: &Tokenizer) -> Result<(), DocError> {
+        self.prompter.base.validate_options().map_err(DocError::Options)?;
         for i in (0..self.segments.len()).filter(|&i| !is_blank(&self.segments[i])) {
             self.prompter
                 .fit(tok, self.prompter.bare(&self.segments, i), 0)
-                .map_err(|e| PromptError(format!("segment {i}: {}", e.0)))?;
+                .map_err(|error| DocError::Segment(SegmentError { segment: i, error }))?;
         }
         Ok(())
     }
@@ -245,7 +263,6 @@ mod tests {
         let r = DocumentRequest {
             segments: vec!["a".into()],
             target_lang: "en".into(),
-            source_lang: Some(String::new()),
             max_new_tokens: Some(10_000),
             ..Default::default()
         };
@@ -260,25 +277,28 @@ mod tests {
 
     #[test]
     fn validation_checks_options_once_and_every_segment() {
-        let req = |segments: &[&str], form: Option<&str>| DocumentRequest {
+        let req = |segments: &[&str], form: Option<yaxus_api::Form>| DocumentRequest {
             segments: segments.iter().map(|s| s.to_string()).collect(),
             target_lang: "en".into(),
-            form: form.map(String::from),
+            form,
             ..Default::default()
         };
         let (tok, _) = tokenizer();
         let n = DEFAULT_MAX_POS;
         assert!(DocJob::from_request(req(&["a", "  ", "b"], None), n).validate(&tok).is_ok());
         let e = DocJob::from_request(req(&["a", "x<|plamo:msg|>"], None), n).validate(&tok).unwrap_err();
-        assert!(e.0.starts_with("segment 1:"), "{}", e.0);
+        assert!(matches!(e, DocError::Segment(SegmentError { segment: 1, .. })), "{e}");
         // `form` needs target_lang = "ja".
-        assert!(DocJob::from_request(req(&["a"], Some("polite")), n).validate(&tok).is_err());
+        let e = DocJob::from_request(req(&["a"], Some(yaxus_api::Form::Polite)), n).validate(&tok).unwrap_err();
+        assert!(matches!(e, DocError::Options(_)), "{e}");
         // Each segment's prompt must fit the context: blank ones need not.
         let b = TranslationRequest { text: "b".into(), target_lang: "en".into(), ..Default::default() };
         let fits = Prompt::new(&tok, &b.validate().unwrap()).len() + 1;
         assert!(DocJob::from_request(req(&["b", " "], None), fits).validate(&tok).is_ok());
         let e = DocJob::from_request(req(&["b", "bb"], None), fits).validate(&tok).unwrap_err();
-        assert!(e.0.starts_with("segment 1:") && e.0.contains("the limit is"), "{}", e.0);
+        let DocError::Segment(SegmentError { segment: 1, error }) = &e else { panic!("{e}") };
+        assert_eq!(error.kind, yaxus_pfml::PromptErrorKind::TooLong, "{e}");
+        assert!(e.to_string().starts_with("segment 1: prompt is"), "{e}");
     }
 
     /// Emits one "x" token per step for every request it holds, and stops each request
@@ -393,7 +413,7 @@ mod tests {
         // Without history the budget is cut to what is left (at least 1).
         assert_eq!(fit(&base, bare + 3, 10).unwrap(), (bare, 3));
         // The prompt alone does not fit.
-        assert!(fit(&base, bare, 0).unwrap_err().0.contains("the limit is"));
+        assert!(fit(&base, bare, 0).unwrap_err().message.contains("the limit is"));
         // The memory key is that of the prompt sent.
         let (p, _) = Prompt::fit(&tok, with_history.clone(), full, 10).unwrap();
         assert_eq!(p.into_parts().1, crate::memory::key(&base));

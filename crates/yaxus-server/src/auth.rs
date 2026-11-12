@@ -5,9 +5,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
+
+use yaxus_api::ErrorCode;
 
 use crate::secret_file::write_private;
 
@@ -61,7 +63,7 @@ impl AccessToken {
 /// Middleware: answers 401 to a request without the token.
 pub async fn require(State(token): State<Arc<AccessToken>>, req: Request, next: Next) -> Response {
     if !token.accepts(req.headers().get(header::AUTHORIZATION)) {
-        let mut r = crate::error(StatusCode::UNAUTHORIZED, "missing or invalid bearer token");
+        let mut r = crate::error(ErrorCode::Unauthorized, "missing or invalid bearer token");
         r.headers_mut().insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         return r;
     }

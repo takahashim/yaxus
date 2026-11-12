@@ -26,10 +26,12 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use yaxus_api::{
-    DocumentEvent, DocumentRequest, DocumentResponse, ErrorResponse, Health, LANGUAGES, Language, StreamEvent,
-    TranslateRequest, TranslateResponse,
+    ApiError, DocumentEvent, DocumentRequest, DocumentResponse, ErrorCode, ErrorResponse, Health, HealthStatus,
+    LANGUAGES, Language, StreamEvent, TranslateRequest, TranslateResponse,
 };
-use yaxus_runtime::{LoadOptions, Prompt, document, load_generator, load_tokenizer, quant_label};
+use yaxus_pfml::{PromptError, PromptErrorKind};
+use yaxus_runtime::document::{self, DocError};
+use yaxus_runtime::{LoadOptions, Prompt, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
 use auth::AccessToken;
@@ -65,8 +67,36 @@ struct AppState {
 
 type Shared = Arc<AppState>;
 
-fn error(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, Json(ErrorResponse { error: msg.into() })).into_response()
+/// The HTTP status of each error code.
+fn status_of(code: ErrorCode) -> StatusCode {
+    match code {
+        ErrorCode::InvalidRequest | ErrorCode::PromptTooLong => StatusCode::BAD_REQUEST,
+        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
+        ErrorCode::QueueFull => StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn error_response(error: ApiError) -> Response {
+    (status_of(error.code), Json(ErrorResponse { error })).into_response()
+}
+
+fn error(code: ErrorCode, msg: impl Into<String>) -> Response {
+    error_response(ApiError::new(code, msg))
+}
+
+/// A request whose prompt cannot be built, as the API reports it.
+pub(crate) fn prompt_error(e: PromptError) -> ApiError {
+    let code = match e.kind {
+        PromptErrorKind::Invalid => ErrorCode::InvalidRequest,
+        PromptErrorKind::TooLong => ErrorCode::PromptTooLong,
+    };
+    ApiError::new(code, e.message)
+}
+
+pub(crate) fn segment_error(e: document::SegmentError) -> ApiError {
+    prompt_error(e.error).in_segment(e.segment)
 }
 
 async fn index() -> impl IntoResponse {
@@ -78,7 +108,7 @@ async fn healthz(State(st): State<Shared>) -> Response {
     h.queue = st.jobs.len();
     // The inference thread has stopped (after a panic): report it instead of "ok".
     if st.jobs.is_closed() {
-        h.status = "stopped".into();
+        h.status = HealthStatus::Stopped;
         return (StatusCode::SERVICE_UNAVAILABLE, Json(h)).into_response();
     }
     Json(h).into_response()
@@ -105,7 +135,7 @@ fn sse_response<E: Serialize + Send + 'static>(rx: mpsc::UnboundedReceiver<E>) -
 
 /// The worker dropped a job's channel without a final event.
 fn worker_stopped() -> Response {
-    error(StatusCode::INTERNAL_SERVER_ERROR, "inference worker stopped")
+    error(ErrorCode::Unavailable, "inference worker stopped")
 }
 
 async fn translate(
@@ -114,17 +144,17 @@ async fn translate(
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+        Err(e) => return error(ErrorCode::InvalidRequest, e.body_text()),
     };
     let (prompt, max_new_tokens) = match Prompt::for_request(&st.tok, &req, st.max_context) {
         Ok(p) => p,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.0),
+        Err(e) => return error_response(prompt_error(e)),
     };
     let (events, mut rx) = mpsc::unbounded_channel();
     let job = Job {
         work: Work::Single { prompt, max_new_tokens, events },
         enqueued: Instant::now(),
-        label: label(req.requested_source_lang(), &req.target_lang),
+        label: label(req.source_lang.as_deref(), &req.target_lang),
     };
     if let Err(r) = enqueue(&st, job) {
         return r;
@@ -135,9 +165,9 @@ async fn translate(
     let mut text = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {
-            StreamEvent::Delta { delta } => text.push_str(&delta),
-            StreamEvent::Done { usage, .. } => return Json(TranslateResponse { text, usage }).into_response(),
-            StreamEvent::Error { error: e } => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            StreamEvent::Delta { text: t } => text.push_str(&t),
+            StreamEvent::Done { usage } => return Json(TranslateResponse { text, usage }).into_response(),
+            StreamEvent::Error { error } => return error_response(error),
         }
     }
     worker_stopped()
@@ -147,8 +177,8 @@ async fn translate(
 #[allow(clippy::result_large_err)]
 fn enqueue(st: &AppState, job: Job) -> std::result::Result<(), Response> {
     st.jobs.push(job).map_err(|e| match e {
-        Rejected::Full => error(StatusCode::TOO_MANY_REQUESTS, "translation queue is full; retry later"),
-        Rejected::Stopped => error(StatusCode::SERVICE_UNAVAILABLE, "inference worker stopped"),
+        Rejected::Full => error(ErrorCode::QueueFull, "translation queue is full; retry later"),
+        Rejected::Stopped => error(ErrorCode::Unavailable, "inference worker stopped"),
     })
 }
 
@@ -161,18 +191,21 @@ async fn translate_document(
 ) -> Response {
     let Json(req) = match body {
         Ok(b) => b,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.body_text()),
+        Err(e) => return error(ErrorCode::InvalidRequest, e.body_text()),
     };
     if req.segments.is_empty() || req.segments.len() > MAX_SEGMENTS {
-        return error(StatusCode::BAD_REQUEST, format!("segments must contain 1..={MAX_SEGMENTS} items"));
+        return error(ErrorCode::InvalidRequest, format!("segments must contain 1..={MAX_SEGMENTS} items"));
     }
-    let (n, stream, label) = (req.segments.len(), req.stream, label(req.requested_source_lang(), &req.target_lang));
+    let (n, stream, label) = (req.segments.len(), req.stream, label(req.source_lang.as_deref(), &req.target_lang));
     let doc = document::DocJob::from_request(req, st.max_context);
     // Options and every segment's prompt without history are checked up front, against the
     // context too (blank segments come back empty); history that does not fit is dropped
     // when the segment is submitted.
     if let Err(e) = doc.validate(&st.tok) {
-        return error(StatusCode::BAD_REQUEST, e.0);
+        return error_response(match e {
+            DocError::Options(e) => prompt_error(e),
+            DocError::Segment(e) => segment_error(e),
+        });
     }
     let (events, mut rx) = mpsc::unbounded_channel();
     let job = Job { work: Work::Document { job: Box::new(doc), events }, enqueued: Instant::now(), label };
@@ -185,12 +218,12 @@ async fn translate_document(
     let mut out = vec![String::new(); n];
     while let Some(ev) = rx.recv().await {
         match ev {
-            DocumentEvent::Delta { segment, delta } => out[segment].push_str(&delta),
-            DocumentEvent::SegmentEnd { .. } => {}
-            DocumentEvent::Done { usage, .. } => {
+            DocumentEvent::Delta { segment, text } => out[segment].push_str(&text),
+            DocumentEvent::SegmentDone { .. } => {}
+            DocumentEvent::Done { usage } => {
                 return Json(DocumentResponse { segments: out, usage }).into_response();
             }
-            DocumentEvent::Error { error: e } => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+            DocumentEvent::Error { error } => return error_response(error),
         }
     }
     worker_stopped()
@@ -282,8 +315,13 @@ fn start_inference(opts: &ServeOptions) -> Result<(AppState, tokio::sync::onesho
         model.backend_name(),
         t0.elapsed()
     );
-    let health =
-        Health { status: "ok".into(), model: opts.model_name.clone(), backend: model.backend_name(), quant, queue: 0 };
+    let health = Health {
+        status: HealthStatus::Ok,
+        model: opts.model_name.clone(),
+        backend: model.backend_name(),
+        quant,
+        queue: 0,
+    };
     let (jobs, queue) = job_queue(opts.queue_limit);
     let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
     let worker_tok = tok.clone();
@@ -335,4 +373,101 @@ fn print_banner(opts: &ServeOptions, tls: &tls::TlsFiles, token: &AccessToken, c
         eprintln!("Access token: {}", opts.config_dir.join("token").display());
     }
     eprintln!();
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef";
+
+    /// The router on a tiny tokenizer, with no inference thread (`queue` is the receiving
+    /// end: drop it to mimic a stopped one) and a context that fits the prompt of "x" with
+    /// room to spare, but not that of a hundred "x".
+    fn app(limit: usize) -> (Router, queue::Jobs) {
+        let tok = Arc::new(yaxus_tokenizer::testing::plamo_like(&[("x", 0.0)]));
+        let x = TranslateRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
+        let max_context = Prompt::for_request(&tok, &x, usize::MAX).unwrap().0.len() + 20;
+        let (jobs, queue) = job_queue(limit);
+        let health =
+            Health { status: HealthStatus::Ok, model: "m".into(), backend: "b".into(), quant: "q".into(), queue: 0 };
+        let st = Arc::new(AppState { tok, jobs, health, max_context });
+        (router(st, Arc::new(AccessToken::new(TOKEN).unwrap())), queue)
+    }
+
+    fn request(uri: &str, body: Option<serde_json::Value>, token: bool) -> Request<Body> {
+        let mut req = Request::builder().uri(uri).method(if body.is_some() { "POST" } else { "GET" });
+        if token {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        }
+        match body {
+            Some(b) => req.header(header::CONTENT_TYPE, "application/json").body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap()
+    }
+
+    async fn call(
+        app: &Router,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        token: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = app.clone().oneshot(request(uri, body, token)).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn code(body: &serde_json::Value) -> &str {
+        body["error"]["code"].as_str().unwrap_or_else(|| panic!("no error code in {body}"))
+    }
+
+    #[tokio::test]
+    async fn errors_carry_a_code_matching_the_status() {
+        let (app, _queue) = app(1);
+        let one = serde_json::json!({"text": "x", "target_lang": "en"});
+
+        let (s, b) = call(&app, "/v1/translate", Some(one.clone()), false).await;
+        assert_eq!((s, code(&b)), (StatusCode::UNAUTHORIZED, "unauthorized"));
+
+        // A form outside the enum is rejected when the request is parsed.
+        let casual = serde_json::json!({"text": "x", "target_lang": "ja", "form": "casual"});
+        let (s, b) = call(&app, "/v1/translate", Some(casual), true).await;
+        assert_eq!((s, code(&b)), (StatusCode::BAD_REQUEST, "invalid_request"));
+        let (s, b) = call(&app, "/v1/translate", Some(serde_json::json!({"text": "x", "target_lang": ""})), true).await;
+        assert_eq!((s, code(&b)), (StatusCode::BAD_REQUEST, "invalid_request"));
+
+        let long = serde_json::json!({"text": "x".repeat(100), "target_lang": "en"});
+        let (s, b) = call(&app, "/v1/translate", Some(long), true).await;
+        assert_eq!((s, code(&b)), (StatusCode::BAD_REQUEST, "prompt_too_long"));
+
+        // A document names the segment.
+        let doc = |second: &str| serde_json::json!({"segments": ["x", second], "target_lang": "en", "stream": true});
+        let (s, b) = call(&app, "/v1/translate/document", Some(doc(&"x".repeat(100))), true).await;
+        assert_eq!((s, code(&b), &b["error"]["segment"]), (StatusCode::BAD_REQUEST, "prompt_too_long", &1.into()));
+        // A streamed document takes the one place in the queue (nothing runs it, and its
+        // body is not read); the next request finds the queue full.
+        let res = app.clone().oneshot(request("/v1/translate/document", Some(doc("x")), true)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (s, b) = call(&app, "/v1/translate/document", Some(doc("x")), true).await;
+        assert_eq!((s, code(&b)), (StatusCode::TOO_MANY_REQUESTS, "queue_full"));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_worker_is_reported() {
+        let (app, queue) = app(4);
+        let (s, b) = call(&app, "/healthz", None, false).await;
+        assert_eq!((s, b["status"].as_str()), (StatusCode::OK, Some("ok")));
+        drop(queue);
+        let (s, b) = call(&app, "/healthz", None, false).await;
+        assert_eq!((s, b["status"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("stopped")));
+        let one = serde_json::json!({"text": "x", "target_lang": "en"});
+        let (s, b) = call(&app, "/v1/translate", Some(one), true).await;
+        assert_eq!((s, code(&b)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"));
+    }
 }

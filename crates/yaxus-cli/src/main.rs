@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, Pair};
+use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, DocumentResponse, Form, Pair};
 
 #[cfg(feature = "local")]
 mod local;
@@ -26,7 +26,7 @@ struct LangArgs {
     from: Option<String>,
     /// polite or plain (only with --to ja).
     #[arg(long)]
-    form: Option<String>,
+    form: Option<Form>,
     /// Reference context for the whole text (situation, surrounding text).
     #[arg(long)]
     context: Option<String>,
@@ -133,10 +133,10 @@ impl LangArgs {
             segments,
             target_lang: self.to.clone(),
             source_lang: self.from.clone(),
-            form: self.form.clone(),
+            form: self.form,
             context: self.context.clone(),
             glossary: parse_glossary(&self.glossary)?,
-            chains: Some(self.chains),
+            chains: std::num::NonZeroUsize::new(self.chains),
             history_chars: Some(self.history_chars),
             neighbor_context: self.neighbor_context,
             max_new_tokens: Some(self.max_new_tokens),
@@ -233,7 +233,7 @@ fn run_client(
     let status = res.status();
     if !status.is_success() {
         let body = res.text().unwrap_or_default();
-        let msg = serde_json::from_str::<yaxus_api::ErrorResponse>(&body).map(|e| e.error).unwrap_or(body);
+        let msg = serde_json::from_str::<yaxus_api::ErrorResponse>(&body).map(|e| e.error.to_string()).unwrap_or(body);
         bail!("server returned {status}: {msg}");
     }
     let mut out = OrderedPrinter::new(std::io::stdout().lock(), n);
@@ -249,8 +249,8 @@ fn run_client(
         let line = line?;
         let Some(data) = line.strip_prefix("data:") else { continue };
         match serde_json::from_str::<DocumentEvent>(data.trim_start())? {
-            DocumentEvent::Delta { segment, delta } => out.delta(segment, &delta)?,
-            DocumentEvent::SegmentEnd { segment, .. } => out.end(segment)?,
+            DocumentEvent::Delta { segment, text } => out.delta(segment, &text)?,
+            DocumentEvent::SegmentDone { segment } => out.end(segment)?,
             DocumentEvent::Done { .. } => return Ok(()),
             DocumentEvent::Error { error } => bail!("server error: {error}"),
         }

@@ -122,7 +122,8 @@ async function init() {
       fetch("healthz").then((r) => r.json()),
       fetch("v1/languages").then((r) => r.json()),
     ]);
-    setStatus(`${h.model} · ${h.quant} · ${h.backend}`);
+    if (h.status === "ok") setStatus(`${h.model} · ${h.quant} · ${h.backend}`);
+    else setStatus("サーバの推論が停止しています。サーバを再起動してください", true);
     for (const l of langs) {
       const label = `${l.name} (${l.code})`;
       $("from").add(new Option(label, l.code));
@@ -157,6 +158,18 @@ function glossary() {
   }).filter(Boolean);
 }
 
+// Messages for the error codes a person can act on; the others show the server's message.
+const ERROR_MESSAGES = {
+  unauthorized: "トークンが正しくありません",
+  queue_full: "サーバが混雑しています。しばらくしてから再試行してください",
+  unavailable: "サーバの推論が停止しています。サーバを再起動してください",
+};
+
+function apiError(error) {
+  const where = error.segment !== undefined ? `段落 ${error.segment + 1}: ` : "";
+  return new Error(ERROR_MESSAGES[error.code] || where + error.message);
+}
+
 // The whole input goes to /v1/translate/document: the server splits the paragraphs into
 // chains (in order with history inside a chain, chains in parallel), so several
 // paragraphs fill in at once.
@@ -168,11 +181,9 @@ async function translateDocument(body, onEvent, signal) {
     signal,
   });
   if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try { msg = (await res.json()).error || msg; } catch {}
-    if (res.status === 401) msg = "トークンが正しくありません";
-    if (res.status === 429) msg = "サーバが混雑しています。しばらくしてから再試行してください";
-    throw new Error(msg);
+    let body = null;
+    try { body = await res.json(); } catch {}
+    throw body && body.error ? apiError(body.error) : new Error(`HTTP ${res.status}`);
   }
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -188,9 +199,17 @@ async function translateDocument(body, onEvent, signal) {
       for (const line of chunk.split("\n")) {
         if (!line.startsWith("data:")) continue;
         const ev = JSON.parse(line.slice(5));
-        if (ev.error) throw new Error(ev.error);
-        if (ev.done) usage = ev.usage;
-        else onEvent(ev);
+        switch (ev.type) {
+          case "delta":
+          case "segment_done":
+            onEvent(ev);
+            break;
+          case "done":
+            usage = ev.usage;
+            break;
+          case "error":
+            throw apiError(ev.error);
+        }
       }
     }
   }
@@ -221,10 +240,10 @@ async function run() {
   $("stats").textContent = `0 / ${paras.length} 段落`;
   try {
     const usage = await translateDocument(body, (ev) => {
-      if (ev.delta !== undefined) {
-        parts[ev.segment] += ev.delta;
+      if (ev.type === "delta") {
+        parts[ev.segment] += ev.text;
         out.value = parts.join("\n\n").replace(/\n{3,}/g, "\n\n").trimEnd();
-      } else if (ev.end) {
+      } else if (ev.type === "segment_done") {
         finished++;
         $("stats").textContent = `${finished} / ${paras.length} 段落`;
       }

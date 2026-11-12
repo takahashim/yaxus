@@ -7,6 +7,7 @@ description = "Model resolution, loading and translation jobs for yaxus (shared 
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
 tracing = "0.1"
 yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }

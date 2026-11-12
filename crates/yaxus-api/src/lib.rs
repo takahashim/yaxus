@@ -1,4 +1,7 @@
-//! JSON types of the yaxus HTTP API (`POST /v1/translate` etc.).
+//! JSON types of the yaxus HTTP API (`POST /v1/translate` etc.), and the document
+//! helpers its client and server share ([`HistoryWindow`], [`split_paragraphs`]).
+
+use std::num::NonZeroUsize;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,11 +12,12 @@ pub const DEFAULT_MAX_NEW_TOKENS: usize = 512;
 pub struct TranslateRequest {
     pub text: String,
     pub target_lang: String,
+    /// Detected from the text when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lang: Option<String>,
-    /// `polite` or `plain`; only with `target_lang = "ja"`.
+    /// Only with `target_lang = "ja"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub form: Option<String>,
+    pub form: Option<Form>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -27,21 +31,38 @@ pub struct TranslateRequest {
     pub stream: bool,
 }
 
-/// An optional language or form field as the request means it: an empty string (as a
-/// form sends for "not chosen") is the same as leaving the field out.
-fn given(field: &Option<String>) -> Option<&str> {
-    field.as_deref().filter(|s| !s.is_empty())
+/// The Japanese politeness a translation into `ja` may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Form {
+    Polite,
+    Plain,
 }
 
-impl TranslateRequest {
-    /// The source language the request names, if any (`""` names none).
-    pub fn requested_source_lang(&self) -> Option<&str> {
-        given(&self.source_lang)
+impl Form {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Form::Polite => "polite",
+            Form::Plain => "plain",
+        }
     }
+}
 
-    /// The form the request asks for, if any (`""` asks for none).
-    pub fn requested_form(&self) -> Option<&str> {
-        given(&self.form)
+impl std::fmt::Display for Form {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Form {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "polite" => Ok(Form::Polite),
+            "plain" => Ok(Form::Plain),
+            _ => Err(format!("unknown form {s:?} (expected polite or plain)")),
+        }
     }
 }
 
@@ -52,18 +73,21 @@ pub struct Pair {
     pub target: String,
 }
 
-/// Missing fields read as 0, so clients and servers of different versions still agree.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Token counts and times of a request (of all segments, for a document). Missing fields
+/// read as 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Usage {
     pub prompt_tokens: usize,
+    /// Prompt tokens whose KV was reused from earlier requests.
+    pub reused_tokens: usize,
     pub completion_tokens: usize,
-    /// Time from dequeue to the end of generation.
-    pub elapsed_ms: u64,
-    /// Time from dequeue to the first generated token (prompt processing).
-    pub prefill_ms: u64,
     /// Time spent waiting in the queue.
     pub queue_ms: u64,
+    /// Time from dequeue to the first generated token (prompt processing).
+    pub prefill_ms: u64,
+    /// Time from dequeue to the end of generation.
+    pub elapsed_ms: u64,
 }
 
 /// Response for `stream: false`.
@@ -73,13 +97,14 @@ pub struct TranslateResponse {
     pub usage: Usage,
 }
 
-/// One `data:` payload of the SSE stream for `stream: true`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+/// One `data:` payload of the SSE stream for `stream: true`, tagged by `type`:
+/// any number of `delta`, then one `done` or `error`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Delta { delta: String },
-    Done { done: bool, usage: Usage },
-    Error { error: String },
+    Delta { text: String },
+    Done { usage: Usage },
+    Error { error: ApiError },
 }
 
 /// `POST /v1/translate/document`: several segments (paragraphs) of one document.
@@ -95,15 +120,15 @@ pub struct DocumentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_lang: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub form: Option<String>,
+    pub form: Option<Form>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub glossary: Vec<Pair>,
-    /// Chains translated in parallel; 0 or absent: one per 4 segments, at most 8.
+    /// Chains translated in parallel; absent: one per 4 segments, at most 8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chains: Option<usize>,
-    /// History budget per chain in characters (default `DEFAULT_HISTORY_CHARS`, 0: none).
+    pub chains: Option<NonZeroUsize>,
+    /// History budget per chain in characters; absent: `DEFAULT_HISTORY_CHARS`, 0: none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_chars: Option<usize>,
     /// Pass the neighbouring source segments as context (useful without history).
@@ -116,30 +141,15 @@ pub struct DocumentRequest {
     pub stream: bool,
 }
 
-impl DocumentRequest {
-    /// See [`TranslateRequest::requested_source_lang`].
-    pub fn requested_source_lang(&self) -> Option<&str> {
-        given(&self.source_lang)
-    }
-
-    /// See [`TranslateRequest::requested_form`].
-    pub fn requested_form(&self) -> Option<&str> {
-        given(&self.form)
-    }
-}
-
-/// Missing fields read as 0, as for [`Usage`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// [`Usage`] of all segments, and how the document was split.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DocumentUsage {
     pub segments: usize,
     pub chains: usize,
-    pub prompt_tokens: usize,
-    /// Prompt tokens whose KV was reused from earlier requests.
-    pub reused_tokens: usize,
-    pub completion_tokens: usize,
-    pub elapsed_ms: u64,
-    pub queue_ms: u64,
+    /// (`prefill_ms` is the time to the document's first generated token.)
+    #[serde(flatten)]
+    pub total: Usage,
 }
 
 /// Response for `stream: false`.
@@ -149,25 +159,81 @@ pub struct DocumentResponse {
     pub usage: DocumentUsage,
 }
 
-/// One `data:` payload of the SSE stream for `stream: true`. Segments progress in
-/// parallel, so deltas of different segments interleave.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+/// One `data:` payload of the SSE stream for `stream: true`, tagged by `type`. Segments
+/// progress in parallel, so deltas of different segments interleave; each segment ends
+/// with `segment_done`, and the document with one `done` or `error`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum DocumentEvent {
-    Delta { segment: usize, delta: String },
-    SegmentEnd { segment: usize, end: bool },
-    Done { done: bool, usage: DocumentUsage },
-    Error { error: String },
+    Delta { segment: usize, text: String },
+    SegmentDone { segment: usize },
+    Done { usage: DocumentUsage },
+    Error { error: ApiError },
 }
 
+/// What went wrong, for programs (`message` is for people).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// A malformed or invalid request (400).
+    InvalidRequest,
+    /// The prompt does not fit the server's context (400).
+    PromptTooLong,
+    /// A missing or wrong bearer token (401).
+    Unauthorized,
+    /// The queue is full; retry later (429).
+    QueueFull,
+    /// The inference thread has stopped; the server must be restarted (503).
+    Unavailable,
+    /// Generation failed (500).
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: ErrorCode,
+    pub message: String,
+    /// The segment of a document request it is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<usize>,
+}
+
+impl ApiError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        ApiError { code, message: message.into(), segment: None }
+    }
+
+    pub fn in_segment(self, segment: usize) -> Self {
+        ApiError { segment: Some(segment), ..self }
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.segment {
+            Some(s) => write!(f, "segment {s}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+/// The body of every error response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    pub error: String,
+    pub error: ApiError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Ok,
+    /// The inference thread has stopped (`/healthz` answers 503).
+    Stopped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Health {
-    pub status: String,
+    pub status: HealthStatus,
     pub model: String,
     pub backend: String,
     pub quant: String,
@@ -309,13 +375,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_language_and_form_mean_unset() {
-        let mut r =
-            TranslateRequest { source_lang: Some(String::new()), form: Some("polite".into()), ..Default::default() };
-        assert_eq!((r.requested_source_lang(), r.requested_form()), (None, Some("polite")));
-        r.source_lang = Some("en".into());
-        r.form = None;
-        assert_eq!((r.requested_source_lang(), r.requested_form()), (Some("en"), None));
+    fn forms_are_a_closed_set() {
+        let r: TranslateRequest = serde_json::from_str(r#"{"text":"x","target_lang":"ja","form":"polite"}"#).unwrap();
+        assert_eq!(r.form, Some(Form::Polite));
+        for bad in [r#""casual""#, r#""""#, r#""Polite""#] {
+            let json = format!(r#"{{"text":"x","target_lang":"ja","form":{bad}}}"#);
+            assert!(serde_json::from_str::<TranslateRequest>(&json).is_err(), "{bad}");
+        }
+        assert_eq!("plain".parse::<Form>(), Ok(Form::Plain));
+        assert!("".parse::<Form>().is_err());
+    }
+
+    #[test]
+    fn zero_chains_are_rejected() {
+        let doc = |chains: &str| format!(r#"{{"segments":["a"],"target_lang":"en","chains":{chains}}}"#);
+        assert_eq!(serde_json::from_str::<DocumentRequest>(&doc("2")).unwrap().chains, NonZeroUsize::new(2));
+        assert!(serde_json::from_str::<DocumentRequest>(&doc("0")).is_err());
     }
 
     #[test]
@@ -338,45 +413,72 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_round_trip() {
-        fn round<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> T {
-            serde_json::from_str(&serde_json::to_string(v).unwrap()).unwrap()
+    fn events_are_tagged_by_type() {
+        fn json<T: Serialize>(v: &T) -> serde_json::Value {
+            serde_json::to_value(v).unwrap()
         }
-        let usage = Usage { prompt_tokens: 1, completion_tokens: 2, elapsed_ms: 3, prefill_ms: 4, queue_ms: 5 };
-        assert!(
-            matches!(round(&StreamEvent::Delta { delta: "a".into() }), StreamEvent::Delta { delta } if delta == "a")
-        );
-        assert!(matches!(
-            round(&StreamEvent::Done { done: true, usage: usage.clone() }),
-            StreamEvent::Done { done: true, usage: Usage { prefill_ms: 4, .. } }
-        ));
-        assert!(
-            matches!(round(&StreamEvent::Error { error: "e".into() }), StreamEvent::Error { error } if error == "e")
+        fn round<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> T {
+            serde_json::from_value(json(v)).unwrap()
+        }
+        let usage = Usage {
+            prompt_tokens: 1,
+            reused_tokens: 6,
+            completion_tokens: 2,
+            queue_ms: 5,
+            prefill_ms: 4,
+            elapsed_ms: 3,
+        };
+        let error = ApiError::new(ErrorCode::PromptTooLong, "too long").in_segment(3);
+        let single = [
+            StreamEvent::Delta { text: "a".into() },
+            StreamEvent::Done { usage: usage.clone() },
+            StreamEvent::Error { error: error.clone() },
+        ];
+        for ev in &single {
+            assert_eq!(&round(ev), ev);
+        }
+        assert_eq!(json(&single[0]), serde_json::json!({"type": "delta", "text": "a"}));
+        assert_eq!(
+            json(&single[2]),
+            serde_json::json!({"type": "error", "error": {"code": "prompt_too_long", "message": "too long", "segment": 3}})
         );
 
-        let du = DocumentUsage { segments: 2, reused_tokens: 7, ..Default::default() };
-        assert!(matches!(
-            round(&DocumentEvent::Delta { segment: 1, delta: "b".into() }),
-            DocumentEvent::Delta { segment: 1, delta } if delta == "b"
-        ));
-        assert!(matches!(
-            round(&DocumentEvent::SegmentEnd { segment: 1, end: true }),
-            DocumentEvent::SegmentEnd { segment: 1, end: true }
-        ));
-        assert!(matches!(
-            round(&DocumentEvent::Done { done: true, usage: du }),
-            DocumentEvent::Done { done: true, usage: DocumentUsage { segments: 2, reused_tokens: 7, .. } }
-        ));
-        assert!(matches!(round(&DocumentEvent::Error { error: "e".into() }), DocumentEvent::Error { .. }));
+        let du = DocumentUsage { segments: 2, chains: 1, total: usage };
+        let doc = [
+            DocumentEvent::Delta { segment: 1, text: "b".into() },
+            DocumentEvent::SegmentDone { segment: 1 },
+            DocumentEvent::Done { usage: du },
+            DocumentEvent::Error { error: ApiError::new(ErrorCode::Internal, "e") },
+        ];
+        for ev in &doc {
+            assert_eq!(&round(ev), ev);
+        }
+        assert_eq!(json(&doc[1]), serde_json::json!({"type": "segment_done", "segment": 1}));
+        // The document's usage is flat, as a single request's with two more fields.
+        assert_eq!(json(&doc[2])["usage"]["reused_tokens"], 6);
+        assert_eq!(json(&doc[2])["usage"]["segments"], 2);
+        // Untagged or unknown events are errors, not a guess.
+        assert!(serde_json::from_str::<StreamEvent>(r#"{"done":true,"usage":{}}"#).is_err());
+        assert!(serde_json::from_str::<StreamEvent>(r#"{"type":"finished"}"#).is_err());
+    }
+
+    #[test]
+    fn errors_and_health_status() {
+        let body = ErrorResponse { error: ApiError::new(ErrorCode::QueueFull, "busy") };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({"error": {"code": "queue_full", "message": "busy"}})
+        );
+        assert_eq!(ApiError::new(ErrorCode::Internal, "x").in_segment(2).to_string(), "segment 2: x");
+        assert_eq!(serde_json::to_value(HealthStatus::Stopped).unwrap(), "stopped");
     }
 
     #[test]
     fn usage_tolerates_missing_fields() {
-        // An older or newer peer may not send every usage field.
-        let ev: DocumentEvent = serde_json::from_str(r#"{"done":true,"usage":{"segments":3}}"#).unwrap();
-        assert!(matches!(ev, DocumentEvent::Done { usage: DocumentUsage { segments: 3, chains: 0, .. }, .. }));
-        let ev: StreamEvent = serde_json::from_str(r#"{"done":true,"usage":{"prompt_tokens":5}}"#).unwrap();
-        assert!(matches!(ev, StreamEvent::Done { usage: Usage { prompt_tokens: 5, elapsed_ms: 0, .. }, .. }));
+        let ev: DocumentEvent = serde_json::from_str(r#"{"type":"done","usage":{"segments":3}}"#).unwrap();
+        assert!(matches!(ev, DocumentEvent::Done { usage: DocumentUsage { segments: 3, chains: 0, .. } }));
+        let ev: StreamEvent = serde_json::from_str(r#"{"type":"done","usage":{"prompt_tokens":5}}"#).unwrap();
+        assert!(matches!(ev, StreamEvent::Done { usage: Usage { prompt_tokens: 5, elapsed_ms: 0, .. } }));
     }
 
     #[test]

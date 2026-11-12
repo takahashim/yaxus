@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::queue::Jobs;
-use yaxus_api::{DocumentEvent, DocumentUsage, StreamEvent, Usage};
+use yaxus_api::{ApiError, DocumentEvent, DocumentUsage, ErrorCode, StreamEvent, Usage};
 use yaxus_model::{Finish, Generator};
 use yaxus_runtime::document::{DocJob, DocRun};
 use yaxus_runtime::memory::{self, Memory};
@@ -57,6 +57,8 @@ struct Doc {
     label: String,
     enqueued: Instant,
     start: Instant,
+    /// When the document's first token came.
+    first_token: Option<Instant>,
 }
 
 /// The documents in progress.
@@ -125,13 +127,14 @@ pub fn run(
 
 /// Tells the clients of the requests in flight and of every document that they failed.
 fn fail_all(owners: Vec<Owner>, docs: &mut Docs, msg: &str) {
+    let error = ApiError::new(ErrorCode::Internal, msg);
     for owner in owners {
         if let Owner::Single { events, .. } = owner {
-            let _ = events.send(StreamEvent::Error { error: msg.to_string() });
+            let _ = events.send(StreamEvent::Error { error: error.clone() });
         }
     }
     for (_, d) in docs.docs.drain() {
-        let _ = d.events.send(DocumentEvent::Error { error: msg.to_string() });
+        let _ = d.events.send(DocumentEvent::Error { error: error.clone() });
     }
 }
 
@@ -147,8 +150,14 @@ fn add(job: Job, session: &mut Session<Owner>, docs: &mut Docs) {
         Work::Document { job: doc, events } => {
             docs.next_key += 1;
             let key = docs.next_key;
-            let d =
-                Doc { run: DocRun::new(*doc), events, label: job.label, enqueued: job.enqueued, start: Instant::now() };
+            let d = Doc {
+                run: DocRun::new(*doc),
+                events,
+                label: job.label,
+                enqueued: job.enqueued,
+                start: Instant::now(),
+                first_token: None,
+            };
             docs.docs.insert(key, d);
             submit_ready(key, session, docs);
         }
@@ -161,29 +170,30 @@ fn submit_ready(key: u64, session: &mut Session<Owner>, docs: &mut Docs) {
     let Some(d) = docs.docs.get_mut(&key) else { return };
     // A history that leaves too little room is dropped.
     if let Err(e) = d.run.submit_ready(session, |segment| Owner::Doc { key, segment }) {
-        let _ = d.events.send(DocumentEvent::Error { error: e.0 });
+        let _ = d.events.send(DocumentEvent::Error { error: crate::segment_error(e) });
     }
     if !d.run.is_over() {
         return;
     }
     // Segments without text complete without the engine.
     if d.run.is_complete() {
-        let usage = DocumentUsage {
-            elapsed_ms: d.start.elapsed().as_millis() as u64,
-            queue_ms: (d.start - d.enqueued).as_millis() as u64,
-            ..d.run.usage().clone()
-        };
+        let mut usage: DocumentUsage = d.run.usage().clone();
+        let ms = |t: std::time::Duration| t.as_millis() as u64;
+        usage.total.queue_ms = ms(d.start - d.enqueued);
+        usage.total.prefill_ms = d.first_token.map_or(0, |t| ms(t - d.start));
+        usage.total.elapsed_ms = ms(d.start.elapsed());
+        let t = &usage.total;
         tracing::info!(
             "{}: document of {} segments in {} chains, {} -> {} tokens ({} reused) in {} ms",
             d.label,
             usage.segments,
             usage.chains,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.reused_tokens,
-            usage.elapsed_ms
+            t.prompt_tokens,
+            t.completion_tokens,
+            t.reused_tokens,
+            t.elapsed_ms
         );
-        let _ = d.events.send(DocumentEvent::Done { done: true, usage });
+        let _ = d.events.send(DocumentEvent::Done { usage });
     }
     docs.docs.remove(&key);
 }
@@ -196,7 +206,7 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
             if text.is_empty() {
                 !events.is_closed()
             } else {
-                events.send(StreamEvent::Delta { delta: text.to_string() }).is_ok()
+                events.send(StreamEvent::Delta { text: text.to_string() }).is_ok()
             }
         }
         Update::Delta { tag: Owner::Doc { key, segment }, text } => {
@@ -205,7 +215,8 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
                 && if text.is_empty() {
                     !d.events.is_closed()
                 } else {
-                    d.events.send(DocumentEvent::Delta { segment: *segment, delta: text.to_string() }).is_ok()
+                    d.first_token.get_or_insert_with(Instant::now);
+                    d.events.send(DocumentEvent::Delta { segment: *segment, text: text.to_string() }).is_ok()
                 };
             if !ok {
                 d.run.stop();
@@ -215,13 +226,13 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         Update::Done { tag: Owner::Single { events, label, enqueued }, done } => {
             let usage = usage(&done, enqueued);
             log_single(&label, &usage, &done);
-            let _ = events.send(StreamEvent::Done { done: true, usage });
+            let _ = events.send(StreamEvent::Done { usage });
             true
         }
         Update::Done { tag: Owner::Doc { key, segment }, done } => {
             if let Some(d) = docs.docs.get_mut(&key) {
                 if d.run.on_done(segment, done).is_some()
-                    && d.events.send(DocumentEvent::SegmentEnd { segment, end: true }).is_err()
+                    && d.events.send(DocumentEvent::SegmentDone { segment }).is_err()
                 {
                     d.run.stop();
                 }
@@ -231,14 +242,15 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
         }
         Update::Failed { tag: Owner::Single { events, label, .. }, message } => {
             tracing::warn!("{label}: generation failed: {message}");
-            let _ = events.send(StreamEvent::Error { error: message });
+            let _ = events.send(StreamEvent::Error { error: ApiError::new(ErrorCode::Internal, message) });
             true
         }
         Update::Failed { tag: Owner::Doc { key, segment }, message } => {
             if let Some(d) = docs.docs.get_mut(&key) {
                 tracing::warn!("{}: segment {segment} failed: {message}", d.label);
-                if let Some(e) = d.run.on_failed(segment, &message) {
-                    let _ = d.events.send(DocumentEvent::Error { error: e });
+                if d.run.on_failed() {
+                    let error = ApiError::new(ErrorCode::Internal, message).in_segment(segment);
+                    let _ = d.events.send(DocumentEvent::Error { error });
                 }
                 docs.resubmit.push(key);
             }
@@ -251,10 +263,11 @@ fn handle(u: Update<'_, Owner>, docs: &mut Docs) -> bool {
 fn usage(done: &Finished, enqueued: Instant) -> Usage {
     Usage {
         prompt_tokens: done.prompt_tokens,
+        reused_tokens: done.start.reused,
         completion_tokens: done.generated,
-        elapsed_ms: done.elapsed().as_millis() as u64,
-        prefill_ms: done.prefill().as_millis() as u64,
         queue_ms: (done.submitted - enqueued).as_millis() as u64,
+        prefill_ms: done.prefill().as_millis() as u64,
+        elapsed_ms: done.elapsed().as_millis() as u64,
     }
 }
 
@@ -346,7 +359,9 @@ mod tests {
         // The worker returns instead of serving from the broken engine (a timeout rather
         // than join(), so that a regression fails instead of hanging the test run).
         assert!(done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the worker kept running");
-        assert!(matches!(out.try_recv(), Ok(StreamEvent::Error { error: m }) if m.contains("internal error")));
+        assert!(
+            matches!(out.try_recv(), Ok(StreamEvent::Error { error: ApiError { code: ErrorCode::Internal, message: m, .. } }) if m.contains("internal error"))
+        );
         assert!(queue.is_closed());
         assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
         assert!(!aborted.load(Ordering::SeqCst), "the broken engine was called again");

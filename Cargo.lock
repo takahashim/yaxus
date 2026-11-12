@@ -2773,6 +2773,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
+ "thiserror 2.0.21",
  "tracing",
  "yaxus-api",
  "yaxus-backend-cpu",
@@ -2797,6 +2798,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "yaxus-api",
  "yaxus-model",
