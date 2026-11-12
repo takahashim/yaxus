@@ -200,8 +200,6 @@ pub struct Gpu {
     coop: bool,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
-    /// Kernels for passes of up to 16 rows, set per call from the model's handle.
-    gemv: Gemv,
     /// Bytes uploaded since the staging memory was last released.
     unflushed_upload: usize,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
@@ -643,7 +641,6 @@ impl Gpu {
             subgroups,
             coop,
             gemm: GemmKind::from_env(),
-            gemv: Gemv::from_env(),
             tile_wgs: std::env::var("YAXUS_TILE_WGS").ok().and_then(|v| v.parse().ok()).unwrap_or(384),
             unflushed_upload: 0,
             oversized: None,
@@ -1241,7 +1238,9 @@ impl Gpu {
         y
     }
 
-    fn matmul(&mut self, x: &Tensor, w: &Weight) -> Tensor {
+    /// `x · w^T`; passes of up to 16 rows (and more where the integer GEMVs win) take
+    /// the kernels `gemv` says.
+    fn matmul(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
         let (n, k, suffix) = (m.n, m.k, m.fmt.suffix());
         assert_eq!(x.cols, k, "matmul inner dim");
@@ -1255,7 +1254,7 @@ impl Gpu {
         };
         if t <= self.gemv_max_rows()
             && self.subgroups
-            && let Some(planes) = self.gemv.planes(t)
+            && let Some(planes) = gemv.planes(t)
             && let Some(f) = m.fmt.gemv_int()
         {
             let [wq, wsc] = <[wgpu::Buffer; 2]>::try_from(m.decode_bufs()).unwrap();
@@ -1604,13 +1603,13 @@ impl Gpu {
         name
     }
 
-    fn matmul_glu(&mut self, x: &Tensor, w: &Weight) -> Tensor {
+    fn matmul_glu(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
         let m = w.matrix();
         let (n2, k) = (m.n, m.k);
         assert_eq!(x.cols, k);
         if x.rows <= self.gemv_max_rows()
             && self.subgroups
-            && let Some(planes) = self.gemv.planes(x.rows)
+            && let Some(planes) = gemv.planes(x.rows)
             && let Some(f) = m.fmt.gemv_int()
         {
             let y = self.tensor(x.rows, n2 / 2);
@@ -1619,7 +1618,7 @@ impl Gpu {
             return y;
         }
         if x.rows != 1 {
-            let gu = self.matmul(x, w);
+            let gu = self.matmul(x, w, gemv);
             return self.swiglu(&gu);
         }
         // (for Q4 the block variant `GLU_32` measured slower: 174 vs 138 us on 12288x1536)
@@ -1868,11 +1867,12 @@ impl Gpu {
         n: usize,
         k: usize,
         glu: bool,
+        gemv: Gemv,
     ) -> Vec<f32> {
         let w = Weight::Matrix(self.load_ggml(dtype, bytes, n, k).expect("a type with a GPU layout"));
         let xt = self.tensor(t, k);
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
-        let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
+        let y = if glu { self.matmul_glu(&xt, &w, gemv) } else { self.matmul(&xt, &w, gemv) };
         self.to_host(&y)
     }
 
@@ -1889,11 +1889,12 @@ impl Gpu {
         k: usize,
         quant: Quant,
         glu: bool,
+        gemv: Gemv,
     ) -> Vec<f32> {
         let w = Weight::Matrix(self.load_matrix(w, n, k, quant).unwrap());
         let xt = self.tensor(t, k);
         self.queue.write_buffer(xt.buf(), 0, bytemuck::cast_slice(x));
-        let y = if glu { self.matmul_glu(&xt, &w) } else { self.matmul(&xt, &w) };
+        let y = if glu { self.matmul_glu(&xt, &w, gemv) } else { self.matmul(&xt, &w, gemv) };
         self.to_host(&y)
     }
 
@@ -2029,9 +2030,8 @@ impl WgpuBackend {
         k: usize,
         glu: bool,
     ) -> Vec<f32> {
-        let mut g = self.g();
-        g.gemv = self.gemv;
-        g.debug_matmul_ggml(x, t, dtype, bytes, n, k, glu)
+        let gemv = self.gemv;
+        self.g().debug_matmul_ggml(x, t, dtype, bytes, n, k, glu, gemv)
     }
 
     /// Test hook, see [`Gpu::debug_matmul`].
@@ -2047,9 +2047,8 @@ impl WgpuBackend {
         quant: Quant,
         glu: bool,
     ) -> Vec<f32> {
-        let mut g = self.g();
-        g.gemv = self.gemv;
-        g.debug_matmul(x, t, w, n, k, quant, glu)
+        let gemv = self.gemv;
+        self.g().debug_matmul(x, t, w, n, k, quant, glu, gemv)
     }
 
     #[doc(hidden)]
@@ -2120,9 +2119,8 @@ impl Backend for WgpuBackend {
         self.g().rmsnorm(x, w, offset, eps)
     }
     fn matmul(&mut self, x: &Tensor, w: &Weight) -> Tensor {
-        let mut g = self.g();
-        g.gemv = self.gemv;
-        g.matmul(x, w)
+        let gemv = self.gemv;
+        self.g().matmul(x, w, gemv)
     }
     fn attention(
         &mut self,
@@ -2154,9 +2152,8 @@ impl Backend for WgpuBackend {
         self.g().add_norm(x, delta, post_w, post_offset, pre_w, pre_offset, eps)
     }
     fn matmul_glu(&mut self, x: &Tensor, w: &Weight) -> Tensor {
-        let mut g = self.g();
-        g.gemv = self.gemv;
-        g.matmul_glu(x, w)
+        let gemv = self.gemv;
+        self.g().matmul_glu(x, w, gemv)
     }
     fn select_rows(&mut self, x: &Tensor, rows: &[usize]) -> Tensor {
         self.g().select_rows(x, rows)
