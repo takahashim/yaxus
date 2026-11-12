@@ -8,8 +8,9 @@ use crate::{ATTN_TILE_SHARED_BYTES, Format, GEMV_MAX_T, GEMVM_MAX_T, GemmKind, G
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MatmulPlan {
     /// Integer GEMVs (`gemv_int`) of up to 16 rows each, with activations in `planes`
-    /// int8 planes.
-    GemvInt { planes: usize },
+    /// int8 planes; a single row rounds them inside the kernel with `inline` (see
+    /// [`gemv_int_inline`]).
+    GemvInt { planes: usize, inline: bool },
     /// The integer GEMM (`gemm_int`), for more than 16 rows.
     GemmInt { planes: usize },
     /// Multi-row f32 GEMVs (`gemvm`): the first `first` rows in one dispatch, the rest
@@ -54,7 +55,7 @@ impl MatmulCase {
             && let Some(planes) = gemv.planes(t)
             && fmt.gemv_int().is_some()
         {
-            return MatmulPlan::GemvInt { planes };
+            return MatmulPlan::GemvInt { planes, inline: gemv_int_inline(caps, t) };
         }
         if t > GEMVM_MAX_T
             && let Some(planes) = gemm.planes()
@@ -82,18 +83,27 @@ impl MatmulCase {
     /// The kernels of `swiglu(x · w^T)` for a fused gate/up matrix `w`.
     pub(crate) fn plan_glu(&self, caps: &DeviceCaps, tuning: &Tuning) -> GluPlan {
         match self.plan(caps, tuning) {
-            MatmulPlan::GemvInt { planes } => GluPlan::GemvInt { planes },
+            MatmulPlan::GemvInt { planes, inline } => GluPlan::GemvInt { planes, inline },
             _ if self.t == 1 => GluPlan::Glu1,
             _ => GluPlan::MatmulThenSwiglu,
         }
     }
 }
 
+/// Whether an integer GEMV of `t` rows rounds its activations inside the kernel rather
+/// than in an `xquant` dispatch of their own (which costs more than its work when a pass
+/// is bound by reading the weights): single rows, except where the compiler uses fast
+/// math. The rounding inside the kernel then need not give the bits of `xquant`'s, and a
+/// row's result would depend on whether it ran alone.
+pub(crate) fn gemv_int_inline(caps: &DeviceCaps, t: usize) -> bool {
+    t == 1 && !caps.fast_math
+}
+
 /// The kernels of `swiglu(x · w^T)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GluPlan {
     /// Integer GEMVs that store `silu(gate) * up` themselves.
-    GemvInt { planes: usize },
+    GemvInt { planes: usize, inline: bool },
     /// The single-row f32 GLU kernel.
     Glu1,
     /// The matrix product's plan, then the `swiglu` kernel.
@@ -192,6 +202,7 @@ mod tests {
             f16: true,
             subgroups,
             coop,
+            fast_math: false,
             timestamps: false,
             max_workgroup_storage: 65536,
         }
@@ -210,9 +221,13 @@ mod tests {
         let (c, tu) = (caps(true, true), tuning());
         let int = |t, fmt| mm(t, fmt, GemmKind::Int16, Gemv::INT16).plan(&c, &tu);
         // Integer GEMVs up to 48 rows, then the integer GEMM.
-        assert_eq!(int(1, Format::Q8), MatmulPlan::GemvInt { planes: 2 });
-        assert_eq!(int(48, Format::Q4K), MatmulPlan::GemvInt { planes: 2 });
+        assert_eq!(int(1, Format::Q8), MatmulPlan::GemvInt { planes: 2, inline: true });
+        assert_eq!(int(48, Format::Q4K), MatmulPlan::GemvInt { planes: 2, inline: false });
         assert_eq!(int(49, Format::Q4K), MatmulPlan::GemmInt { planes: 2 });
+        // With fast math (Metal) single rows are rounded by `xquant`, as longer passes are.
+        let fast = DeviceCaps { fast_math: true, ..c.clone() };
+        let one = mm(1, Format::Q8, GemmKind::Int16, Gemv::INT16).plan(&fast, &tu);
+        assert_eq!(one, MatmulPlan::GemvInt { planes: 2, inline: false });
         // bf16 has no integer kernels: multi-row GEMVs, two for 17..=20 rows, then the GEMM.
         assert_eq!(int(1, Format::Bf16), MatmulPlan::Gemv1);
         assert_eq!(int(16, Format::Bf16), MatmulPlan::GemvMulti { first: 16 });
@@ -239,7 +254,7 @@ mod tests {
         let case = |t| mm(t, Format::Q2, GemmKind::Int16, Gemv::INT16.for_draft());
         assert_eq!(case(1).plan(&c, &tu), MatmulPlan::Gemv1);
         assert_eq!(case(1).plan_glu(&c, &tu), GluPlan::Glu1);
-        assert_eq!(case(4).plan_glu(&c, &tu), GluPlan::GemvInt { planes: 2 });
+        assert_eq!(case(4).plan_glu(&c, &tu), GluPlan::GemvInt { planes: 2, inline: false });
         let bf16 = MatmulCase { fmt: Format::Bf16, ..case(4) };
         assert_eq!(bf16.plan_glu(&c, &tu), GluPlan::MatmulThenSwiglu);
     }

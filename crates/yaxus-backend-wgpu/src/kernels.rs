@@ -135,8 +135,7 @@ impl Gpu {
         if !self.caps.subgroups {
             return;
         }
-        let gemvi_rows = self.tuning.gemvi_rows;
-        let inline = self.tuning.gemvi_inline;
+        let rw = self.tuning.gemvi_rows;
         // (name, bindings, source)
         type Job = (String, Vec<bool>, Box<dyn Fn() -> String + Send + Sync>);
         let mut jobs: Vec<Job> = Vec::new();
@@ -148,22 +147,15 @@ impl Gpu {
             ));
             for f in formats.iter().filter_map(|f| f.gemv_int()) {
                 for glu in [false, true] {
-                    if !gemv.single_f32 && inline {
-                        let rw = gemvi_rows;
+                    // (the row counts and the rounding as `MatmulCase::plan` picks them)
+                    for t in (1..=GEMVM_MAX_T).filter(|&t| gemv.planes(t).is_some()) {
+                        let inline = plan::gemv_int_inline(&self.caps, t);
+                        let bindings =
+                            if inline { vec![false, true, true, true] } else { vec![false, true, true, true, true] };
                         jobs.push((
-                            name::gemv_int(planes, 1, rw, glu, true, f.name),
-                            vec![false, true, true, true],
-                            Box::new(move || gemv_int::source(f, 1, planes, rw, glu, true)),
-                        ));
-                    }
-                    // (single rows take the 1-row kernel of these without `inline`)
-                    let first = if inline || gemv.single_f32 { 2 } else { 1 };
-                    for t in first..=GEMVM_MAX_T {
-                        let rw = gemvi_rows;
-                        jobs.push((
-                            name::gemv_int(planes, t, rw, glu, false, f.name),
-                            vec![false, true, true, true, true],
-                            Box::new(move || gemv_int::source(f, t, planes, rw, glu, false)),
+                            name::gemv_int(planes, t, rw, glu, inline, f.name),
+                            bindings,
+                            Box::new(move || gemv_int::source(f, t, planes, rw, glu, inline)),
                         ));
                     }
                 }

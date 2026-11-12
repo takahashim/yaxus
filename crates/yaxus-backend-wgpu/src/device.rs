@@ -49,6 +49,10 @@ pub struct DeviceCaps {
     /// Cooperative matrices of 16x16x16 with f16 operands and f32 accumulators (the
     /// `Coop` GEMM).
     pub coop: bool,
+    /// The shader compiler may reassociate float arithmetic and contract it into FMAs
+    /// (Metal: wgpu leaves `MTLCompileOptions` at their defaults and offers no way to turn
+    /// it off). Kernels that must agree to the bit then may not.
+    pub fast_math: bool,
     /// Timestamp queries (`YAXUS_PROFILE=2`).
     pub timestamps: bool,
     pub max_workgroup_storage: u32,
@@ -81,6 +85,7 @@ impl DeviceCaps {
             f16,
             subgroups,
             coop,
+            fast_math: info.backend == wgpu::Backend::Metal,
             timestamps: features.contains(wgpu::Features::TIMESTAMP_QUERY),
             max_workgroup_storage: adapter.limits().max_compute_workgroup_storage_size.min(65536),
         }
@@ -123,12 +128,6 @@ pub struct Tuning {
     /// 16 rows 185 / 116 / 109 / 180; single-row decode in tok/s with 1 / 4 / 8: 2B Q4_K_M
     /// 44.1 / 44.6 / 43.6, 0.8B Q2_K 166 / 188 / 184.
     pub gemvi_rows: usize,
-    /// Single rows through the integer GEMV round their activations inside the kernel
-    /// (no `xquant` dispatch of their own, which costs more than its work when a pass is
-    /// bound by reading the weights). Off on Metal: it compiles with fast math, and the
-    /// rounding inside the kernel then need not give the bits of `xquant`'s, so a row's
-    /// result would depend on whether it ran alone.
-    pub gemvi_inline: bool,
     /// Passes with at most this many rows use the split-key attention (a workgroup per
     /// row and chunk of keys). Decode passes are rows of different requests, which the
     /// tiled attention of prompt passes handles badly: 16 requests in one pass took 74 ms
@@ -166,7 +165,6 @@ impl Tuning {
             multi_split_max_rows: 20,
             gemvm_rows: 2,
             gemvi_rows: 4,
-            gemvi_inline: true,
             split_attn_max_rows: 16,
             attn_split_wgs: 64,
             short_context: 64,
@@ -181,9 +179,6 @@ impl Tuning {
     /// as they are measured.
     pub fn for_device(caps: &DeviceCaps) -> Self {
         let mut t = Tuning::radeon_780m();
-        if caps.backend == wgpu::Backend::Metal {
-            t.gemvi_inline = false;
-        }
         if caps.vendor == Vendor::Apple {
             // Apple GPUs have no integer dot product: `dot4I8Packed` is four multiplies
             // and the byte extractions, and the integer kernels lose to the f32 ones
