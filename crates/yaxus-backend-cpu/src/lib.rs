@@ -25,10 +25,46 @@ impl Tensor {
     }
 }
 
+/// A weight as the CPU keeps it: bf16 (vectors, and matrices loaded as bf16) or Q8.
 pub enum Weight {
-    Mapped(TensorRef),
-    Owned(Vec<u16>, Vec<usize>),
+    Bf16(Bf16Matrix),
     Q8(Q8Matrix),
+}
+
+/// The bf16 values of a weight: borrowed from the file's mapping, or decoded from
+/// another format.
+enum Bf16Data {
+    Mapped(TensorRef),
+    Owned(Vec<u16>),
+}
+
+/// A bf16 weight of any shape (`[N, K]` for matrices).
+pub struct Bf16Matrix {
+    data: Bf16Data,
+    shape: Vec<usize>,
+}
+
+impl Bf16Matrix {
+    /// The tensor's values as bf16, without a copy when they are stored so.
+    fn from_tensor(t: &TensorRef) -> Self {
+        let data = match t.as_bf16() {
+            Some(_) => Bf16Data::Mapped(t.clone()),
+            None => Bf16Data::Owned(t.to_bf16_vec()),
+        };
+        Bf16Matrix { data, shape: t.shape.clone() }
+    }
+
+    #[cfg(test)]
+    fn owned(values: Vec<u16>, shape: &[usize]) -> Self {
+        Bf16Matrix { data: Bf16Data::Owned(values), shape: shape.to_vec() }
+    }
+
+    fn values(&self) -> &[u16] {
+        match &self.data {
+            Bf16Data::Mapped(t) => t.as_bf16().expect("checked at load"),
+            Bf16Data::Owned(v) => v,
+        }
+    }
 }
 
 /// `[N, K]` matrix; row `n` block `b` is `qs[n*K + b*32 ..][..32] * scales[n*K/32 + b]`.
@@ -44,24 +80,106 @@ impl Q8Matrix {
         Q8Matrix { qs: q.qs, scales: q.scales, shape: shape.to_vec() }
     }
 
+    fn from_tensor(t: &TensorRef) -> Self {
+        match t.as_bf16() {
+            Some(b) => Q8Matrix::quantize(b, &t.shape),
+            None => Q8Matrix::quantize(&t.to_bf16_vec(), &t.shape),
+        }
+    }
+
     fn row(&self, n: usize) -> (&[i8], &[f16]) {
         let k = self.shape[1];
         (&self.qs[n * k..(n + 1) * k], &self.scales[n * k / Q8_BLOCK..(n + 1) * k / Q8_BLOCK])
     }
 }
 
-impl Weight {
-    fn bf16(&self) -> &[u16] {
-        match self {
-            Weight::Mapped(t) => t.as_bf16().expect("checked at load"),
-            Weight::Owned(v, _) => v,
-            Weight::Q8(_) => panic!("bf16 view of a quantized weight"),
+/// The rows of an `[N, K]` weight matrix, as `matmul` reads them.
+trait MatrixRows: Sync {
+    fn shape(&self) -> (usize, usize);
+    /// `w[j] · x`, reading the stored row directly (few activation rows).
+    fn dot_row(&self, j: usize, x: &[f32]) -> f32;
+    /// Row `j` as f32, to be reused for many activation rows.
+    fn decode_row(&self, j: usize, out: &mut [f32]);
+}
+
+/// The rows of a bf16 matrix, its values looked up once.
+struct Bf16Rows<'a> {
+    values: &'a [u16],
+    n: usize,
+    k: usize,
+}
+
+impl Bf16Matrix {
+    fn rows(&self) -> Bf16Rows<'_> {
+        Bf16Rows { values: self.values(), n: self.shape[0], k: self.shape[1] }
+    }
+}
+
+impl MatrixRows for Bf16Rows<'_> {
+    fn shape(&self) -> (usize, usize) {
+        (self.n, self.k)
+    }
+    fn dot_row(&self, j: usize, x: &[f32]) -> f32 {
+        dot_bf16(&self.values[j * self.k..(j + 1) * self.k], x)
+    }
+    fn decode_row(&self, j: usize, out: &mut [f32]) {
+        for (r, &b) in out.iter_mut().zip(&self.values[j * self.k..(j + 1) * self.k]) {
+            *r = bf16_to_f32(b);
         }
     }
+}
+
+impl MatrixRows for Q8Matrix {
+    fn shape(&self) -> (usize, usize) {
+        (self.shape[0], self.shape[1])
+    }
+    fn dot_row(&self, j: usize, x: &[f32]) -> f32 {
+        let (qs, sc) = self.row(j);
+        dot_q8(qs, sc, x)
+    }
+    fn decode_row(&self, j: usize, out: &mut [f32]) {
+        let (qs, sc) = self.row(j);
+        dequant_q8_row(qs, sc, out);
+    }
+}
+
+/// How the CPU keeps a weight loaded with `quant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuFormat {
+    Bf16,
+    Q8,
+}
+
+impl CpuFormat {
+    /// Bf16 as asked; Q8 for Q8 and the file-dependent formats (the CPU keeps no GGUF
+    /// format of its own), for matrices whose rows are whole Q8 blocks; Q4 is Vulkan only.
+    fn of(quant: Quant, shape: &[usize]) -> Result<Self> {
+        match quant {
+            Quant::Bf16 => Ok(CpuFormat::Bf16),
+            Quant::Q4 => anyhow::bail!("q4 weights are only supported on the Vulkan backend"),
+            Quant::Q8 | Quant::Auto | Quant::Auto4 => {
+                anyhow::ensure!(
+                    matches!(shape, [_, k] if k.is_multiple_of(Q8_BLOCK)),
+                    "q8 needs a matrix whose rows are a multiple of {Q8_BLOCK} (shape {shape:?})"
+                );
+                Ok(CpuFormat::Q8)
+            }
+        }
+    }
+}
+
+impl Weight {
+    /// The values of a vector (or of the embedding table), which are always bf16.
+    fn as_vector(&self) -> &[u16] {
+        match self {
+            Weight::Bf16(m) => m.values(),
+            Weight::Q8(_) => panic!("vectors and the embedding table are loaded as bf16"),
+        }
+    }
+
     fn shape(&self) -> &[usize] {
         match self {
-            Weight::Mapped(t) => &t.shape,
-            Weight::Owned(_, s) => s,
+            Weight::Bf16(m) => &m.shape,
             Weight::Q8(q) => &q.shape,
         }
     }
@@ -69,12 +187,13 @@ impl Weight {
     /// Bytes this weight occupies.
     pub fn nbytes(&self) -> usize {
         match self {
+            Weight::Bf16(m) => m.values().len() * 2,
             Weight::Q8(q) => q.qs.len() + q.scales.len() * 2,
-            _ => self.bf16().len() * 2,
         }
     }
-    fn to_f32(&self) -> Vec<f32> {
-        self.bf16().iter().map(|&x| bf16_to_f32(x)).collect()
+
+    fn vector_f32(&self) -> Vec<f32> {
+        self.as_vector().iter().map(|&x| bf16_to_f32(x)).collect()
     }
 }
 
@@ -212,6 +331,42 @@ fn rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     }
 }
 
+/// `x [T, K] · w[N, K]^T -> [T, N]`.
+fn matmul<M: MatrixRows>(x: &Tensor, w: &M) -> Tensor {
+    let (n, k) = w.shape();
+    assert_eq!(x.cols, k, "matmul inner dim");
+    let t = x.rows;
+    // Compute transposed [N, T] so each task owns one weight row.
+    let mut tr = vec![0f32; n * t];
+    tr.par_chunks_mut(t).enumerate().with_min_len(8).for_each_init(
+        || vec![0f32; k],
+        |row, (j, out)| {
+            if t < DECODE_ROW_MIN_T {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = w.dot_row(j, x.row(i));
+                }
+            } else {
+                w.decode_row(j, row);
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = dot(x.row(i), row);
+                }
+            }
+        },
+    );
+    if t == 1 {
+        return Tensor { data: tr, rows: 1, cols: n };
+    }
+    // Transpose back, one output row per task (about 2% of a 512-row matmul; a serial
+    // loop took a few times longer).
+    let mut out = Tensor::zeros(t, n);
+    out.data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+        for (j, o) in row.iter_mut().enumerate() {
+            *o = tr[j * t + i];
+        }
+    });
+    out
+}
+
 impl Backend for CpuBackend {
     type Tensor = Tensor;
     type Weight = Weight;
@@ -226,18 +381,9 @@ impl Backend for CpuBackend {
     }
 
     fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
-        let w = match (quant, t.as_bf16()) {
-            (Quant::Q4, _) => anyhow::bail!("q4 weights are only supported on the Vulkan backend"),
-            (Quant::Q8 | Quant::Auto | Quant::Auto4, _) if !matches!(t.shape[..], [_, k] if k.is_multiple_of(Q8_BLOCK)) =>
-            {
-                anyhow::bail!("q8 needs a matrix whose rows are a multiple of {Q8_BLOCK} (shape {:?})", t.shape)
-            }
-            (Quant::Q8 | Quant::Auto | Quant::Auto4, Some(b)) => Weight::Q8(Q8Matrix::quantize(b, &t.shape)),
-            (Quant::Q8 | Quant::Auto | Quant::Auto4, None) => {
-                Weight::Q8(Q8Matrix::quantize(&t.to_bf16_vec(), &t.shape))
-            }
-            (Quant::Bf16, Some(_)) => Weight::Mapped(t.clone()),
-            (Quant::Bf16, None) => Weight::Owned(t.to_bf16_vec(), t.shape.clone()),
+        let w = match CpuFormat::of(quant, &t.shape)? {
+            CpuFormat::Bf16 => Weight::Bf16(Bf16Matrix::from_tensor(t)),
+            CpuFormat::Q8 => Weight::Q8(Q8Matrix::from_tensor(t)),
         };
         self.weight_bytes += w.nbytes();
         Ok(w)
@@ -267,7 +413,7 @@ impl Backend for CpuBackend {
     fn embed(&mut self, table: &Weight) -> Tensor {
         let ids = &self.pass.ids;
         let h = table.shape()[1];
-        let w = table.bf16();
+        let w = table.as_vector();
         let mut out = Tensor::zeros(ids.len(), h);
         for (r, &id) in ids.iter().enumerate() {
             let src = &w[id as usize * h..(id as usize + 1) * h];
@@ -279,7 +425,7 @@ impl Backend for CpuBackend {
     }
 
     fn rmsnorm(&mut self, x: &Tensor, w: &Weight, offset: f32, eps: f32) -> Tensor {
-        let w = w.to_f32();
+        let w = w.vector_f32();
         let mut out = Tensor::zeros(x.rows, x.cols);
         out.data
             .par_chunks_mut(x.cols)
@@ -289,63 +435,10 @@ impl Backend for CpuBackend {
     }
 
     fn matmul(&mut self, x: &Tensor, w: &Weight) -> Tensor {
-        let (n, k) = (w.shape()[0], w.shape()[1]);
-        assert_eq!(x.cols, k, "matmul inner dim");
-        let t = x.rows;
-        // Compute transposed [N, T] so each task owns one weight row.
-        let mut tr = vec![0f32; n * t];
-        let tasks = tr.par_chunks_mut(t).enumerate().with_min_len(8);
         match w {
-            Weight::Q8(q) => tasks.for_each_init(
-                || vec![0f32; k],
-                |row, (j, out)| {
-                    let (qs, sc) = q.row(j);
-                    if t < DECODE_ROW_MIN_T {
-                        for (i, o) in out.iter_mut().enumerate() {
-                            *o = dot_q8(qs, sc, x.row(i));
-                        }
-                    } else {
-                        dequant_q8_row(qs, sc, row);
-                        for (i, o) in out.iter_mut().enumerate() {
-                            *o = dot(x.row(i), row);
-                        }
-                    }
-                },
-            ),
-            _ => {
-                let wb = w.bf16();
-                tasks.for_each_init(
-                    || vec![0f32; k],
-                    |row, (j, out)| {
-                        let src = &wb[j * k..(j + 1) * k];
-                        if t < DECODE_ROW_MIN_T {
-                            for (i, o) in out.iter_mut().enumerate() {
-                                *o = dot_bf16(src, x.row(i));
-                            }
-                        } else {
-                            for (r, &b) in row.iter_mut().zip(src) {
-                                *r = bf16_to_f32(b);
-                            }
-                            for (i, o) in out.iter_mut().enumerate() {
-                                *o = dot(x.row(i), row);
-                            }
-                        }
-                    },
-                )
-            }
+            Weight::Bf16(m) => matmul(x, &m.rows()),
+            Weight::Q8(q) => matmul(x, q),
         }
-        if t == 1 {
-            return Tensor { data: tr, rows: 1, cols: n };
-        }
-        // Transpose back, one output row per task (about 2% of a 512-row matmul; a serial
-        // loop took a few times longer).
-        let mut out = Tensor::zeros(t, n);
-        out.data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
-            for (j, o) in row.iter_mut().enumerate() {
-                *o = tr[j * t + i];
-            }
-        });
-        out
     }
 
     fn attention(
@@ -362,8 +455,8 @@ impl Backend for CpuBackend {
         let (qd, kvd) = (hq * d, hkv * d);
         let group = hq / hkv;
         let t = qkv.rows;
-        let qn = q_norm.to_f32();
-        let kn = k_norm.to_f32();
+        let qn = q_norm.vector_f32();
+        let kn = k_norm.vector_f32();
         let eps = cfg.rms_norm_eps;
         let lc = &mut kv.layers[layer.index];
         assert_eq!(t, pass.pos.len(), "attention rows differ from the pass");
@@ -576,7 +669,7 @@ mod tests {
         let cols = qkv[0][0].len();
         let data = rows.iter().flat_map(|&(sq, p)| qkv[sq][p].iter().copied()).collect();
         let x = Tensor { data, rows: rows.len(), cols };
-        let norm = Weight::Owned(vec![0; cfg.head_dim], vec![cfg.head_dim]);
+        let norm = Weight::Bf16(Bf16Matrix::owned(vec![0; cfg.head_dim], &[cfg.head_dim]));
         let out = b.attention(&x, &norm, &norm, kv, cfg, layer);
         (0..out.rows).map(|r| out.row(r).to_vec()).collect()
     }
@@ -630,7 +723,7 @@ mod tests {
         // weights (and, depending on the path, of the input), so it is compared with a
         // tolerance relative to the size of the terms.
         let weights = [
-            ("bf16", Weight::Owned(w.clone(), vec![n, k]), 1e-4),
+            ("bf16", Weight::Bf16(Bf16Matrix::owned(w.clone(), &[n, k])), 1e-4),
             ("q8", Weight::Q8(Q8Matrix::quantize(&w, &[n, k])), 2e-2),
         ];
         for (name, weight, tol) in &weights {
