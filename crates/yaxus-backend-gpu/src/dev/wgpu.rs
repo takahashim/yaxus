@@ -219,12 +219,25 @@ impl WgpuDev {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        #[cfg(not(target_arch = "wasm32"))]
         if bytes.len() as u64 == size {
             self.queue.write_buffer(&buf, 0, bytes);
         } else {
             let mut padded = bytes.to_vec();
             padded.resize(size as usize, 0);
             self.queue.write_buffer(&buf, 0, &padded);
+        }
+        // WebGPU: write in chunks, so the browser does not hold a second copy of a
+        // whole tensor (the largest is 136 MB) in its staging memory at once.
+        #[cfg(target_arch = "wasm32")]
+        {
+            const CHUNK: usize = 16 << 20;
+            let mut off = 0usize;
+            while off < bytes.len() {
+                let end = (off + CHUNK).min(bytes.len());
+                self.queue.write_buffer(&buf, off as u64, &bytes[off..end]);
+                off = end;
+            }
         }
         // Initial contents go through staging memory that is only released after the
         // next submission; flush regularly so loading does not hold a second copy of
@@ -233,7 +246,12 @@ impl WgpuDev {
         if self.unflushed_upload >= UPLOAD_FLUSH_BYTES {
             self.unflushed_upload = 0;
             self.queue.submit([]);
+            #[cfg(not(target_arch = "wasm32"))]
             self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
+            // (on WebGPU, wait acts as poll; the staging memory is released when the
+            // queue drains, which the page's event loop turns take care of)
+            #[cfg(target_arch = "wasm32")]
+            self.device.poll(wgpu::PollType::Poll).expect("device lost");
         }
         Buf::Wgpu(buf)
     }
@@ -603,6 +621,9 @@ pub(crate) async fn open_web(_diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps
         max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
         max_storage_buffers_per_shader_stage: 10,
         max_compute_workgroup_storage_size: caps.max_workgroup_storage,
+        // The kernels run 128- and 256-lane workgroups; the WebGPU defaults are 64.
+        max_compute_invocations_per_workgroup: 256,
+        max_compute_workgroup_size_x: 256,
         ..wgpu::Limits::default()
     };
     let (device, queue) = adapter

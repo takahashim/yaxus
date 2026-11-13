@@ -10,6 +10,7 @@ pub mod quant;
 mod par;
 pub mod weights;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -174,6 +175,14 @@ pub trait Backend {
     /// Argmax of every row.
     fn argmax_rows(&mut self, logits: &Self::Tensor) -> Vec<u32>;
     fn to_host(&mut self, x: &Self::Tensor) -> Vec<f32>;
+    /// The read-back as a future: the blocking `to_host` on native, the awaited
+    /// WebGPU read-back there (`Model::forward_trace_async` drives it).
+    fn to_host_box<'a>(&'a mut self, x: &'a Self::Tensor) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<f32>> + 'a>>
+    where
+        Self: Sized,
+    {
+        Box::pin(std::future::ready(self.to_host(x)))
+    }
 }
 
 struct Layer<B: Backend> {
@@ -241,42 +250,76 @@ pub struct Model<B: Backend> {
 impl<B: Backend> Model<B> {
     /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
     /// or a GGUF file, and allocates its KV arena.
-    pub fn load(path: &Path, mut backend: B, opts: &ModelOptions) -> Result<Self> {
-        let quant = opts.quant;
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load(path: &Path, backend: B, opts: &ModelOptions) -> Result<Self> {
         let (cfg, w) = if gguf::is_gguf(path) {
             let g = gguf::Gguf::open(path)?;
             (g.config()?, g.weights()?)
         } else {
             (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
         };
+        pollster::block_on(Self::load_with_async(cfg, backend, opts, move |name| {
+            std::future::ready(w.get(&name).cloned().with_context(|| format!("missing tensor {name}")))
+        }))
+    }
+
+    /// A web page reads its model's tensors one at a time (async), so [`Model::load`]
+    /// is not available there: `get(name)` provides each tensor under its safetensors
+    /// name instead. The tensors arrive in load order and are dropped once the backend
+    /// holds them, so only the largest one is in memory at a time.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub async fn load_with_async<F, Fut>(cfg: Config, mut backend: B, opts: &ModelOptions, mut get: F) -> Result<Self>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<TensorRef>>,
+    {
+        let quant = opts.quant;
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);
         let qkv = cfg.q_dim() + 2 * cfg.kv_dim();
-        let mut ld = |name: &str, shape: &[usize]| {
-            let q = if shape.len() == 2 { quant } else { Quant::Bf16 };
-            backend.load_weight(w.get_shaped(name, shape)?, q)
-        };
+        // Fetches a tensor and checks its shape (the counterpart of `Weights::get_shaped`).
+        async fn shaped<F, Fut>(get: &mut F, name: String, shape: Vec<usize>) -> Result<TensorRef>
+        where
+            F: FnMut(String) -> Fut,
+            Fut: std::future::Future<Output = Result<TensorRef>>,
+        {
+            let t = get(name.clone()).await?;
+            anyhow::ensure!(t.shape == shape, "{name}: shape {:?}, expected {shape:?}", t.shape);
+            Ok(t)
+        }
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.layers.{i}");
-            let mut l = |n: &str, shape: &[usize]| ld(&format!("{p}.{n}.weight"), shape);
             layers.push(Layer::<B> {
                 meta: cfg.layer_meta(i)?,
-                pre_mixer_norm: l("pre_mixer_norm", &[h])?,
-                qkv_proj: l("mixer.qkv_proj", &[qkv, h])?,
-                q_norm: l("mixer.q_norm", &[d])?,
-                k_norm: l("mixer.k_norm", &[d])?,
-                o_proj: l("mixer.o_proj", &[h, cfg.q_dim()])?,
-                post_mixer_norm: l("post_mixer_norm", &[h])?,
-                pre_mlp_norm: l("pre_mlp_norm", &[h])?,
-                gate_up_proj: l("mlp.gate_up_proj", &[2 * cfg.intermediate_size, h])?,
-                down_proj: l("mlp.down_proj", &[h, cfg.intermediate_size])?,
-                post_mlp_norm: l("post_mlp_norm", &[h])?,
+                pre_mixer_norm: backend
+                    .load_weight(&shaped(&mut get, format!("{p}.pre_mixer_norm.weight"), vec![h]).await?, Quant::Bf16)?,
+                qkv_proj: backend.load_weight(&shaped(&mut get, format!("{p}.mixer.qkv_proj.weight"), vec![qkv, h]).await?, quant)?,
+                q_norm: backend.load_weight(&shaped(&mut get, format!("{p}.mixer.q_norm.weight"), vec![d]).await?, Quant::Bf16)?,
+                k_norm: backend.load_weight(&shaped(&mut get, format!("{p}.mixer.k_norm.weight"), vec![d]).await?, Quant::Bf16)?,
+                o_proj: backend
+                    .load_weight(&shaped(&mut get, format!("{p}.mixer.o_proj.weight"), vec![h, cfg.q_dim()]).await?, quant)?,
+                post_mixer_norm: backend
+                    .load_weight(&shaped(&mut get, format!("{p}.post_mixer_norm.weight"), vec![h]).await?, Quant::Bf16)?,
+                pre_mlp_norm: backend
+                    .load_weight(&shaped(&mut get, format!("{p}.pre_mlp_norm.weight"), vec![h]).await?, Quant::Bf16)?,
+                gate_up_proj: backend
+                    .load_weight(
+                        &shaped(&mut get, format!("{p}.mlp.gate_up_proj.weight"), vec![2 * cfg.intermediate_size, h]).await?,
+                        quant,
+                    )?,
+                down_proj: backend
+                    .load_weight(
+                        &shaped(&mut get, format!("{p}.mlp.down_proj.weight"), vec![h, cfg.intermediate_size]).await?,
+                        quant,
+                    )?,
+                post_mlp_norm: backend
+                    .load_weight(&shaped(&mut get, format!("{p}.post_mlp_norm.weight"), vec![h]).await?, Quant::Bf16)?,
             });
         }
-        let norm = ld("model.norm.weight", &[h])?;
-        let lm_head_t = w.get("lm_head.weight")?;
+        let norm = backend.load_weight(&shaped(&mut get, "model.norm.weight".into(), vec![h]).await?, Quant::Bf16)?;
+        let lm_head_t = get("lm_head.weight".into()).await?;
         anyhow::ensure!(
             matches!(lm_head_t.shape[..], [v, k] if k == h && v >= cfg.vocab_size),
             "lm_head.weight: shape {:?}, expected [>= {}, {h}]",
@@ -292,12 +335,13 @@ impl<B: Backend> Model<B> {
                 .with_context(|| format!("lm_head.weight: cannot drop its padding rows ({:?})", lm_head_t.dtype))?;
             &lm_head_rows
         } else {
-            lm_head_t
+            &lm_head_t
         };
         let lm_head = backend.load_weight(lm_head_t, quant)?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
-        let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;
+        let embed = backend
+            .load_embedding(&shaped(&mut get, "model.embed_tokens.weight".into(), vec![cfg.vocab_size, h]).await?)?;
         let pages = opts.kv_tokens.div_ceil(PAGE);
         let metas: Vec<LayerMeta> = layers.iter().map(|l| l.meta.clone()).collect();
         let kv = backend.new_kv(&cfg, &metas, pages, opts.max_pos)?;
@@ -426,10 +470,74 @@ impl<B: Backend> Model<B> {
         Ok(b.matmul(&sel, &self.lm_head))
     }
 
+    /// One forward pass with a read-back after every op: the web bisects a wrong
+    /// output by comparing these values with the native trace (`logcheck`).
+    /// `trace(op, first values, sum of |x|)` after each step.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[allow(clippy::too_many_lines)]
+    pub async fn forward_trace_async(
+        &mut self,
+        items: &[(SeqId, &[u32])],
+        reader: &mut B,
+        trace: &mut dyn FnMut(&str, &[f32], f32),
+    ) -> Result<()> {
+        let rows: usize = items.iter().map(|(_, t)| t.len()).sum();
+        anyhow::ensure!(rows > 0 && rows <= self.chunk, "pass of {rows} rows");
+        let mut copies = Vec::new();
+        let kv::PassRows { meta, last } = self.seqs.append(items, &mut copies)?;
+        self.copy_pages(std::mem::take(&mut copies));
+        let eps = self.cfg.rms_norm_eps;
+        let b = &mut self.backend;
+        b.begin_pass(&meta);
+        let mut x = b.embed(&self.embed);
+        let hx = reader.to_host_box(&x).await;
+        trace("embed", &hx, hx.iter().map(|v| v.abs()).sum());
+        let mut h = b.rmsnorm(&x, &self.layers[0].pre_mixer_norm, PRE_NORM_OFFSET, eps);
+        let hh = reader.to_host_box(&h).await;
+        trace("rmsnorm h", &hh, hh.iter().map(|v| v.abs()).sum());
+        let n = self.layers.len();
+        for (i, l) in self.layers.iter().enumerate() {
+            let qkv = b.matmul(&h, &l.qkv_proj);
+            let qkvh = reader.to_host_box(&qkv).await;
+            trace(&format!("layer {i} qkv"), &qkvh, qkvh.iter().map(|v| v.abs()).sum());
+            let a = b.attention(&qkv, &l.q_norm, &l.k_norm, &mut self.kv, &self.cfg, &l.meta);
+            let ah = reader.to_host_box(&a).await;
+            trace(&format!("layer {i} attention"), &ah, ah.iter().map(|v| v.abs()).sum());
+            let o = b.matmul(&a, &l.o_proj);
+            let oh = reader.to_host_box(&o).await;
+            trace(&format!("layer {i} o_proj"), &oh, oh.iter().map(|v| v.abs()).sum());
+            let hm = b.add_norm(
+                &mut x,
+                &o,
+                &l.post_mixer_norm,
+                POST_MIXER_NORM_OFFSET,
+                &l.pre_mlp_norm,
+                PRE_NORM_OFFSET,
+                eps,
+            );
+            let xh = reader.to_host_box(&x).await;
+            trace(&format!("layer {i} x += post_mixer"), &xh, xh.iter().map(|v| v.abs()).sum());
+            let m = b.matmul_glu(&hm, &l.gate_up_proj);
+            let mh = reader.to_host_box(&m).await;
+            trace(&format!("layer {i} swiglu"), &mh, mh.iter().map(|v| v.abs()).sum());
+            let m2 = b.matmul(&m, &l.down_proj);
+            let m2h = reader.to_host_box(&m2).await;
+            trace(&format!("layer {i} down"), &m2h, m2h.iter().map(|v| v.abs()).sum());
+            let next = if i + 1 < n { &self.layers[i + 1].pre_mixer_norm } else { &self.norm };
+            h = b.add_norm(&mut x, &m2, &l.post_mlp_norm, POST_MLP_NORM_OFFSET, next, PRE_NORM_OFFSET, eps);
+            let xh = reader.to_host_box(&x).await;
+            trace(&format!("layer {i} x += post_mlp"), &xh, xh.iter().map(|v| v.abs()).sum());
+        }
+        let sel = b.select_rows(&x, &last);
+        let logits = b.matmul(&sel, &self.lm_head);
+        let lh = reader.to_host_box(&logits).await;
+        trace("logits", &lh, lh.iter().map(|v| v.abs()).sum());
+        Ok(())
+    }
+
     /// Feeds any number of tokens to one sequence (in chunks) and returns the logits
     /// after the last one.
-    pub fn prefill(&mut self, id: SeqId, ids: &[u32]) -> Result<B::Tensor> {
-        anyhow::ensure!(!ids.is_empty(), "empty input");
+    pub fn prefill(&mut self, id: SeqId, ids: &[u32]) -> Result<B::Tensor> {        anyhow::ensure!(!ids.is_empty(), "empty input");
         let mut logits = None;
         for c in ids.chunks(self.chunk) {
             logits = Some(self.forward(&[(id, c)], false)?);

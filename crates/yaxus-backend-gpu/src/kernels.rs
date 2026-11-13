@@ -306,7 +306,7 @@ impl Gpu {
         if jobs.is_empty() {
             return;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let n = jobs.len();
         self.compile_all(&jobs);
         if self.diag.compile_log {
@@ -358,7 +358,7 @@ impl Gpu {
     }
 
     pub(crate) fn build_kernels(&mut self) {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let jobs: Vec<Job> = base_sources(&self.caps, &self.tuning)
             .into_iter()
             .map(|(name, src, read_only)| (name, read_only.to_vec(), Box::new(move || src.clone()) as _))
@@ -375,7 +375,7 @@ impl Gpu {
         if self.kernels.contains_key(&name) {
             return name;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         self.add_kernel(name.clone(), &source(), read_only);
         // (`precompile` should have covered it; a line here means a stall mid-request)
         if self.diag.compile_log {

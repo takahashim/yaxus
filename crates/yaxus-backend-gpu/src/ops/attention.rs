@@ -7,7 +7,9 @@ use crate::plan::{AttentionCase, AttentionPlan};
 use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight};
 
 impl Gpu {
-    pub(crate) fn attention(
+    /// Per-head RMSNorm and half-split RoPE of q and k, and the raw k/v write into the
+    /// row's KV slot (the `qk_rope` kernel; the split/tile/row kernels follow it).
+    pub(crate) fn qk_rope(
         &mut self,
         qkv: &Tensor,
         q_norm: &Weight,
@@ -16,16 +18,16 @@ impl Gpu {
         cfg: &Config,
         layer: &LayerMeta,
     ) -> Tensor {
-        let (Weight::Vector(qn), Weight::Vector(kn)) = (q_norm, k_norm) else { panic!("q/k norm") };
+        let Weight::Vector(qn) = q_norm else { panic!("q/k norm") };
+        let Weight::Vector(kn) = k_norm else { panic!("q/k norm") };
         let (hq, hkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
         let t = qkv.rows;
-        assert_eq!(t, self.pass_rows, "attention rows differ from the pass");
         let (kc, vc) = (kv.k[layer.index].clone(), kv.v[layer.index].clone());
         let rope = if layer.full_attn { kv.rope_full.clone() } else { kv.rope_sliding.clone() };
         // (cos and sin, HEAD_DIM / 2 f32 each per position)
         let rope_bytes = (self.pass_max_pos as u64 + 1) * (HEAD_DIM as u64 / 2) * 4 * 2;
         assert!(rope_bytes <= rope.size(), "position beyond the rope table");
-        let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
+        let rows = self.meta_buf(MetaBuf::Rows);
         let q = self.tensor(t, hq * HEAD_DIM);
         // (the fourth immediate: the rope table's half length, which only the MSL kernel reads)
         let msl = self.tuning.apple.msl_small && self.caps.msl;
@@ -35,6 +37,24 @@ impl Gpu {
             &[hq as u32, hkv as u32, cfg.rms_norm_eps.to_bits(), (rope.size() / 8) as u32],
             ((hq + hkv) as u32, t as u32),
         );
+        q
+    }
+
+    pub(crate) fn attention(
+        &mut self,
+        qkv: &Tensor,
+        q_norm: &Weight,
+        k_norm: &Weight,
+        kv: &mut Kv,
+        cfg: &Config,
+        layer: &LayerMeta,
+    ) -> Tensor {
+        let (hq, hkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
+        let t = qkv.rows;
+        assert_eq!(t, self.pass_rows, "attention rows differ from the pass");
+        let (kc, vc) = (kv.k[layer.index].clone(), kv.v[layer.index].clone());
+        let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
+        let q = self.qk_rope(qkv, q_norm, k_norm, kv, cfg, layer);
         let o = self.tensor(t, hq * HEAD_DIM);
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
         let window = layer.window.unwrap_or(0) as u32;
@@ -51,18 +71,8 @@ impl Gpu {
         if let AttentionPlan::Split { g, hg, ch, nch } = plan {
             let part = self.tensor(t * hkv * nch * g, HEAD_DIM);
             let ml = self.tensor(t * hkv * nch * g, 2);
-            self.dispatch(
-                &crate::kernels::name::attn_split(g, ch, hg),
-                &[part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages],
-                &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
-                ((hkv * (g / hg) * nch) as u32, t as u32),
-            );
-            self.dispatch(
-                "attn_combine",
-                &[o.buf(), part.buf(), ml.buf()],
-                &[hq as u32, hkv as u32, nch as u32],
-                (hq as u32, t as u32),
-            );
+            self.attn_split(&q, &kc, &vc, &part, &ml, hq, hkv, g, hg, ch, nch, window, scale, t);
+            self.attn_combine(&o, &part, &ml, hq, hkv, nch, t);
         } else if let AttentionPlan::Tile { nch, ch } = plan {
             let tiles = self.meta_buf(MetaBuf::Tiles);
             let (part, ml) = if nch > 1 {
@@ -93,6 +103,45 @@ impl Gpu {
             );
         }
         o
+    }
+
+    /// The split attention (part 1) and its combine (part 2), as `attention` runs them
+    /// (also used by the test hooks to read the partials back).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_split(
+        &mut self,
+        q: &Tensor,
+        kc: &Buf,
+        vc: &Buf,
+        part: &Tensor,
+        ml: &Tensor,
+        hq: usize,
+        hkv: usize,
+        g: usize,
+        hg: usize,
+        ch: usize,
+        nch: usize,
+        window: u32,
+        scale: f32,
+        t: usize,
+    ) {
+        let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
+        self.dispatch(
+            &crate::kernels::name::attn_split(g, ch, hg),
+            &[part.buf(), ml.buf(), q.buf(), kc, vc, &rows, &pages],
+            &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32],
+            ((hkv * (g / hg) * nch) as u32, t as u32),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_combine(&mut self, o: &Tensor, part: &Tensor, ml: &Tensor, hq: usize, hkv: usize, nch: usize, t: usize) {
+        self.dispatch(
+            "attn_combine",
+            &[o.buf(), part.buf(), ml.buf()],
+            &[hq as u32, hkv as u32, nch as u32],
+            (hq as u32, t as u32),
+        );
     }
 
     pub(crate) fn rope_table(&mut self, meta: &LayerMeta, max_len: usize, d: usize) -> Buf {

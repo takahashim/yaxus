@@ -2382,9 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu"
-version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "527ccdf43dd5b2e8676eed9984ce00e2bbb0a1b85b70c1969dcb6cd2eb55ab9e"
+version = "30.0.2"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -2536,7 +2534,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2807,6 +2805,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
  "wgpu",
  "yaxus-backend-cpu",
  "yaxus-backend-gpu",
@@ -2837,6 +2836,7 @@ dependencies = [
  "anyhow",
  "half",
  "memmap2",
+ "pollster",
  "rayon",
  "safetensors",
  "serde",
@@ -2907,12 +2907,14 @@ name = "yaxus-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "yaxus-backend-gpu",
  "yaxus-model",
+ "yaxus-pfml",
  "yaxus-tokenizer",
 ]
 
@@ -3024,7 +3026,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "wgpu"
-version = "30.0.2"

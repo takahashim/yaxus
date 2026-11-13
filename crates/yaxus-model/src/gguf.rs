@@ -235,7 +235,13 @@ impl GgufHeader {
     /// Whether the GGUF was converted with the norm offsets baked into the weights:
     /// reads the values of the layer-0 `attn_norm` (`bytes` is that tensor's data).
     pub fn baked_norms(&self, bytes: &[u8]) -> bool {
-        let Some(t) = self.tensors.iter().find(|t| t.name == "blk.0.attn_norm") else { return false };
+        let Some(t) = self
+            .tensors
+            .iter()
+            .find(|t| t.name == "blk.0.attn_norm" || t.name == "blk.0.attn_norm.weight")
+        else {
+            return false;
+        };
         let (bl, bw) = t.dtype.block();
         let n = bytes.len() / bw * bl;
         if n == 0 {

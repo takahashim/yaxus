@@ -502,19 +502,55 @@ wgpu 30 の WebGPU バックエンドは Chrome の `subgroups` をリクエス�
   output.weight だけ Q6K、語彙 107520)。ネイティブ側は回帰なし
   (`yaxus-model` 21 テスト、`yaxus-backend-gpu` lib テスト 6 件、CLI の 0.8B 翻訳 72.9 tok/s)。
 
-### 11.4 次のステップ
+### 11.4 ビルドと配信
 
 ビルド: `RUSTFLAGS="" cargo build -p yaxus-web --target wasm32-unknown-unknown && wasm-bindgen
---target web --out-dir crates/yaxus-web/www/pkg target/wasm32-unknown-unknown/debug/yaxus_web.wasm`。
+--target web --out-dir crates/yaxus-web/www/pkg target/wasm32-unknown-unknown/release/yaxus_web.wasm`。
 (`target-cpu=native` の RUSTFLAGS がついたままだと wasm-bindgen が
-`__wbindgen_externref_table_dealloc` を見つけられず失敗するので、wasm は素のフラグで。)
+`__wbindgen_externref_table_dealloc` を見つけられず失敗するので、wasm は素のフラグで。
+Cargo.lock の wgpu が 30.0.1 のままだとパッチが効かないので 30.0.2 に固定。)
 配信は `www/` を静的に (開発中は `python3 -m http.server` で十分)。
 
-1. ステップ 2: テンソルのアップロード (`GgufHeader::weight_list` → 範囲読み →
-   `TensorRef::from_owned` → `backend.load_weight`)。`requiredLimits` は `max_buffer_size`
-   と `max_storage_buffer_binding_size` をアダプタの上限に引き上げる。KV は短文向けに絞る。
-2. ステップ 3: 1 文翻訳で CLI 版と出力照合 (greedy なので一致確認ができる)。
-3. ステップ 4: 1 トークンごとに await するストリーミング表示 (tok/s・TTFT の計測)。
-4. 後回し: Worker 化 (メインスレッドを解放)、OPFS へのモデルキャッシュ (ディスクの
-   重複を避けるため既定 OFF)、デバイスロストの復帰、サーバー機能の全排除
-   (`yaxus-web` は `yaxus-runtime` に依存しない)。
+### 11.5 実装 (ステップ 2〜3、完了): モデル読み込みと翻訳
+
+- `yaxus-model`: `Model::load` の本体を `load_with_async` に一本化 (ネイティブは
+  `pollster::block_on` でラップ)。`get(name)` がテンソルを 1 つずつ供給するので、
+  Web はファイルの範囲読み → `TensorRef::from_owned` → `backend.load_weight` の繰り返しで
+  読める (ピークメモリ = 最大テンソル 1 つ)。`to_host_box` を `Backend` に追加 (既定は
+  ブロッキング `to_host`、WebGPU は await 版)、`forward_trace_async` は op ごとの
+  読み戻しでネイティブと照合できる。
+- `yaxus-backend-gpu`: テンソルのアップロードを 16 MB チャンク化 (ブラウザのステージングが
+  重み全体を抱えないように)、`Instant` を `web-time` に差し替え (std は wasm に無い)、
+  `requiredLimits` に `max_compute_invocations_per_workgroup: 256` と
+  `max_compute_workgroup_size_x: 256` を追加 (WebGPU の既定は 64 で、128/256 レーンの
+  カーネルが全滅する)、`attention` を `qk_rope` / `attn_split` / `attn_combine` に分解
+  (テストフックから読めるように)。
+- `crates/yaxus-web`: `load_model(file, kv_tokens, precise)` (ストリーミング読み込み)、
+  `Translator::translate(text, to, from, max_new)` (greedy、`Model` を直接 1 ステップ
+  ずつ await)、単一 op の診断 `run_diag` と `trace2`。wasm のビルドは `#![cfg(wasm32)]`
+  でネイティブのワークスペースチェックから外れる。
+- ページ: ファイル → 解析 → 読み込み → 翻訳フォーム。JS 側の `u64` は BigInt で返る
+  (`Number()` で直す)。
+
+検証で見つかったもの:
+
+- wgpu のパッチが効いていなかった (`Cargo.lock` が 30.0.1 のまま): `cargo update -p wgpu
+  --precise 30.0.2` で解消。
+- `GgufHeader::baked_norms` が `blk.0.attn_norm.weight` という名前を見ていなかった
+  (norm 重みのオフセット減算が消え、出力が全滅した)。
+- 診断の参照実装を 2 箇所間違えた (GPU は正しかった): add_norm の x 加算忘れと、
+  attention 参照の head スライス漏れ。
+
+結果 (headless Chrome、0.8B Q4_K_M 実ファイル):
+
+- 読み込み 3 秒 (163 テンソルを 1 つずつ)。診断 15 項目全 PASS (単一 op は全て正しい)。
+- 翻訳は CLI と完全一致 (greedy なのでトークン単位で同じ): 日→英・英→日 4 文、
+  本番の int16 経路 (`precise = false`) で確認。デコード 12 トークン 0.3 秒 (~40 tok/s)。
+
+### 11.6 次のステップ
+
+1. ステップ 4: 1 トークンごとに await するストリーミング表示 (`StreamDecoder` + コールバック)、
+   tok/s・TTFT の計測表示。
+2. 後回し: Worker 化 (メインスレッドを解放)、OPFS へのモデルキャッシュ (ディスクの
+   重複を避けるため既定 OFF)、デバイスロストの復帰、診断/trace 関数の整理、
+   wgpu パッチの上流 PR。

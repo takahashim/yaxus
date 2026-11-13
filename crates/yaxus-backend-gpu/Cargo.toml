@@ -11,6 +11,8 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
+# `Instant` through `performance.now()` on wasm (std has none there); std's on native.
+web-time = "1"
 yaxus-model = { path = "../yaxus-model" }
 
 # The platform's GPU API (see `device::platform_backends`).

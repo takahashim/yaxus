@@ -25,12 +25,16 @@
   </head>
   <body>
     <h1>yaxus web — PLaMo 3 翻訳 (WebGPU 試作)</h1>
-    <p>ステップ 1: GGUF を選ぶと、ヘッダを解析してモデル情報を表示します。<br />
-    (重みはまだ読みません。テンソル単位のストリーミング読み込みは次のステップ)</p>
+    <p>GGUF を選んでヘッダを確認し、「モデルを読み込む」でテンソルを GPU へストリーミング、
+    短い文を翻訳します。</p>
 
     <input type="file" id="gguf" accept=".gguf" />
     <button id="go" disabled>解析</button>
+    <button id="load" disabled>モデルを読み込む</button>
+    <button id="diag">診断</button>
+    <button id="probe" disabled>probe</button>
     <div id="status"></div>
+    <pre id="diag-out" hidden></pre>
 
     <table id="info" class="kv" hidden>
       <tbody>
@@ -45,20 +49,41 @@
     <pre id="config" hidden></pre>
     <pre id="tensors" hidden></pre>
 
+    <div id="tr-area" hidden>
+      <p>
+        翻訳先: <select id="to">
+          <option value="en" selected>英語 (en)</option>
+          <option value="ja">日本語 (ja)</option>
+        </select>
+        翻訳元: <select id="from">
+          <option value="" selected>(自動検出)</option>
+          <option value="ja">日本語 (ja)</option>
+          <option value="en">英語 (en)</option>
+        </select>
+      </p>
+      <textarea id="src" rows="3" style="width:100%">こんにちは。今日はとても良い天気ですね。</textarea>
+      <button id="tr">翻訳</button>
+      <pre id="dst"></pre>
+    </div>
+
     <script type="module">
-      import init, { summarize } from "./pkg/yaxus_web.js";
+      import init, { summarize, load_model, hook_panics, run_diag } from "./pkg/yaxus_web.js";
 
       const $ = (id) => document.getElementById(id);
       const status = $("status");
+      const log = (m) => { status.textContent = m; };
       let file = null;
 
-      init().catch((e) => {
+      init()
+        .then(() => { hook_panics(); })
+        .catch((e) => {
         status.textContent = `wasm の初期化に失敗: ${e}`;
       });
 
       $("gguf").addEventListener("change", (ev) => {
         file = ev.target.files[0] ?? null;
         $("go").disabled = !file;
+        $("load").disabled = !file;
         status.textContent = "";
       });
 
@@ -67,7 +92,7 @@
         $("info").hidden = true;
         $("config").hidden = true;
         $("tensors").hidden = true;
-        status.textContent = "解析中…";
+        log("解析中…");
         try {
           const s = await summarize(file);
           $("f-name").textContent = file.name;
@@ -81,9 +106,66 @@
           $("info").hidden = false;
           $("config").hidden = false;
           $("tensors").hidden = false;
-          status.textContent = "";
+          log("");
         } catch (e) {
-          status.textContent = `エラー: ${e}\n${e && e.stack ? e.stack : ""}`;
+          log(`エラー: ${e}`);
+        }
+      });
+
+      let tr = null;
+      $("load").addEventListener("click", async () => {
+        if (!file || tr) return;
+        $("load").disabled = true;
+        log("モデルを読み込み中… (ヘッダ → テンソルを 1 つずつ GPU へ)");
+        const t0 = performance.now();
+        try {
+          tr = await load_model(file, 4096, false);
+          log(`読み込み完了 (${((performance.now() - t0) / 1000).toFixed(1)} 秒)`);
+          $("tr-area").hidden = false;
+          $("probe").disabled = false;
+        } catch (e) {
+          log(`読み込みエラー: ${e}`);
+          $("load").disabled = false;
+        }
+      });
+
+      $("tr").addEventListener("click", async () => {
+        if (!tr) return;
+        $("tr").disabled = true;
+        $("dst").textContent = "";
+        log("翻訳中…");
+        const t0 = performance.now();
+        try {
+          const from = $("from").value || null;
+          const out = await tr.translate($("src").value, $("to").value, from, 256);
+          $("dst").textContent = out;
+          log(`翻訳完了 (${((performance.now() - t0) / 1000).toFixed(1)} 秒)`);
+        } catch (e) {
+          log(`翻訳エラー: ${e}`);
+        }
+        $("tr").disabled = false;
+      });
+
+      $("probe").addEventListener("click", async () => {
+        if (!tr) return;
+        try {
+          $("diag-out").textContent = await tr.trace2($("src").value, $("to").value);
+          $("diag-out").hidden = false;
+          log("");
+        } catch (e) {
+          log(`trace エラー: ${e}`);
+        }
+      });
+
+      $("diag").addEventListener("click", async () => {
+        log("診断中…");
+        try {
+          const out = await run_diag();
+          $("diag-out").textContent = out;
+          $("diag-out").hidden = false;
+          log("");
+        } catch (e) {
+          log(`診断エラー: ${e}`);
         }
       });
     </script>

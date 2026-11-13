@@ -491,4 +491,11 @@ impl Backend for GpuBackend {
     fn to_host(&mut self, _: &Tensor) -> Vec<f32> {
         panic!("to_host is awaited through to_host_async on WebGPU")
     }
+    #[cfg(target_arch = "wasm32")]
+    fn to_host_box<'a>(
+        &'a mut self,
+        x: &'a Tensor,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<f32>> + 'a>> {
+        Box::pin(self.to_host_async(x))
+    }
 }

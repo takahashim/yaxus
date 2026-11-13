@@ -728,10 +728,12 @@ fn sum256(li: u32, v: f32, slot: u32) -> f32 {
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let base = wg.x * p.cols;
-    var dv: array<f32, 16>;
-    var xv: array<f32, 16>;
-    var a1: array<f32, 16>;
-    var a2: array<f32, 16>;
+    // (zero-initialized: the loads below are guarded by `i < p.cols`, and Dawn's
+    // Tint leaves undefined function locals undefined — naga zeroes them)
+    var dv = array<f32, 16>();
+    var xv = array<f32, 16>();
+    var a1 = array<f32, 16>();
+    var a2 = array<f32, 16>();
     var s = 0.0;
     // All loads first: one memory round trip instead of three.
     for (var e = 0u; e < 16u; e++) {
