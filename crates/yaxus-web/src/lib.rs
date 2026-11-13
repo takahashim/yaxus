@@ -170,6 +170,36 @@ async fn summarize_inner(file: &web_sys::File) -> anyhow::Result<GgufSummary> {
     })
 }
 
+/// What a streamed translation took: the prefill (call → first token), the decode
+/// rate, and the full text.
+#[wasm_bindgen]
+pub struct TranslateStats {
+    text: String,
+    tokens: u32,
+    ttft_ms: f64,
+    ms_per_token: f64,
+}
+
+#[wasm_bindgen]
+impl TranslateStats {
+    #[wasm_bindgen(getter)]
+    pub fn text(&self) -> String {
+        self.text.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn tokens(&self) -> u32 {
+        self.tokens
+    }
+    #[wasm_bindgen(getter)]
+    pub fn ttft_ms(&self) -> f64 {
+        self.ttft_ms
+    }
+    #[wasm_bindgen(getter)]
+    pub fn ms_per_token(&self) -> f64 {
+        self.ms_per_token
+    }
+}
+
 /// A loaded model with its tokenizer, ready to translate. Loading reads the GGUF
 /// file's tensors one at a time (`Model::load_with_async`).
 #[wasm_bindgen]
@@ -240,6 +270,87 @@ async fn load_model_inner(file: web_sys::File, kv_tokens: usize, precise: bool) 
 
 #[wasm_bindgen]
 impl Translator {
+    /// Greedy generation with an awaited read-back per token and the incremental
+    /// text pushed to the `on_token` JS callback as it completes
+    /// (`function (delta) {}`). The timing: from the call to the first token is the
+    /// prefill (TTFT), the rest is the decode (the per-token rate comes from its length).
+    #[wasm_bindgen]
+    pub async fn translate_stream(
+        &mut self,
+        text: String,
+        target_lang: String,
+        source_lang: Option<String>,
+        max_new_tokens: u32,
+        on_token: js_sys::Function,
+    ) -> Result<TranslateStats, JsValue> {
+        let mut on = move |delta: String| {
+            let _ = on_token.call1(&JsValue::NULL, &delta.into());
+        };
+        self.translate_stream_inner(text, target_lang, source_lang, max_new_tokens as usize, &mut on)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("{e:#}")))
+    }
+
+    async fn translate_stream_inner(
+        &mut self,
+        text: String,
+        target_lang: String,
+        source_lang: Option<String>,
+        max_new_tokens: usize,
+        on_token: &mut dyn FnMut(String),
+    ) -> anyhow::Result<TranslateStats> {
+        use web_time::Instant;
+        let req = TranslationRequest { text, target_lang, source_lang, form: None, context: None, glossary: vec![], history: vec![] }
+            .validate()?;
+        // The prompt carries its own BOS (`add_bos = false`), as everywhere else.
+        let prompt = self.tok.encode(&req.render(), false);
+        let t0 = Instant::now();
+        let (id, mut logits) = self.model.start(&prompt)?;
+        let mut first = None;
+        let mut out: Vec<u32> = Vec::new();
+        let mut dec = yaxus_tokenizer::StreamDecoder::new();
+        let r = async {
+            while out.len() < max_new_tokens {
+                let next = self.model.backend.argmax_rows_async(&logits).await;
+                let next = *next.last().context("no logits row")?;
+                if next == EOS_ID || next == TAG_ID {
+                    break;
+                }
+                out.push(next);
+                if first.is_none() {
+                    first = Some(Instant::now());
+                }
+                let delta = dec.push(&self.tok, next);
+                if !delta.is_empty() {
+                    on_token(delta);
+                }
+                if out.len() == max_new_tokens {
+                    break;
+                }
+                logits = self.model.forward(&[(id, &[next])], false)?;
+            }
+            Ok::<_, anyhow::Error>(out)
+        }
+        .await;
+        match &r {
+            Ok(_) => self.model.finish(id),
+            Err(_) => self.model.free_seq(id),
+        }
+        let ids = r?;
+        let tail = dec.finish();
+        if !tail.is_empty() {
+            on_token(tail);
+        }
+        let decode = first.map_or(std::time::Duration::ZERO, |f| Instant::now().saturating_duration_since(f));
+        let n = ids.len();
+        Ok(TranslateStats {
+            text: self.tok.decode(&ids),
+            tokens: n as u32,
+            ttft_ms: first.map_or(0.0, |f| f.saturating_duration_since(t0).as_secs_f64() * 1e3),
+            ms_per_token: if n > 0 { decode.as_secs_f64() * 1e3 / n as f64 } else { 0.0 },
+        })
+    }
+
     /// Translates one paragraph, greedy, and returns the whole text (the streaming
     /// API comes later). `source_lang` as the API's language code, or none for
     /// automatic detection.

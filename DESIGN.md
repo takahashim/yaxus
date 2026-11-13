@@ -547,10 +547,19 @@ Cargo.lock の wgpu が 30.0.1 のままだとパッチが効かないので 30.
 - 翻訳は CLI と完全一致 (greedy なのでトークン単位で同じ): 日→英・英→日 4 文、
   本番の int16 経路 (`precise = false`) で確認。デコード 12 トークン 0.3 秒 (~40 tok/s)。
 
-### 11.6 次のステップ
+### 11.6 実装 (ステップ 4、完了): ストリーミング表示と計測
 
-1. ステップ 4: 1 トークンごとに await するストリーミング表示 (`StreamDecoder` + コールバック)、
-   tok/s・TTFT の計測表示。
-2. 後回し: Worker 化 (メインスレッドを解放)、OPFS へのモデルキャッシュ (ディスクの
+- `Translator::translate_stream(text, to, from, max_new, on_token)`:`StreamDecoder` で
+  完結した文字だけを JS コールバック (`js_sys::Function`) に逐次渡す。生成ループは
+  1 トークン = 1 回の `argmax_rows_async` 待ち (最初からその構造なので、追加は
+  コールバックと計測のみ)。
+- `TranslateStats`: トークン数、TTFT (呼び出しから最初のトークンまで = プリフィル込み)、
+  ms/token。ページは宛先を逐次追記し、完了時に計測を表示する。
+- 検証 (headless Chrome、0.8B Q4_K_M): 「これはペンです。昨日…」→ en が CLI と一致し、
+  テキストが段階的に伸びることを確認。TTFT 545 ms、14.7 ms/token (68.2 tok/s)。
+
+### 11.7 次のステップ
+
+1. 後回し: Worker 化 (メインスレッドを解放)、OPFS へのモデルキャッシュ (ディスクの
    重複を避けるため既定 OFF)、デバイスロストの復帰、診断/trace 関数の整理、
-   wgpu パッチの上流 PR。
+   wgpu パッチの上流 PR、翻訳フォームの context/form/語彙対応。

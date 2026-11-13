@@ -137,9 +137,18 @@
         const t0 = performance.now();
         try {
           const from = $("from").value || null;
-          const out = await tr.translate($("src").value, $("to").value, from, 256);
-          $("dst").textContent = out;
-          log(`翻訳完了 (${((performance.now() - t0) / 1000).toFixed(1)} 秒)`);
+          const out = await tr.translate_stream(
+            $("src").value,
+            $("to").value,
+            from,
+            256,
+            (delta) => { $("dst").textContent += delta; },
+          );
+          $("dst").textContent = out.text;
+          log(
+            `${Number(out.tokens)} トークン: TTFT ${Number(out.ttft_ms).toFixed(0)} ms、` +
+              `${Number(out.ms_per_token).toFixed(1)} ms/token (${(1000 / Number(out.ms_per_token)).toFixed(1)} tok/s)`,
+          );
         } catch (e) {
           log(`翻訳エラー: ${e}`);
         }

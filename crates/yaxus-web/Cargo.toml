@@ -14,6 +14,7 @@ yaxus-backend-gpu = { path = "../yaxus-backend-gpu", features = ["test-hooks"] }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-pfml = { path = "../yaxus-pfml" }
 half = "2"
+web-time = "1"
 anyhow.workspace = true
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
