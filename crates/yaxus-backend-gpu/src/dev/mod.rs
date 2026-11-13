@@ -211,7 +211,7 @@ impl Dev {
 
     /// The same on the browser, where the wait must yield to the event loop.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> anyhow::Result<Vec<u8>> {
         match self {
             Dev::Wgpu(d) => d.read_async(src, offset, size).await,
         }
@@ -229,6 +229,9 @@ impl Dev {
     /// An allocation that failed since the last call (devices that report them so).
     pub(crate) fn take_failure(&self) -> Option<String> {
         match self {
+            #[cfg(target_arch = "wasm32")]
+            Dev::Wgpu(d) => d.fault.get(),
+            #[cfg(not(target_arch = "wasm32"))]
             Dev::Wgpu(_) => None,
             #[cfg(target_os = "macos")]
             Dev::Metal(d) => d.take_failure(),

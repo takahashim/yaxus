@@ -83,7 +83,7 @@ impl Gpu {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Result<Vec<u8>> {
         self.pending_flops = 0.0;
         self.dev.read_async(src, offset, size).await
     }

@@ -164,12 +164,14 @@ yaxus/
 
 `crates/yaxus-web` は `yaxus-model` と `yaxus-backend-gpu` を wasm32 に載せ、ユーザーが選んだ GGUF をタブの中だけで動かす。サーバも CLI も使わない。Cloudflare などに置くのは静的ファイル (wasm 約 0.8 MB と HTML) だけで、モデルと計算はユーザーのマシンに残る。
 
-- **範囲:** 英→日、greedy、f32、KV 4096 トークン。Engine、draft、文書チェーン、翻訳メモリ、同時実行は持たない。入口は `load_model(bytes)` と `Translator::translate(text, form, on_text, on_progress)` の 2 つ。
+- **範囲:** 英→日と日→英、greedy、f32、KV 4096 トークン。Engine、draft、文書チェーン、翻訳メモリ、同時実行は持たない。入口は `load_model(file, on_progress)` と `Translator::translate(text, target, form, on_text, on_progress)` の 2 つ。原文の言語は渡さない (CLI で `--from` を省いたときと同じプロンプト)。
+- **Worker:** wasm はページのスレッドではなく専用 Worker (`web/local/worker.js`) で動く。読み込みも翻訳もページを止めない。ファイルは Worker が `File.stream()` で読み、`ModelBuffer` (wasm 側の `Vec<u8>`) へチャンクごとに足すので、メモリ上のコピーは wasm の 1 つだけ。読み込みのたびに新しい Worker を作り、前のモデルのメモリを返す。
 - **モデル:** `Gguf::parse(Vec<u8>)` でメモリ上の GGUF を読み、`TensorRef` の実体を mmap か `Arc<Vec<u8>>` の enum にする。トークナイザは GGUF の語彙から `Tokenizer::from_vocab`。埋め込み表は Q4_K のまま GPU に置き (`embed_q4k`)、bf16 に展開しない (0.8B で 330 MB → 93 MB)。
 - **デバイス:** `WgpuDev::open_async` が WebGPU の adapter/device を await で開く。`Tuning` は f32 固定。必要な `maxBufferSize` と `maxStorageBufferBindingSize` (最大のテンソル、0.8B Q4_K_M では Q6_K の出力行列 135 MB) を要求し、受け入れられなければ adapter の報告値で開き直す。そのとき出力行列が binding 上限を超える場合だけ `lm_head_quant` を Q4 にする (82 MB)。
 - **push constants の代わり:** WebGPU に push constants はない。カーネルの `var<immediate> p` を `@group(0) @binding(15) var<uniform> p` に置き換え、1 MB の uniform バッファに 256 バイトずつ書いて dynamic offset で渡す。送信ごとにリングを先頭へ戻す。
-- **読み戻し:** WebGPU の `Device::poll` は no-op なので、`map_async` の完了を `read_async` で await する。同期の `read` は wasm では呼ばない。argmax の 2 ディスパッチだけを記録する `argmax_prob_pending` を挟み、`GpuBackend::argmax_async` が読み戻す。
-- **長文:** `yaxus_pfml::segments::split_for_context` が、空行で段落に分け、1 段落が 768 入力トークンを超えるときは文末 (`.`、`!`、`?`、`。`、改行) で文に分け、さらに語・文字で切って 768 トークン以下に詰める。各セグメントは 1 要求として順に訳し、直前 2 組 (合計 1600 文字まで) を履歴にする。プロンプトが 4096 に収まらない履歴は古い順に捨てる。段落の切れ目は `\n\n`、同じ段落の文の間は区切りなしで連結し、`on_progress(done, total)` で進み具合を返す。
+- **読み戻し:** WebGPU の `Device::poll` は no-op なので、`map_async` の完了を `read_async` で await する。同期の `read` は wasm では呼ばない。argmax の 2 ディスパッチだけを記録する `argmax_prob_pending` を挟み、`GpuBackend::argmax_async` が読み戻す。prefill の時間は、プロンプトのパスから最初のトークンの読み戻しまで (記録しただけでは GPU はまだ計算していない)。
+- **エラー:** WebGPU の error scope は pop が async で、読み込み中の同期の `Gpu::checked` からは待てない。そこで wasm では scope を使わず、デバイスの uncaptured-error と device-lost のコールバックが最初のエラーを `Fault` に残し、`read_async` が読み戻しの前後でそれを返す (失敗した map もエラーで、panic しない)。読み込みの最後に `GpuBackend::sync_async` で転送の完了を待つので、確保の失敗は読み込みのエラーになる。入力の誤り (空の文、GGUF でないファイル) はモデルをそのまま使えるが、GPU のエラーと panic のあとは `Translator::broken` が真になり、ページは Worker を作り直して「読み込む」を促す。
+- **長文:** `yaxus_pfml::segments::split_for_context` が、空行で段落に分け、1 段落が 768 入力トークンを超えるときは文末 (`.`、`!`、`?`、`。`、改行) で文に分け、さらに語・文字で切って 768 トークン以下に詰める。各セグメントは 1 要求として順に訳し、直前 2 組 (合計 1600 文字まで) を履歴にする。プロンプトが 4096 に収まらない履歴は古い順に捨てる。段落の切れ目は `\n\n`、同じ段落の文の間は、英語の出力ならスペース、日本語なら区切りなしで連結する (入力側でも、`。` などで終わる文には空白を挟まずに詰める)。`on_progress(done, total)` で進み具合を返す。
 - **スレッド:** wasm では rayon は逐次に落ち、カーネルの並列コンパイル (`compile_all`) も逐次。時間は `web-time` で測る (std の `Instant` は wasm32-unknown-unknown で使えない)。
 - **ビルド:** `web/local/build.sh` が `cargo build --target wasm32-unknown-unknown --release` と `wasm-bindgen --target web` を実行する。`web/local/serve.sh` で配る。`web/local/pkg` は生成物なので git に入れない。
 
@@ -233,7 +235,7 @@ yaxus/
 
 - `--quant auto` (既定) は、GGUF なら上の対応でファイルの形式に近いまま持ち、safetensors なら Q8。CPU バックエンドは常に Q8 か bf16。
 - GGUF は設定 (`plamo3.*`) とトークナイザ (`tokenizer.ggml.*`) も読むので、HF のディレクトリは要らない。llama.cpp の変換器が RMSNorm の重みに足したオフセットは、読み込み時に引き戻す。
-- 埋め込み表は bf16 で GPU に置く。ブラウザだけは、GGUF の Q4_K の表を 4 ビットのまま (`embed_q4k`) 読む (0.8B で 93 MB。bf16 にすると 330 MB になり、WebGPU のバッファ上限にも触れる)。
+- 埋め込み表は、GGUF の Q4_K の表なら 4 ビットのまま (`embed_q4k`) 読み、ほかは bf16 で GPU に置く。0.8B で 93 MB (bf16 では 330 MB で、WebGPU のバッファ上限にも触れる)。native もブラウザも同じなので、両者の訳は一致する。行の値は Q4_K を厳密に戻したもので、bf16 に丸めない。
 - 1 行のスケールの並びが 2 のべきの間隔になると GEMM が遅くなるので、該当する行には詰め物を入れる (`pad_scales`、経緯 11.22)。
 
 ---
@@ -441,7 +443,7 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
 - 認証はトークン必須、TLS はローカル CA を自動生成。
 - 長文は段落単位で分け、文書のチェーンで並列に訳す (既定は自動のチェーン数 + チェーン内の履歴)。
-- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路を再利用する (§2.2)。Engine は使わず、1 要求・greedy・KV 2048。push constants は uniform バッファで置き換え、読み戻しだけ async にする。
+- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路を再利用する (§2.2)。Engine は使わず、1 要求・greedy・KV 4096。push constants は uniform バッファで置き換え、読み戻しだけ async にする。Worker で動かし、GPU のエラーのあとは Worker ごと作り直す。
 
 試して採らなかったもの (詳細は経緯):
 
@@ -458,4 +460,4 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 16 並列のデコードの合計速度 (経緯 11.17 で 220 tok/s に届かなかった)。
 - 2B 本体の 4 ビット化の品質評価。
 - ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
-- ブラウザ版の Worker 化 (読み込み中の UI 停止をなくす) と、モデルの再選択を省くキャッシュ。
+- ブラウザ版で、モデルの再選択を省くキャッシュ (OPFS)。

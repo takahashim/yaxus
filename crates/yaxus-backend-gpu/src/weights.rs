@@ -129,10 +129,10 @@ pub(crate) fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> 
 impl Gpu {
     pub(crate) fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
         let h = t.shape[1];
-        // The browser keeps the file's 4-bit table (93 MB for the 0.8B) instead of
-        // expanding it to bf16 (330 MB), which also keeps WebGPU's buffer limits at bay.
-        // Native keeps the bf16 table it has always used.
-        #[cfg(target_arch = "wasm32")]
+        // A Q4_K table stays 4-bit (93 MB for the 0.8B instead of 330 MB in bf16), on every
+        // device: the browser needs the room and WebGPU's buffer limits, and native keeps
+        // the same numbers (the rows are the exact dequantized values, not bf16-rounded),
+        // so the CLI and the browser translate alike.
         if t.dtype == yaxus_model::ggml::GgmlType::Q4K && h.is_multiple_of(256) {
             let q = yaxus_model::ggml::q4k_from_q4_k(t.bytes());
             let table = self.upload("embedding-q4k", &q.data);

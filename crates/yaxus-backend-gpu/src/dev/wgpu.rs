@@ -51,6 +51,9 @@ pub(crate) struct WgpuDev {
     param_offset: u64,
     #[cfg(target_arch = "wasm32")]
     param_stride: u64,
+    /// The first error WebGPU reported, or the device's loss (see `Fault`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fault: Fault,
     pub(crate) kernels_profile: Option<KernelProfile>,
 }
 
@@ -72,6 +75,38 @@ fn wb(b: &Buf) -> &wgpu::Buffer {
     }
 }
 
+/// The first error of a WebGPU device. Error scopes resolve asynchronously in the browser,
+/// so the device reports every error to its uncaptured-error hook instead, and the loss
+/// of the device to its lost callback; both land here, and the next read-back (the point
+/// where the browser path awaits the GPU anyway) returns it. A device that failed once is
+/// not trusted again: the slot is never cleared.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Default)]
+pub(crate) struct Fault(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+#[cfg(target_arch = "wasm32")]
+impl Fault {
+    fn record(&self, what: String) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(what);
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn watch(&self, device: &wgpu::Device) {
+        let fault = self.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| fault.record(format!("WebGPU: {e}"))));
+        let fault = self.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            fault.record(format!("the GPU device was lost ({reason:?}): {message}"));
+        });
+    }
+}
+
 /// Allocation and validation errors captured around a closure (see `Gpu::checked`).
 pub(crate) struct ErrorScope {
     #[cfg(not(target_arch = "wasm32"))]
@@ -83,8 +118,8 @@ pub(crate) struct ErrorScope {
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         // Popping an error scope is async in WebGPU, and `Gpu::checked` runs while the
-        // model loads, synchronously. A failed upload surfaces through the browser's
-        // uncaptured-error hook (and as a load failure) instead.
+        // model loads, synchronously. The errors go to `Fault` instead, which
+        // `take_failure` and every read-back report.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let invalid = pollster::block_on(self.invalid.pop());
@@ -289,6 +324,12 @@ impl WgpuDev {
         });
         #[cfg(target_arch = "wasm32")]
         let param_stride = device.limits().min_uniform_buffer_offset_alignment.max(32) as u64;
+        #[cfg(target_arch = "wasm32")]
+        let fault = {
+            let fault = Fault::default();
+            fault.watch(&device);
+            fault
+        };
         WgpuDev {
             device,
             queue,
@@ -303,6 +344,8 @@ impl WgpuDev {
             param_offset: 0,
             #[cfg(target_arch = "wasm32")]
             param_stride,
+            #[cfg(target_arch = "wasm32")]
+            fault,
             kernels_profile,
         }
     }
@@ -541,9 +584,13 @@ impl WgpuDev {
 
     /// Submits, waits for the map callback, and returns `size` bytes at `offset`.
     /// WebGPU polls the device itself; `Device::poll` is a no-op there, so the read
-    /// must be awaited rather than blocked on.
+    /// must be awaited rather than blocked on. An error the device reported by then (the
+    /// work before the read included) fails the read.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Result<Vec<u8>> {
+        if let Some(e) = self.fault.get() {
+            bail!("{e}");
+        }
         let src = wb(src).clone();
         let staging = if size <= self.readback.size() {
             self.readback.clone()
@@ -561,10 +608,18 @@ impl WgpuDev {
         staging.map_async(wgpu::MapMode::Read, ..size, move |r| {
             let _ = tx.send(r);
         });
-        rx.await.expect("map callback dropped").expect("map failed");
-        let out = staging.get_mapped_range(..size).expect("mapped").to_vec();
+        let mapped = rx.await;
+        if let Some(e) = self.fault.get() {
+            bail!("{e}");
+        }
+        match mapped {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => bail!("reading back from the GPU: {e}"),
+            Err(_) => bail!("reading back from the GPU: the map request was dropped"),
+        }
+        let out = staging.get_mapped_range(..size).context("reading back from the GPU")?.to_vec();
         staging.unmap();
-        out
+        Ok(out)
     }
 
     pub(crate) fn error_scope(&self) -> ErrorScope {

@@ -85,28 +85,30 @@ button:disabled { opacity: .45; cursor: default; }
   </section>
 
   <section>
-    <h2>2. 英語 → 日本語</h2>
+    <h2>2. 翻訳</h2>
     <div class="row" style="margin-bottom:8px">
+      <select id="target" aria-label="翻訳の向き">
+        <option value="ja">英語 → 日本語</option>
+        <option value="en">日本語 → 英語</option>
+      </select>
       <label for="form">文体</label>
       <select id="form">
+        <option value="">指定なし</option>
         <option value="polite">です・ます</option>
         <option value="plain">だ・である</option>
-        <option value="">指定なし</option>
       </select>
       <span class="spacer grow"></span>
       <button id="sample">例文を入れる</button>
       <button id="translate" class="primary" disabled>翻訳する</button>
     </div>
     <textarea id="source" rows="5" placeholder="The meeting has been moved to next Monday." disabled></textarea>
-    <p class="note">長い英文は段落・文単位に自動で分割して、順に訳します。</p>
+    <p class="note">長い文章は段落・文単位に自動で分割して、順に訳します。</p>
     <div id="output" aria-live="polite"></div>
     <div id="stats"></div>
   </section>
 </main>
 
 <script type="module">
-import init, { load_model } from './pkg/yaxus_web.js';
-
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status');
 const fileEl = $('file');
@@ -120,10 +122,22 @@ const warnEl = $('warn');
 const meterEl = $('meter');
 const meterBar = meterEl.firstElementChild;
 const sampleEl = $('sample');
+const targetEl = $('target');
+const formEl = $('form');
 
-let bytes = null;
-let translator = null;
+const SAMPLES = {
+  ja: 'The owner approved the revised plan, and the team will start work next Monday.',
+  en: '改訂した計画が承認されたので、来週の月曜日から作業を始めます。',
+};
+
+// The model lives in a worker (see worker.js). A new worker is started for every load,
+// so the memory of an earlier model is given back, and after an error of the GPU.
+let worker = null;
+let file = null;
+let ready = false;
 let busy = false;
+// The handler of the request in flight: {onText, resolve, reject}.
+let request = null;
 
 const setStatus = (text, err = false) => {
   statusEl.textContent = text;
@@ -132,91 +146,114 @@ const setStatus = (text, err = false) => {
 const setBusy = (b) => {
   busy = b;
   fileEl.disabled = b;
-  loadEl.disabled = b || !bytes;
-  translateEl.disabled = b || !translator;
-  sourceEl.disabled = b || !translator;
-  // The sample only makes sense once there is a model to translate with.
-  sampleEl.disabled = b || !translator;
+  loadEl.disabled = b || !file;
+  translateEl.disabled = b || !ready;
+  sourceEl.disabled = b || !ready;
+  sampleEl.disabled = b || !ready;
+  targetEl.disabled = b;
+  formEl.disabled = b || targetEl.value !== 'ja';
 };
 const fmtMB = (n) => (n / 1e6).toFixed(0) + ' MB';
+
+function startWorker() {
+  worker?.terminate();
+  ready = false;
+  worker = new Worker('./worker.js', { type: 'module' });
+  worker.onmessage = ({ data }) => onMessage(data);
+  // An error the worker could not report itself (a failed import, an abort).
+  worker.onerror = (e) => {
+    e.preventDefault();
+    finish({ type: 'error', message: e.message || 'worker error', fatal: true });
+  };
+}
+
+function onMessage(msg) {
+  switch (msg.type) {
+    case 'status':
+      setStatus(msg.message);
+      break;
+    case 'read':
+      meterEl.style.display = msg.done < msg.total ? 'block' : 'none';
+      meterBar.style.width = ((100 * msg.done) / msg.total).toFixed(1) + '%';
+      break;
+    case 'progress':
+      if (msg.total > 1) setStatus(`翻訳しています… ${Math.min(msg.done + 1, msg.total)}/${msg.total} 段落`);
+      break;
+    case 'text':
+      request?.onText?.(msg.text);
+      break;
+    default:
+      finish(msg);
+  }
+}
+
+// The end of the request in flight: `ready`, `done` or `error`.
+function finish(msg) {
+  const r = request;
+  request = null;
+  meterEl.style.display = 'none';
+  if (msg.type === 'error') {
+    if (msg.fatal) {
+      // The worker cannot be trusted any more; the file is kept for another load.
+      startWorker();
+      msg.message += '（GPU のエラーです。「読み込む」でモデルを読み込み直してください）';
+    }
+    r?.reject(new Error(msg.message));
+  } else {
+    r?.resolve(msg);
+  }
+}
+
+function send(msg, onText) {
+  return new Promise((resolve, reject) => {
+    request = { onText, resolve, reject };
+    worker.postMessage(msg);
+  });
+}
 
 function fail(e) {
   console.error(e);
   setStatus(e?.message || String(e), true);
 }
 
-async function readFile(file) {
-  const buf = new Uint8Array(file.size);
-  const reader = file.stream().getReader();
-  let off = 0;
-  meterEl.style.display = 'block';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf.set(value, off);
-    off += value.length;
-    meterBar.style.width = (100 * off / file.size).toFixed(1) + '%';
-  }
-  meterEl.style.display = 'none';
-  return buf;
-}
-
-fileEl.addEventListener('change', async () => {
+fileEl.addEventListener('change', () => {
   const f = fileEl.files?.[0];
-  bytes = null;
-  translator?.free?.();
-  translator = null;
-  outputEl.textContent = '';
-  statsEl.textContent = '';
-  infoEl.textContent = '';
-  warnEl.textContent = '';
-  if (!f) { ignore(); return; }
-  try {
-    setBusy(true);
-    setStatus('ファイルを読んでいます…');
-    bytes = await readFile(f);
-    // The file API may report the symlink's target (a blob hash) rather than the name
-    // the user picked.
-    const name = f.name.toLowerCase().endsWith('.gguf') ? f.name : '選択した GGUF';
-    $('fileinfo').textContent = `${name} · ${fmtMB(f.size)}`;
-    // Reading a model is the only reason to pick a file here; load it right away.
-    await loadModel();
-  } catch (e) {
-    fail(e);
-  } finally {
-    setBusy(false);
-    // Allow picking the same file again (a `change` event only fires on a new value).
-    fileEl.value = '';
-  }
+  // Allow picking the same file again (a `change` event only fires on a new value).
+  fileEl.value = '';
+  if (!f) return;
+  file = f;
+  // The file API may report the symlink's target (a blob hash) rather than the name
+  // the user picked.
+  const name = f.name.toLowerCase().endsWith('.gguf') ? f.name : '選択した GGUF';
+  $('fileinfo').textContent = `${name} · ${fmtMB(f.size)}`;
+  // Reading a model is the only reason to pick a file here; load it right away.
+  loadModel();
 });
 
-function ignore() {
-  $('fileinfo').textContent = '';
-  setStatus('モデルを選んでください。');
-  setBusy(false);
-}
-
 async function loadModel() {
-  if (!bytes) return;
+  if (!file || busy) return;
   try {
     setBusy(true);
-    setStatus('モデルを読み込んでいます…');
+    startWorker();
+    outputEl.textContent = '';
+    statsEl.textContent = '';
     infoEl.textContent = '';
     warnEl.textContent = '';
+    setStatus('モデルを読み込んでいます…');
     const t0 = performance.now();
-    translator = await load_model(bytes, (msg) => setStatus(msg));
+    const { info } = await send({ type: 'load', file });
     const wall = performance.now() - t0;
-    bytes = null; // free the JS copy; wasm has its own
+    ready = true;
     infoEl.textContent =
-      `device: ${translator.device}\n` +
-      `binding: ${fmtMB(translator.max_binding)}\n` +
-      `load: ${(translator.load_ms / 1e3).toFixed(1)} s (wasm+GPU; 画面側 ${(wall / 1e3).toFixed(1)} s)`;
-    if (translator.lm_head_q4) {
+      `device: ${info.device}\n` +
+      `binding: ${fmtMB(info.maxBinding)}\n` +
+      `load: ${(info.loadMs / 1e3).toFixed(1)} s (wasm+GPU; ファイルの読み込みを含めて ${(wall / 1e3).toFixed(1)} s)`;
+    if (info.lmHeadQ4) {
       warnEl.textContent = 'この GPU の binding 上限に収めるため、出力行列を Q4 にしました（訳の質が少し下がります）。';
     }
-    setStatus('準備できました。英文を入れて翻訳してください。');
+    setStatus('準備できました。文章を入れて翻訳してください。');
   } catch (e) {
-    translator = null;
+    ready = false;
     fail(e);
   } finally {
     setBusy(false);
@@ -225,35 +262,39 @@ async function loadModel() {
 
 loadEl.addEventListener('click', loadModel);
 
+targetEl.addEventListener('change', () => {
+  sourceEl.placeholder = SAMPLES[targetEl.value];
+  setBusy(busy);
+});
+
 translateEl.addEventListener('click', async () => {
-  if (!translator) return;
+  if (!ready || busy) return;
   const text = sourceEl.value.trim();
-  if (!text) { setStatus('英文を入力してください。', true); return; }
+  if (!text) { setStatus('訳す文章を入力してください。', true); return; }
   try {
     setBusy(true);
     outputEl.textContent = '';
     statsEl.textContent = '';
     setStatus('翻訳しています…');
-    const form = $('form').value || null;
-    const stats = await translator.translate(text, form,
+    const { stats } = await send(
+      { type: 'translate', text, target: targetEl.value, form: targetEl.value === 'ja' ? formEl.value : '' },
       (delta) => {
         outputEl.textContent += delta;
         outputEl.scrollTop = outputEl.scrollHeight;
       },
-      (i, n) => {
-        if (n > 1) setStatus(`翻訳しています… ${i + 1}/${n} 段落`);
-      });
+    );
     const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
-    const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.max_new} tokens`;
+    const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.maxNew} tokens`;
     statsEl.textContent =
-      `prompt ${stats.prompt_tokens} tokens · ${stats.prefill_ms.toFixed(0)} ms prefill · ` +
-      `${stats.output_tokens} tokens${size} (${stop}) · ${stats.decode_ms.toFixed(0)} ms decode · ` +
-      `${stats.tokens_per_second.toFixed(1)} tok/s · ${stats.chars} 文字`;
+      `prompt ${stats.promptTokens} tokens · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
+      `${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode · ` +
+      `${stats.tokensPerSecond.toFixed(1)} tok/s · ${stats.chars} 文字`;
     if (stats.stop === 'limit') {
       statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';
     }
     setStatus('完了');
   } catch (e) {
+    // (after an error of the GPU, `finish` has started a new worker without a model)
     fail(e);
   } finally {
     setBusy(false);
@@ -261,22 +302,17 @@ translateEl.addEventListener('click', async () => {
 });
 
 sampleEl.addEventListener('click', () => {
-  if (!translator) return;
-  sourceEl.value = 'The owner approved the revised plan, and the team will start work next Monday.';
+  if (!ready) return;
+  sourceEl.value = SAMPLES[targetEl.value];
   sourceEl.focus();
 });
 
-try {
-  if (!navigator.gpu) {
-    throw new Error('このブラウザには WebGPU がありません。デスクトップの Chrome で開いてください。');
-  }
-  await init();
+if (!navigator.gpu) {
+  fail(new Error('このブラウザには WebGPU がありません。デスクトップの Chrome で開いてください。'));
+  fileEl.disabled = true;
+} else {
   setStatus('モデルを選んでください。');
   setBusy(false);
-} catch (e) {
-  fail(e);
-  loadEl.disabled = true;
-  translateEl.disabled = true;
 }
 </script>
 </body>

@@ -326,13 +326,25 @@ impl GpuBackend {
     /// recorded pass and its read-back must not interleave with another request.
     #[cfg(target_arch = "wasm32")]
     #[allow(clippy::await_holding_lock)]
-    pub async fn argmax_async(&mut self, logits: &Tensor) -> u32 {
+    pub async fn argmax_async(&mut self, logits: &Tensor) -> Result<u32> {
         debug_assert_eq!(logits.rows, 1, "the browser path decodes one request");
         let gpu = self.gpu.clone();
         let mut g = gpu.lock().unwrap();
         let (out, size) = g.argmax_prob_pending(logits);
-        let bytes = g.read_async(&out, 0, size).await;
-        parse_argmax(&bytes, logits.cols as u32).first().map_or(0, |&(id, _)| id)
+        let bytes = g.read_async(&out, 0, size).await?;
+        Ok(parse_argmax(&bytes, logits.cols as u32).first().map_or(0, |&(id, _)| id))
+    }
+
+    /// Waits until the GPU has done everything submitted so far, and returns the first
+    /// error WebGPU reported for it (a failed allocation while loading, for example: the
+    /// browser reports those after `create_buffer` has returned).
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::await_holding_lock)]
+    pub async fn sync_async(&mut self) -> Result<()> {
+        let gpu = self.gpu.clone();
+        let mut g = gpu.lock().unwrap();
+        let out = g.argmax_out.clone();
+        g.read_async(&out, 0, 8).await.map(|_| ())
     }
 
     /// The choices the kernels are run with on this device.

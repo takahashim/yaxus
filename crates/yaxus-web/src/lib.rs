@@ -1,9 +1,15 @@
-//! yaxus in the browser: a chosen GGUF file is parsed in wasm memory, the weights go to
-//! WebGPU, and translation streams back into the page.
+//! yaxus in the browser: a chosen GGUF file is read into wasm memory, the weights go to
+//! WebGPU, and translation streams back into the page. It runs in a dedicated worker
+//! (`web/local/worker.js`), so a long load or translation never blocks the page.
 //!
 //! The browser path deliberately keeps one request and one model: no engine, draft
 //! model, document chains, batching or KV-prefix cache. Everything above the GPU is the
 //! same code as the CLI (`yaxus-model` and the kernels of `yaxus-backend-gpu`).
+//!
+//! Errors come in two kinds. A bad input (no text, a file that is not a PLaMo GGUF) is an
+//! ordinary error and the model stays usable. An error of the GPU (a failed allocation,
+//! a lost device) or a panic leaves the device or the wasm instance in an unknown state:
+//! [`Translator::broken`] turns true and the page starts a new worker.
 #![cfg(target_arch = "wasm32")]
 
 use std::fmt::Display;
@@ -45,37 +51,55 @@ fn report(on_progress: &Function, message: &str) {
     let _ = on_progress.call1(&JsValue::NULL, &JsValue::from_str(message));
 }
 
-/// Lets the browser paint the progress message before a long synchronous step.
-async fn tick() {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        match web_sys::window() {
-            Some(window) => {
-                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
-            }
-            // A worker (or a test runtime) has no `window`; resolve at once.
-            None => {
-                let _ = resolve.call0(&JsValue::NULL);
-            }
-        }
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+/// The bytes of the GGUF file, filled chunk by chunk from the worker's file stream, so
+/// the file is in memory once (in wasm), not also as one JavaScript array.
+#[wasm_bindgen]
+pub struct ModelBuffer {
+    bytes: Vec<u8>,
+    len: usize,
 }
 
-/// Loads a GGUF file (already in wasm memory) and opens WebGPU.
+#[wasm_bindgen]
+impl ModelBuffer {
+    /// Reserves room for a file of `len` bytes; fails rather than aborting when wasm
+    /// memory cannot grow that far.
+    #[wasm_bindgen(constructor)]
+    pub fn new(len: f64) -> Result<ModelBuffer, JsError> {
+        let len = len as usize;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| JsError::new(&format!("not enough memory for a {} MB file", len >> 20)))?;
+        Ok(ModelBuffer { bytes, len })
+    }
+
+    /// Appends one chunk of the file.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<(), JsError> {
+        if self.bytes.len() + chunk.len() > self.len {
+            return Err(JsError::new("the file grew while it was read"));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(())
+    }
+}
+
+/// Loads a GGUF file (read into `file`) and opens WebGPU.
 ///
 /// `on_progress` is called with one short message per phase. The errors are the same
-/// ones the CLI reports (not a PLaMo GGUF, a tensor missing, a device too small).
+/// ones the CLI reports (not a PLaMo GGUF, a tensor missing, a device too small), and a
+/// device that failed while the weights were uploaded.
 #[wasm_bindgen]
-pub async fn load_model(bytes: Vec<u8>, on_progress: Function) -> Result<Translator, JsError> {
+pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Translator, JsError> {
     let total = Instant::now();
+    if file.bytes.len() != file.len {
+        return Err(JsError::new("the file was not read to the end"));
+    }
     report(&on_progress, "GGUF を解析しています…");
-    tick().await;
-    let g = Gguf::parse(bytes).map_err(jserr)?;
+    let g = Gguf::parse(file.bytes).map_err(jserr)?;
     let vocab = g.vocab().map_err(jserr)?;
     g.config().map_err(jserr)?;
 
     report(&on_progress, "トークナイザを構築しています…");
-    tick().await;
     let kinds = vocab.types.iter().copied().map(TokenKind::from_ggml_type).collect();
     let tokenizer = Tokenizer::from_vocab(vocab.tokens, kinds, vocab.scores).map_err(jserr)?;
 
@@ -96,7 +120,6 @@ pub async fn load_model(bytes: Vec<u8>, on_progress: Function) -> Result<Transla
             })
             .unwrap_or(0);
     report(&on_progress, "WebGPU デバイスを開いています…");
-    tick().await;
     let need_binding = max_tensor.max(embed);
     let backend = GpuBackend::new_async(need_binding, need_binding.max(64 << 20)).await.map_err(jserr)?;
     let name = backend.caps().name.clone();
@@ -106,7 +129,6 @@ pub async fn load_model(bytes: Vec<u8>, on_progress: Function) -> Result<Transla
     let lm_head_quant = if max_tensor > max_binding { Some(Quant::Q4) } else { None };
 
     report(&on_progress, "重みを GPU に転送しています…");
-    tick().await;
     let opts = ModelOptions {
         quant: Quant::Auto,
         kv_tokens: MAX_CONTEXT,
@@ -114,10 +136,13 @@ pub async fn load_model(bytes: Vec<u8>, on_progress: Function) -> Result<Transla
         prefix_cache: false,
         lm_head_quant,
     };
-    let model = Model::from_gguf(g, backend, &opts).map_err(jserr)?;
+    let mut model = Model::from_gguf(g, backend, &opts).map_err(jserr)?;
+    // WebGPU reports a failed allocation after the call that made it; wait for the
+    // uploads so that such a failure is a load error, not a broken first translation.
+    model.backend.sync_async().await.map_err(jserr)?;
     report(&on_progress, "準備できました");
     let load_ms = total.elapsed().as_secs_f64() * 1e3;
-    Ok(Translator { model, tokenizer, name, load_ms, max_binding, lm_head_q4: lm_head_quant.is_some() })
+    Ok(Translator { model, tokenizer, name, load_ms, max_binding, lm_head_q4: lm_head_quant.is_some(), broken: false })
 }
 
 /// One loaded model. Only one translation runs at a time (the page's button is disabled
@@ -130,14 +155,36 @@ pub struct Translator {
     load_ms: f64,
     max_binding: u64,
     lm_head_q4: bool,
+    /// Set by an error of the GPU (see the crate documentation).
+    broken: bool,
+}
+
+/// An error of `translate`: whether the device (and so the model) is still usable.
+enum Failure {
+    Input(JsError),
+    Gpu(JsError),
+}
+
+fn gpu(e: impl Display) -> Failure {
+    Failure::Gpu(jserr(e))
+}
+
+fn input(e: impl Display) -> Failure {
+    Failure::Input(jserr(e))
 }
 
 #[wasm_bindgen]
 impl Translator {
-    /// The WebGPU adapter's name.
+    /// The WebGPU adapter's name (often empty: browsers hide it).
     #[wasm_bindgen(getter)]
     pub fn device(&self) -> String {
         self.name.clone()
+    }
+
+    /// True after an error of the GPU: the model cannot be used again.
+    #[wasm_bindgen(getter)]
+    pub fn broken(&self) -> bool {
+        self.broken
     }
 
     /// Loading time (parse, tokenizer, upload) in milliseconds.
@@ -158,27 +205,60 @@ impl Translator {
         self.lm_head_q4
     }
 
-    /// Translates English into Japanese. Long text is split into paragraphs and
+    /// Translates `text` into `target` (`ja` or `en`; the source language is left to
+    /// the model, as the CLI does without `--from`). `form` (`polite`, `plain`, or
+    /// none) applies to Japanese output. Long text is split into paragraphs and
     /// sentences; each segment is translated in order, with the previous segments as
     /// history, and `on_text` receives text as it is produced. `on_progress` gets
     /// `(segments_done, segments_total)`.
     pub async fn translate(
         &mut self,
         text: String,
+        target: String,
         form: Option<String>,
         on_text: Function,
         on_progress: Option<Function>,
     ) -> Result<Stats, JsError> {
-        let form = match form.as_deref() {
+        if self.broken {
+            return Err(JsError::new("the GPU failed earlier; load the model again"));
+        }
+        match self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await {
+            Ok(stats) => Ok(stats),
+            Err(Failure::Input(e)) => Err(e),
+            Err(Failure::Gpu(e)) => {
+                self.broken = true;
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Translator {
+    async fn translate_inner(
+        &mut self,
+        text: &str,
+        target: &str,
+        form: Option<&str>,
+        on_text: &Function,
+        on_progress: Option<&Function>,
+    ) -> Result<Stats, Failure> {
+        if !matches!(target, "ja" | "en") {
+            return Err(input(format!("unsupported target language {target:?}")));
+        }
+        let form = match form {
+            _ if target != "ja" => None,
             None | Some("") | Some("none") => None,
             Some("polite") => Some(Form::Polite),
             Some("plain") => Some(Form::Plain),
-            Some(other) => return Err(JsError::new(&format!("unknown form {other:?}"))),
+            Some(other) => return Err(input(format!("unknown form {other:?}"))),
         };
-        let segments = split_for_context(&text, &self.tokenizer, SEGMENT_INPUT_TOKENS);
+        let segments = split_for_context(text, &self.tokenizer, SEGMENT_INPUT_TOKENS);
         if segments.is_empty() {
-            return Err(JsError::new("the text is empty or only whitespace"));
+            return Err(input("the text is empty or only whitespace"));
         }
+        // Sentences of one paragraph are translated apart and joined: with a space in
+        // English, directly in Japanese.
+        let sentence_gap = if target == "en" { " " } else { "" };
         let total = segments.len();
         let mut history: Vec<Pair> = Vec::new();
         let mut prompt_tokens = 0u32;
@@ -191,25 +271,27 @@ impl Translator {
         let mut last_max_new = MAX_NEW_TOKENS as u32;
 
         for (i, segment) in segments.iter().enumerate() {
-            if let Some(progress) = &on_progress {
+            if let Some(progress) = on_progress {
                 let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(i as f64), &JsValue::from_f64(total as f64));
             }
-            let (ids, max_new) = self.fit_segment(segment, form, &history)?;
+            let (ids, max_new) = self.fit_segment(segment, target, form, &history)?;
             if chars > 0 {
-                let separator = if segment.paragraph { "\n\n" } else { "" };
+                let separator = if segment.paragraph { "\n\n" } else { sentence_gap };
                 if !separator.is_empty() {
                     chars += separator.chars().count();
-                    emit(&on_text, separator)?;
+                    emit(on_text, separator)?;
                 }
             }
             let prompt_len = ids.len() as u32;
-            let prefill_start = Instant::now();
-            let (id, first) = self.model.start(&ids).map_err(jserr)?;
-            prefill_ms += prefill_start.elapsed().as_secs_f64() * 1e3;
-
-            let decode_start = Instant::now();
-            let (translated, stop, generated) = self.decode_segment(id, first, max_new, &on_text, &mut chars).await?;
-            decode_ms += decode_start.elapsed().as_secs_f64() * 1e3;
+            let started = Instant::now();
+            let (id, first) = self.model.start(&ids).map_err(gpu)?;
+            let decoded = self.decode_segment(id, first, max_new, on_text, &mut chars).await?;
+            let (translated, stop, generated) = (decoded.text, decoded.stop, decoded.tokens);
+            // The prompt's pass ends with the first token's read-back: until then the GPU
+            // has only been given the work, so that is where prefill ends.
+            let first_ms = (decoded.first_token - started).as_secs_f64() * 1e3;
+            prefill_ms += first_ms;
+            decode_ms += started.elapsed().as_secs_f64() * 1e3 - first_ms;
             prompt_tokens += prompt_len;
             output_tokens += generated;
             last_max_new = max_new as u32;
@@ -230,7 +312,7 @@ impl Translator {
                 }
             }
         }
-        if let Some(progress) = &on_progress {
+        if let Some(progress) = on_progress {
             let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(total as f64), &JsValue::from_f64(total as f64));
         }
         Ok(Stats {
@@ -249,28 +331,29 @@ impl Translator {
     fn fit_segment(
         &self,
         segment: &Segment,
+        target: &str,
         form: Option<Form>,
         earlier: &[Pair],
-    ) -> Result<(Vec<u32>, usize), JsError> {
+    ) -> Result<(Vec<u32>, usize), Failure> {
         let mut history = select_history(earlier);
         loop {
             let req = TranslationRequest {
                 text: segment.text.clone(),
-                target_lang: "ja".into(),
-                source_lang: Some("en".into()),
+                target_lang: target.into(),
+                source_lang: None,
                 form,
                 context: None,
                 glossary: Vec::new(),
                 history: history.clone(),
             };
-            let req = req.validate().map_err(jserr)?;
+            let req = req.validate().map_err(input)?;
             let ids = self.tokenizer.encode(&req.render(), false);
             let len = ids.len();
             if len < MAX_CONTEXT && (history.is_empty() || len + MIN_NEW <= MAX_CONTEXT) {
                 return Ok((ids, MAX_NEW_TOKENS.min(MAX_CONTEXT - len)));
             }
             if history.is_empty() {
-                return Err(JsError::new(&format!("a segment needs {len} prompt tokens; the limit is {MAX_CONTEXT}")));
+                return Err(input(format!("a segment needs {len} prompt tokens; the limit is {MAX_CONTEXT}")));
             }
             history.remove(0);
         }
@@ -284,15 +367,17 @@ impl Translator {
         max_new: usize,
         on_text: &Function,
         chars: &mut usize,
-    ) -> Result<(String, &'static str, u32), JsError> {
+    ) -> Result<Decoded, Failure> {
         let mut logits = first;
         let mut decoder = StreamDecoder::new();
         let mut translated = String::new();
         let mut output_tokens = 0u32;
         let mut stop = "limit";
+        let mut first_token = None;
         let result = async {
             while (output_tokens as usize) < max_new {
-                let next = self.model.backend.argmax_async(&logits).await;
+                let next = self.model.backend.argmax_async(&logits).await.map_err(gpu)?;
+                first_token.get_or_insert_with(Instant::now);
                 if next == EOS_ID {
                     stop = "eos";
                     break;
@@ -311,7 +396,7 @@ impl Translator {
                 if output_tokens as usize >= max_new {
                     break;
                 }
-                logits = self.model.forward(&[(id, &[next])], false).map_err(jserr)?;
+                logits = self.model.forward(&[(id, &[next])], false).map_err(gpu)?;
             }
             // A character split across byte tokens is held until the next token; there is
             // no next token at the end, so emit its replacement here.
@@ -321,13 +406,14 @@ impl Translator {
                 translated.push_str(&tail);
                 emit(on_text, &tail)?;
             }
-            Ok::<(), JsError>(())
+            Ok::<(), Failure>(())
         }
         .await;
         match result {
             Ok(()) => {
                 self.model.finish(id);
-                Ok((translated, stop, output_tokens))
+                let first_token = first_token.unwrap_or_else(Instant::now);
+                Ok(Decoded { text: translated, stop, tokens: output_tokens, first_token })
             }
             Err(e) => {
                 self.model.free_seq(id);
@@ -337,12 +423,22 @@ impl Translator {
     }
 }
 
+/// One segment's output.
+struct Decoded {
+    text: String,
+    /// `tag`, `eos` or `limit` (see [`Stats::stop`]).
+    stop: &'static str,
+    tokens: u32,
+    /// When the first token was read back.
+    first_token: Instant,
+}
+
 /// Emits text to the page.
-fn emit(on_text: &Function, text: &str) -> Result<(), JsError> {
+fn emit(on_text: &Function, text: &str) -> Result<(), Failure> {
     on_text
         .call1(&JsValue::NULL, &JsValue::from_str(text))
         .map(|_| ())
-        .map_err(|e| JsError::new(&format!("on_text callback failed: {e:?}")))
+        .map_err(|e| input(format!("on_text callback failed: {e:?}")))
 }
 
 /// The newest pairs within the history budget (at most two).
@@ -422,9 +518,11 @@ impl Stats {
         self.decode_ms
     }
 
-    /// Output tokens per second over the decode loop.
+    /// Output tokens per second over the decode loop (the first token of each segment
+    /// comes with the prefill, so it is not counted).
     #[wasm_bindgen(getter)]
     pub fn tokens_per_second(&self) -> f64 {
-        if self.decode_ms <= 0.0 { 0.0 } else { f64::from(self.output_tokens) * 1e3 / self.decode_ms }
+        let tokens = self.output_tokens.saturating_sub(self.segments);
+        if self.decode_ms <= 0.0 { 0.0 } else { f64::from(tokens) * 1e3 / self.decode_ms }
     }
 }

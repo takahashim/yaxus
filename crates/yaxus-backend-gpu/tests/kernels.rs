@@ -373,7 +373,7 @@ fn failed_allocations_are_errors() {
     assert_eq!(gpu.debug_argmax(&[0.0, 1.0, 0.5], 1), [1]);
 }
 
-/// The embedding kernels read a Q4_K table (the browser's 0.8B path) and a bf16 table
+/// The embedding kernels read a Q4_K table (the 0.8B GGUF's, kept 4-bit) and a bf16 table
 /// row for row.
 #[test]
 #[ignore]

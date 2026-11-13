@@ -49,7 +49,7 @@ pub fn split_for_context(text: &str, tok: &Tokenizer, budget: usize) -> Vec<Segm
                 }
                 continue;
             }
-            let candidate = if current.is_empty() { sentence.to_string() } else { format!("{current} {sentence}") };
+            let candidate = join_sentences(&current, sentence);
             if count(tok, &candidate) <= budget {
                 current = candidate;
             } else {
@@ -60,6 +60,18 @@ pub fn split_for_context(text: &str, tok: &Tokenizer, budget: usize) -> Vec<Segm
         flush(&mut current, &mut first, &mut out);
     }
     out
+}
+
+/// `current` and the next sentence of its paragraph: Japanese sentences follow one
+/// another directly, other sentences with a space.
+fn join_sentences(current: &str, sentence: &str) -> String {
+    if current.is_empty() {
+        sentence.to_string()
+    } else if current.ends_with(['。', '！', '？', '」', '』', '）']) {
+        format!("{current}{sentence}")
+    } else {
+        format!("{current} {sentence}")
+    }
 }
 
 fn count(tok: &Tokenizer, text: &str) -> usize {
@@ -186,6 +198,17 @@ mod tests {
         for word in ["One", "three.", "Four", "nine."] {
             assert!(joined.contains(word), "{joined}");
         }
+    }
+
+    #[test]
+    fn japanese_sentences_are_packed_without_spaces() {
+        let tok = plamo_like(&[]);
+        let budget = count(&tok, "これは一つ。これは二つ。");
+        let segments = split_for_context("これは一つ。これは二つ。これは三つ。", &tok, budget);
+        assert_eq!(
+            segments.iter().map(|s| (s.text.as_str(), s.paragraph)).collect::<Vec<_>>(),
+            [("これは一つ。これは二つ。", true), ("これは三つ。", false)]
+        );
     }
 
     #[test]

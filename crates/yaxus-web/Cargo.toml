@@ -16,7 +16,6 @@ console_error_panic_hook = "0.1"
 js-sys = "=0.3.107"
 wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "=0.4.80"
-web-sys = { version = "0.3", features = ["Window"] }
 web-time = "1"
 yaxus-backend-gpu = { path = "../yaxus-backend-gpu" }
 yaxus-model = { path = "../yaxus-model" }

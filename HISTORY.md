@@ -1709,10 +1709,14 @@ M2、llama.cpp b11972 で測った。yaxus は既定の設定 (wgpu の Metal、
 - `Tuning::for_device` が Intel/AMD とみなして int16 を選ぶ。WebGPU は f32 固定 (subgroup の 32 レーンを WebGPU から確認できないため、subgroup も要求しない)。`gemv1` / `gemv8` と `gemm_f32`、行ごとの attention は lavapipe の CI と同じ経路。
 - GGUF が mmap とパス前提。`Gguf::parse(Vec<u8>)` と `TensorRef` の `Mmap | Arc<Vec<u8>>` を足した。トークナイザは `Tokenizer::from_vocab`。
 - std の `Instant` は wasm32-unknown-unknown で panic する。時間は `web-time` に置き換えた。
-- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。ブラウザでは Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした (native は従来どおり bf16)。出力行列 (Q6_K、135 MB) が storage binding の上限 (128 MB の段階) を超える場合は、`ModelOptions.lm_head_quant = Q4` (82 MB) に落とす。
+- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした。native も同じ表を使う (下の「CLI との一致」)。出力行列 (Q6_K、135 MB) が storage binding の上限 (128 MB の段階) を超える場合は、`ModelOptions.lm_head_quant = Q4` (82 MB) に落とす。
 
-**測ったこと。** native のテストと clippy (workspace と wasm32) は通る。wasm は 0.8 MB。Deno の wasm で、573 MB の Q4_K_M の GGUF 解析とトークナイザ構築までは動いた (0.4 秒)。GPU のデバイス作成はこの環境の Metal コンパイラサービスが使えず止まるので、カーネル、prefill、decode の時間と tok/s は未計測。ページは読み込み時間、prefill、decode の tok/s を表示する。
+**測ったこと。** native のテストと clippy (workspace と wasm32) は通る。wasm は 0.8 MB。M2 の Chrome (ヘッドレス、Playwright で操作) で、0.8B Q4_K_M の読み込みはファイルの読み込みを含めて 2.7 秒、decode は 72〜81 tok/s (1 段落)。
 
 **長文。** ブラウザは最初、入力全体を 1 プロンプトにしていたので、長い文は 2048 トークンの文脈と 1024 トークンの出力で切れた。`yaxus_pfml::segments` で空行の段落、次に文 (`.`、`!`、`?`、`。`、改行)、最後に語・文字の順に 768 入力トークン以下へ分け、1 セグメントずつ順に訳すようにした。直前 2 組 (1600 文字まで) を履歴にし、4096 トークンに収まらない履歴は捨てる。ページには `on_progress(done, total)` で「3/12 段落」を出す。
 
-**残り。** WebGPU の subgroup (32 レーン) が使えるか、Worker 化、モデルの再読み込みを省くキャッシュ。
+**CLI との一致。** 最初の版のページの訳は CLI と違った (「寝ています」と「寝ている」)。原因は埋め込み表ではなく、ページの文体の既定が「です・ます」だったこと (CLI は指定なし)。既定を「指定なし」にし、原文の言語も CLI と同じく渡さないようにした。そのうえで埋め込み表を native でも Q4_K のまま読むようにした。CLI の訳は、3 つの文 (英→日の短文と 3 文の段落、日→英) で bf16 の表のときと一字一句同じで、f32 と int16 でも同じ。ブラウザの訳はこの 3 つとも CLI と一致する。
+
+**Worker とエラー。** 最初の版はページのスレッドで動き、ファイルを JavaScript の配列に読んでから wasm にコピーしていた (573 MB が 2 つ)。また wasm では error scope を空にしていたので、GPU のエラーは捕まえられなかった。専用 Worker に移し、ファイルはチャンクごとに wasm の `ModelBuffer` へ足すようにした。WebGPU のエラーは uncaptured-error と device-lost のコールバックで `Fault` に残し、読み戻しが返す。`device.destroy()` と不正な `createBuffer` を Worker に差し込んで試し、どちらもエラーを表示し、翻訳を止め、「読み込む」で元に戻ることを確かめた。
+
+**残り。** WebGPU の subgroup (32 レーン) が使えるか、モデルの再読み込みを省くキャッシュ。
