@@ -83,7 +83,8 @@ pub enum Weight {
     Vector(Buf),
     /// Embedding table `[V, H]` in bf16 (two values per u32).
     Embedding {
-        table: Buf,
+        tables: Vec<Buf>,
+        rows_per_table: usize,
         h: usize,
     },
 }
@@ -133,7 +134,11 @@ impl Gpu {
                 &raw
             }
         };
-        Ok(Weight::Embedding { table: self.upload("embedding", bytemuck::cast_slice(bf16)), h: t.shape[1] })
+        let h = t.shape[1];
+        let rows_per_table = (self.dev.max_binding() as usize / (h * 2)).max(1);
+        let tables =
+            bf16.chunks(rows_per_table * h).map(|rows| self.upload("embedding", bytemuck::cast_slice(rows))).collect();
+        Ok(Weight::Embedding { tables, rows_per_table, h })
     }
 
     pub(crate) fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {

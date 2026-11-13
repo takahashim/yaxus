@@ -306,7 +306,7 @@ impl Gpu {
         if jobs.is_empty() {
             return;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let n = jobs.len();
         self.compile_all(&jobs);
         if self.diag.compile_log {
@@ -317,9 +317,12 @@ impl Gpu {
     /// Compiles `jobs` on all cores and adds them in their order (a cold shader cache
     /// makes a kernel cost a compiler run: on CI's virtual Apple GPUs, ~0.2 s each).
     fn compile_all(&mut self, jobs: &[Job]) {
+        #[cfg(not(target_arch = "wasm32"))]
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len()).max(1);
+        #[cfg(not(target_arch = "wasm32"))]
         let next = std::sync::atomic::AtomicUsize::new(0);
         let compiler = self.dev.compiler(self.compile);
+        #[cfg(not(target_arch = "wasm32"))]
         let mut built: Vec<(usize, Kernel)> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -337,6 +340,15 @@ impl Gpu {
                 .collect();
             workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
         });
+        #[cfg(target_arch = "wasm32")]
+        let mut built: Vec<(usize, Kernel)> = jobs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, read_only, source))| {
+                let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                (i, compiler.compile(name, &src, read_only))
+            })
+            .collect();
         built.sort_by_key(|(i, _)| *i);
         for (i, k) in built {
             self.insert_kernel(jobs[i].0.clone(), k);
@@ -344,7 +356,7 @@ impl Gpu {
     }
 
     pub(crate) fn build_kernels(&mut self) {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let jobs: Vec<Job> = base_sources(&self.caps, &self.tuning)
             .into_iter()
             .map(|(name, src, read_only)| (name, read_only.to_vec(), Box::new(move || src.clone()) as _))
@@ -361,7 +373,7 @@ impl Gpu {
         if self.kernels.contains_key(&name) {
             return name;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         self.add_kernel(name.clone(), &source(), read_only);
         // (`precompile` should have covered it; a line here means a stall mid-request)
         if self.diag.compile_log {

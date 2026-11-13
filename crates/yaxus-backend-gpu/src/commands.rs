@@ -59,11 +59,11 @@ impl Gpu {
     }
 
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
-        let t_rec = std::time::Instant::now();
+        let t_rec = web_time::Instant::now();
         self.pending_flops = 0.0;
         let out = self.dev.read(src, offset, size);
         if let Some(p) = &mut self.profile {
-            let now = std::time::Instant::now();
+            let now = web_time::Instant::now();
             if let Some(last) = p.last_sync {
                 p.record += t_rec - last;
                 p.wait += now - t_rec;
@@ -98,8 +98,12 @@ impl Gpu {
     pub(crate) fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         // Only report a buffer from this call (uploads outside `checked` also set it).
         self.oversized = None;
+        // Browser error scopes resolve asynchronously; the synchronous loading path cannot
+        // wait for them. Oversized bindings are still checked below on both platforms.
+        #[cfg(not(target_arch = "wasm32"))]
         let scope = self.dev.error_scope();
         let r = f(self);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(e) = scope.finish().or_else(|| self.dev.take_failure()) {
             anyhow::bail!("{what}: {e}");
         }

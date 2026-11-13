@@ -154,6 +154,44 @@ In a browser, open `https://host.example:8443/` and enter the token. The API is
 `POST /v1/translate`, `POST /v1/translate/document` and `GET /v1/languages`
 (see `crates/yaxus-api`).
 
+### Browser-local prototype
+
+The experimental local browser UI runs the 0.8B Q4_K_M GGUF on the browser's WebGPU
+device. Choose the GGUF file already on your computer; the model and input stay on your
+computer. It supports short Japanese-to-English and English-to-Japanese translations and
+streams the result. It uses one request at a time, a 1024-token context and at most 256
+generated tokens. It reads the GGUF in chunks into WASM memory, where the entire file is
+still held during initialization, and needs additional GPU memory. This prototype rejects
+GGUF files larger than the wasm32 allocation limit (about 2 GiB).
+The UI reports when generation reaches the output limit before a stop token.
+The device must support WebGPU and the limits requested by the kernels; Chrome on desktop
+is the tested browser.
+
+Build and run it locally:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+sh web/local/build.sh
+python3 -m http.server 8765 --bind 127.0.0.1 --directory web/local
+```
+
+Open `http://localhost:8765/` in Chrome and select
+`plamo-3-translate-0.8b-Q4_K_M.gguf`. The generated `web/local/pkg/` files are build
+outputs. Run the build again after changing Rust code. WebGPU requires a secure context;
+localhost is supported for development. The model's separate license also applies here.
+
+The optional browser integration test uses `playwright-core` and an installed Chrome.
+With the server above running, install `playwright-core` outside the repository and run:
+
+```sh
+npm install --prefix /tmp/yaxus-web-test playwright-core
+NODE_PATH=/tmp/yaxus-web-test/node_modules \
+CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+YAXUS_GGUF=/path/to/plamo-3-translate-0.8b-Q4_K_M.gguf \
+node tests/web/chrome.cjs
+```
+
 ### Speed and precision
 
 By default (`--prefill-precision auto`, `--decode-precision auto`) the device chooses the

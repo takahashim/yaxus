@@ -10,11 +10,28 @@ use safetensors::{Dtype, SafeTensors};
 
 use crate::ggml::GgmlType;
 
+/// Storage shared by the tensor views of a model.
+pub(crate) enum TensorData {
+    Mmap(Mmap),
+    Bytes(Vec<u8>),
+}
+
+impl std::ops::Deref for TensorData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Mmap(data) => data,
+            Self::Bytes(data) => data,
+        }
+    }
+}
+
 /// A tensor living inside a memory-mapped file: bf16 from safetensors, or any
 /// [`GgmlType`] from a GGUF file. `shape` is row-major (`[N, K]` for matrices).
 #[derive(Clone)]
 pub struct TensorRef {
-    pub(crate) mmap: Arc<Mmap>,
+    pub(crate) mmap: Arc<TensorData>,
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub shape: Vec<usize>,
@@ -64,7 +81,7 @@ impl TensorRef {
         if self.dtype == GgmlType::Bf16 && self.minus == 0.0 {
             return self.bytes().as_chunks::<2>().0.iter().map(|&b| u16::from_le_bytes(b)).collect();
         }
-        self.to_f32_vec().into_iter().map(f32_to_bf16).collect()
+        crate::ggml::dequantize_bf16(self.dtype, self.bytes(), self.numel(), self.minus)
     }
 
     pub fn to_f32_vec(&self) -> Vec<f32> {
@@ -114,7 +131,7 @@ impl Weights {
             let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
             // SAFETY: the file is treated as read-only; modifying it while mapped is UB
             // like with any mmap-based loader.
-            let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+            let mmap = Arc::new(TensorData::Mmap(unsafe { Mmap::map(&file)? }));
             let (header_len, meta) = SafeTensors::read_metadata(&mmap[..])?;
             let data_start = 8 + header_len;
             for (name, info) in meta.tensors() {

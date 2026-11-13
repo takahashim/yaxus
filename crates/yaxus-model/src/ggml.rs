@@ -259,6 +259,28 @@ pub fn dequantize(t: GgmlType, bytes: &[u8], n: usize) -> Vec<f32> {
     y
 }
 
+/// Dequantize directly into bf16, keeping only one block of f32 scratch per task.
+pub(crate) fn dequantize_bf16(t: GgmlType, bytes: &[u8], n: usize, offset: f32) -> Vec<u16> {
+    let (e, bsz) = t.block();
+    let mut y = vec![0u16; n];
+    if e == 1 {
+        y.par_iter_mut().zip(bytes.par_chunks(bsz)).with_min_len(256).for_each(|(out, block)| {
+            let mut value = 0.0;
+            dequant_block(t, block, std::slice::from_mut(&mut value));
+            *out = crate::weights::f32_to_bf16(if offset == 0.0 { value } else { value - offset });
+        });
+        return y;
+    }
+    y.par_chunks_mut(e).zip(bytes.par_chunks(bsz)).with_min_len(256).for_each(|(out, block)| {
+        let mut scratch = [0.0f32; 256];
+        dequant_block(t, block, &mut scratch[..out.len()]);
+        for (dst, value) in out.iter_mut().zip(scratch) {
+            *dst = crate::weights::f32_to_bf16(if offset == 0.0 { value } else { value - offset });
+        }
+    });
+    y
+}
+
 /// Q8_0 as [`Q8Data`] (identical values: 32 int8 and one f16 scale per block).
 pub fn q8_from_q8_0(bytes: &[u8]) -> Q8Data {
     let nb = bytes.len() / 34;
@@ -431,6 +453,35 @@ pub fn q3_from_q3_k(bytes: &[u8], n: usize, k: usize) -> Q3Data {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_bf16_matches_f32_conversion_for_all_formats() {
+        for t in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::Bf16,
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::Q2K,
+            GgmlType::Q3K,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+        ] {
+            let (elements, bytes_per_block) = t.block();
+            let bytes: Vec<u8> = (0..bytes_per_block * 5).map(|i| (i.wrapping_mul(53) + 7) as u8).collect();
+            for offset in [0.0, 0.25] {
+                let expected: Vec<u16> = dequantize(t, &bytes, elements * 5)
+                    .into_iter()
+                    .map(|v| crate::weights::f32_to_bf16(if offset == 0.0 { v } else { v - offset }))
+                    .collect();
+                assert_eq!(dequantize_bf16(t, &bytes, elements * 5, offset), expected, "{t:?}, offset {offset}");
+            }
+        }
+    }
 
     fn q4k_block(seed: u32) -> Vec<u8> {
         let mut b: Vec<u8> = (0..144u32).map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8).collect();

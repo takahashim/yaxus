@@ -6,6 +6,7 @@ mod matmul;
 use anyhow::{Context, Result};
 use yaxus_model::{Config, LayerMeta, PAGE, PassMeta};
 
+use crate::dev::Buf;
 use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight, plan};
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
@@ -102,10 +103,18 @@ impl Gpu {
     }
 
     pub(crate) fn embed(&mut self, table: &Weight) -> Tensor {
-        let Weight::Embedding { table, h } = table else { panic!("embed needs the embedding table") };
+        let Weight::Embedding { tables, rows_per_table, h } = table else { panic!("embed needs the embedding table") };
         let y = self.tensor(self.pass_rows, *h);
         let ids = self.meta_buf(MetaBuf::Ids);
-        self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass_rows as u32, 1));
+        for (i, table) in tables.iter().enumerate() {
+            let first = i * rows_per_table;
+            self.dispatch(
+                "embed",
+                &[y.buf(), table, &ids],
+                &[*h as u32, first as u32, (first + rows_per_table) as u32],
+                (self.pass_rows as u32, 1),
+            );
+        }
         y
     }
 
@@ -202,6 +211,17 @@ impl Gpu {
             }
             return out;
         }
+        let out = self.dispatch_argmax(logits);
+        let b = self.read(&out, 0, logits.rows as u64 * 8);
+        let v: &[u32] = bytemuck::cast_slice(&b);
+        // A row of only -inf or NaN keeps the kernel's "none" index; the CPU picks the
+        // first element then, and an id beyond the vocabulary must not escape.
+        let cols = logits.cols as u32;
+        v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
+    }
+
+    /// Record the reduction shared by native and browser readback paths.
+    fn dispatch_argmax(&mut self, logits: &Tensor) -> Buf {
         let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
         let slice = logits.cols.div_ceil(ARGMAX_SLICES);
         self.dispatch(
@@ -211,11 +231,14 @@ impl Gpu {
             (ARGMAX_SLICES as u32, logits.rows as u32),
         );
         self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
-        let b = self.read(&out, 0, logits.rows as u64 * 8);
-        let v: &[u32] = bytemuck::cast_slice(&b);
-        // A row of only -inf or NaN keeps the kernel's "none" index; the CPU picks the
-        // first element then, and an id beyond the vocabulary must not escape.
-        let cols = logits.cols as u32;
-        v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
+        out
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn begin_web_argmax(&mut self, logits: &Tensor) -> wgpu::Buffer {
+        debug_assert_eq!(logits.rows, 1);
+        let out = self.dispatch_argmax(logits);
+        let crate::dev::Dev::Wgpu(dev) = &mut self.dev;
+        dev.begin_web_read(&out, 8)
     }
 }

@@ -18,6 +18,10 @@
 //! - `dev`: the device layer (wgpu, or Metal directly); `msl`: the MSL sources.
 //! - `shaders`, `gemv_int`, `gemm_int`, `gemv_f32`: the WGSL sources.
 
+// The backend's shared handles use Arc on native; WebGPU handles are confined to the
+// browser worker and are not Send even though they use the same shared representation.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 mod commands;
 mod dev;
 mod device;
@@ -222,7 +226,22 @@ impl Gpu {
     /// Opens the GPU (see `dev::Dev::open`).
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
-        let (mut dev, caps) = Dev::open(&diag)?;
+        let (dev, caps) = Dev::open(&diag)?;
+        Self::from_device(dev, caps, diag)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn new_web() -> Result<Self> {
+        let diag = Diagnostics::default();
+        let (dev, caps) = Dev::open_web(&diag).await?;
+        let Dev::Wgpu(device) = &dev;
+        let scope = WebErrorScope::new(&device.device);
+        let gpu = Self::from_device(dev, caps, diag);
+        scope.finish().await?;
+        gpu
+    }
+
+    fn from_device(mut dev: Dev, caps: DeviceCaps, diag: Diagnostics) -> Result<Self> {
         let tuning = Tuning::for_device(&caps);
         let compile = CompileSettings::for_device(&caps);
         let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);
@@ -271,12 +290,78 @@ pub struct GpuBackend {
     formats: Vec<Format>,
 }
 
+/// Browser GPU errors must be collected after the synchronous operations have yielded.
+#[cfg(target_arch = "wasm32")]
+pub struct WebErrorScope {
+    internal: wgpu::ErrorScopeGuard,
+    oom: wgpu::ErrorScopeGuard,
+    validation: wgpu::ErrorScopeGuard,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WebErrorScope {
+    fn new(device: &wgpu::Device) -> Self {
+        Self {
+            internal: device.push_error_scope(wgpu::ErrorFilter::Internal),
+            oom: device.push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+            validation: device.push_error_scope(wgpu::ErrorFilter::Validation),
+        }
+    }
+
+    pub async fn finish(self) -> Result<()> {
+        let validation = self.validation.pop();
+        let oom = self.oom.pop();
+        let internal = self.internal.pop();
+        let validation = validation.await;
+        let oom = oom.await;
+        let internal = internal.await;
+        if let Some(error) = oom.or(validation).or(internal) {
+            anyhow::bail!("WebGPU: {error}");
+        }
+        Ok(())
+    }
+}
+
 impl GpuBackend {
     /// Opens the platform's GPU (see [`Gpu::new`]), with the device's tuned kernels.
     pub fn new() -> Result<Self> {
         let gpu = Gpu::new()?;
         let gemv = gpu.tuning.gemv;
         Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+    }
+
+    /// Opens WebGPU without blocking the browser's event loop.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_web() -> Result<Self> {
+        let gpu = Gpu::new_web().await?;
+        let gemv = gpu.tuning.gemv;
+        Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+    }
+
+    /// Capture asynchronous allocation and validation errors while loading a model.
+    #[cfg(target_arch = "wasm32")]
+    pub fn web_error_scope(&self) -> WebErrorScope {
+        let g = self.g();
+        let Dev::Wgpu(dev) = &g.dev;
+        WebErrorScope::new(&dev.device)
+    }
+
+    /// Reads a greedy token while yielding to the browser event loop.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn argmax_web(&mut self, logits: &Tensor) -> Result<u32> {
+        anyhow::ensure!(logits.rows == 1, "WebGPU argmax requires exactly one row");
+        let staging = self.g().begin_web_argmax(logits);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        staging.map_async(wgpu::MapMode::Read, ..8, move |result| {
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| anyhow::anyhow!("GPU readback cancelled"))??;
+        let token = {
+            let bytes = staging.get_mapped_range(..8)?;
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        };
+        staging.unmap();
+        Ok(if token < logits.cols as u32 { token } else { 0 })
     }
 
     /// What the device can do.

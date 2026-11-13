@@ -14,6 +14,17 @@ fn f32_to_bf16(x: f32) -> u16 {
     (x.to_bits() >> 16) as u16
 }
 
+#[test]
+#[ignore]
+fn split_embedding_selects_rows_from_each_buffer() {
+    let mut gpu = GpuBackend::new().unwrap();
+    let values: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let table: Vec<u16> = values.iter().map(|&x| f32_to_bf16(x)).collect();
+    let got = gpu.debug_split_embedding(&table, 4, &[5, 0, 2, 3], 2);
+    let want: Vec<f32> = [5, 0, 2, 3].into_iter().flat_map(|i| values[i * 4..i * 4 + 4].iter().copied()).collect();
+    assert_eq!(got, want);
+}
+
 /// Deterministic pseudo-random values in [-1, 1).
 fn values(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed;

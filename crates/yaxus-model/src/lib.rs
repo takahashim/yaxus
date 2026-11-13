@@ -240,14 +240,23 @@ pub struct Model<B: Backend> {
 impl<B: Backend> Model<B> {
     /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
     /// or a GGUF file, and allocates its KV arena.
-    pub fn load(path: &Path, mut backend: B, opts: &ModelOptions) -> Result<Self> {
-        let quant = opts.quant;
+    pub fn load(path: &Path, backend: B, opts: &ModelOptions) -> Result<Self> {
         let (cfg, w) = if gguf::is_gguf(path) {
             let g = gguf::Gguf::open(path)?;
             (g.config()?, g.weights()?)
         } else {
             (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
         };
+        Self::from_weights(cfg, w, backend, opts)
+    }
+
+    /// Loads from an already parsed GGUF, including one supplied as an owned buffer.
+    pub fn from_gguf(gguf: &gguf::Gguf, backend: B, opts: &ModelOptions) -> Result<Self> {
+        Self::from_weights(gguf.config()?, gguf.weights()?, backend, opts)
+    }
+
+    fn from_weights(cfg: Config, w: Weights, mut backend: B, opts: &ModelOptions) -> Result<Self> {
+        let quant = opts.quant;
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);

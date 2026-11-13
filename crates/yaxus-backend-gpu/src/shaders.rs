@@ -1188,7 +1188,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
 /// Embedding gather from the bf16 table (two values per u32): one workgroup per row.
 pub const EMBED: &str = r#"
-struct P { h: u32, _a: u32, _b: u32, _c: u32 }
+struct P { h: u32, first: u32, end: u32, _c: u32 }
 var<immediate> p: P;
 @group(0) @binding(0) var<storage, read_write> y: array<f32>;
 @group(0) @binding(1) var<storage, read> table: array<u32>;
@@ -1197,7 +1197,9 @@ var<immediate> p: P;
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let h2 = p.h / 2u;
-    let src = ids[wg.x] * h2;
+    let id = ids[wg.x];
+    if (id < p.first || id >= p.end) { return; }
+    let src = (id - p.first) * h2;
     let dst = wg.x * p.h;
     for (var i = li; i < h2; i += 256u) {
         let u = table[src + i];

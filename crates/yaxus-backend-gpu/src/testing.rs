@@ -95,6 +95,26 @@ impl Gpu {
         self.dev.write(x.buf(), 0, bytemuck::cast_slice(logits));
         self.argmax_rows(&x)
     }
+
+    #[doc(hidden)]
+    pub fn debug_split_embedding(&mut self, table: &[u16], h: usize, ids: &[u32], rows_per_table: usize) -> Vec<f32> {
+        let tables: Vec<_> = table
+            .chunks(rows_per_table * h)
+            .map(|chunk| self.upload("embedding", bytemuck::cast_slice(chunk)))
+            .collect();
+        let ids_buffer = self.upload("ids", bytemuck::cast_slice(ids));
+        let out = self.tensor(ids.len(), h);
+        for (i, part) in tables.iter().enumerate() {
+            let start = i * rows_per_table;
+            self.dispatch(
+                "embed",
+                &[out.buf(), part, &ids_buffer],
+                &[h as u32, start as u32, (start + rows_per_table) as u32],
+                (ids.len() as u32, 1),
+            );
+        }
+        self.to_host(&out)
+    }
 }
 
 impl GpuBackend {
@@ -169,6 +189,11 @@ impl GpuBackend {
     #[doc(hidden)]
     pub fn debug_argmax(&mut self, logits: &[f32], rows: usize) -> Vec<u32> {
         self.g().debug_argmax(logits, rows)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_split_embedding(&mut self, table: &[u16], h: usize, ids: &[u32], rows_per_table: usize) -> Vec<f32> {
+        self.g().debug_split_embedding(table, h, ids, rows_per_table)
     }
 
     #[doc(hidden)]

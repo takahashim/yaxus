@@ -25,6 +25,7 @@ pub(crate) struct WgpuDev {
     pass: Option<wgpu::ComputePass<'static>>,
     /// Bind groups by (kernel, buffers). Pooled buffers recur every token, so most
     /// dispatches reuse one instead of creating it.
+    #[cfg(not(target_arch = "wasm32"))]
     bind_groups: HashMap<(usize, Vec<wgpu::Buffer>), wgpu::BindGroup>,
     readback: wgpu::Buffer,
     /// Bytes uploaded since the staging memory was last released.
@@ -51,11 +52,13 @@ fn wb(b: &Buf) -> &wgpu::Buffer {
 }
 
 /// Allocation and validation errors captured around a closure (see `Gpu::checked`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ErrorScope {
     oom: wgpu::ErrorScopeGuard,
     invalid: wgpu::ErrorScopeGuard,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         let invalid = pollster::block_on(self.invalid.pop());
@@ -69,12 +72,26 @@ impl WgpuDev {
     /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
     /// can run on machines without a GPU (CI).
     pub(crate) fn open(diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = diag;
+            bail!("WebGPU must be opened asynchronously with GpuBackend::new_web")
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        pollster::block_on(Self::open_async(diag))
+    }
+
+    pub(crate) async fn open_async(diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
         let backends = platform_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapters = instance.enumerate_adapters(backends).await;
+        #[cfg(target_arch = "wasm32")]
+        let adapters =
+            vec![instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.context("no WebGPU adapter")?];
         let adapter = adapters
             .into_iter()
             .find(|a| diag.software || a.get_info().device_type != wgpu::DeviceType::Cpu)
@@ -89,7 +106,7 @@ impl WgpuDev {
             })?;
         let alimits = adapter.limits();
         let caps = detect(&adapter);
-        if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
+        if !cfg!(target_arch = "wasm32") && !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             bail!("{} does not support push constants (wgpu IMMEDIATES)", caps.name);
         }
         let timed = diag.profile == Some(2) && caps.timestamps;
@@ -99,41 +116,44 @@ impl WgpuDev {
             max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
             max_storage_buffers_per_shader_stage: 10,
             max_compute_workgroup_storage_size: caps.max_workgroup_storage,
-            max_immediate_size: 32,
+            max_immediate_size: if cfg!(target_arch = "wasm32") { 0 } else { 32 },
             ..wgpu::Limits::default()
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("yaxus"),
-            required_features: {
-                let mut f = wgpu::Features::IMMEDIATES;
-                if caps.msl {
-                    f |= wgpu::Features::PASSTHROUGH_SHADERS;
-                }
-                if f16 {
-                    f |= wgpu::Features::SHADER_F16;
-                }
-                if coop {
-                    f |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
-                }
-                if subgroups {
-                    f |= wgpu::Features::SUBGROUP;
-                }
-                if timed {
-                    f |= wgpu::Features::TIMESTAMP_QUERY;
-                }
-                f
-            },
-            required_limits: limits,
-            // SAFETY: only the cooperative-matrix feature is experimental here; its kernel is
-            // checked against the f32 GEMM and the CPU reference by the test suite.
-            experimental_features: if coop {
-                unsafe { wgpu::ExperimentalFeatures::enabled() }
-            } else {
-                wgpu::ExperimentalFeatures::disabled()
-            },
-            ..Default::default()
-        }))
-        .context("creating the wgpu device")?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("yaxus"),
+                required_features: {
+                    let mut f =
+                        if cfg!(target_arch = "wasm32") { wgpu::Features::empty() } else { wgpu::Features::IMMEDIATES };
+                    if caps.msl {
+                        f |= wgpu::Features::PASSTHROUGH_SHADERS;
+                    }
+                    if f16 {
+                        f |= wgpu::Features::SHADER_F16;
+                    }
+                    if coop {
+                        f |= wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+                    }
+                    if subgroups {
+                        f |= wgpu::Features::SUBGROUP;
+                    }
+                    if timed {
+                        f |= wgpu::Features::TIMESTAMP_QUERY;
+                    }
+                    f
+                },
+                required_limits: limits,
+                // SAFETY: only the cooperative-matrix feature is experimental here; its kernel is
+                // checked against the f32 GEMM and the CPU reference by the test suite.
+                experimental_features: if coop {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                },
+                ..Default::default()
+            })
+            .await
+            .context("creating the wgpu device")?;
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: 256,
@@ -170,6 +190,7 @@ impl WgpuDev {
             queue,
             encoder: None,
             pass: None,
+            #[cfg(not(target_arch = "wasm32"))]
             bind_groups: HashMap::new(),
             readback,
             unflushed_upload: 0,
@@ -263,7 +284,9 @@ impl WgpuDev {
         groups: (u32, u32),
         label: Option<String>,
     ) {
+        #[cfg(not(target_arch = "wasm32"))]
         let key = (id, bufs.iter().map(|b| wb(b).clone()).collect::<Vec<_>>());
+        #[cfg(not(target_arch = "wasm32"))]
         let bg = match self.bind_groups.get(&key) {
             Some(bg) => bg.clone(),
             None => {
@@ -285,6 +308,28 @@ impl WgpuDev {
                 self.bind_groups.insert(key, bg.clone());
                 bg
             }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let bg = {
+            let _ = id;
+            // Each dispatch owns its parameters. Reusing one buffer would make earlier
+            // dispatches see later writes before the command buffer is submitted.
+            let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("dispatch parameters"),
+                contents: bytemuck::cast_slice(imm),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let mut entries: Vec<_> = bufs
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: wb(b).as_entire_binding() })
+                .collect();
+            entries.push(wgpu::BindGroupEntry { binding: bufs.len() as u32, resource: params.as_entire_binding() });
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &k.layout,
+                entries: &entries,
+            })
         };
         let timing = self.kernels_profile.as_mut().and_then(|kp| {
             (kp.pending.len() < MAX_TIMED).then(|| {
@@ -314,6 +359,7 @@ impl WgpuDev {
         let pass = self.pass.as_mut().unwrap();
         pass.set_pipeline(&k.pipeline);
         pass.set_bind_group(0, &bg, &[]);
+        #[cfg(not(target_arch = "wasm32"))]
         pass.set_immediates(0, bytemuck::cast_slice(imm));
         pass.dispatch_workgroups(groups.0, groups.1, 1);
     }
@@ -323,6 +369,20 @@ impl WgpuDev {
         if let Some(enc) = self.encoder.take() {
             self.queue.submit([enc.finish()]);
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn begin_web_read(&mut self, src: &Buf, size: u64) -> wgpu::Buffer {
+        let src = wb(src).clone();
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("web readback"),
+            size: size.next_multiple_of(4),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.encoder().copy_buffer_to_buffer(&src, 0, &staging, 0, size);
+        self.submit();
+        staging
     }
 
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
@@ -368,6 +428,7 @@ impl WgpuDev {
         out
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn error_scope(&self) -> ErrorScope {
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let invalid = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -411,6 +472,11 @@ pub(crate) fn compile(
         };
         (module, "k0")
     } else {
+        #[cfg(target_arch = "wasm32")]
+        let src =
+            src.replace("var<immediate> p: P;", &format!("@group(0) @binding({}) var<uniform> p: P;", read_only.len()));
+        #[cfg(target_arch = "wasm32")]
+        let src = src.as_str();
         let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
         let checks = wgpu::ShaderRuntimeChecks {
             force_loop_bounding: settings.loop_bounding,
@@ -421,13 +487,36 @@ pub(crate) fn compile(
         // checks for every source; bounds checks stay on.
         (unsafe { device.create_shader_module_trusted(desc, checks) }, "main")
     };
-    let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
+    let entries: Vec<_> = read_only
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| storage_entry(i as u32, r))
+        .chain({
+            #[cfg(target_arch = "wasm32")]
+            {
+                Some(wgpu::BindGroupLayoutEntry {
+                    binding: read_only.len() as u32,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                })
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                None
+            }
+        })
+        .collect();
     let layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(name),
         bind_group_layouts: &[Some(&layout)],
-        immediate_size: 32,
+        immediate_size: if cfg!(target_arch = "wasm32") { 0 } else { 32 },
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(name),
@@ -445,7 +534,13 @@ pub(crate) fn compile(
 
 /// The wgpu backends of the platform: Metal on macOS, Vulkan elsewhere.
 fn platform_backends() -> wgpu::Backends {
-    if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN }
+    if cfg!(target_arch = "wasm32") {
+        wgpu::Backends::BROWSER_WEBGPU
+    } else if cfg!(target_os = "macos") {
+        wgpu::Backends::METAL
+    } else {
+        wgpu::Backends::VULKAN
+    }
 }
 
 /// The vendor of `info`'s adapter (PCI vendor ids; Apple's on Metal).

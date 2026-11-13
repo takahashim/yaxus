@@ -80,6 +80,11 @@ pub(crate) enum Dev {
 }
 
 impl Dev {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn open_web(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
+        let (d, caps) = wgpu::WgpuDev::open_async(diag).await?;
+        Ok((Dev::Wgpu(Box::new(d)), caps))
+    }
     /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
     /// without wgpu, else wgpu.
     pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
@@ -213,6 +218,7 @@ impl Dev {
     }
 
     /// An allocation that failed since the last call (devices that report them so).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn take_failure(&self) -> Option<String> {
         match self {
             Dev::Wgpu(_) => None,
@@ -223,6 +229,7 @@ impl Dev {
 
     /// Captures allocation and validation errors until `ErrorScope::finish` (see
     /// `Gpu::checked`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn error_scope(&self) -> ErrorScope {
         match self {
             Dev::Wgpu(d) => ErrorScope::Wgpu(d.error_scope()),
@@ -236,6 +243,7 @@ impl Dev {
 }
 
 /// Errors captured since `Dev::error_scope`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum ErrorScope {
     Wgpu(wgpu::ErrorScope),
     /// (Metal reports a failed allocation at the call)
@@ -243,6 +251,7 @@ pub(crate) enum ErrorScope {
     None,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         match self {

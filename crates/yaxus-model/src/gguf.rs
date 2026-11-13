@@ -10,7 +10,7 @@ use memmap2::Mmap;
 
 use crate::config::{Config, RopeParam, RopeParameters, Yarn};
 use crate::ggml::GgmlType;
-use crate::weights::{TensorRef, Weights};
+use crate::weights::{TensorData, TensorRef, Weights};
 use crate::{POST_MIXER_NORM_OFFSET, POST_MLP_NORM_OFFSET, PRE_NORM_OFFSET};
 
 #[derive(Debug, Clone)]
@@ -101,7 +101,7 @@ impl Reader<'_> {
             8 => Value::Str(self.string()?),
             9 => {
                 let it = self.u32()?;
-                let n = self.u64()? as usize;
+                let n = usize::try_from(self.u64()?).context("GGUF array is too long")?;
                 let mut v = Vec::with_capacity(n.min(1 << 20));
                 for _ in 0..n {
                     v.push(self.value(it)?);
@@ -121,13 +121,23 @@ impl Gguf {
         let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: read-only mapping; modifying the file while mapped is UB like with any
         // mmap-based loader.
-        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+        let mmap = Arc::new(TensorData::Mmap(unsafe { Mmap::map(&file)? }));
+        Self::parse(mmap)
+    }
+
+    /// Parse an owned GGUF buffer, for callers without a memory-mapped filesystem.
+    /// Tensor views share this allocation without copying their contents.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        Self::parse(Arc::new(TensorData::Bytes(bytes)))
+    }
+
+    fn parse(mmap: Arc<TensorData>) -> Result<Self> {
         let mut r = Reader { b: &mmap[..], at: 0 };
-        ensure!(r.take(4)? == b"GGUF", "{} is not a GGUF file", path.display());
+        ensure!(r.take(4)? == b"GGUF", "not a GGUF file");
         let version = r.u32()?;
         ensure!(version == 2 || version == 3, "GGUF version {version} is not supported");
-        let n_tensors = r.u64()? as usize;
-        let n_kv = r.u64()? as usize;
+        let n_tensors = usize::try_from(r.u64()?).context("too many GGUF tensors")?;
+        let n_kv = usize::try_from(r.u64()?).context("too many GGUF metadata entries")?;
         let mut meta = HashMap::new();
         for _ in 0..n_kv {
             let k = r.string()?;
@@ -142,15 +152,16 @@ impl Gguf {
             let nd = r.u32()? as usize;
             let mut dims = Vec::with_capacity(nd.min(8));
             for _ in 0..nd {
-                dims.push(r.u64()? as usize);
+                dims.push(usize::try_from(r.u64()?).with_context(|| format!("{name}: dimension is too large"))?);
             }
             let t = GgmlType::from_id(r.u32()?).with_context(|| format!("tensor {name}"))?;
-            let off = r.u64()? as usize;
+            let off = usize::try_from(r.u64()?).with_context(|| format!("{name}: offset is too large"))?;
             infos.push((name, dims, t, off));
         }
-        let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
+        let align = usize::try_from(meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32))
+            .context("GGUF alignment is too large")?;
         ensure!(align.is_power_of_two(), "GGUF alignment {align} is not a power of two");
-        let data = r.at.div_ceil(align) * align;
+        let data = r.at.checked_add(align - 1).map(|n| n & !(align - 1)).context("GGUF alignment overflows")?;
         let mut tensors = Vec::with_capacity(n_tensors.min(1 << 16));
         for (name, dims, t, off) in infos {
             // GGUF lists dimensions innermost first.
@@ -434,5 +445,22 @@ mod tests {
         let g = Gguf::open(&f.0).unwrap();
         assert_eq!(g.tensors.len(), 1);
         assert_eq!(g.tensors[0].1.to_f32_vec(), [1.5, -2.0]);
+    }
+
+    #[test]
+    fn owned_bytes_match_file_and_outlive_parser() {
+        let mut b = head(1, 0);
+        tensor(&mut b, &[2], 0);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b.extend(1.5f32.to_le_bytes());
+        b.extend((-2.0f32).to_le_bytes());
+        let f = write("owned", &b);
+        let file = Gguf::open(&f.0).unwrap();
+        let owned = Gguf::from_bytes(b).unwrap();
+        let tensor = owned.tensors[0].1.clone();
+        assert_eq!(tensor.to_f32_vec(), file.tensors[0].1.to_f32_vec());
+        drop(owned);
+        assert_eq!(tensor.to_f32_vec(), [1.5, -2.0]);
+        assert!(Gguf::from_bytes(head(1, 0)).is_err());
     }
 }

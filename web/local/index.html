@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yaxus ローカル翻訳</title>
+<style>
+body{font:16px system-ui;max-width:48rem;margin:3rem auto;padding:0 1rem;line-height:1.5}
+textarea{box-sizing:border-box;width:100%;min-height:10rem;padding:.7rem;font:inherit}
+label{display:block;margin:1rem 0 .3rem}button,select,input{font:inherit}button{padding:.5rem 1rem;margin:.8rem .5rem .8rem 0}#output{white-space:pre-wrap;min-height:4rem;border:1px solid #ccc;padding:.7rem}#status{color:#444}
+</style>
+<h1>yaxus ローカル翻訳</h1>
+<p>モデルと翻訳はこの端末で処理します。</p>
+<label for="model">0.8B Q4_K_M GGUF モデル</label>
+<input id="model" type="file" accept=".gguf">
+<button id="load">モデルを読み込む</button>
+<p id="status">モデルを選択してください。</p>
+<label for="input">原文</label>
+<textarea id="input"></textarea>
+<label for="target">翻訳先</label>
+<select id="target"><option value="en">英語</option><option value="ja">日本語</option></select>
+<button id="translate" disabled>翻訳</button>
+<div id="output" aria-live="polite"></div>
+<script type="module" src="./main.js"></script>
+</html>

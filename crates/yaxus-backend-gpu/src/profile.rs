@@ -17,7 +17,7 @@ pub(crate) const MAX_TIMED: usize = 2048;
 
 #[derive(Default)]
 pub(crate) struct Profile {
-    pub(crate) last_sync: Option<std::time::Instant>,
+    pub(crate) last_sync: Option<web_time::Instant>,
     pub(crate) record: std::time::Duration,
     pub(crate) wait: std::time::Duration,
     pub(crate) dispatches: usize,
