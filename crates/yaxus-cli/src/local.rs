@@ -345,6 +345,11 @@ fn with_polisher(m: &ModelArgs, verbose: bool, f: impl FnOnce(&mut Local) -> Res
     f(&mut Local { model: model.as_mut(), tok: &tok, verbose })
 }
 
+/// `yaxus mcp`: serves on stdin and stdout until the client closes stdin.
+pub fn mcp(m: ModelArgs, verbose: bool) -> Result<()> {
+    with_polisher(&m, verbose, |p| crate::mcp::serve(p, std::io::stdin().lock(), std::io::stdout().lock()))
+}
+
 pub fn polish(mut c: PolishCmd) -> Result<()> {
     match c.mark {
         Some(PolishMode::Mark(args)) => {

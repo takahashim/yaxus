@@ -67,16 +67,31 @@ yaxus translate --model 2b:Q4_K_M --to en < document.txt   # a GGUF file from th
 ```
 
 Proofreading help for Japanese: `yaxus polish` rewrites each paragraph and shows what
-changed (`[-removed-]{+added+}`). `--via direct` (the default) translates Japanese into
-Japanese, the closest to the source; `--via en` goes through English and back, freer but
-more prone to drift. Each paragraph keeps its politeness (`--form auto`), and a rewrite
-that loses a number, a Latin word or a quotation is marked for checking.
+changed (`[-removed-]{+added+}`). By default (`--via en`) it goes through English and back,
+so the model writes the Japanese anew in its own words; `--via direct` translates
+Japanese into Japanese, the closest to the source (it fixes errors but keeps the
+wording). Each paragraph keeps its politeness (`--form auto`), and a rewrite that loses a
+number, a Latin word or a quotation is marked for checking.
 
 ```sh
 yaxus polish < draft.txt
-yaxus polish --via direct,en,zh-hans --show-pivot < draft.txt   # one candidate per route
+yaxus polish --via en,direct --show-pivot < draft.txt           # one candidate per route
 yaxus polish --format text < draft.txt                          # the rewritten text alone
 yaxus polish mark < draft.txt                                   # marks, no rewrite
+```
+
+The model keeps what the text says, emphasis and all (`**...**`, emoji, headings). With
+`--pivot-cmd`, a general LLM writes the English instead: it decides what is said, and
+the model writes the Japanese, how it is said. The command reads the paragraphs on stdin
+and writes as many on stdout, separated by blank lines; the text goes wherever it sends
+it. For example, with Claude Code:
+
+```sh
+yaxus polish --show-pivot --pivot-cmd 'claude -p "Translate this Japanese into plain
+English for a translator. Drop emphasis (bold, emoji, exclamation marks), stock phrases
+and summaries that add nothing; turn headings and lists into sentences. Keep every fact,
+number and name. Keep the paragraphs, separated by blank lines, and print only the
+English."' < draft.txt
 ```
 
 `yaxus polish mark` rewrites nothing: the model reads each paragraph as the direct rewrite
@@ -87,6 +102,34 @@ generation. `yaxus bench polish` measures the marks against an annotated set
 
 `polish mark --via en` scores the wording alone (the text as the translation of its
 English). A high probability means typical wording, not necessarily human wording.
+
+### MCP server
+
+`yaxus mcp` serves `polish` to Claude Code, Codex and other MCP clients, over stdio. The
+model is loaded once and stays loaded for the session.
+
+```sh
+claude mcp add yaxus -- yaxus mcp --model 8b          # Claude Code
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.yaxus]
+command = "yaxus"
+args = ["mcp", "--model", "8b"]
+```
+
+- **`polish`:** rewrites Japanese text and returns each paragraph's output, its diff, the
+  words it lost and the English pivot (`via`, `form`).
+- **`polish_mark`:** marks the wording the model finds unlikely, with its own choice there
+  (`threshold`, `via`, `form`).
+- **`write_japanese`:** the calling LLM decides what is said and writes each paragraph in
+  plain English; the model writes the Japanese. With the Japanese paragraph as `source`,
+  the politeness comes from it, and the output is diffed against it and checked for lost
+  numbers, Latin words, URLs and quotations. This is how to remove emphasis, emoji and
+  stock phrases from machine-written text without stripping them mechanically.
+
+A call takes at most 40 paragraphs and runs one at a time.
 
 Run a server:
 
