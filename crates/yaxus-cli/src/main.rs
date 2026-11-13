@@ -8,6 +8,8 @@ use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, DocumentEvent, DocumentRequest, Document
 #[cfg(feature = "local")]
 mod local;
 #[cfg(feature = "local")]
+mod mcp;
+#[cfg(feature = "local")]
 mod polish;
 
 #[derive(Parser)]
@@ -75,6 +77,16 @@ enum Cmd {
     /// through another language) and show what changed; `polish mark` marks instead.
     #[cfg(feature = "local")]
     Polish(local::PolishCmd),
+    /// Serve `polish` to Claude Code, Codex and other MCP clients on stdio: the model stays
+    /// loaded for the session. The tools are polish, polish_mark and write_japanese.
+    #[cfg(feature = "local")]
+    Mcp {
+        #[command(flatten)]
+        model: local::ModelArgs,
+        /// Print each step's time to stderr.
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Translate through a remote yaxus server.
     Client {
         /// Server URL.
@@ -274,6 +286,8 @@ fn main() -> Result<()> {
         Cmd::Translate { model, lang, verbose } => local::translate(model, lang, verbose),
         #[cfg(feature = "local")]
         Cmd::Polish(c) => local::polish(c),
+        #[cfg(feature = "local")]
+        Cmd::Mcp { model, verbose } => local::mcp(model, verbose),
         Cmd::Client { server, token, ca, insecure, no_stream, lang } => {
             run_client(server, token, ca, insecure, no_stream, lang)
         }

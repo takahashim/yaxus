@@ -445,35 +445,7 @@ pub fn mark(a: &MarkArgs, p: &mut dyn Polisher) -> Result<()> {
         places += spans.len();
         marked += usize::from(!spans.is_empty());
         if a.format == MarkFormat::Json {
-            let ps: Vec<_> = pieces
-                .iter()
-                .map(|p| {
-                    serde_json::json!({
-                        "text": &seg[p.start..p.end],
-                        "prob": p.logprob.exp(),
-                        "best": p.best.text(),
-                        "best_ends": p.best == Choice::End,
-                        "best_prob": p.best_logprob.exp(),
-                    })
-                })
-                .collect();
-            let ms: Vec<_> = spans
-                .iter()
-                .map(|&(s, e, k)| {
-                    serde_json::json!({"start": s, "end": e, "text": &seg[s..e], "best": pieces[k].best.text(),
-                        "best_ends": pieces[k].best == Choice::End, "prob": pieces[k].logprob.exp()})
-                })
-                .collect();
-            json.push(serde_json::json!({
-                "source": seg,
-                "form": forms[i].map(Form::as_str),
-                "via": via.to_string(),
-                "pivot": n.pivot,
-                "logprob_per_char": n.per_char,
-                "own": n.own.as_ref().map(|(t, lp)| serde_json::json!({"text": t, "logprob_per_char": lp})),
-                "marks": ms,
-                "pieces": ps,
-            }));
+            json.push(mark_json(seg, n, &spans, forms[i], via, true));
             continue;
         }
         if i > 0 {
@@ -516,6 +488,49 @@ pub fn mark(a: &MarkArgs, p: &mut dyn Polisher) -> Result<()> {
         a.threshold
     );
     Ok(())
+}
+
+/// A scored paragraph as JSON: its marks, and with `pieces` every piece's probability.
+fn mark_json(
+    seg: &str,
+    n: &Natural,
+    spans: &[(usize, usize, usize)],
+    form: Option<Form>,
+    via: &Via,
+    pieces: bool,
+) -> serde_json::Value {
+    let ps = &n.pieces;
+    let marks: Vec<_> = spans
+        .iter()
+        .map(|&(s, e, k)| {
+            serde_json::json!({"start": s, "end": e, "text": &seg[s..e], "best": ps[k].best.text(),
+                "best_ends": ps[k].best == Choice::End, "prob": ps[k].logprob.exp()})
+        })
+        .collect();
+    let mut v = serde_json::json!({
+        "source": seg,
+        "form": form.map(Form::as_str),
+        "via": via.to_string(),
+        "pivot": n.pivot,
+        "logprob_per_char": n.per_char,
+        "own": n.own.as_ref().map(|(t, lp)| serde_json::json!({"text": t, "logprob_per_char": lp})),
+        "marks": marks,
+    });
+    if pieces {
+        v["pieces"] = ps
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "text": &seg[p.start..p.end],
+                    "prob": p.logprob.exp(),
+                    "best": p.best.text(),
+                    "best_ends": p.best == Choice::End,
+                    "best_prob": p.best_logprob.exp(),
+                })
+            })
+            .collect();
+    }
+    v
 }
 
 /// Runs of consecutive pieces below `limit` (a log-probability) where the model would
@@ -1032,6 +1047,142 @@ fn lcs_ops(a: &[char], b: &[char]) -> Vec<(Op, char)> {
         }
     }
     ops
+}
+
+// What the MCP server (`yaxus mcp`) runs: the same steps as the commands, their results as
+// JSON rather than text on stdout.
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS,
+            history_chars: yaxus_api::DEFAULT_HISTORY_CHARS,
+            chains: 0,
+        }
+    }
+}
+
+/// A diff as text: [-removed-]{+added+}.
+fn marked(diff: &[(Op, String)]) -> String {
+    diff.iter()
+        .map(|(op, t)| match op {
+            Op::Equal => t.clone(),
+            Op::Delete => format!("[-{t}-]"),
+            Op::Insert => format!("{{+{t}+}}"),
+        })
+        .collect()
+}
+
+/// What a rewrite of `source` came to, for a tool's result.
+fn review_json(source: &str, output: &str) -> serde_json::Value {
+    let r = Review::of(source, output);
+    serde_json::json!({
+        "output": if r.empty { source } else { output },
+        "changed": r.changed(),
+        "diff": marked(&r.diff),
+        // Words of the source the rewrite lost (numbers, Latin words, URLs, quotations).
+        "lost": r.missing,
+        "empty": r.empty,
+    })
+}
+
+/// `polish`: each paragraph rewritten through each of `vias`.
+pub(crate) fn polish_tool(
+    p: &mut dyn Polisher,
+    o: &Opts,
+    segments: &[String],
+    vias: &[Via],
+    form: FormChoice,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(!vias.is_empty(), "via needs at least one of direct or a language code");
+    let forms = forms(form, segments);
+    let cands = vias.iter().map(|v| route(p, o, v, segments, &forms, None)).collect::<Result<Vec<_>>>()?;
+    let paragraphs: Vec<_> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let candidates: Vec<_> = cands
+                .iter()
+                .map(|c| {
+                    let mut v = review_json(s, &c.output[i]);
+                    v["via"] = c.via.to_string().into();
+                    v["pivot"] = c.pivot.as_ref().map(|p| p[i].clone()).into();
+                    v
+                })
+                .collect();
+            serde_json::json!({"source": s, "form": forms[i].map(Form::as_str), "candidates": candidates})
+        })
+        .collect();
+    Ok(serde_json::json!({ "paragraphs": paragraphs }))
+}
+
+/// `polish mark`: the pieces of each paragraph the model finds below `threshold`.
+pub(crate) fn mark_tool(
+    p: &mut dyn Polisher,
+    o: &Opts,
+    segments: &[String],
+    via: &Via,
+    form: FormChoice,
+    threshold: f32,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(threshold > 0.0 && threshold < 1.0, "threshold must be between 0 and 1");
+    let forms = forms(form, segments);
+    let nat = naturalness(p, o, via, segments, &forms)?;
+    let limit = threshold.ln();
+    let paragraphs: Vec<_> = segments
+        .iter()
+        .zip(&nat)
+        .enumerate()
+        .map(|(i, (s, n))| mark_json(s, n, &unlikely(s, &n.pieces, limit), forms[i], via, false))
+        .collect();
+    Ok(serde_json::json!({ "paragraphs": paragraphs }))
+}
+
+/// One paragraph of `write_japanese`: the text in the pivot language, and the Japanese
+/// source it was written from, if there is one.
+pub(crate) struct Draft {
+    pub text: String,
+    pub source: Option<String>,
+}
+
+/// The Japanese of paragraphs written in `lang` by someone else (a general LLM): the
+/// model's choice of words. With the source, each paragraph takes its politeness (as
+/// `form` says) and is checked and diffed against it.
+pub(crate) fn write_tool(
+    p: &mut dyn Polisher,
+    o: &Opts,
+    lang: &str,
+    drafts: &[Draft],
+    form: FormChoice,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(!drafts.is_empty(), "no paragraphs");
+    let with_source = drafts.iter().filter(|d| d.source.is_some()).count();
+    anyhow::ensure!(with_source == 0 || with_source == drafts.len(), "give a source for every paragraph, or for none");
+    let texts: Vec<String> = drafts.iter().map(|d| d.text.clone()).collect();
+    let sources: Option<Vec<String>> =
+        (with_source > 0).then(|| drafts.iter().map(|d| d.source.clone().unwrap_or_default()).collect());
+    let forms = match (&sources, form) {
+        (Some(s), f) => forms(f, s),
+        // (the politeness of English cannot be read from its endings)
+        (None, FormChoice::Polite) => vec![Some(Form::Polite); texts.len()],
+        (None, FormChoice::Plain) => vec![Some(Form::Plain); texts.len()],
+        (None, _) => vec![None; texts.len()],
+    };
+    let output = home(p, o, &format!("{lang}→{LANG}"), lang, &texts, &forms)?;
+    let paragraphs: Vec<_> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut v = match &sources {
+                Some(s) => review_json(&s[i], &output[i]),
+                None => serde_json::json!({"output": output[i], "empty": output[i].trim().is_empty()}),
+            };
+            v["text"] = t.clone().into();
+            v["form"] = forms[i].map(Form::as_str).into();
+            v
+        })
+        .collect();
+    Ok(serde_json::json!({ "paragraphs": paragraphs }))
 }
 
 #[cfg(test)]

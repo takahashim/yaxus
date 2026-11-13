@@ -103,6 +103,34 @@ generation. `yaxus bench polish` measures the marks against an annotated set
 `polish mark --via en` scores the wording alone (the text as the translation of its
 English). A high probability means typical wording, not necessarily human wording.
 
+### MCP server
+
+`yaxus mcp` serves `polish` to Claude Code, Codex and other MCP clients, over stdio. The
+model is loaded once and stays loaded for the session.
+
+```sh
+claude mcp add yaxus -- yaxus mcp --model 8b          # Claude Code
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.yaxus]
+command = "yaxus"
+args = ["mcp", "--model", "8b"]
+```
+
+- **`polish`:** rewrites Japanese text and returns each paragraph's output, its diff, the
+  words it lost and the English pivot (`via`, `form`).
+- **`polish_mark`:** marks the wording the model finds unlikely, with its own choice there
+  (`threshold`, `via`, `form`).
+- **`write_japanese`:** the calling LLM decides what is said and writes each paragraph in
+  plain English; the model writes the Japanese. With the Japanese paragraph as `source`,
+  the politeness comes from it, and the output is diffed against it and checked for lost
+  numbers, Latin words, URLs and quotations. This is how to remove emphasis, emoji and
+  stock phrases from machine-written text without stripping them mechanically.
+
+A call takes at most 40 paragraphs and runs one at a time.
+
 Run a server:
 
 ```sh
