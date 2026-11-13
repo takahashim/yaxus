@@ -42,6 +42,10 @@ jobs:
         run: |
           cargo clippy -p yaxus-cli --no-default-features --features local
           cargo clippy -p yaxus-cli --no-default-features
+      - name: Browser (wasm32 + WebGPU)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p yaxus-web --target wasm32-unknown-unknown
       - name: Tokenizer for the golden tests
         uses: actions/cache@v6
         with:

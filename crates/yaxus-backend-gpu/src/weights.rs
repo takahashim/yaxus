@@ -81,10 +81,13 @@ pub enum Weight {
     Matrix(Matrix),
     /// 1-D weights (norms), converted to f32.
     Vector(Buf),
-    /// Embedding table `[V, H]` in bf16 (two values per u32).
+    /// Embedding table `[V, H]`, in bf16 (two values per u32) or as the GGUF Q4_K
+    /// blocks; a quantized table is read directly, which saves the 330 MB a bf16 copy
+    /// of the 0.8B's 107520 x 1536 table would take.
     Embedding {
         table: Buf,
         h: usize,
+        fmt: Format,
     },
 }
 
@@ -125,6 +128,16 @@ pub(crate) fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> 
 
 impl Gpu {
     pub(crate) fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
+        let h = t.shape[1];
+        // The browser keeps the file's 4-bit table (93 MB for the 0.8B) instead of
+        // expanding it to bf16 (330 MB), which also keeps WebGPU's buffer limits at bay.
+        // Native keeps the bf16 table it has always used.
+        #[cfg(target_arch = "wasm32")]
+        if t.dtype == yaxus_model::ggml::GgmlType::Q4K && h.is_multiple_of(256) {
+            let q = yaxus_model::ggml::q4k_from_q4_k(t.bytes());
+            let table = self.upload("embedding-q4k", &q.data);
+            return Ok(Weight::Embedding { table, h, fmt: Format::Q4K });
+        }
         let raw;
         let bf16: &[u16] = match t.as_bf16() {
             Some(b) => b,
@@ -133,7 +146,7 @@ impl Gpu {
                 &raw
             }
         };
-        Ok(Weight::Embedding { table: self.upload("embedding", bytemuck::cast_slice(bf16)), h: t.shape[1] })
+        Ok(Weight::Embedding { table: self.upload("embedding", bytemuck::cast_slice(bf16)), h, fmt: Format::Bf16 })
     }
 
     pub(crate) fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {

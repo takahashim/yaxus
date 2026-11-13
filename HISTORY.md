@@ -1696,3 +1696,23 @@ M2、llama.cpp b11972 で測った。yaxus は既定の設定 (wgpu の Metal、
 - 0.8B は 1 件あたりほぼ同じ。
 - 2〜16 行のパス (検証) は同じか速い。32 行以上の prefill は 4〜11% 遅い (yaxus は f32、llama.cpp は f16)。
 - 1 行のパスの値は回によって揺れる。2B の `bench rows` は 23.6〜24.0 ms で、12.8 の 21.1 ms より遅い。この計測の間、スワップは 11.7 GB 使われていた。
+
+## 13. ブラウザ版 (wasm32 + WebGPU、2026-11-13)
+
+**なぜ。** CLI とサーバは 1 プロセスで GPU を持つが、配布にはビルド済みバイナリが要る。wasm なら静的ファイルを置くだけで、モデルはユーザーが選んだファイルをタブの中で読める。0.8B Q4_K_M (573 MB、16 層、hidden 1536、KV ヘッド 1) なら GPU の重みは約 570 MB で、デスクトップの GPU に収まる。CPU の wasm は 1 桁 tok/s になるので採らない。
+
+**そのままでは動かなかったもの。**
+
+- WebGPU に push constants がない。全カーネルの `var<immediate> p: P;` を `@group(0) @binding(15) var<uniform> p: P;` に置き換え、1 MB の uniform バッファへ 256 バイトずつ書いて dynamic offset で渡す。native は今までどおり `set_immediates`。
+- `Device::poll` が WebGPU では no-op。`read` の `map_async` + `poll(wait)` は永久に返らないので、`read_async` を足して argmax の読み戻しだけ await する。Engine は使わず、`Model::start` / `forward` の間に `argmax_async` を挟む。
+- `WgpuDev::open` の `pollster::block_on` と `IMMEDIATES` の必須要求。wasm は `request_adapter` / `request_device` を await し、push constants を要求しない。
+- `Tuning::for_device` が Intel/AMD とみなして int16 を選ぶ。WebGPU は f32 固定 (subgroup の 32 レーンを WebGPU から確認できないため、subgroup も要求しない)。`gemv1` / `gemv8` と `gemm_f32`、行ごとの attention は lavapipe の CI と同じ経路。
+- GGUF が mmap とパス前提。`Gguf::parse(Vec<u8>)` と `TensorRef` の `Mmap | Arc<Vec<u8>>` を足した。トークナイザは `Tokenizer::from_vocab`。
+- std の `Instant` は wasm32-unknown-unknown で panic する。時間は `web-time` に置き換えた。
+- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。ブラウザでは Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした (native は従来どおり bf16)。出力行列 (Q6_K、135 MB) が storage binding の上限 (128 MB の段階) を超える場合は、`ModelOptions.lm_head_quant = Q4` (82 MB) に落とす。
+
+**測ったこと。** native のテストと clippy (workspace と wasm32) は通る。wasm は 0.8 MB。Deno の wasm で、573 MB の Q4_K_M の GGUF 解析とトークナイザ構築までは動いた (0.4 秒)。GPU のデバイス作成はこの環境の Metal コンパイラサービスが使えず止まるので、カーネル、prefill、decode の時間と tok/s は未計測。ページは読み込み時間、prefill、decode の tok/s を表示する。
+
+**長文。** ブラウザは最初、入力全体を 1 プロンプトにしていたので、長い文は 2048 トークンの文脈と 1024 トークンの出力で切れた。`yaxus_pfml::segments` で空行の段落、次に文 (`.`、`!`、`?`、`。`、改行)、最後に語・文字の順に 768 入力トークン以下へ分け、1 セグメントずつ順に訳すようにした。直前 2 組 (1600 文字まで) を履歴にし、4096 トークンに収まらない履歴は捨てる。ページには `on_progress(done, total)` で「3/12 段落」を出す。
+
+**残り。** WebGPU の subgroup (32 レーン) が使えるか、Worker 化、モデルの再読み込みを省くキャッシュ。

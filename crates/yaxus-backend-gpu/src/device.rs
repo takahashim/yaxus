@@ -23,6 +23,8 @@ pub enum Api {
     Metal,
     /// Metal without wgpu (`dev::metal`, `YAXUS_DEVICE=metal`).
     MetalDirect,
+    /// WebGPU in a browser (wasm32).
+    WebGpu,
     /// Another wgpu backend.
     Other,
 }
@@ -30,6 +32,10 @@ pub enum Api {
 impl Api {
     pub fn is_metal(self) -> bool {
         matches!(self, Api::Metal | Api::MetalDirect)
+    }
+
+    pub fn is_webgpu(self) -> bool {
+        matches!(self, Api::WebGpu)
     }
 }
 
@@ -39,6 +45,7 @@ impl std::fmt::Display for Api {
             Api::Vulkan => "vulkan",
             Api::Metal => "metal",
             Api::MetalDirect => "metal (direct)",
+            Api::WebGpu => "webgpu",
             Api::Other => "other",
         })
     }
@@ -225,6 +232,18 @@ impl Tuning {
     /// as they are measured.
     pub fn for_device(caps: &DeviceCaps) -> Self {
         let mut t = Tuning::radeon_780m();
+        // WebGPU has no push constants (they are passed as a uniform buffer), no
+        // integer dot product and, in practice, no subgroup size we can rely on:
+        // every matrix product is f32. There is no APU watchdog either, so one
+        // submission per token is both safe and cheaper than splitting it.
+        if caps.api.is_webgpu() {
+            t.gemm = GemmKind::F32;
+            t.gemv = Gemv::F32;
+            t.gemv_f32 = false;
+            t.submit_flops = f64::INFINITY;
+            t.early_submit_dispatches = usize::MAX;
+            return t;
+        }
         // (by vendor, not backend: an AMD GPU in an Intel Mac would keep the integer
         // kernels on Metal, unmeasured)
         if caps.vendor == Vendor::Apple {

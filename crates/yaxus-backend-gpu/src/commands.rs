@@ -58,12 +58,13 @@ impl Gpu {
         self.dev.submit();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
-        let t_rec = std::time::Instant::now();
+        let t_rec = web_time::Instant::now();
         self.pending_flops = 0.0;
         let out = self.dev.read(src, offset, size);
         if let Some(p) = &mut self.profile {
-            let now = std::time::Instant::now();
+            let now = web_time::Instant::now();
             if let Some(last) = p.last_sync {
                 p.record += t_rec - last;
                 p.wait += now - t_rec;
@@ -72,6 +73,19 @@ impl Gpu {
             p.last_sync = Some(now);
         }
         out
+    }
+
+    /// A synchronous read on the web would deadlock (WebGPU polls itself); the browser
+    /// path goes through this instead.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read(&mut self, _src: &Buf, _offset: u64, _size: u64) -> Vec<u8> {
+        panic!("synchronous read on wasm; use read_async")
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+        self.pending_flops = 0.0;
+        self.dev.read_async(src, offset, size).await
     }
 
     pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {

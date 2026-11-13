@@ -214,12 +214,22 @@ pub struct ModelOptions {
     pub max_pos: usize,
     /// Keep finished sequences and reuse their KV for prompts sharing a prefix.
     pub prefix_cache: bool,
+    /// The output matrix's format when it differs from `quant`. A GGUF Q6_K output is
+    /// 135 MB for the 0.8B, which is more than the 128 MB storage binding some WebGPU
+    /// devices allow; Q4 there is 82 MB.
+    pub lm_head_quant: Option<Quant>,
 }
 
 impl ModelOptions {
     /// Weights in `quant`, the default KV arena, prefix reuse on.
     pub fn new(quant: Quant) -> Self {
-        ModelOptions { quant, kv_tokens: DEFAULT_KV_TOKENS, max_pos: DEFAULT_MAX_POS, prefix_cache: true }
+        ModelOptions {
+            quant,
+            kv_tokens: DEFAULT_KV_TOKENS,
+            max_pos: DEFAULT_MAX_POS,
+            prefix_cache: true,
+            lm_head_quant: None,
+        }
     }
 }
 
@@ -240,14 +250,25 @@ pub struct Model<B: Backend> {
 impl<B: Backend> Model<B> {
     /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
     /// or a GGUF file, and allocates its KV arena.
-    pub fn load(path: &Path, mut backend: B, opts: &ModelOptions) -> Result<Self> {
-        let quant = opts.quant;
+    pub fn load(path: &Path, backend: B, opts: &ModelOptions) -> Result<Self> {
         let (cfg, w) = if gguf::is_gguf(path) {
             let g = gguf::Gguf::open(path)?;
             (g.config()?, g.weights()?)
         } else {
             (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
         };
+        Self::build(cfg, w, backend, opts)
+    }
+
+    /// Loads a model from a GGUF file already in memory (browser mode).
+    pub fn from_gguf(g: gguf::Gguf, backend: B, opts: &ModelOptions) -> Result<Self> {
+        let cfg = g.config()?;
+        let w = g.weights()?;
+        Self::build(cfg, w, backend, opts)
+    }
+
+    fn build(cfg: Config, w: Weights, mut backend: B, opts: &ModelOptions) -> Result<Self> {
+        let quant = opts.quant;
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);
@@ -293,7 +314,7 @@ impl<B: Backend> Model<B> {
         } else {
             lm_head_t
         };
-        let lm_head = backend.load_weight(lm_head_t, quant)?;
+        let lm_head = backend.load_weight(lm_head_t, opts.lm_head_quant.unwrap_or(quant))?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
         let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;

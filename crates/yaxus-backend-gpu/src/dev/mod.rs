@@ -12,9 +12,13 @@
 pub(crate) mod metal;
 pub(crate) mod wgpu;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Result;
 
-use crate::device::{CompileSettings, DeviceCaps, Diagnostics};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::{DeviceCaps, Diagnostics};
+
+use crate::device::CompileSettings;
 
 /// A GPU buffer of either device (opaque outside the crate).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -82,6 +86,7 @@ pub(crate) enum Dev {
 impl Dev {
     /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
     /// without wgpu, else wgpu.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
         #[cfg(target_os = "macos")]
         if std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal") {
@@ -195,11 +200,20 @@ impl Dev {
     }
 
     /// Submits, waits, and returns `size` bytes of `src` from `offset`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         match self {
             Dev::Wgpu(d) => d.read(src, offset, size),
             #[cfg(target_os = "macos")]
             Dev::Metal(d) => d.read(src, offset, size),
+        }
+    }
+
+    /// The same on the browser, where the wait must yield to the event loop.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+        match self {
+            Dev::Wgpu(d) => d.read_async(src, offset, size).await,
         }
     }
 

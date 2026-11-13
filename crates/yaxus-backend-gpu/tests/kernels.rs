@@ -372,3 +372,28 @@ fn failed_allocations_are_errors() {
     assert!(gpu.debug_alloc(1 << 20).is_ok());
     assert_eq!(gpu.debug_argmax(&[0.0, 1.0, 0.5], 1), [1]);
 }
+
+/// The embedding kernels read a Q4_K table (the browser's 0.8B path) and a bf16 table
+/// row for row.
+#[test]
+#[ignore]
+fn embedding_rows_match_the_table() {
+    let mut gpu = GpuBackend::new().unwrap();
+    let (rows, h) = (3, 512);
+    let ids = [2u32, 0, 1];
+
+    let bytes = ggml_blocks(GgmlType::Q4K, rows, h, 7);
+    let all = yaxus_model::ggml::dequantize(GgmlType::Q4K, &bytes, rows * h);
+    let want: Vec<f32> = ids.iter().flat_map(|&i| all[i as usize * h..][..h].to_vec()).collect();
+    let got = gpu.debug_embed(&bytes, GgmlType::Q4K, h, &ids);
+    let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1.0);
+    let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    assert!(err <= 1e-4 * scale, "Q4_K embedding: err {err} (scale {scale})");
+
+    let bf: Vec<u16> = values(rows * h, 11).iter().map(|&v| (v.to_bits() >> 16) as u16).collect();
+    let bytes: Vec<u8> = bf.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let want: Vec<f32> =
+        ids.iter().flat_map(|&i| bf[i as usize * h..][..h].iter().map(|&u| f32::from_bits((u as u32) << 16))).collect();
+    let got = gpu.debug_embed(&bytes, GgmlType::Bf16, h, &ids);
+    assert_eq!(got, want);
+}

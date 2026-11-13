@@ -6,7 +6,7 @@ mod matmul;
 use anyhow::{Context, Result};
 use yaxus_model::{Config, LayerMeta, PAGE, PassMeta};
 
-use crate::{Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight, plan};
+use crate::{Buf, Format, Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight, plan};
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
 pub(crate) const ARGMAX_SLICES: usize = 64;
@@ -102,10 +102,23 @@ impl Gpu {
     }
 
     pub(crate) fn embed(&mut self, table: &Weight) -> Tensor {
-        let Weight::Embedding { table, h } = table else { panic!("embed needs the embedding table") };
+        let Weight::Embedding { table, h, fmt } = table else { panic!("embed needs the embedding table") };
         let y = self.tensor(self.pass_rows, *h);
         let ids = self.meta_buf(MetaBuf::Ids);
-        self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass_rows as u32, 1));
+        match fmt {
+            // The Q4_K table is bound twice (nibbles and headers), as the matrix kernels do.
+            Format::Q4K => {
+                self.dispatch(
+                    "embed_q4k",
+                    &[y.buf(), &ids, table, table],
+                    &[*h as u32, *h as u32],
+                    (self.pass_rows as u32, 1),
+                );
+            }
+            _ => {
+                self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass_rows as u32, 1));
+            }
+        }
         y
     }
 
@@ -202,6 +215,14 @@ impl Gpu {
             }
             return out;
         }
+        let (out, size) = self.argmax_prob_pending(logits);
+        let b = self.read(&out, 0, size);
+        parse_argmax(&b, logits.cols as u32)
+    }
+
+    /// Records the two argmax dispatches and returns the buffer to read (for the async
+    /// read of the browser).
+    pub(crate) fn argmax_prob_pending(&mut self, logits: &Tensor) -> (Buf, u64) {
         let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
         let slice = logits.cols.div_ceil(ARGMAX_SLICES);
         self.dispatch(
@@ -211,11 +232,14 @@ impl Gpu {
             (ARGMAX_SLICES as u32, logits.rows as u32),
         );
         self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
-        let b = self.read(&out, 0, logits.rows as u64 * 8);
-        let v: &[u32] = bytemuck::cast_slice(&b);
-        // A row of only -inf or NaN keeps the kernel's "none" index; the CPU picks the
-        // first element then, and an id beyond the vocabulary must not escape.
-        let cols = logits.cols as u32;
-        v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
+        (out, (logits.rows * 8) as u64)
     }
+}
+
+/// The `(index, probability)` pairs of an argmax read-back.
+pub(crate) fn parse_argmax(bytes: &[u8], cols: u32) -> Vec<(u32, f32)> {
+    let v: &[u32] = bytemuck::cast_slice(bytes);
+    // A row of only -inf or NaN keeps the kernel's "none" index; the CPU picks the
+    // first element then, and an id beyond the vocabulary must not escape.
+    v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
 }

@@ -3,6 +3,8 @@
 //! A [`TranslationRequest`] is the unchecked input. [`TranslationRequest::validate`]
 //! turns it into a [`ValidRequest`], whose [`render`](ValidRequest::render) cannot fail.
 
+pub mod segments;
+
 use yaxus_tokenizer::{SPECIAL_PREFIX, py_isspace};
 
 /// Glossary entries and history pairs (source, translation) are the API's pairs, and

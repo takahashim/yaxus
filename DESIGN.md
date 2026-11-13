@@ -147,7 +147,9 @@ yaxus/
     yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
+    yaxus-web/             # ブラウザ用 (wasm32 + WebGPU)。native では空のライブラリ
   web/                       # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
+  web/local/                 # ブラウザでモデルを動かす実験版 (wasm-bindgen の pkg と HTML)
   tests/golden/              # Python 側で生成した tokenizer / logits のゴールデンデータ
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
 ```
@@ -157,6 +159,19 @@ yaxus/
 サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ。
 
 1 件の要求がエンジン上でたどる処理 (停止トークン、翻訳メモリのヒント、トークンから文字列への復号、終わったら出力をメモリへ) は `yaxus_runtime::Session<T>` の 1 か所にある。`T` はその要求の持ち主で、サーバのワーカーでは HTTP の接続 (単文) か文書の段落、`run_document` では段落の番号、`run_request` では無し。呼び出し側は `Session::step` が返す更新 (`Delta`、`Done`、`Failed`) を持ち主へ届けるだけ。
+
+### 2.2 ブラウザ (wasm32 + WebGPU)
+
+`crates/yaxus-web` は `yaxus-model` と `yaxus-backend-gpu` を wasm32 に載せ、ユーザーが選んだ GGUF をタブの中だけで動かす。サーバも CLI も使わない。Cloudflare などに置くのは静的ファイル (wasm 約 0.8 MB と HTML) だけで、モデルと計算はユーザーのマシンに残る。
+
+- **範囲:** 英→日、greedy、f32、KV 4096 トークン。Engine、draft、文書チェーン、翻訳メモリ、同時実行は持たない。入口は `load_model(bytes)` と `Translator::translate(text, form, on_text, on_progress)` の 2 つ。
+- **モデル:** `Gguf::parse(Vec<u8>)` でメモリ上の GGUF を読み、`TensorRef` の実体を mmap か `Arc<Vec<u8>>` の enum にする。トークナイザは GGUF の語彙から `Tokenizer::from_vocab`。埋め込み表は Q4_K のまま GPU に置き (`embed_q4k`)、bf16 に展開しない (0.8B で 330 MB → 93 MB)。
+- **デバイス:** `WgpuDev::open_async` が WebGPU の adapter/device を await で開く。`Tuning` は f32 固定。必要な `maxBufferSize` と `maxStorageBufferBindingSize` (最大のテンソル、0.8B Q4_K_M では Q6_K の出力行列 135 MB) を要求し、受け入れられなければ adapter の報告値で開き直す。そのとき出力行列が binding 上限を超える場合だけ `lm_head_quant` を Q4 にする (82 MB)。
+- **push constants の代わり:** WebGPU に push constants はない。カーネルの `var<immediate> p` を `@group(0) @binding(15) var<uniform> p` に置き換え、1 MB の uniform バッファに 256 バイトずつ書いて dynamic offset で渡す。送信ごとにリングを先頭へ戻す。
+- **読み戻し:** WebGPU の `Device::poll` は no-op なので、`map_async` の完了を `read_async` で await する。同期の `read` は wasm では呼ばない。argmax の 2 ディスパッチだけを記録する `argmax_prob_pending` を挟み、`GpuBackend::argmax_async` が読み戻す。
+- **長文:** `yaxus_pfml::segments::split_for_context` が、空行で段落に分け、1 段落が 768 入力トークンを超えるときは文末 (`.`、`!`、`?`、`。`、改行) で文に分け、さらに語・文字で切って 768 トークン以下に詰める。各セグメントは 1 要求として順に訳し、直前 2 組 (合計 1600 文字まで) を履歴にする。プロンプトが 4096 に収まらない履歴は古い順に捨てる。段落の切れ目は `\n\n`、同じ段落の文の間は区切りなしで連結し、`on_progress(done, total)` で進み具合を返す。
+- **スレッド:** wasm では rayon は逐次に落ち、カーネルの並列コンパイル (`compile_all`) も逐次。時間は `web-time` で測る (std の `Instant` は wasm32-unknown-unknown で使えない)。
+- **ビルド:** `web/local/build.sh` が `cargo build --target wasm32-unknown-unknown --release` と `wasm-bindgen --target web` を実行する。`web/local/serve.sh` で配る。`web/local/pkg` は生成物なので git に入れない。
 
 ---
 
@@ -218,7 +233,7 @@ yaxus/
 
 - `--quant auto` (既定) は、GGUF なら上の対応でファイルの形式に近いまま持ち、safetensors なら Q8。CPU バックエンドは常に Q8 か bf16。
 - GGUF は設定 (`plamo3.*`) とトークナイザ (`tokenizer.ggml.*`) も読むので、HF のディレクトリは要らない。llama.cpp の変換器が RMSNorm の重みに足したオフセットは、読み込み時に引き戻す。
-- 埋め込み表は bf16 で GPU に置く。
+- 埋め込み表は bf16 で GPU に置く。ブラウザだけは、GGUF の Q4_K の表を 4 ビットのまま (`embed_q4k`) 読む (0.8B で 93 MB。bf16 にすると 330 MB になり、WebGPU のバッファ上限にも触れる)。
 - 1 行のスケールの並びが 2 のべきの間隔になると GEMM が遅くなるので、該当する行には詰め物を入れる (`pad_scales`、経緯 11.22)。
 
 ---
@@ -228,7 +243,7 @@ yaxus/
 ### 4.1 構成
 
 - `Gpu` がデバイス、カーネル、バッファプールを持つ。本体と下書きは `GpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
-- `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。
+- `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。wasm32 では `dev::wgpu` の WebGPU だけを使い、オープンと読み戻しが async になる (§2.2)。
 - `msl/`: Apple GPU 用に MSL で書いたカーネル。`access` (形式ごとの重みの展開)、`gemv2` (1〜16 行の GEMV)、`gemm` (prefill の GEMM)、`small` (`rmsnorm`・`add_norm`・`qk_rope`)。カーネルは値 (`msl::Gemv2 { t, glu, tiles }`、`msl::Gemm { f16, rb }`) で表し、名前は `kernels::name`、ソースは値から作る。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
 - `dev/metal/translate.rs`: Metal 直接のときに、WGSL のカーネルを naga で MSL に変換する。immediates を `buffer(0)`、binding `i` を `buffer(i + 1)` に置き、MSL のカーネルと同じ形でディスパッチできるようにする (単体テストで固定)。
 - `device.rs`:
@@ -258,6 +273,7 @@ yaxus/
 - Apple GPU の `gemv2` は Q8、Q4_K、Q6_K、Q3_K、Q2_K を読む。K を 32 値の区間に切り、区間 `c` をスライス `c % 8` に割り当てる。スライスごとに 4 本のアキュムレータを `fma` で進め、最後に決まった木の形で足す。M2 では 8×8 の行列演算が k の順の `fma` の鎖とビット単位で一致するので、スカラーと行列の 2 つのカーネルで同じ値になる (経緯 12.8)。起動時に 1 行・8 行・16 行のパスを比べ (`Gpu::gemv2_rows_agree`)、違えば `gemv_f32` (同じ性質を持つ WGSL の f32 GEMV) に戻す。ほかの形式 (Q4_0、bf16) も `gemv_f32` を使う。
 - Apple GPU の prefill は `msl::gemm` (llama.cpp の `kernel_mul_mm` と同じ形)。重み 64 行 × パスの 64 行のタイルで、threadgroup メモリに 8×8 の塊を置く。既定は f32 のタイル (何も丸めない) で、`--prefill-precision f16` で重みと活性値を half に丸める (`GemmKind::CoopF16`)。最後の 64 行タイルの後の残りは、16 行以下なら `gemv2`、32 行以下なら 32 行のタイルで計算する。MSL 版が読まない形式は WGSL の `gemm_coop8` (8×8 の f32 行列)。
 - bf16 の重みは f32 のカーネルだけで読む。
+- **WebGPU**: subgroup を要求しないので、行列積は `gemv1` / `gemv8` (subgroup なしの workgroup リダクション) と `gemm_f32`、attention は行ごとの `attention` になる。整数ドット積と cooperative matrix は WebGPU にない。lavapipe の CI と同じ経路。
 
 **attention** (`AttentionPlan`):
 
@@ -425,6 +441,7 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
 - 認証はトークン必須、TLS はローカル CA を自動生成。
 - 長文は段落単位で分け、文書のチェーンで並列に訳す (既定は自動のチェーン数 + チェーン内の履歴)。
+- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路を再利用する (§2.2)。Engine は使わず、1 要求・greedy・KV 2048。push constants は uniform バッファで置き換え、読み戻しだけ async にする。
 
 試して採らなかったもの (詳細は経緯):
 
@@ -440,3 +457,5 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 8×8 の行列演算が `fma` の鎖と一致する性質は M2 でしか測っていない。M1、M3 以降で `gemv2` が起動時の検査に通るか。
 - 16 並列のデコードの合計速度 (経緯 11.17 で 220 tok/s に届かなかった)。
 - 2B 本体の 4 ビット化の品質評価。
+- ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
+- ブラウザ版の Worker 化 (読み込み中の UI 停止をなくす) と、モデルの再選択を省くキャッシュ。

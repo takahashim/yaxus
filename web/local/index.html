@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yaxus — browser</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085; --border: #d9dde5;
+  --accent: #2f6fde; --accent-text: #ffffff; --danger: #c43c3c; --focus: #2f6fde55;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171d; --panel: #1c2028; --text: #e4e7ee; --muted: #9098aa; --border: #313745;
+    --accent: #5b8ff0; --accent-text: #0d1220; --danger: #e06464; --focus: #5b8ff055;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+header .tag { color: var(--muted); font-size: 13px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+header .spacer { flex: 1; }
+main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+select, input, textarea, button {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+select, input { padding: 6px 8px; }
+textarea { width: 100%; padding: 10px; resize: vertical; }
+button { padding: 7px 14px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+button:disabled { opacity: .45; cursor: default; }
+#status { color: var(--muted); font-size: 13px; }
+#status.err { color: var(--danger); }
+.note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+#meter { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 8px; display: none; }
+#meter > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+#info { font-size: 13px; color: var(--muted); white-space: pre-wrap; }
+#output {
+  min-height: 7em; white-space: pre-wrap; word-break: break-word;
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+  background: var(--bg); font-size: 16px; line-height: 1.8;
+}
+#stats { font-size: 13px; color: var(--muted); margin-top: 8px; }
+#warn { color: var(--danger); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>yaxus</h1>
+  <span class="tag">browser · wasm + WebGPU · 実験版</span>
+  <span class="spacer"></span>
+  <span id="status">wasm を読み込んでいます…</span>
+</header>
+
+<main>
+  <section>
+    <h2>1. モデル（GGUF ファイル）</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".gguf,application/octet-stream">
+      <button id="load" class="primary" disabled>読み込む</button>
+      <span id="fileinfo" class="note"></span>
+    </div>
+    <div id="meter"><div></div></div>
+    <p class="note">
+      PLaMo 3 Translate の GGUF（<code>plamo-3-translate-0.8b-Q4_K_M.gguf</code>、約 573 MB）を選んでください。
+      ファイルはこのタブの中だけで読み、どこにも送りません。デスクトップの Chrome と WebGPU が必要です。
+    </p>
+    <div id="info"></div>
+    <div id="warn"></div>
+  </section>
+
+  <section>
+    <h2>2. 英語 → 日本語</h2>
+    <div class="row" style="margin-bottom:8px">
+      <label for="form">文体</label>
+      <select id="form">
+        <option value="polite">です・ます</option>
+        <option value="plain">だ・である</option>
+        <option value="">指定なし</option>
+      </select>
+      <span class="spacer grow"></span>
+      <button id="sample">例文を入れる</button>
+      <button id="translate" class="primary" disabled>翻訳する</button>
+    </div>
+    <textarea id="source" rows="5" placeholder="The meeting has been moved to next Monday." disabled></textarea>
+    <p class="note">長い英文は段落・文単位に自動で分割して、順に訳します。</p>
+    <div id="output" aria-live="polite"></div>
+    <div id="stats"></div>
+  </section>
+</main>
+
+<script type="module">
+import init, { load_model } from './pkg/yaxus_web.js';
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const fileEl = $('file');
+const loadEl = $('load');
+const translateEl = $('translate');
+const sourceEl = $('source');
+const outputEl = $('output');
+const statsEl = $('stats');
+const infoEl = $('info');
+const warnEl = $('warn');
+const meterEl = $('meter');
+const meterBar = meterEl.firstElementChild;
+const sampleEl = $('sample');
+
+let bytes = null;
+let translator = null;
+let busy = false;
+
+const setStatus = (text, err = false) => {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('err', err);
+};
+const setBusy = (b) => {
+  busy = b;
+  fileEl.disabled = b;
+  loadEl.disabled = b || !bytes;
+  translateEl.disabled = b || !translator;
+  sourceEl.disabled = b || !translator;
+  // The sample only makes sense once there is a model to translate with.
+  sampleEl.disabled = b || !translator;
+};
+const fmtMB = (n) => (n / 1e6).toFixed(0) + ' MB';
+
+function fail(e) {
+  console.error(e);
+  setStatus(e?.message || String(e), true);
+}
+
+async function readFile(file) {
+  const buf = new Uint8Array(file.size);
+  const reader = file.stream().getReader();
+  let off = 0;
+  meterEl.style.display = 'block';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf.set(value, off);
+    off += value.length;
+    meterBar.style.width = (100 * off / file.size).toFixed(1) + '%';
+  }
+  meterEl.style.display = 'none';
+  return buf;
+}
+
+fileEl.addEventListener('change', async () => {
+  const f = fileEl.files?.[0];
+  bytes = null;
+  translator?.free?.();
+  translator = null;
+  outputEl.textContent = '';
+  statsEl.textContent = '';
+  infoEl.textContent = '';
+  warnEl.textContent = '';
+  if (!f) { ignore(); return; }
+  try {
+    setBusy(true);
+    setStatus('ファイルを読んでいます…');
+    bytes = await readFile(f);
+    // The file API may report the symlink's target (a blob hash) rather than the name
+    // the user picked.
+    const name = f.name.toLowerCase().endsWith('.gguf') ? f.name : '選択した GGUF';
+    $('fileinfo').textContent = `${name} · ${fmtMB(f.size)}`;
+    // Reading a model is the only reason to pick a file here; load it right away.
+    await loadModel();
+  } catch (e) {
+    fail(e);
+  } finally {
+    setBusy(false);
+    // Allow picking the same file again (a `change` event only fires on a new value).
+    fileEl.value = '';
+  }
+});
+
+function ignore() {
+  $('fileinfo').textContent = '';
+  setStatus('モデルを選んでください。');
+  setBusy(false);
+}
+
+async function loadModel() {
+  if (!bytes) return;
+  try {
+    setBusy(true);
+    setStatus('モデルを読み込んでいます…');
+    infoEl.textContent = '';
+    warnEl.textContent = '';
+    const t0 = performance.now();
+    translator = await load_model(bytes, (msg) => setStatus(msg));
+    const wall = performance.now() - t0;
+    bytes = null; // free the JS copy; wasm has its own
+    infoEl.textContent =
+      `device: ${translator.device}\n` +
+      `binding: ${fmtMB(translator.max_binding)}\n` +
+      `load: ${(translator.load_ms / 1e3).toFixed(1)} s (wasm+GPU; 画面側 ${(wall / 1e3).toFixed(1)} s)`;
+    if (translator.lm_head_q4) {
+      warnEl.textContent = 'この GPU の binding 上限に収めるため、出力行列を Q4 にしました（訳の質が少し下がります）。';
+    }
+    setStatus('準備できました。英文を入れて翻訳してください。');
+  } catch (e) {
+    translator = null;
+    fail(e);
+  } finally {
+    setBusy(false);
+  }
+}
+
+loadEl.addEventListener('click', loadModel);
+
+translateEl.addEventListener('click', async () => {
+  if (!translator) return;
+  const text = sourceEl.value.trim();
+  if (!text) { setStatus('英文を入力してください。', true); return; }
+  try {
+    setBusy(true);
+    outputEl.textContent = '';
+    statsEl.textContent = '';
+    setStatus('翻訳しています…');
+    const form = $('form').value || null;
+    const stats = await translator.translate(text, form,
+      (delta) => {
+        outputEl.textContent += delta;
+        outputEl.scrollTop = outputEl.scrollHeight;
+      },
+      (i, n) => {
+        if (n > 1) setStatus(`翻訳しています… ${i + 1}/${n} 段落`);
+      });
+    const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
+    const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.max_new} tokens`;
+    statsEl.textContent =
+      `prompt ${stats.prompt_tokens} tokens · ${stats.prefill_ms.toFixed(0)} ms prefill · ` +
+      `${stats.output_tokens} tokens${size} (${stop}) · ${stats.decode_ms.toFixed(0)} ms decode · ` +
+      `${stats.tokens_per_second.toFixed(1)} tok/s · ${stats.chars} 文字`;
+    if (stats.stop === 'limit') {
+      statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';
+    }
+    setStatus('完了');
+  } catch (e) {
+    fail(e);
+  } finally {
+    setBusy(false);
+  }
+});
+
+sampleEl.addEventListener('click', () => {
+  if (!translator) return;
+  sourceEl.value = 'The owner approved the revised plan, and the team will start work next Monday.';
+  sourceEl.focus();
+});
+
+try {
+  if (!navigator.gpu) {
+    throw new Error('このブラウザには WebGPU がありません。デスクトップの Chrome で開いてください。');
+  }
+  await init();
+  setStatus('モデルを選んでください。');
+  setBusy(false);
+} catch (e) {
+  fail(e);
+  loadEl.disabled = true;
+  translateEl.disabled = true;
+}
+</script>
+</body>
+</html>

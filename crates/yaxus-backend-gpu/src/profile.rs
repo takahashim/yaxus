@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 /// Per-kernel GPU time from timestamp queries (`YAXUS_PROFILE=2`).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) struct KernelProfile {
     pub(crate) queries: wgpu::QuerySet,
     pub(crate) resolve: wgpu::Buffer,
@@ -16,8 +17,9 @@ pub(crate) struct KernelProfile {
 pub(crate) const MAX_TIMED: usize = 2048;
 
 #[derive(Default)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) struct Profile {
-    pub(crate) last_sync: Option<std::time::Instant>,
+    pub(crate) last_sync: Option<web_time::Instant>,
     pub(crate) record: std::time::Duration,
     pub(crate) wait: std::time::Duration,
     pub(crate) dispatches: usize,
