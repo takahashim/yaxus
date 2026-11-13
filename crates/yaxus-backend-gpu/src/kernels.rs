@@ -314,29 +314,43 @@ impl Gpu {
         }
     }
 
-    /// Compiles `jobs` on all cores and adds them in their order (a cold shader cache
-    /// makes a kernel cost a compiler run: on CI's virtual Apple GPUs, ~0.2 s each).
+    /// Compiles `jobs` and adds them in their order (a cold shader cache makes a kernel
+    /// cost a compiler run: on CI's virtual Apple GPUs, ~0.2 s each). Native: on all cores.
     fn compile_all(&mut self, jobs: &[Job]) {
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len()).max(1);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let compiler = self.dev.compiler(self.compile);
-        let mut built: Vec<(usize, Kernel)> = std::thread::scope(|s| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
-                    s.spawn(|| {
-                        let mut out = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some((name, read_only, source)) = jobs.get(i) else { break };
-                            let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
-                            out.push((i, compiler.compile(name, &src, read_only)));
-                        }
-                        out
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut built: Vec<(usize, Kernel)> = {
+            let compiler = self.dev.compiler(self.compile);
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len()).max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads)
+                    .map(|_| {
+                        s.spawn(|| {
+                            let mut out = Vec::new();
+                            loop {
+                                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some((name, read_only, source)) = jobs.get(i) else { break };
+                                let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                                out.push((i, compiler.compile(name, &src, read_only)));
+                            }
+                            out
+                        })
                     })
-                })
-                .collect();
-            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
-        });
+                    .collect();
+                workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+            })
+        };
+        // WebGPU: one thread (a page's main thread has none to spare).
+        #[cfg(target_arch = "wasm32")]
+        let mut built: Vec<(usize, Kernel)> = {
+            let compiler = self.dev.compiler(self.compile);
+            let mut b = Vec::with_capacity(jobs.len());
+            for (i, (name, read_only, source)) in jobs.iter().enumerate() {
+                let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                b.push((i, compiler.compile(name, &src, read_only)));
+            }
+            b
+        };
         built.sort_by_key(|(i, _)| *i);
         for (i, k) in built {
             self.insert_kernel(jobs[i].0.clone(), k);

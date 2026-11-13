@@ -220,6 +220,7 @@ pub(crate) const ATTN_TILE_SHARED_BYTES_NO_QS: u32 = ATTN_TILE_SHARED_BYTES - 10
 
 impl Gpu {
     /// Opens the GPU (see `dev::Dev::open`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
         let (mut dev, caps) = Dev::open(&diag)?;
@@ -256,6 +257,43 @@ impl Gpu {
         }
         Ok(b)
     }
+
+    /// Opens the browser's WebGPU device (wasm only; see `dev::Dev::open_web`). The
+    /// browser needs the futures awaited, so this is async; the rest is the same as
+    /// `new`.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_web() -> Result<Self> {
+        let diag = Diagnostics::from_env();
+        let (mut dev, caps) = Dev::open_web(&diag).await?;
+        let tuning = Tuning::for_device(&caps);
+        let compile = CompileSettings::for_device(&caps);
+        let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);
+        let argmax_part = dev.storage("argmax-part", (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64);
+        let mut b = Gpu {
+            argmax_part,
+            prof_detail: None,
+            dev,
+            gemm: tuning.gemm,
+            tuning,
+            compile,
+            caps,
+            kernels: HashMap::new(),
+            meta_bufs: [None, None, None, None],
+            pass_tiles: 0,
+            pass_rows: 0,
+            pass_max_pos: 0,
+            pool: Arc::new(Mutex::new(HashMap::new())),
+            weight_bytes: 0,
+            argmax_out,
+            pending_flops: 0.0,
+            pass_dispatches: 0,
+            oversized: None,
+            profile: None,
+            diag,
+        };
+        b.build_kernels();
+        Ok(b)
+    }
 }
 
 /// A handle to a shared [`Gpu`] context. Every model loaded through a handle shares the
@@ -273,8 +311,17 @@ pub struct GpuBackend {
 
 impl GpuBackend {
     /// Opens the platform's GPU (see [`Gpu::new`]), with the device's tuned kernels.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self> {
         let gpu = Gpu::new()?;
+        let gemv = gpu.tuning.gemv;
+        Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+    }
+
+    /// Opens the browser's WebGPU device (wasm only; see [`Gpu::new_web`]).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_web() -> Result<Self> {
+        let gpu = Gpu::new_web().await?;
         let gemv = gpu.tuning.gemv;
         Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
     }
@@ -323,6 +370,20 @@ impl GpuBackend {
     fn track(&mut self, before: usize) {
         let after = self.g().weight_bytes;
         self.weight_bytes += after - before;
+    }
+
+    /// The WebGPU read-backs (wasm only): the sync `argmax`/`to_host` of the
+    /// [`Backend`] trait cannot block a browser's main thread, so the page awaits
+    /// these instead, one per decode step.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn argmax_rows_async(&mut self, logits: &Tensor) -> Vec<u32> {
+        self.gpu.lock().unwrap().argmax_rows_async(logits).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::wrong_self_convention)]
+    pub async fn to_host_async(&mut self, x: &Tensor) -> Vec<f32> {
+        self.gpu.lock().unwrap().to_host_async(x).await
     }
 }
 
@@ -412,10 +473,22 @@ impl Backend for GpuBackend {
     fn select_rows(&mut self, x: &Tensor, rows: &[usize]) -> Tensor {
         self.g().select_rows(x, rows)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
         self.g().argmax_rows(logits)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         self.g().to_host(x)
+    }
+    // On WebGPU the read-backs are awaited (`argmax_rows_async` / `to_host_async`),
+    // so the sync points of the trait do not exist there.
+    #[cfg(target_arch = "wasm32")]
+    fn argmax_rows(&mut self, _: &Tensor) -> Vec<u32> {
+        panic!("argmax_rows is awaited through argmax_rows_async on WebGPU")
+    }
+    #[cfg(target_arch = "wasm32")]
+    fn to_host(&mut self, _: &Tensor) -> Vec<f32> {
+        panic!("to_host is awaited through to_host_async on WebGPU")
     }
 }

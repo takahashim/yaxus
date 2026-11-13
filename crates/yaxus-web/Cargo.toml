@@ -1,0 +1,19 @@
+[package]
+name = "yaxus-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web frontend for yaxus: PLaMo 3 translation running in the browser on WebGPU"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+yaxus-model = { path = "../yaxus-model" }
+yaxus-backend-gpu = { path = "../yaxus-backend-gpu" }
+yaxus-tokenizer = { path = "../yaxus-tokenizer" }
+anyhow.workspace = true
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "File", "Blob"] }

@@ -58,6 +58,7 @@ impl Gpu {
         self.dev.submit();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         let t_rec = std::time::Instant::now();
         self.pending_flops = 0.0;
@@ -72,6 +73,14 @@ impl Gpu {
             p.last_sync = Some(now);
         }
         out
+    }
+
+    /// The WebGPU read-back (wasm only): the map callback comes from the event loop,
+    /// so the call must be awaited. The profile timing is native-only.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+        self.pending_flops = 0.0;
+        self.dev.read_async(src, offset, size).await
     }
 
     pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {
@@ -95,6 +104,7 @@ impl Gpu {
     /// Runs `f` with the device's out-of-memory and validation errors captured, so that
     /// a weight or KV arena that does not fit comes back as `Err` instead of panicking
     /// in the device's default error handler.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         // Only report a buffer from this call (uploads outside `checked` also set it).
         self.oversized = None;
@@ -103,6 +113,21 @@ impl Gpu {
         if let Some(e) = scope.finish().or_else(|| self.dev.take_failure()) {
             anyhow::bail!("{what}: {e}");
         }
+        if let Some((label, bytes)) = self.oversized.take() {
+            anyhow::bail!(
+                "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",
+                self.dev.max_binding()
+            );
+        }
+        r
+    }
+
+    /// The WebGPU errors are reported asynchronously (through the console, see
+    /// `open_web`), so there is no scope to finish; the binding-limit check remains.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.oversized = None;
+        let r = f(self);
         if let Some((label, bytes)) = self.oversized.take() {
             anyhow::bail!(
                 "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",

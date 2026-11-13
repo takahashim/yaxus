@@ -1,1 +1,3 @@
 /target
+# wasm-bindgen のビルド成果物 (wasm-bindgen --out-dir www/pkg)
+crates/yaxus-web/www/pkg/

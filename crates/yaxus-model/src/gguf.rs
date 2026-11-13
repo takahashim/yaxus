@@ -3,13 +3,17 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
 
 use crate::config::{Config, RopeParam, RopeParameters, Yarn};
 use crate::ggml::GgmlType;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::weights::Backing;
 use crate::weights::{TensorRef, Weights};
 use crate::{POST_MIXER_NORM_OFFSET, POST_MLP_NORM_OFFSET, PRE_NORM_OFFSET};
 
@@ -50,6 +54,26 @@ pub struct Vocab {
     pub scores: Vec<f64>,
     /// llama.cpp token types: 1 normal, 2 unknown, 3 control, 4 user-defined, 5 unused, 6 byte.
     pub types: Vec<i32>,
+}
+
+/// One tensor's place in the file: name (GGUF), shape (row-major), type, and
+/// the absolute byte range of its data.
+#[derive(Clone)]
+pub struct TensorInfo {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: GgmlType,
+    pub start: usize,
+    pub len: usize,
+}
+
+/// A GGUF file's header: the metadata and where the tensors are. The web
+/// loader parses this from a prefix of the file and then reads the tensors one
+/// at a time; the native loader maps the whole file and builds tensors
+/// directly.
+pub struct GgufHeader {
+    pub meta: HashMap<String, Value>,
+    pub tensors: Vec<TensorInfo>,
 }
 
 pub struct Gguf {
@@ -116,14 +140,13 @@ impl Reader<'_> {
     }
 }
 
-impl Gguf {
-    pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // SAFETY: read-only mapping; modifying the file while mapped is UB like with any
-        // mmap-based loader.
-        let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-        let mut r = Reader { b: &mmap[..], at: 0 };
-        ensure!(r.take(4)? == b"GGUF", "{} is not a GGUF file", path.display());
+impl GgufHeader {
+    /// Parses the header from a prefix of the file. `file_len` (the mapping length
+    /// when the whole file is at hand) bounds-checks the tensor ranges; `None`
+    /// leaves that to the streaming reader, which reads each range separately.
+    pub fn parse(prefix: &[u8], file_len: Option<usize>) -> Result<Self> {
+        let mut r = Reader { b: prefix, at: 0 };
+        ensure!(r.take(4)? == b"GGUF", "not a GGUF file");
         let version = r.u32()?;
         ensure!(version == 2 || version == 3, "GGUF version {version} is not supported");
         let n_tensors = r.u64()? as usize;
@@ -163,80 +186,110 @@ impl Gguf {
             let len =
                 (n / t.block().0).checked_mul(t.block().1).with_context(|| format!("{name}: too many elements"))?;
             let end = data.checked_add(off).and_then(|s| s.checked_add(len));
-            ensure!(end.is_some_and(|e| e <= mmap.len()), "{name}: data beyond the end of the file");
+            ensure!(end.is_some_and(|e| file_len.is_none_or(|fl| e <= fl)), "{name}: data beyond the end of the file");
             let start = data + off;
-            tensors.push((name, TensorRef { mmap: mmap.clone(), start, len, shape, dtype: t, minus: 0.0 }));
+            tensors.push(TensorInfo { name, shape, dtype: t, start, len });
         }
-        Ok(Gguf { meta, tensors })
-    }
-
-    fn arch(&self) -> Result<&str> {
-        self.meta.get("general.architecture").and_then(Value::as_str).context("general.architecture missing")
-    }
-
-    fn num(&self, key: &str) -> Result<f64> {
-        let k = format!("{}.{key}", self.arch()?);
-        self.meta.get(&k).and_then(Value::as_f64).with_context(|| format!("GGUF metadata {k} missing"))
+        Ok(GgufHeader { meta, tensors })
     }
 
     /// The model configuration from the `plamo3.*` metadata.
     pub fn config(&self) -> Result<Config> {
-        let arch = self.arch()?;
-        ensure!(arch == "plamo3", "GGUF architecture {arch:?} is not supported (expected plamo3)");
-        let u = |k: &str| self.num(k).map(|v| v as usize);
-        let truncate = matches!(self.meta.get("plamo3.rope.scaling.yarn_truncate"), Some(Value::Bool(true)));
-        let vocab = match self.meta.get("tokenizer.ggml.tokens") {
-            Some(Value::Array(t)) => t.len(),
-            _ => u("vocab_size")?,
-        };
-        let yarn = Yarn {
-            factor: self.num("rope.scaling.factor")?,
-            original_max_position_embeddings: u("rope.scaling.original_context_length")?,
-            beta_fast: self.num("rope.scaling.yarn_beta_fast")?,
-            beta_slow: self.num("rope.scaling.yarn_beta_slow")?,
-            truncate,
-        };
-        let (factor, original) = (yarn.factor, yarn.original_max_position_embeddings);
-        let full = RopeParam::yarn(self.num("rope.freq_base")?, yarn);
-        let sliding = RopeParam::plain(self.num("rope.freq_base_swa")?);
-        let cfg = Config {
-            hidden_size: u("embedding_length")?,
-            num_hidden_layers: u("block_count")?,
-            num_attention_heads: u("attention.head_count")?,
-            num_key_value_heads: u("attention.head_count_kv")?,
-            head_dim: u("attention.key_length")?,
-            intermediate_size: u("feed_forward_length")?,
-            vocab_size: vocab,
-            rms_norm_eps: self.num("attention.layer_norm_rms_epsilon")? as f32,
-            window_size: u("attention.sliding_window")?,
-            sliding_window_pattern: u("attention.sliding_window_pattern")?,
-            rope_theta: full.rope_theta,
-            rope_local_theta: sliding.rope_theta,
-            scale_embedding: false,
-            tie_word_embeddings: false,
-            rope_scaling_factor: factor,
-            initial_context_length: original,
-            rope_parameters: Some(RopeParameters { full_attention: full, sliding_attention: sliding }),
-        };
-        cfg.validate()?;
-        Ok(cfg)
+        config_from(&self.meta)
     }
 
     /// The vocabulary (`tokenizer.ggml.*`); the model must use the PLaMo 3 tokenizer.
     pub fn vocab(&self) -> Result<Vocab> {
-        let model = self.meta.get("tokenizer.ggml.model").and_then(Value::as_str).unwrap_or("");
-        ensure!(model == "plamo3", "GGUF tokenizer {model:?} is not supported (expected plamo3)");
-        let arr = |k: &str| match self.meta.get(k) {
-            Some(Value::Array(v)) => Ok(v),
-            _ => bail!("GGUF metadata {k} missing"),
+        vocab_from(&self.meta)
+    }
+
+    /// The most common matrix type, for display (e.g. `Q4_K`).
+    pub fn main_type(&self) -> Option<GgmlType> {
+        let mut count: HashMap<GgmlType, usize> = HashMap::new();
+        for t in &self.tensors {
+            if t.shape.len() == 2 {
+                *count.entry(t.dtype).or_default() +=
+                    t.shape.iter().product::<usize>() / t.dtype.block().0;
+            }
+        }
+        count.into_iter().max_by_key(|&(_, n)| n).map(|(t, _)| t)
+    }
+
+    /// The tensors under the safetensors names of the HF checkpoint: (safetensors
+    /// name, index into `tensors`, and the offset subtracted from norm weights
+    /// when they are baked). The streaming loader reads each tensor's bytes,
+    /// builds a `TensorRef` with [`GgufHeader::baked_norms`] in mind, and loads it.
+    pub fn weight_list(&self) -> Result<Vec<(String, usize, Option<f32>)>> {
+        let by_name: HashMap<&str, usize> =
+            self.tensors.iter().enumerate().map(|(i, t)| (t.name.as_str(), i)).collect();
+        let get = |n: &str| {
+            by_name
+                .get(n)
+                .or_else(|| by_name.get(format!("{n}.weight").as_str()))
+                .copied()
+                .with_context(|| format!("GGUF tensor {n} missing"))
         };
-        let tokens: Vec<String> =
-            arr("tokenizer.ggml.tokens")?.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect();
-        let scores: Vec<f64> = arr("tokenizer.ggml.scores")?.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
-        let types: Vec<i32> =
-            arr("tokenizer.ggml.token_type")?.iter().map(|v| v.as_f64().unwrap_or(1.0) as i32).collect();
-        ensure!(tokens.len() == scores.len() && tokens.len() == types.len(), "GGUF vocabulary arrays differ in length");
-        Ok(Vocab { tokens, scores, types })
+        weight_names(&self.meta)?.into_iter().map(|(hf, gguf, off)| Ok((hf, get(&gguf)?, off))).collect()
+    }
+
+    /// Whether the GGUF was converted with the norm offsets baked into the weights:
+    /// reads the values of the layer-0 `attn_norm` (`bytes` is that tensor's data).
+    pub fn baked_norms(&self, bytes: &[u8]) -> bool {
+        let Some(t) = self.tensors.iter().find(|t| t.name == "blk.0.attn_norm") else { return false };
+        let (bl, bw) = t.dtype.block();
+        let n = bytes.len() / bw * bl;
+        if n == 0 {
+            return false;
+        }
+        let v = crate::ggml::dequantize(t.dtype, bytes, n);
+        v.iter().sum::<f32>() / v.len() as f32 > 0.5
+    }
+}
+
+impl Gguf {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open(path: &Path) -> Result<Self> {        let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: read-only mapping; modifying the file while mapped is UB like with any
+        // mmap-based loader.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let header = GgufHeader::parse(&mmap[..], Some(mmap.len()))
+            .with_context(|| format!("reading {}", path.display()))?;
+        let backing = Arc::new(Backing::Mmap(mmap));
+        let tensors = header
+            .tensors
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    TensorRef {
+                        backing: backing.clone(),
+                        start: t.start,
+                        len: t.len,
+                        shape: t.shape.clone(),
+                        dtype: t.dtype,
+                        minus: 0.0,
+                    },
+                )
+            })
+            .collect();
+        Ok(Gguf { meta: header.meta, tensors })
+    }
+
+    /// GGUF files are streamed from JavaScript on wasm (one tensor at a time,
+    /// through [`GgufHeader`]); this path is not available there.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open(_path: &Path) -> Result<Self> {
+        bail!("GGUF file loading is not supported on wasm; use the streaming loader")
+    }
+
+    /// The model configuration from the `plamo3.*` metadata.
+    pub fn config(&self) -> Result<Config> {
+        config_from(&self.meta)
+    }
+
+    /// The vocabulary (`tokenizer.ggml.*`); the model must use the PLaMo 3 tokenizer.
+    pub fn vocab(&self) -> Result<Vocab> {
+        vocab_from(&self.meta)
     }
 
     /// The tensors under the safetensors names of the HF checkpoint. RMSNorm weights are
@@ -254,40 +307,13 @@ impl Gguf {
         // HF norm weights are small corrections around 0; converted ones sit around the offset.
         let first = get("blk.0.attn_norm")?.to_f32_vec();
         let baked = first.iter().sum::<f32>() / first.len() as f32 > 0.5;
-        let norm = |n: &str, offset: f32| -> Result<TensorRef> {
-            let mut t = get(n)?.clone();
-            if baked {
-                t.minus = offset;
-            }
-            Ok(t)
-        };
         let mut out = HashMap::new();
-        out.insert("model.embed_tokens.weight".to_string(), get("token_embd")?.clone());
-        out.insert("lm_head.weight".to_string(), get("output")?.clone());
-        out.insert("model.norm.weight".to_string(), norm("output_norm", PRE_NORM_OFFSET)?);
-        let layers = self.num("block_count")? as usize;
-        for i in 0..layers {
-            let (b, p) = (format!("blk.{i}"), format!("model.layers.layers.{i}"));
-            let plain = [
-                ("attn_qkv", "mixer.qkv_proj"),
-                ("attn_output", "mixer.o_proj"),
-                ("ffn_up", "mlp.gate_up_proj"),
-                ("ffn_down", "mlp.down_proj"),
-            ];
-            for (g, h) in plain {
-                out.insert(format!("{p}.{h}.weight"), get(&format!("{b}.{g}"))?.clone());
+        for (hf, gguf, offset) in weight_names(&self.meta)? {
+            let mut t = get(&gguf)?.clone();
+            if baked && let Some(off) = offset {
+                t.minus = off;
             }
-            let norms = [
-                ("attn_norm", "pre_mixer_norm", PRE_NORM_OFFSET),
-                ("attn_q_norm", "mixer.q_norm", PRE_NORM_OFFSET),
-                ("attn_k_norm", "mixer.k_norm", PRE_NORM_OFFSET),
-                ("post_attention_norm", "post_mixer_norm", POST_MIXER_NORM_OFFSET),
-                ("ffn_norm", "pre_mlp_norm", PRE_NORM_OFFSET),
-                ("post_ffw_norm", "post_mlp_norm", POST_MLP_NORM_OFFSET),
-            ];
-            for (g, h, off) in norms {
-                out.insert(format!("{p}.{h}.weight"), norm(&format!("{b}.{g}"), off)?);
-            }
+            out.insert(hf, t);
         }
         Ok(Weights { tensors: out })
     }
@@ -302,6 +328,111 @@ impl Gguf {
         }
         count.into_iter().max_by_key(|&(_, n)| n).map(|(t, _)| t)
     }
+}
+
+fn arch_from(meta: &HashMap<String, Value>) -> Result<&str> {
+    meta.get("general.architecture").and_then(Value::as_str).context("general.architecture missing")
+}
+
+/// The model configuration from the `plamo3.*` metadata.
+fn config_from(meta: &HashMap<String, Value>) -> Result<Config> {
+    let arch = arch_from(meta)?;
+    ensure!(arch == "plamo3", "GGUF architecture {arch:?} is not supported (expected plamo3)");
+    let num = |k: &str| -> Result<f64> {
+        let k = format!("{arch}.{k}");
+        meta.get(&k).and_then(Value::as_f64).with_context(|| format!("GGUF metadata {k} missing"))
+    };
+    let u = |k: &str| num(k).map(|v| v as usize);
+    let truncate = matches!(meta.get("plamo3.rope.scaling.yarn_truncate"), Some(Value::Bool(true)));
+    let vocab = match meta.get("tokenizer.ggml.tokens") {
+        Some(Value::Array(t)) => t.len(),
+        _ => u("vocab_size")?,
+    };
+    let yarn = Yarn {
+        factor: num("rope.scaling.factor")?,
+        original_max_position_embeddings: u("rope.scaling.original_context_length")?,
+        beta_fast: num("rope.scaling.yarn_beta_fast")?,
+        beta_slow: num("rope.scaling.yarn_beta_slow")?,
+        truncate,
+    };
+    let (factor, original) = (yarn.factor, yarn.original_max_position_embeddings);
+    let full = RopeParam::yarn(num("rope.freq_base")?, yarn);
+    let sliding = RopeParam::plain(num("rope.freq_base_swa")?);
+    let cfg = Config {
+        hidden_size: u("embedding_length")?,
+        num_hidden_layers: u("block_count")?,
+        num_attention_heads: u("attention.head_count")?,
+        num_key_value_heads: u("attention.head_count_kv")?,
+        head_dim: u("attention.key_length")?,
+        intermediate_size: u("feed_forward_length")?,
+        vocab_size: vocab,
+        rms_norm_eps: num("attention.layer_norm_rms_epsilon")? as f32,
+        window_size: u("attention.sliding_window")?,
+        sliding_window_pattern: u("attention.sliding_window_pattern")?,
+        rope_theta: full.rope_theta,
+        rope_local_theta: sliding.rope_theta,
+        scale_embedding: false,
+        tie_word_embeddings: false,
+        rope_scaling_factor: factor,
+        initial_context_length: original,
+        rope_parameters: Some(RopeParameters { full_attention: full, sliding_attention: sliding }),
+    };
+    cfg.validate()?;
+    Ok(cfg)
+}
+
+/// The vocabulary (`tokenizer.ggml.*`); the model must use the PLaMo 3 tokenizer.
+fn vocab_from(meta: &HashMap<String, Value>) -> Result<Vocab> {
+    let model = meta.get("tokenizer.ggml.model").and_then(Value::as_str).unwrap_or("");
+    ensure!(model == "plamo3", "GGUF tokenizer {model:?} is not supported (expected plamo3)");
+    let arr = |k: &str| match meta.get(k) {
+        Some(Value::Array(v)) => Ok(v),
+        _ => bail!("GGUF metadata {k} missing"),
+    };
+    let tokens: Vec<String> =
+        arr("tokenizer.ggml.tokens")?.iter().map(|v| v.as_str().unwrap_or_default().to_string()).collect();
+    let scores: Vec<f64> = arr("tokenizer.ggml.scores")?.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+    let types: Vec<i32> =
+        arr("tokenizer.ggml.token_type")?.iter().map(|v| v.as_f64().unwrap_or(1.0) as i32).collect();
+    ensure!(tokens.len() == scores.len() && tokens.len() == types.len(), "GGUF vocabulary arrays differ in length");
+    Ok(Vocab { tokens, scores, types })
+}
+
+/// The tensors of the HF checkpoint in file order: (safetensors name, GGUF name,
+/// and the offset subtracted from norm weights when they are baked). Shared by
+/// the whole-file loader ([`Gguf::weights`]) and the streaming loader
+/// ([`GgufHeader::weight_list`]).
+fn weight_names(meta: &HashMap<String, Value>) -> Result<Vec<(String, String, Option<f32>)>> {
+    let arch = arch_from(meta)?;
+    let num = |k: &str| -> Result<f64> {
+        let k = format!("{arch}.{k}");
+        meta.get(&k).and_then(Value::as_f64).with_context(|| format!("GGUF metadata {k} missing"))
+    };
+    let layers = num("block_count")? as usize;
+    let mut out = vec![
+        ("model.embed_tokens.weight".to_string(), "token_embd".to_string(), None),
+        ("lm_head.weight".to_string(), "output".to_string(), None),
+        ("model.norm.weight".to_string(), "output_norm".to_string(), Some(PRE_NORM_OFFSET)),
+    ];
+    for i in 0..layers {
+        let (b, p) = (format!("blk.{i}"), format!("model.layers.layers.{i}"));
+        for (g, h) in
+            [("attn_qkv", "mixer.qkv_proj"), ("attn_output", "mixer.o_proj"), ("ffn_up", "mlp.gate_up_proj"), ("ffn_down", "mlp.down_proj")]
+        {
+            out.push((format!("{p}.{h}.weight"), format!("{b}.{g}"), None));
+        }
+        for (g, h, off) in [
+            ("attn_norm", "pre_mixer_norm", PRE_NORM_OFFSET),
+            ("attn_q_norm", "mixer.q_norm", PRE_NORM_OFFSET),
+            ("attn_k_norm", "mixer.k_norm", PRE_NORM_OFFSET),
+            ("post_attention_norm", "post_mixer_norm", POST_MIXER_NORM_OFFSET),
+            ("ffn_norm", "pre_mlp_norm", PRE_NORM_OFFSET),
+            ("post_ffw_norm", "post_mlp_norm", POST_MLP_NORM_OFFSET),
+        ] {
+            out.push((format!("{p}.{h}.weight"), format!("{b}.{g}"), Some(off)));
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

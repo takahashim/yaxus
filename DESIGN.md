@@ -147,6 +147,7 @@ yaxus/
     yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
+    yaxus-web/             # Web フロントエンド (wasm32 + WebGPU。第 3 のフロントエンド、§11)
   web/                       # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
   tests/golden/              # Python 側で生成した tokenizer / logits のゴールデンデータ
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
@@ -440,3 +441,80 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 8×8 の行列演算が `fma` の鎖と一致する性質は M2 でしか測っていない。M1、M3 以降で `gemv2` が起動時の検査に通るか。
 - 16 並列のデコードの合計速度 (経緯 11.17 で 220 tok/s に届かなかった)。
 - 2B 本体の 4 ビット化の品質評価。
+
+---
+
+## 11. Web (WASM + WebGPU) 対応
+
+CLI とサーバーの下にある本体 (4 ライブラリクレート) を使い、ブラウザローカルで PLaMo 3 を
+動かす第 3 のフロントエンド `crates/yaxus-web`。サーバー側実行はモデルの大きさから
+対価・転送ともに現実的でないため、重みはユーザーが手元の GGUF を選んで読み込む。
+
+### 11.1 制約と方針
+
+- 実行マシンは 16 GB でメモリに余裕がない。そこで読み込みは **テンソル単位のストリーミング**:
+  GGUF のヘッダだけを先に読み、各テンソルは必要になった時点で範囲読み → GPU アップロード →
+  即解放。ピークは最大テンソル (output.weight Q6K ≈ 136 MB) だけで、定常状態は GPU 上の
+  重み (iGPU なので実メモリ ~0.5 GB) + KV (0.8B: 2.1 MB/ページ × 数十ページ) + タブ ≒ 1 GB 未満。
+  wasm 線形メモリにモデル全体 (573 MB) を置かない。
+- draft なし (推測的デコード対象外)、0.8B 単体、まずはメインスレッド実行 (Worker 化は後)。
+  COOP/COEP 不要。
+- Chrome は WebGPU の `subgroups` / `shader-f16` をデバイス機能として要求しない限り
+  WGSL の `enable` を拒否する。ネイティブの wgpu はデバイス機能から自動で有効化するので、
+  Web ビルドだけ `enable subgroups; enable f16;` をソースに前置する。
+- Chrome には push constants (`immediates`) がない。`var<immediate> p: P;` を
+  `@group(0) @binding(9) var<uniform> p: P;` に移植し、dispatch ごとに uniform リング
+  バッファ (4096 スロット × 256 B、submit でリセット。キューの順序が直列なので正しい)
+  に書いてダイナミックオフセットで束縛する。
+- WebGPU の `map_async` コールバックはイベントループから来る。ブロック待ち (`PollType::Wait`)
+  は Web では使えないので、`event_loop_turn()` (setTimeout 0 の Promise) を await しながら
+  `device.poll(Poll)` を回す非同期 readback (`read_async`) を追加した。`Backend` トレイトの
+  同期点 (`argmax` / `to_host`) は wasm では使えないため、`GpuBackend::argmax_rows_async` /
+  `to_host_async` (具象型の固有メソッド) を追加し、トレイト側は panic にする。エンジンを使わず
+  `Model<GpuBackend>` を直接 1 ステップずつ回す経路を Web 側に置く。
+
+### 11.2 wgpu のパッチ
+
+wgpu 30 の WebGPU バックエンドは Chrome の `subgroups` をリクエストしない
+(`FEATURES_MAPPING` に漏れがある。bindings 自体には `GpuFeatureName::Subgroups` がある)。
+1 行追加した wgpu を `vendor/wgpu` に置き、ワークスペースの `[patch.crates-io]` で差し替える。
+ネイティブビルドへの影響はない (マッピングは webgpu.rs バックエンドしか読まない)。
+上流 PR の候補。
+
+### 11.3 実装 (ステップ 0〜1、完了)
+
+- ステップ 0: headless Chrome (Vulkan 経由) で実アダプタを取得し、13 カーネルの uniform
+  ポート版がすべてコンパイル、gemv1_q4k を Q4_K の合成データで実 dispatch して整数
+  リファレンスと完全一致。limits: バッファ ~4 GB、workgroup storage 64 KB、storage 16/stage、
+  `shader-f16` OK。subgroup は [32, 64]。
+- ステップ 1 (この節の内容):
+  - `yaxus-model`: `TensorRef` のバッキングを `Arc<Backing>` (`Mmap` | `Owned(Vec<u8>)`) に
+    抽象化。`GgufHeader::parse(prefix, file_len)` でヘッダ (メタ + テンソルの絶対範囲) だけを
+    先に解析できるようにし、`weight_list()` (HF 名, テンソル番号, 焼き込み済み norm オフセット) と
+    `baked_norms()` をストリーミングローダー向けに追加。rayon は wasm では逐次 shim
+    (`par.rs`、`with_min_len` だけネイティブ限定)。
+  - `yaxus-backend-gpu`: `GpuBackend::new_web()` (async)、uniform リング、`enable` 前置、
+    `read_async`、エラースコープなしの `checked` (Chrome は非同期にコンソールへ報告)。
+  - `crates/yaxus-web`: `summarize(File)` がヘッダを解析してモデル情報 (名前、量子化、
+    構成、テンソル上位) を返す。www/index.html が UI。
+- 検証: headless Chrome で実ファイル (0.8B Q4_K_M, 573 MB) を選んで情報表示まで動作
+  (ヘッダは 4 MB のプレフィックスで解析できた: 163 テンソル、main type Q4K、
+  output.weight だけ Q6K、語彙 107520)。ネイティブ側は回帰なし
+  (`yaxus-model` 21 テスト、`yaxus-backend-gpu` lib テスト 6 件、CLI の 0.8B 翻訳 72.9 tok/s)。
+
+### 11.4 次のステップ
+
+ビルド: `RUSTFLAGS="" cargo build -p yaxus-web --target wasm32-unknown-unknown && wasm-bindgen
+--target web --out-dir crates/yaxus-web/www/pkg target/wasm32-unknown-unknown/debug/yaxus_web.wasm`。
+(`target-cpu=native` の RUSTFLAGS がついたままだと wasm-bindgen が
+`__wbindgen_externref_table_dealloc` を見つけられず失敗するので、wasm は素のフラグで。)
+配信は `www/` を静的に (開発中は `python3 -m http.server` で十分)。
+
+1. ステップ 2: テンソルのアップロード (`GgufHeader::weight_list` → 範囲読み →
+   `TensorRef::from_owned` → `backend.load_weight`)。`requiredLimits` は `max_buffer_size`
+   と `max_storage_buffer_binding_size` をアダプタの上限に引き上げる。KV は短文向けに絞る。
+2. ステップ 3: 1 文翻訳で CLI 版と出力照合 (greedy なので一致確認ができる)。
+3. ステップ 4: 1 トークンごとに await するストリーミング表示 (tok/s・TTFT の計測)。
+4. 後回し: Worker 化 (メインスレッドを解放)、OPFS へのモデルキャッシュ (ディスクの
+   重複を避けるため既定 OFF)、デバイスロストの復帰、サーバー機能の全排除
+   (`yaxus-web` は `yaxus-runtime` に依存しない)。

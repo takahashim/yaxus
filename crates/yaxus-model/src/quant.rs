@@ -1,8 +1,10 @@
 //! Q8 quantization shared by all backends (so they see bit-identical weights).
 
 use half::f16;
-use rayon::prelude::*;
 
+use crate::par;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::par::*;
 use crate::bf16_to_f32;
 
 /// Weights per scale.
@@ -20,7 +22,11 @@ pub fn quantize_q8(w: &[u16], k: usize) -> Q8Data {
     let nb = w.len() / Q8_BLOCK;
     let mut qs = vec![0i8; w.len()];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(Q8_BLOCK).zip(scales.par_iter_mut()).zip(w.par_chunks(Q8_BLOCK)).with_min_len(1024).for_each(
+    let blocks =
+        par::chunks_mut(&mut qs, Q8_BLOCK).zip(par::iter_mut(&mut scales)).zip(par::chunks(w, Q8_BLOCK));
+    #[cfg(not(target_arch = "wasm32"))]
+    let blocks = blocks.with_min_len(1024);
+    blocks.for_each(
         |((q, sc), src)| {
             let amax = src.iter().map(|&x| bf16_to_f32(x).abs()).fold(0f32, f32::max);
             let d = f16::from_f32(amax / 127.0);
@@ -48,7 +54,11 @@ pub fn quantize_q4(w: &[u16], k: usize) -> Q4Data {
     let nb = w.len() / Q8_BLOCK;
     let mut qs = vec![0u8; w.len() / 2];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(Q8_BLOCK / 2).zip(scales.par_iter_mut()).zip(w.par_chunks(Q8_BLOCK)).with_min_len(1024).for_each(
+    let blocks =
+        par::chunks_mut(&mut qs, Q8_BLOCK / 2).zip(par::iter_mut(&mut scales)).zip(par::chunks(w, Q8_BLOCK));
+    #[cfg(not(target_arch = "wasm32"))]
+    let blocks = blocks.with_min_len(1024);
+    blocks.for_each(
         |((q, sc), src)| {
             let amax = src.iter().map(|&x| bf16_to_f32(x).abs()).fold(0f32, f32::max);
             let d = f16::from_f32(amax / 7.0);

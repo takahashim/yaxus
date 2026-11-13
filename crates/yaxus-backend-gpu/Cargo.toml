@@ -14,7 +14,7 @@ half = "2"
 yaxus-model = { path = "../yaxus-model" }
 
 # The platform's GPU API (see `device::platform_backends`).
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -25,6 +25,15 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
 naga = { version = "30", default-features = false, features = ["wgsl-in", "msl-out"] }
+
+# The browser's WebGPU (wasm only). The patched wgpu adds Chrome's `subgroups`
+# feature to its WebGPU request (see vendor/wgpu and the workspace patch).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
 
 [features]
 # Single ops on given data for the integration tests (`debug_*`).

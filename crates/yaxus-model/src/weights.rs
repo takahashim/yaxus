@@ -1,20 +1,45 @@
 //! Memory-mapped safetensors (possibly sharded) access.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
+#[cfg(not(target_arch = "wasm32"))]
 use safetensors::{Dtype, SafeTensors};
 
 use crate::ggml::GgmlType;
 
-/// A tensor living inside a memory-mapped file: bf16 from safetensors, or any
+/// The bytes a tensor lives in: a memory-mapped file (native), or an owned
+/// buffer (a web page: a tensor's bytes read out of the File, and freed once
+/// the backend holds the weight).
+pub enum Backing {
+    /// A read-only memory mapping.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(Mmap),
+    /// Owned bytes (the web loader reads a tensor, uploads it, drops it).
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Backing::Mmap(m) => &m[..],
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// A tensor living in a [`Backing`]: bf16 from safetensors, or any
 /// [`GgmlType`] from a GGUF file. `shape` is row-major (`[N, K]` for matrices).
 #[derive(Clone)]
 pub struct TensorRef {
-    pub(crate) mmap: Arc<Mmap>,
+    pub(crate) backing: Arc<Backing>,
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub shape: Vec<usize>,
@@ -25,9 +50,15 @@ pub struct TensorRef {
 }
 
 impl TensorRef {
+    /// A tensor over owned bytes `b` (`shape` row-major, `len` = `b.len()`).
+    pub fn from_owned(b: Vec<u8>, shape: Vec<usize>, dtype: GgmlType, minus: f32) -> Self {
+        let len = b.len();
+        TensorRef { backing: Arc::new(Backing::Owned(b)), start: 0, len, shape, dtype, minus }
+    }
+
     /// Raw bytes in the file's encoding.
     pub fn bytes(&self) -> &[u8] {
-        &self.mmap[self.start..self.start + self.len]
+        &self.backing.as_slice()[self.start..self.start + self.len]
     }
 
     pub fn numel(&self) -> usize {
@@ -97,6 +128,7 @@ pub struct Weights {
 
 impl Weights {
     /// Opens `model.safetensors.index.json` shards or a single `model.safetensors`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(dir: &Path) -> Result<Self> {
         let index = dir.join("model.safetensors.index.json");
         let files: Vec<PathBuf> = if index.exists() {
@@ -114,8 +146,8 @@ impl Weights {
             let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
             // SAFETY: the file is treated as read-only; modifying it while mapped is UB
             // like with any mmap-based loader.
-            let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-            let (header_len, meta) = SafeTensors::read_metadata(&mmap[..])?;
+            let mmap = Arc::new(Backing::Mmap(unsafe { Mmap::map(&file)? }));
+            let (header_len, meta) = SafeTensors::read_metadata(mmap.as_slice())?;
             let data_start = 8 + header_len;
             for (name, info) in meta.tensors() {
                 if info.dtype != Dtype::BF16 {
@@ -125,7 +157,7 @@ impl Weights {
                 tensors.insert(
                     name.clone(),
                     TensorRef {
-                        mmap: mmap.clone(),
+                        backing: mmap.clone(),
                         start: data_start + s,
                         len: e - s,
                         shape: info.shape.clone(),
@@ -136,6 +168,13 @@ impl Weights {
             }
         }
         Ok(Weights { tensors })
+    }
+
+    /// The web loader reads GGUF tensors one at a time instead of opening
+    /// safetensors files.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open(_dir: &Path) -> Result<Self> {
+        bail!("safetensors loading is not supported on wasm")
     }
 
     pub fn names(&self) -> impl Iterator<Item = &str> {

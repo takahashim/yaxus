@@ -13,6 +13,13 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The WebGPU (browser) backend of wgpu 30 does not request Chrome's `subgroups`
+# feature (its FEATURES_MAPPING leaves it out, though the vendored WebGPU
+# bindings have the name). One added mapping entry; see vendor/wgpu/. No effect
+# on the native builds: the mapping is only read by the webgpu.rs backend.
+[patch.crates-io]
+wgpu = { path = "vendor/wgpu" }
+
 [profile.release]
 debug = 1
 

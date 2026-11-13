@@ -30,7 +30,18 @@ pub(crate) struct WgpuDev {
     /// Bytes uploaded since the staging memory was last released.
     unflushed_upload: usize,
     pub(crate) kernels_profile: Option<KernelProfile>,
+    /// WebGPU only: there are no push constants (`immediates`), so the per-dispatch
+    /// scalars go into a slot of this ring uniform buffer, one slot per dispatch.
+    #[cfg(target_arch = "wasm32")]
+    immediates: wgpu::Buffer,
+    #[cfg(target_arch = "wasm32")]
+    imm_i: usize,
 }
+
+/// Uniform ring slots: one per dispatch recorded between submissions (reset at each).
+/// A slot is 256 bytes apart, the minimum uniform buffer offset alignment.
+#[cfg(target_arch = "wasm32")]
+const IMMEDIATE_SLOTS: usize = 4096;
 
 impl Drop for WgpuDev {
     fn drop(&mut self) {
@@ -51,11 +62,13 @@ fn wb(b: &Buf) -> &wgpu::Buffer {
 }
 
 /// Allocation and validation errors captured around a closure (see `Gpu::checked`).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct ErrorScope {
     oom: wgpu::ErrorScopeGuard,
     invalid: wgpu::ErrorScopeGuard,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         let invalid = pollster::block_on(self.invalid.pop());
@@ -68,6 +81,7 @@ impl WgpuDev {
     /// Opens the first GPU of the platform's API (Vulkan; Metal on macOS).
     /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
     /// can run on machines without a GPU (CI).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open(diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
         let backends = platform_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -273,6 +287,19 @@ impl WgpuDev {
                     .enumerate()
                     .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
                     .collect();
+                #[cfg(target_arch = "wasm32")]
+                let entries = {
+                    let mut e = entries;
+                    e.push(wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.immediates,
+                            offset: 0,
+                            size: Some(std::num::NonZeroU64::new(32).unwrap()),
+                        }),
+                    });
+                    e
+                };
                 let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &k.layout,
@@ -313,21 +340,71 @@ impl WgpuDev {
         }
         let pass = self.pass.as_mut().unwrap();
         pass.set_pipeline(&k.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.set_immediates(0, bytemuck::cast_slice(imm));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pass.set_bind_group(0, &bg, &[]);
+            pass.set_immediates(0, bytemuck::cast_slice(imm));
+        }
+        // WebGPU has no push constants: the scalars go through the ring's next slot
+        // (the write is applied in queue order, before this submission's commands).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let slot = (self.imm_i * 256) as u64;
+            self.imm_i += 1;
+            assert!(self.imm_i <= IMMEDIATE_SLOTS, "the immediates ring is exhausted in one submission");
+            self.queue.write_buffer(&self.immediates, slot, bytemuck::cast_slice(imm));
+            pass.set_bind_group(0, &bg, &[slot as u32]);
+        }
         pass.dispatch_workgroups(groups.0, groups.1, 1);
     }
 
     pub(crate) fn submit(&mut self) {
         self.pass = None;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.imm_i = 0;
+        }
         if let Some(enc) = self.encoder.take() {
             self.queue.submit([enc.finish()]);
         }
     }
 
-    pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+    /// The async counterpart of `read` for WebGPU: the map callback comes from the
+    /// event loop, so the read-back awaits event-loop turns while polling. (Kernel
+    /// timing does not exist there.)
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         let src = wb(src).clone();
-        let staging = if size <= self.readback.size() {
+        let staging = self.readback_staging(size);
+        self.encoder().copy_buffer_to_buffer(&src, offset, &staging, 0, size);
+        self.submit();
+        let mapped = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let mapped = mapped.clone();
+            staging.map_async(wgpu::MapMode::Read, ..size, move |r| {
+                if r.is_err() {
+                    web_sys::console::error_1(&"map_async failed".into());
+                }
+                mapped.set(true);
+            });
+        }
+        for _ in 0..600 {
+            self.device.poll(wgpu::PollType::Poll).expect("device lost");
+            if mapped.get() {
+                break;
+            }
+            event_loop_turn().await;
+        }
+        assert!(mapped.get(), "read-back did not map in time");
+        let out = staging.get_mapped_range(..size).expect("mapped").to_vec();
+        staging.unmap();
+        out
+    }
+
+    /// The MAP_READ buffer for reading `size` bytes: the pooled small one, or a fresh
+    /// large one.
+    fn readback_staging(&mut self, size: u64) -> wgpu::Buffer {
+        if size <= self.readback.size() {
             self.readback.clone()
         } else {
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -336,7 +413,13 @@ impl WgpuDev {
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
-        };
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+        let src = wb(src).clone();
+        let staging = self.readback_staging(size);
         self.encoder().copy_buffer_to_buffer(&src, offset, &staging, 0, size);
         let timed_n = self.kernels_profile.as_ref().map_or(0, |k| k.pending.len());
         if timed_n > 0 {
@@ -368,6 +451,7 @@ impl WgpuDev {
         out
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn error_scope(&self) -> ErrorScope {
         let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let invalid = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -395,7 +479,19 @@ pub(crate) fn compile(
     src: &str,
     read_only: &[bool],
 ) -> WgpuKernel {
-    let (module, entry) = if let Some(size) = crate::msl::workgroup_size(src) {
+    // WebGPU: port the push constants to a uniform buffer at binding 9 (every kernel
+    // has at most 9 buffer bindings), and add the `enable` directives Chrome requires
+    // (native wgpu enables f16 and subgroups from the device features).
+    #[cfg(target_arch = "wasm32")]
+    let src = {
+        let s = src.replace("var<immediate> p: P;", "@group(0) @binding(9) var<uniform> p: P;");
+        if s.starts_with("enable ") {
+            s
+        } else {
+            format!("enable subgroups;\nenable f16;\n{s}")
+        }
+    };
+    let (module, entry) = if let Some(size) = crate::msl::workgroup_size(&src) {
         // SAFETY: the source is ours (`msl`), its loops end (`every_kernel_loop_ends`) and
         // its bindings are those of `read_only` at the buffer indices wgpu gives them.
         let module = unsafe {
@@ -422,12 +518,30 @@ pub(crate) fn compile(
         (unsafe { device.create_shader_module_trusted(desc, checks) }, "main")
     };
     let entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
+    #[cfg(target_arch = "wasm32")]
+    let entries = {
+        let mut e = entries;
+        e.push(wgpu::BindGroupLayoutEntry {
+            binding: 9,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+        e
+    };
     let layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(name),
         bind_group_layouts: &[Some(&layout)],
+        #[cfg(not(target_arch = "wasm32"))]
         immediate_size: 32,
+        #[cfg(target_arch = "wasm32")]
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(name),
@@ -444,8 +558,101 @@ pub(crate) fn compile(
 }
 
 /// The wgpu backends of the platform: Metal on macOS, Vulkan elsewhere.
+#[cfg(not(target_arch = "wasm32"))]
 fn platform_backends() -> wgpu::Backends {
     if cfg!(target_os = "macos") { wgpu::Backends::METAL } else { wgpu::Backends::VULKAN }
+}
+
+/// Opens the browser's WebGPU device (wasm only). The futures are JS promises, so
+/// this must be awaited (`Gpu::new_web`); the scalars of the kernels go through a
+/// uniform ring buffer instead of push constants, and the WGSL sources carry the
+/// `enable` directives and the `var<uniform>` port (see `compile`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn open_web(_diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::BROWSER_WEBGPU,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let mut adapter = None;
+    for fallback in [false, true] {
+        let opts = wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: fallback,
+            ..Default::default()
+        };
+        match instance.request_adapter(&opts).await {
+            Ok(a) => {
+                adapter = Some(a);
+                break;
+            }
+            Err(e) if fallback => return Err(e).context("no WebGPU adapter found"),
+            Err(_) => continue,
+        }
+    }
+    let adapter = adapter.context("no WebGPU adapter found")?;
+    // The kernels are written with f16 scalars and subgroup shuffles behind `enable`
+    // directives, which Chrome requires explicitly (native wgpu enables them from the
+    // device features). Chrome 129 and later have both.
+    if !adapter.features().contains(wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16) {
+        bail!("this WebGPU adapter lacks subgroups or f16 (a newer Chrome may help)");
+    }
+    let alimits = adapter.limits();
+    let caps = detect(&adapter);
+    let limits = wgpu::Limits {
+        max_buffer_size: alimits.max_buffer_size,
+        max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
+        max_storage_buffers_per_shader_stage: 10,
+        max_compute_workgroup_storage_size: caps.max_workgroup_storage,
+        ..wgpu::Limits::default()
+    };
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("yaxus"),
+            required_features: wgpu::Features::SHADER_F16 | wgpu::Features::SUBGROUP,
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            ..Default::default()
+        })
+        .await
+        .context("creating the WebGPU device")?;
+    // Validation errors come back through the console; a failed allocation or kernel
+    // otherwise surfaces as a lost device at the next read-back.
+    device.on_uncaptured_error(std::sync::Arc::new(|e| web_sys::console::error_1(&format!("WebGPU: {e}").into())));
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let immediates = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("immediates"),
+        size: (IMMEDIATE_SLOTS * 256) as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let d = WgpuDev {
+        device,
+        queue,
+        encoder: None,
+        pass: None,
+        bind_groups: HashMap::new(),
+        readback,
+        unflushed_upload: 0,
+        kernels_profile: None,
+        immediates,
+        imm_i: 0,
+    };
+    Ok((d, caps))
+}
+
+/// One event-loop turn (a macrotask), so browser callbacks (a buffer map, device
+/// loss) can run.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn event_loop_turn() {
+    use wasm_bindgen::JsCast;
+    let p: js_sys::Promise =
+        js_sys::eval("new Promise(r => setTimeout(r, 0))").expect("eval").unchecked_into();
+    let _ = wasm_bindgen_futures::JsFuture::from(p).await;
 }
 
 /// The vendor of `info`'s adapter (PCI vendor ids; Apple's on Metal).

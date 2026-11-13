@@ -82,6 +82,9 @@ pub(crate) enum Dev {
 impl Dev {
     /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
     /// without wgpu, else wgpu.
+    /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
+    /// without wgpu, else wgpu.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
         #[cfg(target_os = "macos")]
         if std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal") {
@@ -89,6 +92,13 @@ impl Dev {
             return Ok((Dev::Metal(d), caps));
         }
         let (d, caps) = wgpu::WgpuDev::open(diag)?;
+        Ok((Dev::Wgpu(Box::new(d)), caps))
+    }
+
+    /// Opens the browser's WebGPU device (wasm only; see `WgpuDev::open_web`).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn open_web(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
+        let (d, caps) = wgpu::open_web(diag).await?;
         Ok((Dev::Wgpu(Box::new(d)), caps))
     }
 
@@ -139,6 +149,7 @@ impl Dev {
     }
 
     /// Writes `bytes` into `dst` at `offset`, after everything recorded so far.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn write(&mut self, dst: &Buf, offset: u64, bytes: &[u8]) {
         match self {
             Dev::Wgpu(d) => d.write(dst, offset, bytes),
@@ -195,9 +206,20 @@ impl Dev {
     }
 
     /// Submits, waits, and returns `size` bytes of `src` from `offset`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         match self {
             Dev::Wgpu(d) => d.read(src, offset, size),
+            #[cfg(target_os = "macos")]
+            Dev::Metal(d) => d.read(src, offset, size),
+        }
+    }
+
+    /// The WebGPU read-back: awaits event-loop turns while the map completes.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
+        match self {
+            Dev::Wgpu(d) => d.read_async(src, offset, size).await,
             #[cfg(target_os = "macos")]
             Dev::Metal(d) => d.read(src, offset, size),
         }
@@ -213,6 +235,7 @@ impl Dev {
     }
 
     /// An allocation that failed since the last call (devices that report them so).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn take_failure(&self) -> Option<String> {
         match self {
             Dev::Wgpu(_) => None,
@@ -223,6 +246,7 @@ impl Dev {
 
     /// Captures allocation and validation errors until `ErrorScope::finish` (see
     /// `Gpu::checked`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn error_scope(&self) -> ErrorScope {
         match self {
             Dev::Wgpu(d) => ErrorScope::Wgpu(d.error_scope()),
@@ -235,7 +259,8 @@ impl Dev {
     }
 }
 
-/// Errors captured since `Dev::error_scope`.
+    /// Errors captured since `Dev::error_scope`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) enum ErrorScope {
     Wgpu(wgpu::ErrorScope),
     /// (Metal reports a failed allocation at the call)
@@ -243,6 +268,7 @@ pub(crate) enum ErrorScope {
     None,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ErrorScope {
     pub(crate) fn finish(self) -> Option<String> {
         match self {

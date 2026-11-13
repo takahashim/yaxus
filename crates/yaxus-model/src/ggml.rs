@@ -6,7 +6,9 @@
 
 use anyhow::{Result, bail};
 use half::f16;
-use rayon::prelude::*;
+use crate::par;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::par::*;
 
 use crate::quant::{Q2Data, Q3Data, Q4Data, Q4KData, Q6Data, Q8Data};
 
@@ -255,7 +257,10 @@ fn q6k_values(b: &[u8]) -> Vec<(i32, f32)> {
 pub fn dequantize(t: GgmlType, bytes: &[u8], n: usize) -> Vec<f32> {
     let (e, bsz) = t.block();
     let mut y = vec![0f32; n];
-    y.par_chunks_mut(e).zip(bytes.par_chunks(bsz)).with_min_len(256).for_each(|(out, blk)| dequant_block(t, blk, out));
+    let rows = par::chunks_mut(&mut y, e).zip(par::chunks(bytes, bsz));
+    #[cfg(not(target_arch = "wasm32"))]
+    let rows = rows.with_min_len(256);
+    rows.for_each(|(out, blk)| dequant_block(t, blk, out));
     y
 }
 
@@ -264,7 +269,7 @@ pub fn q8_from_q8_0(bytes: &[u8]) -> Q8Data {
     let nb = bytes.len() / 34;
     let mut qs = vec![0i8; nb * 32];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(32).zip(scales.par_iter_mut()).zip(bytes.par_chunks(34)).for_each(|((q, s), b)| {
+    par::chunks_mut(&mut qs, 32).zip(par::iter_mut(&mut scales)).zip(par::chunks(bytes, 34)).for_each(|((q, s), b)| {
         *s = f16::from_le_bytes([b[0], b[1]]);
         for (o, &x) in q.iter_mut().zip(&b[2..34]) {
             *o = x as i8;
@@ -279,7 +284,7 @@ pub fn q4_from_q4_0(bytes: &[u8]) -> Q4Data {
     let nb = bytes.len() / 18;
     let mut qs = vec![0u8; nb * 16];
     let mut scales = vec![f16::ZERO; nb];
-    qs.par_chunks_mut(16).zip(scales.par_iter_mut()).zip(bytes.par_chunks(18)).for_each(|((q, s), b)| {
+    par::chunks_mut(&mut qs, 16).zip(par::iter_mut(&mut scales)).zip(par::chunks(bytes, 18)).for_each(|((q, s), b)| {
         *s = f16::from_le_bytes([b[0], b[1]]);
         let nib = |e: usize| if e < 16 { b[2 + e] & 0xF } else { b[2 + e - 16] >> 4 };
         for (i, o) in q.iter_mut().enumerate() {
@@ -292,7 +297,7 @@ pub fn q4_from_q4_0(bytes: &[u8]) -> Q4Data {
 /// Q4_K as [`Q4KData`]: the same bytes with the nibbles of each block reordered.
 pub fn q4k_from_q4_k(bytes: &[u8]) -> Q4KData {
     let mut data = vec![0u8; bytes.len()];
-    data.par_chunks_mut(144).zip(bytes.par_chunks(144)).for_each(|(o, b)| {
+    par::chunks_mut(&mut data, 144).zip(par::chunks(bytes, 144)).for_each(|(o, b)| {
         o[0..16].copy_from_slice(&b[0..16]);
         let (q, ql) = (&mut o[16..144], &b[16..144]);
         for sub in 0..8 {
@@ -317,7 +322,8 @@ pub fn q6_from_q6_k(bytes: &[u8], n: usize, k: usize) -> Q6Data {
     let mut qs = vec![0u8; n * row_bytes];
     let mut meta = vec![0u8; n * ms];
     let mut scales16 = vec![f16::ZERO; n * k / 16];
-    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(scales16.par_chunks_mut(k / 16));
+    let rows =
+        par::chunks_mut(&mut qs, row_bytes).zip(par::chunks_mut(&mut meta, ms)).zip(par::chunks_mut(&mut scales16, k / 16));
     rows.enumerate().for_each(|(r, ((q, m), s16))| {
         for blk in 0..bpr {
             let b = &bytes[(r * bpr + blk) * 210..][..210];
@@ -354,7 +360,8 @@ pub fn q2_from_q2_k(bytes: &[u8], n: usize, k: usize) -> Q2Data {
     let mut qs = vec![0u8; n * row_bytes];
     let mut meta = vec![0u8; n * ms];
     let mut pairs16 = vec![f16::ZERO; n * k / 8];
-    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(pairs16.par_chunks_mut(k / 8));
+    let rows =
+        par::chunks_mut(&mut qs, row_bytes).zip(par::chunks_mut(&mut meta, ms)).zip(par::chunks_mut(&mut pairs16, k / 8));
     rows.enumerate().for_each(|(r, ((q, m), p16))| {
         for blk in 0..bpr {
             let b = &bytes[(r * bpr + blk) * 84..][..84];
@@ -408,7 +415,8 @@ pub fn q3_from_q3_k(bytes: &[u8], n: usize, k: usize) -> Q3Data {
     let mut qs = vec![0u8; n * row_bytes];
     let mut meta = vec![0u8; n * ms];
     let mut scales16 = vec![f16::ZERO; n * k / 16];
-    let rows = qs.par_chunks_mut(row_bytes).zip(meta.par_chunks_mut(ms)).zip(scales16.par_chunks_mut(k / 16));
+    let rows =
+        par::chunks_mut(&mut qs, row_bytes).zip(par::chunks_mut(&mut meta, ms)).zip(par::chunks_mut(&mut scales16, k / 16));
     rows.enumerate().for_each(|(r, ((q, m), s16))| {
         for blk in 0..bpr {
             let b = &bytes[(r * bpr + blk) * 110..][..110];

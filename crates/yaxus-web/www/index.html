@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>yaxus web — PLaMo 3 翻訳 (WebGPU)</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 46rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+        line-height: 1.6;
+      }
+      h1 { font-size: 1.3rem; }
+      input[type="file"] { margin: 1rem 0; }
+      .kv { border-collapse: collapse; margin: 1rem 0; }
+      .kv td, .kv th { border: 1px solid #8884; padding: 0.2rem 0.7rem; text-align: left; }
+      .kv th { font-weight: 600; }
+      pre { background: #8881; padding: 0.8rem; border-radius: 0.5rem; overflow-x: auto; white-space: pre-wrap; }
+      #status { color: #b00; min-height: 1.5em; white-space: pre-wrap; }
+      button { padding: 0.3rem 1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>yaxus web — PLaMo 3 翻訳 (WebGPU 試作)</h1>
+    <p>ステップ 1: GGUF を選ぶと、ヘッダを解析してモデル情報を表示します。<br />
+    (重みはまだ読みません。テンソル単位のストリーミング読み込みは次のステップ)</p>
+
+    <input type="file" id="gguf" accept=".gguf" />
+    <button id="go" disabled>解析</button>
+    <div id="status"></div>
+
+    <table id="info" class="kv" hidden>
+      <tbody>
+        <tr><th>ファイル</th><td id="f-name"></td></tr>
+        <tr><th>モデル</th><td id="f-model"></td></tr>
+        <tr><th>arch / 量子化</th><td id="f-quant"></td></tr>
+        <tr><th>サイズ</th><td id="f-size"></td></tr>
+        <tr><th>テンソル</th><td id="f-tensors"></td></tr>
+        <tr><th>語彙</th><td id="f-vocab"></td></tr>
+      </tbody>
+    </table>
+    <pre id="config" hidden></pre>
+    <pre id="tensors" hidden></pre>
+
+    <script type="module">
+      import init, { summarize } from "./pkg/yaxus_web.js";
+
+      const $ = (id) => document.getElementById(id);
+      const status = $("status");
+      let file = null;
+
+      init().catch((e) => {
+        status.textContent = `wasm の初期化に失敗: ${e}`;
+      });
+
+      $("gguf").addEventListener("change", (ev) => {
+        file = ev.target.files[0] ?? null;
+        $("go").disabled = !file;
+        status.textContent = "";
+      });
+
+      $("go").addEventListener("click", async () => {
+        if (!file) return;
+        $("info").hidden = true;
+        $("config").hidden = true;
+        $("tensors").hidden = true;
+        status.textContent = "解析中…";
+        try {
+          const s = await summarize(file);
+          $("f-name").textContent = file.name;
+          $("f-model").textContent = s.name;
+          $("f-quant").textContent = `${s.arch} / ${s.quant}`;
+          $("f-size").textContent = `${(Number(s.file_bytes) / 1e6).toFixed(1)} MB (テンソル合計 ${(Number(s.tensor_bytes) / 1e6).toFixed(1)} MB)`;
+          $("f-tensors").textContent = `${s.tensors}`;
+          $("f-vocab").textContent = `${s.vocab_size} トークン`;
+          $("config").textContent = s.config;
+          $("tensors").textContent = s.tensors_preview;
+          $("info").hidden = false;
+          $("config").hidden = false;
+          $("tensors").hidden = false;
+          status.textContent = "";
+        } catch (e) {
+          status.textContent = `エラー: ${e}\n${e && e.stack ? e.stack : ""}`;
+        }
+      });
+    </script>
+  </body>
+</html>

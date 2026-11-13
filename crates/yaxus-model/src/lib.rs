@@ -7,6 +7,7 @@ pub mod gguf;
 pub mod hub;
 pub mod kv;
 pub mod quant;
+mod par;
 pub mod weights;
 
 use std::path::Path;

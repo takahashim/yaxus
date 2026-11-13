@@ -178,12 +178,15 @@ impl Gpu {
         y
     }
 
+    /// Greedy token of every row (native only; the WebGPU path awaits `argmax_rows_async`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
         self.argmax_prob_rows(logits).into_iter().map(|(i, _)| i).collect()
     }
 
     // (`&mut`: reading back submits the recorded work)
     #[allow(clippy::wrong_self_convention)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         let size = (x.rows * x.cols * 4) as u64;
         let b = self.read(&x.buf().clone(), 0, size);
@@ -191,6 +194,7 @@ impl Gpu {
     }
 
     /// Greedy token and its softmax probability for every row (two-stage reduction).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn argmax_prob_rows(&mut self, logits: &Tensor) -> Vec<(u32, f32)> {
         if logits.rows > ARGMAX_ROWS {
             // More streams than one dispatch covers (--max-streams has no upper bound).
@@ -217,5 +221,54 @@ impl Gpu {
         // first element then, and an id beyond the vocabulary must not escape.
         let cols = logits.cols as u32;
         v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
+    }
+}
+
+/// The WebGPU read-backs (wasm only): like their sync counterparts, but awaited, since
+/// a buffer map completes from the event loop and `to_host`/`argmax` are the sync
+/// points of a pass.
+#[cfg(target_arch = "wasm32")]
+impl Gpu {
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) async fn to_host_async(&mut self, x: &Tensor) -> Vec<f32> {
+        let size = (x.rows * x.cols * 4) as u64;
+        let b = self.read_async(&x.buf().clone(), 0, size).await;
+        bytemuck::cast_slice(&b).to_vec()
+    }
+
+    /// Greedy token and its softmax probability for every row (two-stage reduction).
+    /// Boxed for the recursion past `ARGMAX_ROWS` (an async fn cannot recurse).
+    pub(crate) fn argmax_prob_rows_async<'a>(
+        &'a mut self,
+        logits: &'a Tensor,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(u32, f32)>> + 'a>> {
+        Box::pin(async move {
+            if logits.rows > ARGMAX_ROWS {
+                let mut out = Vec::with_capacity(logits.rows);
+                for start in (0..logits.rows).step_by(ARGMAX_ROWS) {
+                    let rows: Vec<usize> = (start..(start + ARGMAX_ROWS).min(logits.rows)).collect();
+                    let part = self.select_rows(logits, &rows);
+                    out.extend(self.argmax_prob_rows_async(&part).await);
+                }
+                return out;
+            }
+            let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
+            let slice = logits.cols.div_ceil(ARGMAX_SLICES);
+            self.dispatch(
+                "argmax1",
+                &[&part, logits.buf()],
+                &[logits.cols as u32, slice as u32],
+                (ARGMAX_SLICES as u32, logits.rows as u32),
+            );
+            self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
+            let b = self.read_async(&out, 0, logits.rows as u64 * 8).await;
+            let v: &[u32] = bytemuck::cast_slice(&b);
+            let cols = logits.cols as u32;
+            v.as_chunks::<2>().0.iter().map(|&[i, x]| (if i < cols { i } else { 0 }, f32::from_bits(x))).collect()
+        })
+    }
+
+    pub(crate) async fn argmax_rows_async(&mut self, logits: &Tensor) -> Vec<u32> {
+        self.argmax_prob_rows_async(logits).await.into_iter().map(|(i, _)| i).collect()
     }
 }
