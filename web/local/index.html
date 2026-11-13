@@ -248,8 +248,8 @@ async function loadModel() {
       `device: ${info.device}\n` +
       `binding: ${fmtMB(info.maxBinding)}\n` +
       `load: ${(info.loadMs / 1e3).toFixed(1)} s (wasm+GPU; ファイルの読み込みを含めて ${(wall / 1e3).toFixed(1)} s)`;
-    if (info.lmHeadQ4) {
-      warnEl.textContent = 'この GPU の binding 上限に収めるため、出力行列を Q4 にしました（訳の質が少し下がります）。';
+    if (info.reducedToQ4) {
+      warnEl.textContent = 'この GPU の binding 上限に収まらない行列（出力行列）を Q4 にしました（訳の質が少し下がります）。';
     }
     setStatus('準備できました。文章を入れて翻訳してください。');
   } catch (e) {

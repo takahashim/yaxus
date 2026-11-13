@@ -200,6 +200,10 @@ pub struct StartInfo {
     pub cached: bool,
 }
 
+/// The embedding table's name in [`Weights`] (the HF checkpoint's; GGUF's `token_embd`
+/// is renamed to it).
+pub const EMBED_TOKENS: &str = "model.embed_tokens.weight";
+
 /// Default KV arena size in tokens and maximum position.
 pub const DEFAULT_KV_TOKENS: usize = 16384;
 pub const DEFAULT_MAX_POS: usize = 8192;
@@ -214,22 +218,12 @@ pub struct ModelOptions {
     pub max_pos: usize,
     /// Keep finished sequences and reuse their KV for prompts sharing a prefix.
     pub prefix_cache: bool,
-    /// The output matrix's format when it differs from `quant`. A GGUF Q6_K output is
-    /// 135 MB for the 0.8B, which is more than the 128 MB storage binding some WebGPU
-    /// devices allow; Q4 there is 82 MB.
-    pub lm_head_quant: Option<Quant>,
 }
 
 impl ModelOptions {
     /// Weights in `quant`, the default KV arena, prefix reuse on.
     pub fn new(quant: Quant) -> Self {
-        ModelOptions {
-            quant,
-            kv_tokens: DEFAULT_KV_TOKENS,
-            max_pos: DEFAULT_MAX_POS,
-            prefix_cache: true,
-            lm_head_quant: None,
-        }
+        ModelOptions { quant, kv_tokens: DEFAULT_KV_TOKENS, max_pos: DEFAULT_MAX_POS, prefix_cache: true }
     }
 }
 
@@ -314,10 +308,10 @@ impl<B: Backend> Model<B> {
         } else {
             lm_head_t
         };
-        let lm_head = backend.load_weight(lm_head_t, opts.lm_head_quant.unwrap_or(quant))?;
+        let lm_head = backend.load_weight(lm_head_t, quant)?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
-        let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;
+        let embed = backend.load_embedding(w.get_shaped(EMBED_TOKENS, &[cfg.vocab_size, h])?)?;
         let pages = opts.kv_tokens.div_ceil(PAGE);
         let metas: Vec<LayerMeta> = layers.iter().map(|l| l.meta.clone()).collect();
         let kv = backend.new_kv(&cfg, &metas, pages, opts.max_pos)?;

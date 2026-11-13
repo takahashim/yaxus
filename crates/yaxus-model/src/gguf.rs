@@ -272,7 +272,7 @@ impl Gguf {
             Ok(t)
         };
         let mut out = HashMap::new();
-        out.insert("model.embed_tokens.weight".to_string(), get("token_embd")?.clone());
+        out.insert(crate::EMBED_TOKENS.to_string(), get("token_embd")?.clone());
         out.insert("lm_head.weight".to_string(), get("output")?.clone());
         out.insert("model.norm.weight".to_string(), norm("output_norm", PRE_NORM_OFFSET)?);
         let layers = self.num("block_count")? as usize;

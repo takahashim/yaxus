@@ -128,6 +128,8 @@ pub struct Gpu {
     pub gemm: GemmKind,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
     oversized: Option<(String, usize)>,
+    /// Matrices loaded as Q4 because their own format exceeds the binding limit.
+    reduced_to_q4: usize,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
     /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
@@ -268,6 +270,7 @@ impl Gpu {
             pending_flops: 0.0,
             pass_dispatches: 0,
             oversized: None,
+            reduced_to_q4: 0,
             profile: diag.profile.map(|_| Profile::default()),
             diag,
         };
@@ -319,6 +322,12 @@ impl GpuBackend {
     /// fit it whole).
     pub fn max_binding_bytes(&self) -> u64 {
         self.g().dev.max_binding()
+    }
+
+    /// How many matrices were loaded as Q4 because one storage binding cannot cover them
+    /// in their own format (see `Gpu::load_weight`). Their outputs change slightly.
+    pub fn reduced_to_q4(&self) -> usize {
+        self.g().reduced_to_q4
     }
 
     /// The greedy token of a one-row logits tensor, awaiting the read-back (browser).

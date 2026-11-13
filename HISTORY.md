@@ -1709,7 +1709,7 @@ M2、llama.cpp b11972 で測った。yaxus は既定の設定 (wgpu の Metal、
 - `Tuning::for_device` が Intel/AMD とみなして int16 を選ぶ。WebGPU は f32 固定 (subgroup の 32 レーンを WebGPU から確認できないため、subgroup も要求しない)。`gemv1` / `gemv8` と `gemm_f32`、行ごとの attention は lavapipe の CI と同じ経路。
 - GGUF が mmap とパス前提。`Gguf::parse(Vec<u8>)` と `TensorRef` の `Mmap | Arc<Vec<u8>>` を足した。トークナイザは `Tokenizer::from_vocab`。
 - std の `Instant` は wasm32-unknown-unknown で panic する。時間は `web-time` に置き換えた。
-- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした。native も同じ表を使う (下の「CLI との一致」)。出力行列 (Q6_K、135 MB) が storage binding の上限 (128 MB の段階) を超える場合は、`ModelOptions.lm_head_quant = Q4` (82 MB) に落とす。
+- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした。native も同じ表を使う (下の「CLI との一致」)。出力行列 (Q6_K、135 MB) が storage binding の上限 (128 MB の段階) を超える場合は、Q4 (82 MB) に落とす。最初はページがテンソルの大きさを数えて `ModelOptions.lm_head_quant` で指定していたが、binding の上限はバックエンドの制約なので、判断をバックエンドの `load_weight` に移した (native もファイルの形式で上限を超える行列は Q4 で読み、警告を出す)。
 
 **測ったこと。** native のテストと clippy (workspace と wasm32) は通る。wasm は 0.8 MB。M2 の Chrome (ヘッドレス、Playwright で操作) で、0.8B Q4_K_M の読み込みはファイルの読み込みを含めて 2.7 秒、decode は 72〜81 tok/s (1 段落)。
 

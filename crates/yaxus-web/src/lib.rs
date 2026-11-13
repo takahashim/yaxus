@@ -103,38 +103,20 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let kinds = vocab.types.iter().copied().map(TokenKind::from_ggml_type).collect();
     let tokenizer = Tokenizer::from_vocab(vocab.tokens, kinds, vocab.scores).map_err(jserr)?;
 
-    // The largest buffer a single binding has to cover. For the 0.8B Q4_K_M this is the
-    // Q6_K output matrix (135 MB); the embedding stays Q4_K (93 MB) instead of bf16.
-    let max_tensor = g.tensors.iter().map(|(_, t)| t.bytes().len() as u64).max().unwrap_or(0);
-    // A table of another format grows to bf16 in `load_embedding`, so ask for that room.
-    let embed =
-        g.tensors
-            .iter()
-            .find(|(name, _)| name == "token_embd" || name == "model.embed_tokens.weight")
-            .map(|(_, t)| {
-                if t.dtype == yaxus_model::ggml::GgmlType::Q4K {
-                    t.bytes().len() as u64
-                } else {
-                    (t.numel() * 2) as u64
-                }
-            })
-            .unwrap_or(0);
+    // The largest buffer a single binding has to cover (for the 0.8B Q4_K_M, the Q6_K
+    // output matrix of 135 MB). A device that cannot bind it gets that matrix at Q4.
     report(&on_progress, "WebGPU デバイスを開いています…");
-    let need_binding = max_tensor.max(embed);
+    let need_binding = GpuBackend::largest_weight_bytes(&g.weights().map_err(jserr)?);
     let backend = GpuBackend::new_async(need_binding, need_binding.max(64 << 20)).await.map_err(jserr)?;
     let name = backend.caps().name.clone();
     let max_binding = backend.max_binding_bytes();
-    // A device whose storage binding is 128 MB cannot bind the 135 MB Q6_K output; Q4
-    // there is 82 MB. This only happens on the conservative limit tier.
-    let lm_head_quant = if max_tensor > max_binding { Some(Quant::Q4) } else { None };
 
     report(&on_progress, "重みを GPU に転送しています…");
     let opts = ModelOptions {
-        quant: Quant::Auto,
         kv_tokens: MAX_CONTEXT,
         max_pos: MAX_CONTEXT,
         prefix_cache: false,
-        lm_head_quant,
+        ..ModelOptions::new(Quant::Auto)
     };
     let mut model = Model::from_gguf(g, backend, &opts).map_err(jserr)?;
     // WebGPU reports a failed allocation after the call that made it; wait for the
@@ -142,7 +124,8 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     model.backend.sync_async().await.map_err(jserr)?;
     report(&on_progress, "準備できました");
     let load_ms = total.elapsed().as_secs_f64() * 1e3;
-    Ok(Translator { model, tokenizer, name, load_ms, max_binding, lm_head_q4: lm_head_quant.is_some(), broken: false })
+    let reduced_to_q4 = model.backend.reduced_to_q4() > 0;
+    Ok(Translator { model, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false })
 }
 
 /// One loaded model. Only one translation runs at a time (the page's button is disabled
@@ -154,7 +137,7 @@ pub struct Translator {
     name: String,
     load_ms: f64,
     max_binding: u64,
-    lm_head_q4: bool,
+    reduced_to_q4: bool,
     /// Set by an error of the GPU (see the crate documentation).
     broken: bool,
 }
@@ -199,10 +182,11 @@ impl Translator {
         self.max_binding as f64
     }
 
-    /// True when the output matrix had to be reduced to Q4 to fit the binding limit.
+    /// True when a matrix (the output matrix, on a device that binds 128 MB) was loaded
+    /// as Q4 because the storage binding limit is smaller than it.
     #[wasm_bindgen(getter)]
-    pub fn lm_head_q4(&self) -> bool {
-        self.lm_head_q4
+    pub fn reduced_to_q4(&self) -> bool {
+        self.reduced_to_q4
     }
 
     /// Translates `text` into `target` (`ja` or `en`; the source language is left to

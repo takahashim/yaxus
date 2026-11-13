@@ -67,7 +67,7 @@ async function load(file) {
       device: translator.device || (await adapterName()),
       maxBinding: translator.max_binding,
       loadMs: translator.load_ms,
-      lmHeadQ4: translator.lm_head_q4,
+      reducedToQ4: translator.reduced_to_q4,
     },
   });
 }

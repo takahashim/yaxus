@@ -52,10 +52,13 @@ const CASES = [
   { name: 'en->ja document', to: 'ja', text: LONG_EN, check: (out) => out.split('\n\n').length === 12 },
 ];
 
-// Test-only: keeps the worker's GPUDevice where the test can reach it, to break it.
+// Test-only: keeps the worker's GPUDevice where the test can reach it, to break it, and
+// caps the storage binding when `self.__maxBinding` is set (WebGPU's 128 MB tier).
 const SHIM =
   'const __requestDevice = GPUAdapter.prototype.requestDevice;\n' +
   'GPUAdapter.prototype.requestDevice = async function (d) {\n' +
+  '  const l = d?.requiredLimits;\n' +
+  '  if (self.__maxBinding && l) l.maxStorageBufferBindingSize = Math.min(l.maxStorageBufferBindingSize ?? Infinity, self.__maxBinding);\n' +
   '  const device = await __requestDevice.call(this, d);\n' +
   '  self.__device = device;\n' +
   '  return device;\n' +
@@ -131,11 +134,13 @@ async function translate(page, c) {
   };
   try {
     const page = await browser.newPage();
+    let maxBinding = 0;
     await page.route('**/worker.js', async (route) => {
       const res = await route.fetch();
       const body = await res.text();
       const at = body.indexOf('\n', body.indexOf('import init')) + 1;
-      await route.fulfill({ response: res, body: body.slice(0, at) + SHIM + body.slice(at) });
+      const shim = SHIM + (maxBinding ? `self.__maxBinding = ${maxBinding};\n` : '');
+      await route.fulfill({ response: res, body: body.slice(0, at) + shim + body.slice(at) });
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
 
@@ -167,6 +172,15 @@ async function translate(page, c) {
       s = await translate(page, CASES[0]);
       check(`${name}: works after loading again`, !s.err && s.out === CASES[0].want, s.out);
     }
+
+    // A device that binds 128 MB: the 135 MB Q6_K output matrix is loaded as Q4, the page
+    // says so, and translation still works (the output may differ from the CLI's).
+    maxBinding = 128 << 20;
+    await load(page);
+    const warn = await page.locator('#warn').textContent();
+    check('a 128 MB binding limit loads the output matrix as Q4', /Q4/.test(warn), warn);
+    s = await translate(page, CASES[0]);
+    check('a 128 MB binding limit still translates', !s.err && s.out.length > 0, s.out);
   } finally {
     await browser.close();
     server.close();

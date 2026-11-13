@@ -2,10 +2,10 @@
 //! into them.
 
 use anyhow::Result;
-use yaxus_model::{Quant, TensorRef};
+use yaxus_model::{Quant, TensorRef, Weights};
 
 use crate::dev::Buf;
-use crate::{Gpu, gemm_int, gemv_int};
+use crate::{Gpu, GpuBackend, gemm_int, gemv_int};
 
 /// How a weight matrix is stored on the GPU (and which kernels read it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,14 +126,37 @@ pub(crate) fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> 
     out
 }
 
+/// Whether the embedding table is kept as the file's Q4_K blocks (93 MB for the 0.8B
+/// instead of 330 MB in bf16), on every device: the browser needs the room and WebGPU's
+/// buffer limits, and native keeps the same numbers (the rows are the exact dequantized
+/// values, not bf16-rounded), so the CLI and the browser translate alike.
+fn embedding_stays_q4k(t: &TensorRef) -> bool {
+    t.dtype == yaxus_model::ggml::GgmlType::Q4K && t.shape.len() == 2 && t.shape[1].is_multiple_of(256)
+}
+
+impl GpuBackend {
+    /// The largest buffer one of the weights of `w` takes on the device, before any device
+    /// is open (WebGPU asks for its limits up front). The file's size of each tensor, and
+    /// the embedding table as [`Gpu::load_embedding`] stores it.
+    pub fn largest_weight_bytes(w: &Weights) -> u64 {
+        w.names()
+            .filter_map(|name| w.get(name).ok().map(|t| (name, t)))
+            .map(|(name, t)| {
+                if name == yaxus_model::EMBED_TOKENS && !embedding_stays_q4k(t) {
+                    (t.numel() * 2) as u64
+                } else {
+                    t.bytes().len() as u64
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 impl Gpu {
     pub(crate) fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
         let h = t.shape[1];
-        // A Q4_K table stays 4-bit (93 MB for the 0.8B instead of 330 MB in bf16), on every
-        // device: the browser needs the room and WebGPU's buffer limits, and native keeps
-        // the same numbers (the rows are the exact dequantized values, not bf16-rounded),
-        // so the CLI and the browser translate alike.
-        if t.dtype == yaxus_model::ggml::GgmlType::Q4K && h.is_multiple_of(256) {
+        if embedding_stays_q4k(t) {
             let q = yaxus_model::ggml::q4k_from_q4_k(t.bytes());
             let table = self.upload("embedding-q4k", &q.data);
             return Ok(Weight::Embedding { table, h, fmt: Format::Q4K });
@@ -157,9 +180,20 @@ impl Gpu {
         let (n, k) = (t.shape[0], t.shape[1]);
         use yaxus_model::ggml::GgmlType;
         let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
-        if (quant == Quant::Auto || (quant == Quant::Auto4 && low_bit))
-            && let Some(m) = self.load_gguf_matrix(t, n, k)?
-        {
+        let file_format = quant == Quant::Auto || (quant == Quant::Auto4 && low_bit);
+        // A matrix one storage binding cannot cover in the file's format is read at 4 bits
+        // instead: the 0.8B's Q6_K output is 135 MB, WebGPU's lower limit tier binds
+        // 128 MB, and Q4 makes it 82 MB. Native devices bind far more.
+        if file_format && t.bytes().len() as u64 > self.dev.max_binding() {
+            eprintln!(
+                "[weights] a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
+                t.dtype.name(),
+                self.dev.max_binding()
+            );
+            self.reduced_to_q4 += 1;
+            return self.load_matrix(&t.to_bf16_vec(), n, k, Quant::Q4).map(Weight::Matrix);
+        }
+        if file_format && let Some(m) = self.load_gguf_matrix(t, n, k)? {
             return Ok(Weight::Matrix(m));
         }
         let raw;
