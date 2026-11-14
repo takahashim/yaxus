@@ -755,15 +755,12 @@ fn request_failure(e: anyhow::Error) -> Result<String> {
     }
 }
 
-impl<B: SyncReadback> Generator for Engine<B> {
+impl<B: AsyncReadback> Generator for Engine<B> {
     fn submit(&mut self, req: Request) {
         Engine::submit(self, req)
     }
     fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>> {
         Box::pin(Engine::step_async(self, emit))
-    }
-    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        Engine::step(self, emit)
     }
     fn fresh_id(&mut self) -> ReqId {
         Engine::fresh_id(self)
@@ -808,7 +805,10 @@ impl<B: SyncReadback> Generator for Engine<B> {
         self.last_start
     }
     fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
-        self.target.score(prompt, forced)
+        match B::scorer() {
+            Some(score) => score(&mut self.target, prompt, forced),
+            None => anyhow::bail!("this backend cannot score text"),
+        }
     }
 }
 

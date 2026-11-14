@@ -21,4 +21,5 @@ yaxus-api = { path = "../yaxus-api" }
 yaxus-backend-gpu = { path = "../yaxus-backend-gpu" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-pfml = { path = "../yaxus-pfml" }
+yaxus-runtime = { path = "../yaxus-runtime" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }

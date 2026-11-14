@@ -18,15 +18,12 @@ use std::fmt::Display;
 use js_sys::Function;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
-use yaxus_api::HistoryWindow;
 use yaxus_backend_gpu::GpuBackend;
-use yaxus_model::{Engine, EngineConfig, Event, Finish, Model, ModelOptions, Quant, Request, gguf::Gguf};
-use yaxus_pfml::{
-    Form, Pair, TranslationRequest, fit_prompt,
-    segments::{Segment, split_for_context},
-    validate_history_pair,
-};
-use yaxus_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, TokenKind, Tokenizer};
+use yaxus_model::{Engine, EngineConfig, Finish, Model, ModelOptions, Quant, gguf::Gguf};
+use yaxus_pfml::{Form, TranslationRequest, segments::split_for_context};
+use yaxus_runtime::document::{DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, run_document_async};
+use yaxus_runtime::memory::Memory;
+use yaxus_tokenizer::{TokenKind, Tokenizer};
 
 /// The longest output one segment asks for.
 const MAX_NEW_TOKENS: usize = 1024;
@@ -276,65 +273,94 @@ impl Translator {
         // English, directly in Japanese.
         let sentence_gap = if target == "en" { " " } else { "" };
         let total = segments.len();
-        // Every finished pair a prompt may hold, oldest first, and the window of them sent.
-        let mut history: Vec<Pair> = Vec::new();
-        let mut window = HistoryWindow::new(HISTORY_CHARS);
-        let mut prompt_tokens = 0u32;
-        let mut output_tokens = 0u32;
-        let mut decode_steps = 0u32;
-        let mut reused_tokens = 0u32;
-        let mut out = Output { on_text, chars: 0, owed: "" };
-        let mut prefill_ms = 0.0;
-        let mut decode_ms = 0.0;
-        let mut any_limit = false;
-        let mut last_stop = "tag";
-        let mut last_max_new = MAX_NEW_TOKENS as u32;
 
-        for (i, segment) in segments.iter().enumerate() {
+        // One chain: each segment is translated with the earlier ones as history, as the
+        // CLI does for a document, with the page's history rules.
+        let opts = DocOptions {
+            request: TranslationRequest { target_lang: target.into(), form, ..Default::default() },
+            history_chars: HISTORY_CHARS,
+            chains: 1,
+            neighbor_context: false,
+            max_new_tokens: MAX_NEW_TOKENS,
+            history_rules: HistoryRules { skip_truncated: true, trim: true },
+        };
+        let job = DocJob::new(segments.iter().map(|s| s.text.clone()).collect(), opts).with_max_context(MAX_CONTEXT);
+        job.validate(&self.tokenizer).map_err(request_err)?;
+
+        let progress = |done: usize| {
             if let Some(progress) = on_progress {
-                let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(i as f64), &JsValue::from_f64(total as f64));
+                let _ =
+                    progress.call2(&JsValue::NULL, &JsValue::from_f64(done as f64), &JsValue::from_f64(total as f64));
             }
-            let (ids, max_new) = self.fit_segment(segment, target, form, window.select(&history))?;
-            out.owe(if segment.paragraph { "\n\n" } else { sentence_gap });
-            let prompt_len = ids.len() as u32;
-            let started = Instant::now();
-            // A request fails on its own only at host-side limits (KV pages, positions); a
-            // GPU error shows at a read-back, which fails the step.
-            let decoded = self.decode_segment(ids, max_new, &mut out).await?;
-            let (translated, stop, generated) = (decoded.text, decoded.stop, decoded.tokens);
-            // The prompt's pass ends with the first token's read-back: until then the GPU
-            // has only been given the work, so that is where prefill ends.
-            let first_ms = (decoded.first_token - started).as_secs_f64() * 1e3;
-            prefill_ms += first_ms;
-            decode_ms += started.elapsed().as_secs_f64() * 1e3 - first_ms;
-            prompt_tokens += prompt_len;
-            output_tokens += generated;
-            decode_steps += decoded.steps;
-            reused_tokens += decoded.reused;
-            last_max_new = max_new as u32;
-            if stop == "limit" {
-                any_limit = true;
-            }
-            last_stop = stop;
+        };
+        progress(0);
 
-            // Use complete translations only: a segment cut at the budget is a misleading
-            // history for the next one.
-            if stop != "limit" && !translated.trim().is_empty() {
-                let pair = Pair { source: segment.text.clone(), target: translated.trim().to_string() };
-                if validate_history_pair(&pair).is_ok() {
-                    history.push(pair);
+        let mut out = Output { on_text, chars: 0, owed: "" };
+        // The separator a segment owes is set before its text, in order, also for a
+        // segment that has none.
+        let mut owed_upto = 0;
+        let mut write_failure = None;
+        let (mut prompt_tokens, mut output_tokens, mut decode_steps, mut reused_tokens) = (0u32, 0u32, 0u32, 0u32);
+        let (mut prefill_ms, mut decode_ms) = (0.0, 0.0);
+        let (mut any_limit, mut last_max_new) = (false, MAX_NEW_TOKENS as u32);
+        // The segments run one after another: the current one started when the last ended.
+        let mut segment_start = Instant::now();
+        let mut first_text: Option<Instant> = None;
+
+        // The page keeps no translation memory: a repeated translation is computed again.
+        let mut memory = Memory::new(0);
+        let result = run_document_async(&mut self.engine, &self.tokenizer, job, &mut memory, &mut |event| {
+            let segment = match &event {
+                DocEvent::Delta { segment, .. } => *segment,
+                DocEvent::SegmentDone(end) => end.segment,
+            };
+            while owed_upto <= segment {
+                out.owe(if segments[owed_upto].paragraph { "\n\n" } else { sentence_gap });
+                owed_upto += 1;
+            }
+            match event {
+                DocEvent::Delta { text, .. } => {
+                    first_text.get_or_insert_with(Instant::now);
+                    if let Err(e) = out.text(text) {
+                        write_failure = Some(e);
+                        return false;
+                    }
+                }
+                DocEvent::SegmentDone(end) => {
+                    let now = Instant::now();
+                    // The prompt's pass ends with the first token: until then the GPU has
+                    // only been given the work, so that is where prefill ends.
+                    let first_ms = (first_text.take().unwrap_or(now) - segment_start).as_secs_f64() * 1e3;
+                    prefill_ms += first_ms;
+                    decode_ms += (now - segment_start).as_secs_f64() * 1e3 - first_ms;
+                    segment_start = now;
+                    prompt_tokens += end.prompt_tokens as u32;
+                    reused_tokens += end.reused as u32;
+                    output_tokens += end.generated as u32;
+                    decode_steps += end.generated.saturating_sub(1) as u32;
+                    last_max_new = MAX_NEW_TOKENS.min(MAX_CONTEXT.saturating_sub(end.prompt_tokens)).max(1) as u32;
+                    any_limit |= end.finish == Finish::Length;
+                    progress(end.segment + 1);
                 }
             }
+            true
+        })
+        .await;
+        if let Some(e) = write_failure {
+            return Err(e);
         }
-        if let Some(progress) = on_progress {
-            let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(total as f64), &JsValue::from_f64(total as f64));
+        match result {
+            Ok(_) => {}
+            // The engine's step failed: only a read-back reports an error of the device.
+            Err(DocRunError::Engine(e)) => return Err(device_err(format!("{e:#}"))),
+            Err(DocRunError::Segment(message)) => return Err(request_err(message)),
         }
         Ok(Stats {
             prompt_tokens,
             output_tokens,
             max_new: last_max_new,
             segments: total as u32,
-            stop: (if any_limit { "limit" } else { last_stop }).into(),
+            stop: (if any_limit { "limit" } else { "tag" }).into(),
             chars: out.chars as u32,
             decode_steps,
             reused_tokens,
@@ -342,119 +368,6 @@ impl Translator {
             decode_ms,
         })
     }
-
-    /// The prompt for `segment` with `history` (dropped when it leaves too little room
-    /// for the answer, as in the CLI), and the output budget.
-    fn fit_segment(
-        &self,
-        segment: &Segment,
-        target: &str,
-        form: Option<Form>,
-        history: &[Pair],
-    ) -> Result<(Vec<u32>, usize), Failure> {
-        let req = TranslationRequest {
-            text: segment.text.clone(),
-            target_lang: target.into(),
-            source_lang: None,
-            form,
-            context: None,
-            glossary: Vec::new(),
-            history: history.to_vec(),
-        };
-        let req = req.validate().map_err(request_err)?;
-        let (_, ids, max_new) = fit_prompt(&self.tokenizer, req, MAX_CONTEXT, MAX_NEW_TOKENS).map_err(request_err)?;
-        Ok((ids, max_new))
-    }
-
-    /// Greedy generation of one segment. The text goes to `on_text` as it is produced.
-    async fn decode_segment(
-        &mut self,
-        ids: Vec<u32>,
-        max_new: usize,
-        out: &mut Output<'_>,
-    ) -> Result<Decoded, Failure> {
-        let id = self.engine.fresh_id();
-        self.engine.submit(Request::new(id, ids, max_new, vec![EOS_ID, TAG_ID]));
-        let tokenizer = &self.tokenizer;
-        let mut decoder = StreamDecoder::new();
-        let mut translated = String::new();
-        let mut tokens = 0u32;
-        let mut first_token = None;
-        let mut finish = None;
-        let mut error = None;
-        let mut write_failure = None;
-        let mut reused = 0u32;
-        while finish.is_none() && error.is_none() {
-            let worked = self
-                .engine
-                .step_async(&mut |event| match event {
-                    Event::Token { token, .. } => {
-                        first_token.get_or_insert_with(Instant::now);
-                        tokens += 1;
-                        let delta = decoder.push(tokenizer, token);
-                        translated.push_str(&delta);
-                        match out.text(&delta) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                write_failure = Some(e);
-                                false
-                            }
-                        }
-                    }
-                    Event::Done { finish: f, start, .. } => {
-                        finish = Some(f);
-                        reused = start.reused as u32;
-                        true
-                    }
-                    Event::Error { message, .. } => {
-                        error = Some(message);
-                        true
-                    }
-                })
-                .await
-                .map_err(device_err)?;
-            if !worked {
-                break;
-            }
-        }
-        if let Some(e) = write_failure {
-            return Err(e);
-        }
-        if let Some(message) = error {
-            return Err(request_err(message));
-        }
-        // A character split across byte tokens is held until the next token; there is
-        // no next token at the end, so emit its replacement here.
-        let tail = decoder.finish();
-        translated.push_str(&tail);
-        out.text(&tail)?;
-        let stop = match finish {
-            Some(Finish::Stop) => "tag",
-            _ => "limit",
-        };
-        Ok(Decoded {
-            text: translated,
-            stop,
-            tokens,
-            steps: tokens.saturating_sub(1),
-            reused,
-            first_token: first_token.unwrap_or_else(Instant::now),
-        })
-    }
-}
-
-/// One segment's output.
-struct Decoded {
-    text: String,
-    /// `tag`, `eos` or `limit` (see [`Stats::stop`]).
-    stop: &'static str,
-    tokens: u32,
-    /// Decode passes after the first token (each one read back one more token).
-    steps: u32,
-    /// Prompt tokens whose KV an earlier segment had computed (prefix reuse).
-    reused: u32,
-    /// When the first token was read back.
-    first_token: Instant,
 }
 
 /// The page's output. The separator a segment owes the text before it is written just

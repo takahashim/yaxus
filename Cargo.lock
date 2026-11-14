@@ -2929,6 +2929,7 @@ dependencies = [
  "yaxus-backend-gpu",
  "yaxus-model",
  "yaxus-pfml",
+ "yaxus-runtime",
  "yaxus-tokenizer",
 ]
 

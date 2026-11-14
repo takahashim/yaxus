@@ -19,6 +19,8 @@ pub struct SegmentEnd {
     /// Prompt tokens whose KV was reused.
     pub reused: usize,
     pub generated: usize,
+    /// How it ended: `Stop` (complete) or `Length` (cut at the output budget).
+    pub finish: Finish,
 }
 
 /// A document in progress on a session.
@@ -100,11 +102,12 @@ impl DocRun {
             prompt_tokens: done.prompt_tokens,
             reused: done.start.reused,
             generated: done.generated,
+            finish: done.finish,
         };
         self.usage.total.prompt_tokens += end.prompt_tokens;
         self.usage.total.reused_tokens += end.reused;
         self.usage.total.completion_tokens += end.generated;
-        self.job.finished(segment, done.text);
+        self.job.finished(segment, done.text, done.finish == Finish::Length);
         Some(end)
     }
 
@@ -124,6 +127,17 @@ impl DocRun {
     pub fn is_complete(&self) -> bool {
         self.job.is_done()
     }
+}
+
+/// Why [`run_document_async`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DocRunError {
+    /// The engine failed (a read-back of its backend): it is not to be used again.
+    #[error("{0:#}")]
+    Engine(anyhow::Error),
+    /// A segment failed, or its prompt could not be built. The engine is as before.
+    #[error("{0}")]
+    Segment(String),
 }
 
 /// Events of [`run_document`].
@@ -150,7 +164,7 @@ pub fn run_document(
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<DocJob> {
-    poll_once(run_document_async(engine, tok, job, memory, on))
+    Ok(poll_once(run_document_async(engine, tok, job, memory, on))?)
 }
 
 /// [`run_document`], awaiting the engine.
@@ -160,7 +174,7 @@ pub async fn run_document_async(
     job: DocJob,
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
-) -> Result<DocJob> {
+) -> Result<DocJob, DocRunError> {
     let mut session = Session::new(engine, tok, memory);
     let mut run = DocRun::new(job);
     let mut failure: Option<String> = None;
@@ -195,14 +209,17 @@ pub async fn run_document_async(
                 }
                 true
             })
-            .await?;
+            .await
+            .map_err(DocRunError::Engine)?;
         if let Err(e) = run.submit_ready(&mut session, |s| s) {
             failure.get_or_insert(e.to_string());
         }
-        anyhow::ensure!(worked || run.is_over() || !session.is_idle(), "engine idle with segments left");
+        if !(worked || run.is_over() || !session.is_idle()) {
+            return Err(DocRunError::Engine(anyhow::anyhow!("engine idle with segments left")));
+        }
     }
     if let Some(e) = failure {
-        anyhow::bail!(e);
+        return Err(DocRunError::Segment(e));
     }
     Ok(run.into_job())
 }
