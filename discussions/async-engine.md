@@ -1,124 +1,189 @@
-# Engine の非同期化 (Web でも Engine を使う)
+# Engine の非同期化と、Web を含めた全体の設計
 
-状態: 進め方 1 まで実施済み (ブランチ `async-engine`)。2026-11-14 作成、同日にレビューを受けて改訂。
+状態: 設計 (2026-11-14 に全体を見直して改訂)。後方互換性は考えない。
+実施済みの部分はブランチ `async-engine` にある (下の「出発点」)。
 
-## 進捗
+## 要約
 
-- 進め方 1 (済): `AsyncReadback` と `Engine::step_async` を入れ、`Engine::step` は `SyncReadback` の型に限って 1 回 poll する形にした。
-  Web の `Translator` は Engine で翻訳する (1 ストリーム、下書きなし、応答キャッシュなし)。
-  - ネイティブ (2B、19 文、交互に 3 回): 下書きあり 61.8 tok/s、なし 26.65 tok/s、変更前と同じ。出力は 19/19 一致。
-  - Chrome E2E (0.8B Q4_K_M): 全件通過、訳は変更前と同じ。
-- 進め方 1 の続き (済): Web で prefix 再利用を有効にした。12 段落の文書の prefill は 2212 ms から約 390 ms
-  (プロンプト 2888 トークンのうち 2651 を再利用)。出力は再利用なしとバイト単位で同じ。
-- 残り: 進め方 2 (バッチ)、進め方 3 (文書チェーン)。2 は、wasm-bindgen の `&mut self` を await 中に
-  再入できないので、Rust 側に投入と駆動を分ける API が要る (未決)。
+WebGPU は GPU の完了をブロックして待てない。これを理由に、Web は Engine を使わず、
+段落の分割、履歴、出力の組み立て、統計を、runtime とは別に自前で持っている。
+問題は Engine ではなく、**同期か非同期かで層が割れていること**で、Engine より上の層
+(`Generator`、`Session`、文書、server の worker) がすべて同期を前提にしている。
 
-## 背景
+方針は 1 つ。**推論から出力までのスケジューラを 1 つにし、それを非同期で書く。**
+同期の環境 (server、CLI) はそれを `block_on` で動かし、Web は `spawn_local` で動かす。
+Web 固有のコードは、GGUF の読み込みと JS との接続だけにする。
 
-`crates/yaxus-web` (WASM + WebGPU) は、`Engine` を使わず `Model<GpuBackend>` を直接 1 ステップずつ
-await して回している。WebGPU はブロックして待てないので、`Engine` はコンパイルできない
-(`Engine<B: SyncReadback>`、`SyncReadback` は CPU とネイティブ GPU だけが実装する)。
+## 出発点 (実施済み、ブランチ `async-engine`)
 
-その結果、Web では次のものを使っていない。
+- `AsyncReadback` と `Engine::step_async`。`Engine::step` は `SyncReadback` の型に限り、1 回 poll する。
+- Web の `Translator` は Engine で翻訳し、prefix 再利用が効いている
+  (12 段落の文書の prefill 2212 ms → 約 390 ms、出力は再利用なしとバイト単位で同じ)。
+- ネイティブの速度と出力は変わらない (2B、19 文: 下書きあり 61.8 tok/s、なし 26.65 tok/s、19/19 一致)。
 
-- ページ化 KV の共有と共通 prefix の再利用 (`prefix_cache: false`)
-- 複数リクエストのバッチ
-- 翻訳メモリのヒント
-- 文書のチェーン (`yaxus-runtime` の `DocJob`、`Session` は Engine 越し)
+これは設計の土台として正しかった。ただ、Web の `Translator` はまだ 1 リクエストずつ、
+段落を自前で処理している。ここから先を、層ごとに作り直す。
 
-plamo-translate-desktop のブラウザ拡張 (wllama) はスロット 4 本でバッチを回し、80 段落で 66 秒が
-46 秒になっている (RX 9070 XT、2B)。Web でバッチと文書翻訳を使うには、Engine を非同期で回せる必要がある。
+## いまの構造と、割れている所
 
-## 現状 (改訂の前提)
+```
+Backend ─ Model ─ Engine ─ Generator (dyn、同期、Send) ─ Session<T> ─┬─ DocRun / run_document (CLI)
+                                                                     ├─ server の worker (Docs、jobs)
+                                                                     └─ run_request
+yaxus-web: Translator が Model→Engine を直接使い、分割・履歴・出力・統計を自前で持つ (約 300 行の重複)
+```
 
-- `Backend` は読み戻しを持たない。読み戻しは `SyncReadback` (`argmax`、`argmax_rows`、`to_host`) で、
-  ネイティブ専用 (`yaxus-model/src/lib.rs:171`)。`Model::generate`、`Model::score`、`Engine` はこれに依存する。
-- WebGPU の読み戻しは `read_async` (`yaxus-backend-gpu/src/dev/wgpu/web.rs:250`)。`map_async` の
-  コールバックを待つ。`setTimeout(0)` は使っていない。性能比較の基準はこの現行の経路。
-- Engine の同期点は 4 か所: `prefill_step`、`decode_step`、`verify`、`draft_tokens` の argmax。
-- Web の `Translator` は、読み戻しとエラースコープの失敗を GPU 障害として `broken` にし、Worker を
-  作り直させる。Worker は `translate` を 1 件ずつ直列に処理する (`web/local/worker.js:12`)。
-- Web の KV アリーナは合計 4,096 トークン (`MAX_CONTEXT`)、1 ページ 128 トークンなので 32 ページ。
+- Web の `translate_inner`、`fit_segment`、`decode_segment`、`Output`、`Stats` は、runtime の
+  `DocJob`、`Session`、`DocRun` の働きを別の形で書き直したもの。
+- 長い段落を文に分ける処理 (`split_for_context`、トークン数で見る) は Web にしかない。
+  native は段落の分割しか持たず、長い段落は 1 つのまま訳す。
+- 同時に走れるのは、server の worker だけ (`Docs` で複数の文書をつなぐ)。Web は 1 件ずつ。
 
-## 方針: スケジューラは `Engine::step_async` に一本化する
+## 設計
 
-別実装を 2 つ持つと挙動がずれるので、async 版を唯一の実装にし、同期版はその上に載せる。
-ただし、最初に変えるのは Engine が使う argmax だけに絞る。
+### 1. Engine: 容量を見て受け付ける
 
-### 1. 読み戻しは argmax だけを共通化する
+`Engine::admit` は、`target.begin` が KV のページ不足で失敗すると `Event::Error` にしている。
+同時に複数のリクエストを走らせる前提では、これは待たせるべき状況であって、エラーではない。
 
-- Engine 向けに、`Result<Vec<u32>>` を返す非同期の argmax を持つトレイトを用意する
-  (名前は未定。`SyncReadback` を置き換えず、並べて置く)。
-- CPU とネイティブ GPU は、既存の同期実装をその場で呼んで即完了の Future を返す。
-- WebGPU は `read_async` を使う。読み戻しの失敗が `Err` で返る。
-- `Engine::step_async` を本体にする。`prefill_step`、`decode_step`、`verify`、`spec_round`、
-  `propose`、`draft_tokens` を `async fn` にする。`emit: &mut dyn FnMut(Event) -> bool` は同期のままでよい。
-- `Engine::step` は、`SyncReadback` を持つ型に限って `block_on(step_async)` で包む
-  (`pollster` は `Model::load` が既に使っている)。これで `Model::generate` と `score` の同期 API、
-  `Generator` を使う server、CLI、runtime の呼び出し側は変わらない。
-- `to_host` の非同期化は、Engine の経路では要らないので扱わない。
-- `Engine` と tuner の `std::time::Instant` は wasm で panic するので、`web-time` に差し替える
-  (ネイティブでは std と同じ)。
+- 受付時に、要求が必要とするページ数を見積もる: `ceil(min(prompt + max_new, max_pos) / PAGE)`
+  から、再利用できるページ数を引いたもの。
+- 走っているストリームが予約しているページの合計と、空きページ (追い出せる cache を含む) で、
+  足りなければ `waiting` に残す。ストリームが終わるたびに再判定する。
+- 空のアリーナでも収まらない要求 (`prompt + max_new` が上限を超える) だけを、`Event::Error` にする。
+- 最悪の出力長 (`max_new`) で予約すると無駄が大きい。最初は保守的にその値で予約して、正しさを優先する。
+  実測で詰まりが目立つなら、出力が予約を超えたストリームを止めて再計算に回す (preemption) を足す。
+- `max_streams` は上限として残すが、実際の同時数は KV の容量が決める。
 
-### 2. GPU 障害はバッチ全体に伝える
+`step_async` の戻り値の意味は、先の改訂のまま: `Err` はバックエンドの失敗 (読み戻しの失敗)
+で、エンジンは作り直すまで使わない。要求ごとの失敗は `Event::Error`。
 
-現行の Web は、GPU 障害で `Translator` を `broken` にして Worker を作り直す。この挙動を保つ。
+### 2. `Generator`: 非同期で、`Send` を要求しない
 
-- GPU 障害 (読み戻しの失敗、エラースコープの失敗、デバイスロスト) は、個々の `Event::Error` に変換せず、
-  `step_async` 自体の `Err` として返す。今の Engine は、forward などの失敗を各ストリームの `error` にして
-  `Event::Error` を出すので、そこを区別する必要がある。
-- KV 不足のようなリクエスト単位のエラーは、これまでどおり `Event::Error` にする。
-- `forward` は読み戻しを待つ前に KV を更新する。そのため、進行中の Future を破棄して同じ Engine を
-  再開する経路は作らない。キャンセルは、ステップを完了させてから `emit` が `false` を返す今の経路で、
-  対象のリクエストだけを終了させる。`step_async` が `Err` を返した Engine は、作り直すまで使わない。
+```rust
+pub trait Generator {
+    fn submit(&mut self, req: Request);
+    fn step<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>>;
+    // fresh_id、abort_all、score、... は今のまま (score も非同期にする)
+}
+```
 
-### 3. Worker 内で 1 つの駆動ループにリクエストを集める
+- `LocalBoxFuture` (Send でない) にする。WebGPU の Future は Send でないので、`Generator: Send` は外す。
+- ネイティブの推論スレッドへ渡す境界でだけ、`Box<dyn Generator + Send>` を要求する。
+- ステップごとの boxing は、ステップが ms 単位なので無視できる。必要なら `enum AnyEngine { Cpu, Gpu }`
+  にして dyn を避けることもできる (要測定、いまは dyn のまま)。
+- `Engine::step` (同期) は、テストと CLI の小さな用途のために `block_on` の薄い包みとして残す。
 
-- 今の Worker は `translate(&mut self)` を完了まで直列化している。これを、1 つの Engine に
-  リクエストを投入し続け、`step_async` を回し続ける駆動ループに変える。
-- KV アリーナが合計 4,096 トークンなので、`max_streams` を増やす前に、同時に受け付ける要求の
-  合計ページ数を見るか、容量が足りないときに待たせる方針を決める。今の `admit` は、ページが足りないと
-  `Event::Error` にする。
-- 文書チェーンをつなぐ段階では `Generator: Send` を見直す。`LocalBoxFuture` を足すだけでは、
-  Send でない WebGPU の Future を載せられない。`Send` は、ネイティブの推論スレッドへ渡す境界でだけ
-  要求し、`Session` の `std::time::Instant` も `web-time` に移す。
+### 3. `yaxus-runtime` を、ターゲットに依存しない非同期のコアにする
 
-## 進め方
+runtime を 2 つに分ける。
 
-1. Engine 向けの非同期 argmax と `Engine::step_async` を入れ、`Engine::step` を `block_on` で包む。
-   ネイティブの回帰がないことを確認する。続けて、Web の単一リクエストの翻訳を Engine に載せ替える。
-2. バッチを有効にする。同じ Engine に 2 件を先に投入し、同じ decode パスで両方が進むことを確認する。
-   KV の容量の方針をここで決める。
-3. `Generator` と `Session` の async 化、runtime の `native` フィーチャー分離を行い、文書チェーンを載せる。
+- **コア (wasm でも動く)**: `Prompt`、`Memory`、`Session<T>`、`DocJob` / `DocRun`、`Scheduler`。
+  `tokio` もファイルも使わない。`futures` の型だけに頼る。
+- **`native` フィーチャー**: モデルの解決 (`resolve.rs`、HF キャッシュ)、バックエンド (CPU、GPU) の読み込み (`load.rs`)。
 
-## 受け入れ条件
+`Session::step`、`DocRun` の実行ループは `async fn` にする。同期版は作らない (呼び出し側が `block_on` する)。
 
-- 同じブラウザ、GGUF、プロンプトで、現行の Web と単一リクエストのトークン列が一致する。
-  (既存の Chrome E2E: `web/local/e2e.cjs`)
-- 2 件のバッチが、同じ decode パスで両方進む。
-- 異なるプロンプトの間で prefix が再利用される (`StartInfo.reused > 0` かつ `cached == false`)。
-- GPU 障害の後、モデルの再ロードで復帰できる。
-- ネイティブの性能は、同じ環境で変更の前後を複数回測り、ばらつきを踏まえて判定する。
-  基準は 0.8B と 2B の `yaxus bench` (下書きあり・なし)。投機デコードは `draft_tokens` が 1 トークンずつ
-  待つので、一番影響を受けやすい。
+### 4. `Scheduler`: server の worker を一般化する
 
-## 注意点
+server の `worker::run` が、すでに正しい形をしている: 入口の queue から job を受け、Engine を回し、
+文書のチェーンをつなぎ、イベントを返す。これを runtime のコアに移し、server と Web で共有する。
 
-- **下書きモデルは Web では最初は外す。** `draft_tokens` は k 回の await になる。ブラウザで得になるかは
-  測るまで分からない。
-- **Worker 化は済んでいる。** Worker 内で async 版がそのまま使える。
-- **`Generator::score` と `Model::generate`。** 同期のまま残す。Web の翻訳の経路には要らない。
+```rust
+pub struct Scheduler { engine: Box<dyn Generator>, tok: Rc<Tokenizer>, memory: Memory, session, docs, ... }
 
-## 関連: plamo-translate-desktop との比較から出た他の改善候補
+impl Scheduler {
+    /// jobs が尽きるまで回る。待つ物が無いときは jobs.next().await で眠る。
+    pub async fn run(&mut self, jobs: impl JobSource) -> Result<(), Poisoned>;
+}
+pub enum Job {
+    Single { prompt, max_new_tokens, events },
+    Document { job: DocJob, events },
+    Cancel { id },
+}
+```
 
-この検討のきっかけになった比較 (2026-11-13、14) で挙がった項目。優先度は下がる。
+- イベントの出口は、`yaxus-api` の `StreamEvent` / `DocumentEvent` をそのまま使う
+  (`Delta { segment, text }`、`SegmentDone`、`Done { usage }`、`Error`)。server は SSE に、Web は JS の関数に流す。
+- `JobSource` は `async fn next()` と `try_next()` を持つ小さなトレイト。server は `tokio::sync::mpsc`
+  を包んだもの (今の `Jobs` と同じ上限と計数)、Web は `futures_channel::mpsc` を包んだもの。
+- **server の推論スレッド**は、`pollster::block_on(scheduler.run(jobs))` を 1 回呼ぶだけになる。
+  ネイティブの future はすべて即座に完了するので、待ち (`jobs.next().await`) 以外で眠らない。
+- **キャンセル**は `Job::Cancel` と、`emit` が `false` を返す今の経路の両方で扱う。
+  進行中のステップは捨てずに、完了してから対象のリクエストを終える。
+- **失敗の方針を 1 つにする。** 今は「panic ならエンジンを捨てて停止」と「`Err` なら全部を失敗にして続行」
+  の 2 つがある。`step` の `Err` はバックエンドの失敗でありエンジンは使えないので、両者を
+  `Poisoned` に統一する: 全リクエストを失敗にし、`run` は返る。server は 503 と `/healthz` で再起動を促し
+  (今の panic の扱い)、Web は `broken` にして Worker を作り直す (今のまま)。
 
-- 出力ループの検出と回復 (周期 64 トークン以上が 3 回以上。小さい単位、文ごと、DRY サンプラーの順に回復)。
-- 長い段落の分割 (1 チャンク約 1,024 トークン)。履歴の上限は文字数でなくトークン数で持つ。
-- sliding window 層の KV で、窓を外れたページを解放しているかの確認。
-- OPFS へのモデルのキャッシュ (今は毎回 GGUF を選ぶ)、2B 対応。
-- デバイスの自動選択と、メモリ見積もり (ファイルサイズ × 1.2 + 384 MiB)。
-- 量子化ごとの品質表示。
+### 5. 文書の構築を共通にする
 
-トークナイザは llama.cpp の `plamo3` と同じアルゴリズム (末尾からの Viterbi、`round(score*1e4)`、
-バイトフォールバック) で、改善点はない。
+- `DocJob::new(text, tokenizer, options)` が、段落の分割と、**長い段落の文への分割** (トークンの予算で。
+  今の `split_for_context`) までを担う。`Segment { text, paragraph }` の `paragraph` で、出力の区切り
+  (段落なら空行、文なら英語はスペース、日本語は空) を決める。
+- これで native にも、長い段落の分割が入る。Web の `translate_inner`、`fit_segment`、`Output` は不要になる。
+- 履歴は、トークン数で上限を持つ (今は文字数)。言語による差が出ない。
+- 並列のチェーンの数は、同時に走らせたい数と KV の容量から決める (`auto_chains` の上限を、
+  バックエンドごとの設定にする)。
+
+### 6. Web: 薄いグルー
+
+`yaxus-web` に残すのは次だけ。
+
+- GGUF のストリーミング読み込みと WebGPU の初期化 (今のまま)。
+- `Rc<RefCell<..>>` を持たず、**投入と駆動を分ける**。`load_model` が `Runtime` を返し、
+  そのコンストラクタが `Scheduler::run` を `spawn_local` で 1 回だけ起動する。
+  JS からの `translate(request, on_event) -> Promise` は、job を `JobSource` に積み、完了で解決する
+  Promise を返すだけ。wasm-bindgen の `&mut self` を await 中に再入する問題は、これで起きない
+  (`&self` で積むだけだから)。
+- `cancel(id)`。ページの中止ボタンと、将来のタブの切り替えで使う。
+- `Poisoned` で `broken` にし、Worker を作り直す (今のまま)。E2E の GPU 障害のケースがそのまま使える。
+- ページは、サーバーの Web UI と同じく、段落が並行して埋まる表示にする
+  (イベントの `segment` で場所が決まる)。サーバーの UI と共通の部分は、トランスポート
+  (SSE か、Worker のメッセージか) だけを差し替える形にできる。まとめるのは後でよい。
+- Web の設定: `max_streams` は KV の容量から決める。KV のアリーナは、チェーンの数 × 1 セグメントの
+  コンテキストに合わせて、`MAX_CONTEXT` の固定 (4,096) をやめる。0.8B は 1 ページ 2.1 MB なので、
+  128 ページ (16k トークン) で約 270 MB。デバイスの `max_buffer_size` と空きを見て決める。
+  応答キャッシュは、E2E の GPU 障害のケースが GPU を通る必要があるので、いまは切る。
+
+### 7. 後回しにするもの
+
+- **下書きモデルの Web 対応**: Engine は対応済みだが、2 つのモデルを 1 つのデバイスに載せるメモリと、
+  k 回の連続した読み戻しの往復が割に合うかを測ってから。
+- **デコードの往復を隠す**: 次のトークンを GPU 上で次のパスへ渡し、読み戻しを待たずに次のパスを投入する
+  (ネイティブの投機でやっている GPU 上のトークン受け渡しの応用)。ストリーム 1 本のときの速度に効くが、
+  複数のチェーンが走るときは並行で隠れる。まず 1 トークンあたりの時間のうち、往復の待ちが
+  どれだけかを `YAXUS_PROFILE` で測る。
+- **ループ検出と回復**、**sliding window の KV の解放**、**OPFS へのモデルのキャッシュ**、
+  **2B/8B の Web 対応**、**デバイスの自動選択**、**量子化ごとの品質表示**。
+  plamo-translate-desktop との比較で挙がった項目で、この設計の上に独立に足せる。
+  ループ検出は `Session` に置く (全フロントエンドに効く)。
+
+## 実施順
+
+各段階で、ネイティブの出力が変わらないこと (19 文のセットが 19/19 一致)、速度が
+ばらつきの範囲に収まること (交互に複数回)、既存のテストと Chrome E2E が通ることを確かめる。
+
+1. **runtime を非同期のコアにする。** `Generator` を非同期にし (`Send` は外す)、`Session`、
+   `DocRun` / `run_document` を async にする。`Scheduler` を server の worker から取り出し、
+   server と CLI をそれに載せ替える。`native` フィーチャーの分離もここで行う。
+   (ネイティブだけで検証できる。Web はまだ触らない)
+2. **Engine の容量を見た受付。** `waiting` に残す方針と、予約の見積もり。`NullBackend` で、
+   ページ不足でも待つこと、収まらない要求だけがエラーになることを単体テストで確かめる。
+3. **Web を `Scheduler` に載せる。** `Translator` を `Runtime` に置き換え、段落が並行して
+   埋まる表示にする。確かめること:
+   1. 単一リクエストのトークン列が、現行の Web と一致する。
+   2. 2 件を同時に投入すると、同じ decode パスで両方が進む。
+   3. 異なるプロンプトの間で prefix が再利用される (`reused > 0` かつ `cached == false`)。
+   4. GPU 障害の後に、再読み込みで復帰できる。
+4. **文書の構築の共通化。** 長い段落の分割を `DocJob` に移し、Web の重複を消す。トークン数での履歴の上限。
+5. 後回しの項目を、測ってから個別に。
+
+## 決めきれていない点
+
+- `Generator` を dyn のままにするか、`enum AnyEngine` にするか。後者はステップごとの boxing を避けるが、
+  バックエンドを増やすたびに分岐が増える。ステップが ms 単位なので、いまは dyn のままでよいと考える。
+- KV の予約を、最初は最悪の長さにするのが適切か。Web の 0.8B で、チェーン 4 本が同時に走るとき
+  どれだけ待たされるかを、段階 3 の測定で見て決める。
+- server の UI と Web のページを 1 つの UI にまとめるか (トランスポートだけの差し替え)。
+  この設計の範囲外だが、イベントを `yaxus-api` に揃えたことで可能になる。
