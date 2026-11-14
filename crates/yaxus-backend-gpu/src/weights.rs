@@ -126,6 +126,43 @@ pub(crate) fn pad_scales(sc: Vec<u16>, n: usize, blocks: usize, unit: usize) -> 
     out
 }
 
+/// The largest buffer [`Gpu::load_ggml`] uploads for an `[n, k]` matrix of `dtype`, or
+/// `None` when the type has no GPU layout. Each buffer is bound on its own, so this is
+/// what has to fit the storage binding limit (pinned to the layouts by a test).
+pub(crate) fn ggml_largest_buffer(dtype: yaxus_model::ggml::GgmlType, n: usize, k: usize) -> Option<usize> {
+    use yaxus_model::ggml::GgmlType;
+    use yaxus_model::quant::q6_meta_stride;
+    // `pad_scales`: `blocks` entries of `unit` u16 per row, padded, as an even count.
+    let scales = |blocks: usize, unit: usize| {
+        let row = blocks * unit;
+        let stride = if blocks.is_multiple_of(256) { row + SCALE_PAD * unit } else { row };
+        (n * stride).next_multiple_of(2) * 2
+    };
+    Some(match dtype {
+        GgmlType::Q8_0 => (n * k).max(scales(k / 32, 1)),
+        GgmlType::Q4_0 => (n * k / 2).max(scales(k / 32, 1)),
+        GgmlType::Q4K => n * (k / 256) * 144,
+        GgmlType::Q6K => (n * 3 * k / 4).max(n * q6_meta_stride(k)).max(scales(k / 16, 1)),
+        GgmlType::Q3K => (n * 3 * k / 8).max(n * q6_meta_stride(k)).max(scales(k / 16, 1)),
+        GgmlType::Q2K => (n * k / 4).max(n * 20 * (k / 256)).max(scales(k / 16, 2)),
+        _ => return None,
+    })
+}
+
+/// The largest buffer of matrix `t` loaded with `quant` when the format is left to the
+/// backend (`Auto`, `Auto4`): the file's GPU layout, else Q8 for `Auto`. `None` for an
+/// explicit format, a 4-bit one, or a vector.
+fn planned_largest_buffer(t: &TensorRef, quant: Quant) -> Option<usize> {
+    use yaxus_model::ggml::GgmlType;
+    let &[n, k] = &t.shape[..] else { return None };
+    let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
+    match quant {
+        Quant::Auto => ggml_largest_buffer(t.dtype, n, k).or_else(|| ggml_largest_buffer(GgmlType::Q8_0, n, k)),
+        Quant::Auto4 if low_bit => ggml_largest_buffer(t.dtype, n, k),
+        _ => None,
+    }
+}
+
 /// Whether the embedding table is kept as the file's Q4_K blocks (93 MB for the 0.8B
 /// instead of 330 MB in bf16), on every device: the browser needs the room and WebGPU's
 /// buffer limits, and native keeps the same numbers (the rows are the exact dequantized
@@ -135,18 +172,22 @@ fn embedding_stays_q4k(t: &TensorRef) -> bool {
 }
 
 impl GpuBackend {
-    /// The largest buffer one of the weights of `w` takes on the device, before any device
-    /// is open (WebGPU asks for its limits up front). The file's size of each tensor, and
-    /// the embedding table as [`Gpu::load_embedding`] stores it.
+    /// The largest buffer one of the weights of `w` takes on the device with
+    /// `Quant::Auto`, before any device is open (WebGPU asks for its limits up front):
+    /// each matrix's largest buffer, vectors in f32, and the embedding table as
+    /// [`Gpu::load_embedding`] stores it.
     pub fn largest_weight_bytes(w: &Weights) -> u64 {
         w.names()
             .filter_map(|name| w.get(name).ok().map(|t| (name, t)))
             .map(|(name, t)| {
-                if name == yaxus_model::EMBED_TOKENS && !embedding_stays_q4k(t) {
-                    (t.numel() * 2) as u64
+                let bytes = if name == yaxus_model::EMBED_TOKENS {
+                    if embedding_stays_q4k(t) { t.bytes().len() } else { t.numel() * 2 }
+                } else if t.shape.len() == 1 {
+                    t.numel() * 4
                 } else {
-                    t.bytes().len() as u64
-                }
+                    planned_largest_buffer(t, Quant::Auto).unwrap_or(t.numel() * 2)
+                };
+                bytes as u64
             })
             .max()
             .unwrap_or(0)
@@ -181,10 +222,13 @@ impl Gpu {
         use yaxus_model::ggml::GgmlType;
         let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
         let file_format = quant == Quant::Auto || (quant == Quant::Auto4 && low_bit);
-        // A matrix one storage binding cannot cover in the file's format is read at 4 bits
-        // instead: the 0.8B's Q6_K output is 135 MB, WebGPU's lower limit tier binds
-        // 128 MB, and Q4 makes it 82 MB. Native devices bind far more.
-        if file_format && t.bytes().len() as u64 > self.dev.max_binding() {
+        // A matrix whose buffers one storage binding cannot cover in the format chosen for
+        // it is read at 4 bits instead (only when the format was left to us). Each buffer
+        // is bound on its own: the 0.8B's Q6_K output is 135 MB in the file but its
+        // largest buffer is 124 MB, which a 128 MB binding covers. Native devices bind
+        // far more.
+        let planned = planned_largest_buffer(t, quant);
+        if planned.is_some_and(|b| b as u64 > self.dev.max_binding()) {
             eprintln!(
                 "[weights] a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
                 t.dtype.name(),
@@ -294,5 +338,45 @@ impl Gpu {
         let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 32, 1);
         let sb = self.upload("q4-scales", bytemuck::cast_slice(&sc));
         Matrix { fmt: Format::Q4, n, k, q: qb, s: Some(sb), s16: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use yaxus_model::ggml::{self, GgmlType};
+
+    use super::*;
+
+    /// `ggml_largest_buffer` follows the layouts `load_ggml` uploads, padded scales
+    /// included (K = 4096 gives Q6_K, Q3_K and Q2_K rows of 256 scale entries).
+    #[test]
+    fn largest_buffer_matches_the_packed_layouts() {
+        let u16s = |v: Vec<u16>| v.len() * 2;
+        for (n, k) in [(3, 512), (2, 4096), (1, 8192)] {
+            let bytes = |t: GgmlType| vec![0u8; t.bytes_for(n * k)];
+            let sc = |v: &[half::f16], blocks: usize, unit: usize| {
+                u16s(pad_scales(v.iter().map(|s| s.to_bits()).collect(), n, blocks, unit))
+            };
+            let q8 = ggml::q8_from_q8_0(&bytes(GgmlType::Q8_0));
+            let q4 = ggml::q4_from_q4_0(&bytes(GgmlType::Q4_0));
+            let q6 = ggml::q6_from_q6_k(&bytes(GgmlType::Q6K), n, k);
+            let q3 = ggml::q3_from_q3_k(&bytes(GgmlType::Q3K), n, k);
+            let q2 = ggml::q2_from_q2_k(&bytes(GgmlType::Q2K), n, k);
+            let want = [
+                (GgmlType::Q8_0, q8.qs.len().max(sc(&q8.scales, k / 32, 1))),
+                (GgmlType::Q4_0, q4.qs.len().max(sc(&q4.scales, k / 32, 1))),
+                (GgmlType::Q4K, ggml::q4k_from_q4_k(&bytes(GgmlType::Q4K)).data.len()),
+                (GgmlType::Q6K, q6.qs.len().max(q6.meta.len()).max(sc(&q6.scales16, k / 16, 1))),
+                (GgmlType::Q3K, q3.qs.len().max(q3.meta.len()).max(sc(&q3.scales16, k / 16, 1))),
+                (GgmlType::Q2K, q2.qs.len().max(q2.meta.len()).max(sc(&q2.pairs16, k / 16, 2))),
+            ];
+            for (t, w) in want {
+                assert_eq!(ggml_largest_buffer(t, n, k), Some(w), "{t:?} [{n}, {k}]");
+            }
+        }
+        // The 0.8B's Q6_K output fits a 128 MiB binding; only its file size does not.
+        let (n, k) = (107520, 1536);
+        assert!(GgmlType::Q6K.bytes_for(n * k) > 128 << 20);
+        assert!(ggml_largest_buffer(GgmlType::Q6K, n, k).unwrap() < 128 << 20);
     }
 }

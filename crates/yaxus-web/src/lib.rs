@@ -104,7 +104,8 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let tokenizer = Tokenizer::from_vocab(vocab.tokens, kinds, vocab.scores).map_err(jserr)?;
 
     // The largest buffer a single binding has to cover (for the 0.8B Q4_K_M, the Q6_K
-    // output matrix of 135 MB). A device that cannot bind it gets that matrix at Q4.
+    // output matrix's 124 MB of 6-bit values). A device that cannot bind a matrix's
+    // buffer gets that matrix at Q4.
     report(&on_progress, "WebGPU デバイスを開いています…");
     let need_binding = GpuBackend::largest_weight_bytes(&g.weights().map_err(jserr)?);
     let backend = GpuBackend::new_async(need_binding, need_binding.max(64 << 20)).await.map_err(jserr)?;
@@ -182,7 +183,7 @@ impl Translator {
         self.max_binding as f64
     }
 
-    /// True when a matrix (the output matrix, on a device that binds 128 MB) was loaded
+    /// True when a matrix (for the 0.8B, the output matrix under a 124 MB binding) was loaded
     /// as Q4 because the storage binding limit is smaller than it.
     #[wasm_bindgen(getter)]
     pub fn reduced_to_q4(&self) -> bool {

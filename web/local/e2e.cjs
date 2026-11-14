@@ -52,14 +52,21 @@ const CASES = [
   { name: 'en->ja document', to: 'ja', text: LONG_EN, check: (out) => out.split('\n\n').length === 12 },
 ];
 
-// Test-only: keeps the worker's GPUDevice where the test can reach it, to break it, and
-// caps the storage binding when `self.__maxBinding` is set (WebGPU's 128 MB tier).
+// Test-only: keeps the worker's GPUDevice where the test can reach it, to break it.
+// `self.__rejectFirst` makes the first device request fail (an adapter that advertises
+// more than it grants); `self.__fakeBinding` makes the device report a smaller storage
+// binding than it has (WebGPU never grants less than 128 MB, which the 0.8B fits).
 const SHIM =
   'const __requestDevice = GPUAdapter.prototype.requestDevice;\n' +
   'GPUAdapter.prototype.requestDevice = async function (d) {\n' +
-  '  const l = d?.requiredLimits;\n' +
-  '  if (self.__maxBinding && l) l.maxStorageBufferBindingSize = Math.min(l.maxStorageBufferBindingSize ?? Infinity, self.__maxBinding);\n' +
+  '  if (self.__rejectFirst && !self.__rejected) { self.__rejected = true; throw new DOMException("test: rejected", "OperationError"); }\n' +
   '  const device = await __requestDevice.call(this, d);\n' +
+  '  if (self.__fakeBinding) {\n' +
+  '    const limits = {};\n' +
+  '    for (const k in device.limits) limits[k] = device.limits[k];\n' +
+  '    limits.maxStorageBufferBindingSize = self.__fakeBinding;\n' +
+  '    Object.defineProperty(device, "limits", { value: limits });\n' +
+  '  }\n' +
   '  self.__device = device;\n' +
   '  return device;\n' +
   '};\n';
@@ -134,12 +141,12 @@ async function translate(page, c) {
   };
   try {
     const page = await browser.newPage();
-    let maxBinding = 0;
+    let flags = '';
     await page.route('**/worker.js', async (route) => {
       const res = await route.fetch();
       const body = await res.text();
       const at = body.indexOf('\n', body.indexOf('import init')) + 1;
-      const shim = SHIM + (maxBinding ? `self.__maxBinding = ${maxBinding};\n` : '');
+      const shim = SHIM + flags;
       await route.fulfill({ response: res, body: body.slice(0, at) + shim + body.slice(at) });
     });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
@@ -173,14 +180,23 @@ async function translate(page, c) {
       check(`${name}: works after loading again`, !s.err && s.out === CASES[0].want, s.out);
     }
 
-    // A device that binds 128 MB: the 135 MB Q6_K output matrix is loaded as Q4, the page
-    // says so, and translation still works (the output may differ from the CLI's).
-    maxBinding = 128 << 20;
+    // The first device request is rejected: the retry with the base limits (a 128 MB
+    // binding) works, and the 0.8B fits it whole (its largest buffer is 124 MB).
+    flags = 'self.__rejectFirst = true;\n';
     await load(page);
-    const warn = await page.locator('#warn').textContent();
-    check('a 128 MB binding limit loads the output matrix as Q4', /Q4/.test(warn), warn);
+    let warn = await page.locator('#warn').textContent();
     s = await translate(page, CASES[0]);
-    check('a 128 MB binding limit still translates', !s.err && s.out.length > 0, s.out);
+    check('a rejected device request is retried', !s.err && s.out === CASES[0].want && !warn, warn || s.out);
+
+    // A 110 MiB binding: the Q6_K output matrix (a 123.9 MB buffer) is loaded as Q4
+    // (82.6 MB), the page says so, and translation still works (the output may differ
+    // from the CLI's).
+    flags = `self.__fakeBinding = ${110 << 20};\n`;
+    await load(page);
+    warn = await page.locator('#warn').textContent();
+    check('a matrix over the binding limit loads as Q4', /Q4/.test(warn), warn);
+    s = await translate(page, CASES[0]);
+    check('a matrix over the binding limit: still translates', !s.err && s.out.length > 0, s.out);
   } finally {
     await browser.close();
     server.close();
