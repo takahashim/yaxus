@@ -143,7 +143,17 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let load_ms = total.elapsed().as_secs_f64() * 1e3;
     let reduced_to_q4 = model.backend.reduced_to_q4() > 0;
     let engine = Engine::new(model, None, ENGINE).map_err(jserr)?;
-    Ok(Translator { engine, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false, chains: 1 })
+    Ok(Translator {
+        engine,
+        tokenizer,
+        name,
+        load_ms,
+        max_binding,
+        reduced_to_q4,
+        broken: false,
+        chains: 1,
+        neighbor_context: false,
+    })
 }
 
 /// One loaded model. Only one translation runs at a time (the page's button is disabled
@@ -160,6 +170,8 @@ pub struct Translator {
     broken: bool,
     /// Chains of the next translation: the segments translated side by side.
     chains: usize,
+    /// Give each segment the source of its neighbours as context.
+    neighbor_context: bool,
 }
 
 /// An error of `translate`, by whether the model is still usable.
@@ -193,6 +205,13 @@ impl Translator {
     /// differs from the one in a single chain.
     pub fn set_chains(&mut self, chains: u32) {
         self.chains = (chains as usize).clamp(1, MAX_CHAINS);
+    }
+
+    /// Whether each segment of a document gets the source of the segments before and after
+    /// it as context (off by default). The prompts differ from those without it, so the
+    /// translation does too.
+    pub fn set_neighbor_context(&mut self, on: bool) {
+        self.neighbor_context = on;
     }
 
     /// True after an error of the GPU: the model cannot be used again.
@@ -298,7 +317,7 @@ impl Translator {
             request: TranslationRequest { target_lang: target.into(), form, ..Default::default() },
             history_chars: HISTORY_CHARS,
             chains: self.chains,
-            neighbor_context: false,
+            neighbor_context: self.neighbor_context,
             max_new_tokens: MAX_NEW_TOKENS,
             history_rules: HistoryRules { skip_truncated: true, trim: true },
         };

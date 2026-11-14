@@ -292,6 +292,8 @@ translateEl.addEventListener('click', async () => {
           form: targetEl.value === 'ja' ? formEl.value : '',
           // `?chains=N` (1 to 4): segments of a document translated side by side.
           chains: Number(new URLSearchParams(location.search).get('chains')) || 1,
+          // `?neighbor=1`: each segment also gets the source of its neighbours as context.
+          neighbor: new URLSearchParams(location.search).get('neighbor') === '1',
         },
         { onPlan: (breaks) => layout.plan(breaks), onText: (segment, text) => layout.add(segment, text) },
       ));
