@@ -21,7 +21,9 @@ use web_time::Instant;
 use yaxus_backend_gpu::GpuBackend;
 use yaxus_model::{Engine, EngineConfig, Finish, Model, ModelOptions, Quant, gguf::Gguf};
 use yaxus_pfml::{Form, TranslationRequest, segments::split_for_context};
-use yaxus_runtime::document::{DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, run_document_async};
+use yaxus_runtime::document::{
+    DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, auto_chains, run_document_async,
+};
 use yaxus_runtime::memory::Memory;
 use yaxus_tokenizer::{TokenKind, Tokenizer};
 
@@ -200,11 +202,12 @@ impl Translator {
         self.name.clone()
     }
 
-    /// How many segments of a document are translated side by side (1 to 4; 1 by default).
+    /// How many segments of a document are translated side by side: 1 to 4, or 0 for the
+    /// CLI's and the server's rule (a chain per 4 segments), at most 4. One by default.
     /// With more, a segment's history is only that of its own chain, so the translation
     /// differs from the one in a single chain.
     pub fn set_chains(&mut self, chains: u32) {
-        self.chains = (chains as usize).clamp(1, MAX_CHAINS);
+        self.chains = if chains == 0 { 0 } else { (chains as usize).clamp(1, MAX_CHAINS) };
     }
 
     /// Whether each segment of a document gets the source of the segments before and after
@@ -316,7 +319,7 @@ impl Translator {
         let opts = DocOptions {
             request: TranslationRequest { target_lang: target.into(), form, ..Default::default() },
             history_chars: HISTORY_CHARS,
-            chains: self.chains,
+            chains: if self.chains == 0 { auto_chains(total).min(MAX_CHAINS) } else { self.chains },
             neighbor_context: self.neighbor_context,
             max_new_tokens: MAX_NEW_TOKENS,
             history_rules: HistoryRules { skip_truncated: true, trim: true },

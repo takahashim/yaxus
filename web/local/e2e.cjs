@@ -214,6 +214,18 @@ async function translate(page, c) {
       check(c.name, ok, ok ? s.stats : `${s.status} | got ${JSON.stringify(s.out.slice(0, 200))}`);
     }
 
+    // The document again with segments translated side by side: all of them, in order, and the
+    // choice is the page's own (`#chains`).
+    for (const [value, label] of [['2', '2 chains'], ['0', 'automatic chains (3 for 12 segments)']]) {
+      await page.locator('#chains').selectOption(value);
+      s = await translate(page, CASES[4]);
+      const parts = s.out.split('\n\n');
+      // Side by side, a chain's first segment has no history: the prompts are not those of one chain (2888 tokens).
+      const side = !/prompt 2888 tokens/.test(s.stats);
+      check(`${label}: the document is translated in full`, !s.err && parts.length === 12 && parts.every((p) => p.trim()) && side, s.stats);
+    }
+    await page.locator('#chains').selectOption('1');
+
     // Segments may be translated side by side: the text of each is kept apart and laid out in order.
     const laid = await page.evaluate(async () => {
       const { Layout } = await import('./layout.js');

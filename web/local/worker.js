@@ -85,7 +85,8 @@ async function adapterName() {
 
 async function translate({ text, target, form, chains, neighbor }) {
   if (!translator) throw new Error('モデルが読み込まれていません。');
-  translator.set_chains(chains || 1);
+  // 0 is the automatic number of chains.
+  translator.set_chains(chains ?? 1);
   translator.set_neighbor_context(!!neighbor);
   const stats = await translator.translate(
     text,

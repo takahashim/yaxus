@@ -97,12 +97,23 @@ button:disabled { opacity: .45; cursor: default; }
         <option value="polite">です・ます</option>
         <option value="plain">だ・である</option>
       </select>
+      <label for="chains">並列</label>
+      <select id="chains" title="いくつかの段落を同時に訳すと速くなります。前の段落の訳を手がかりにできないので、訳が変わることがあります。">
+        <option value="1">順に訳す</option>
+        <option value="2">2 本</option>
+        <option value="3">3 本</option>
+        <option value="4">4 本</option>
+        <option value="0">自動（4 段落に 1 本）</option>
+      </select>
       <span class="spacer grow"></span>
       <button id="sample">例文を入れる</button>
       <button id="translate" class="primary" disabled>翻訳する</button>
     </div>
     <textarea id="source" rows="5" placeholder="The meeting has been moved to next Monday." disabled></textarea>
-    <p class="note">長い文章は段落・文単位に自動で分割して、順に訳します。</p>
+    <p class="note">
+      長い文章は段落・文単位に自動で分割します。「並列」を増やすと、いくつかの段落を同時に訳して速くなりますが、
+      別の本で訳している段落の訳は手がかりにできないため、訳が変わることがあります。
+    </p>
     <div id="output" aria-live="polite"></div>
     <div id="stats"></div>
   </section>
@@ -125,6 +136,7 @@ const meterBar = meterEl.firstElementChild;
 const sampleEl = $('sample');
 const targetEl = $('target');
 const formEl = $('form');
+const chainsEl = $('chains');
 
 const SAMPLES = {
   ja: 'The owner approved the revised plan, and the team will start work next Monday.',
@@ -153,6 +165,7 @@ const setBusy = (b) => {
   sampleEl.disabled = b || !ready;
   targetEl.disabled = b;
   formEl.disabled = b || targetEl.value !== 'ja';
+  chainsEl.disabled = b;
 };
 const fmtMB = (n) => (n / 1e6).toFixed(0) + ' MB';
 
@@ -267,6 +280,17 @@ async function loadModel() {
 
 loadEl.addEventListener('click', loadModel);
 
+// The choice is kept for the next visit.
+try {
+  const saved = localStorage.getItem('yaxus.chains');
+  if (saved !== null && [...chainsEl.options].some((o) => o.value === saved)) chainsEl.value = saved;
+} catch {}
+chainsEl.addEventListener('change', () => {
+  try {
+    localStorage.setItem('yaxus.chains', chainsEl.value);
+  } catch {}
+});
+
 targetEl.addEventListener('change', () => {
   sourceEl.placeholder = SAMPLES[targetEl.value];
   setBusy(busy);
@@ -290,8 +314,8 @@ translateEl.addEventListener('click', async () => {
           text,
           target: targetEl.value,
           form: targetEl.value === 'ja' ? formEl.value : '',
-          // `?chains=N` (1 to 4): segments of a document translated side by side.
-          chains: Number(new URLSearchParams(location.search).get('chains')) || 1,
+          // Segments of a document translated side by side: 1 to 4, or 0 for a chain per 4 segments.
+          chains: Number(chainsEl.value),
           // `?neighbor=1`: each segment also gets the source of its neighbours as context.
           neighbor: new URLSearchParams(location.search).get('neighbor') === '1',
         },
