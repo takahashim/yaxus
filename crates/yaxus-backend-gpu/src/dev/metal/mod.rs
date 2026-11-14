@@ -21,7 +21,7 @@ use objc2_metal::{
 mod translate;
 
 use self::translate::{Translated, translate};
-use super::Buf;
+use super::{Buf, BufImpl};
 use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
 
 type Device = ProtocolObject<dyn MTLDevice>;
@@ -30,7 +30,7 @@ type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 
 /// A Metal buffer, compared and hashed by identity.
 #[derive(Clone)]
-pub struct MBuf(Retained<Buffer>);
+pub(crate) struct MBuf(Retained<Buffer>);
 
 // SAFETY: Metal buffers may be used from any thread; the crate orders their use through
 // the `Gpu` mutex.
@@ -61,8 +61,8 @@ impl MBuf {
 }
 
 fn mb(b: &Buf) -> &Retained<Buffer> {
-    match b {
-        Buf::Metal(b) => &b.0,
+    match &b.0 {
+        BufImpl::Metal(b) => &b.0,
         #[allow(unreachable_patterns)]
         _ => panic!("a buffer of another device"),
     }
@@ -257,7 +257,7 @@ impl MetalDev {
         let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
         blit.fillBuffer_range_value(&b, NSRange { location: 0, length: b.length() }, 0);
         blit.endEncoding();
-        Buf::Metal(MBuf(b))
+        Buf(BufImpl::Metal(MBuf(b)))
     }
 
     fn with_bytes(&self, bytes: &[u8]) -> Retained<Buffer> {
@@ -276,7 +276,7 @@ impl MetalDev {
     }
 
     pub(crate) fn upload(&mut self, _label: &str, bytes: &[u8]) -> Buf {
-        Buf::Metal(MBuf(self.with_bytes(bytes)))
+        Buf(BufImpl::Metal(MBuf(self.with_bytes(bytes))))
     }
 
     /// Waits for everything submitted so far; a command buffer that failed is fatal (as
@@ -308,7 +308,7 @@ impl MetalDev {
 
     /// A new buffer per pass: the command buffers that read the previous one retain it.
     pub(crate) fn upload_meta(&mut self, slot: &mut Option<Buf>, data: &[u8]) {
-        *slot = Some(Buf::Metal(MBuf(self.with_bytes(data))));
+        *slot = Some(Buf(BufImpl::Metal(MBuf(self.with_bytes(data)))));
     }
 
     fn cmd(&mut self) -> &Retained<ProtocolObject<dyn MTLCommandBuffer>> {

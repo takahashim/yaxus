@@ -25,22 +25,24 @@ use crate::device::{DeviceCaps, Diagnostics};
 
 use crate::device::CompileSettings;
 
-/// A GPU buffer of either device (opaque outside the crate).
+/// A GPU buffer of either device. Opaque outside the crate: what it holds (a wgpu or a
+/// Metal buffer) is the device layer's business.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Buf {
-    #[doc(hidden)]
+pub struct Buf(pub(crate) BufImpl);
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum BufImpl {
     Wgpu(::wgpu::Buffer),
     #[cfg(target_os = "macos")]
-    #[doc(hidden)]
     Metal(metal::MBuf),
 }
 
 impl Buf {
     pub(crate) fn size(&self) -> u64 {
-        match self {
-            Buf::Wgpu(b) => b.size(),
+        match &self.0 {
+            BufImpl::Wgpu(b) => b.size(),
             #[cfg(target_os = "macos")]
-            Buf::Metal(b) => b.size(),
+            BufImpl::Metal(b) => b.size(),
         }
     }
 }

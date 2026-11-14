@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, bail};
 use wgpu::util::DeviceExt;
 
-use super::Buf;
+use super::{Buf, BufImpl};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::device::Diagnostics;
 use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
@@ -67,8 +67,8 @@ impl Drop for WgpuDev {
 }
 
 fn wb(b: &Buf) -> &wgpu::Buffer {
-    match b {
-        Buf::Wgpu(b) => b,
+    match &b.0 {
+        BufImpl::Wgpu(b) => b,
         #[allow(unreachable_patterns)]
         _ => panic!("a buffer of another device"),
     }
@@ -230,12 +230,12 @@ impl WgpuDev {
     }
 
     pub(crate) fn storage(&self, label: &str, size: u64) -> Buf {
-        Buf::Wgpu(self.device.create_buffer(&wgpu::BufferDescriptor {
+        Buf(BufImpl::Wgpu(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        }))
+        })))
     }
 
     pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {
@@ -265,7 +265,7 @@ impl WgpuDev {
             self.queue.submit([]);
             self.device.poll(wgpu::PollType::wait_indefinitely()).expect("device lost");
         }
-        Buf::Wgpu(buf)
+        Buf(BufImpl::Wgpu(buf))
     }
 
     pub(crate) fn write(&mut self, dst: &Buf, offset: u64, bytes: &[u8]) {
