@@ -145,6 +145,8 @@ struct Stream {
     start: StartInfo,
     finish: Option<Finish>,
     error: Option<String>,
+    /// KV pages kept for the request from its start to its end (see [`Engine::admit`]).
+    reserved: usize,
 }
 
 /// Where the tokens of a speculative round come from.
@@ -335,17 +337,34 @@ impl<B: AsyncReadback> Engine<B> {
         Ok(true)
     }
 
+    /// Starts waiting requests while there is room for them.
+    ///
+    /// A request is started only when the KV pages it can need are free of the other
+    /// requests: `ceil(min(prompt + max_new, max_pos) / PAGE)`, kept for it until it ends.
+    /// That bound holds for speculation too, whose proposals never go past `max_new`. The
+    /// pages of a prefix it reuses are not subtracted (a shared page is counted once for
+    /// each request that holds it), which keeps the rule simple and a little cautious.
+    /// Sequences kept for prefix reuse are not counted: they are evicted when needed.
+    ///
+    /// A request that waits stays at the front of the queue. One that cannot fit even in
+    /// an empty arena would wait for ever, and fails at once instead.
     fn admit(&mut self, emit: &mut dyn FnMut(Event) -> bool) {
+        let (mut total, max_pos) = self.target.arena();
+        if let Some(draft) = &self.draft {
+            total = total.min(draft.arena().0);
+        }
         while self.streams.len() < self.cfg.max_streams
-            && let Some(req) = self.waiting.pop_front()
+            && let Some(req) = self.waiting.front()
         {
             if req.prompt.is_empty() || req.max_new_tokens == 0 {
+                let req = self.waiting.pop_front().unwrap();
                 emit(Event::Done { id: req.id, finish: Finish::Length, generated: 0, start: StartInfo::default() });
                 continue;
             }
             if self.cfg.response_cache > 0
-                && let Some((out, mut finish)) = self.cache.get(&req)
+                && let Some((out, mut finish)) = self.cache.get(req)
             {
+                let req = self.waiting.pop_front().unwrap();
                 self.spec.cache_hits += 1;
                 let mut generated = 0;
                 for &token in &out {
@@ -360,6 +379,23 @@ impl<B: AsyncReadback> Engine<B> {
                 emit(Event::Done { id: req.id, finish, generated, start });
                 continue;
             }
+            let tokens = req.prompt.len() + req.max_new_tokens;
+            let need = tokens.min(max_pos).div_ceil(crate::PAGE);
+            if tokens > max_pos || need > total {
+                let req = self.waiting.pop_front().unwrap();
+                let message = if tokens > max_pos {
+                    format!("the request needs {tokens} positions, more than the {max_pos} the model's KV covers")
+                } else {
+                    format!("the request needs {need} KV pages, more than the {total} the arena has")
+                };
+                emit(Event::Error { id: req.id, message });
+                continue;
+            }
+            let reserved: usize = self.streams.iter().map(|s| s.reserved).sum();
+            if reserved + need > total {
+                break;
+            }
+            let req = self.waiting.pop_front().unwrap();
             match self.target.begin(&req.prompt) {
                 Ok((ts, reused)) => {
                     let start = StartInfo { reused, computed: req.prompt.len() - reused, cached: false };
@@ -375,6 +411,7 @@ impl<B: AsyncReadback> Engine<B> {
                         start,
                         finish: None,
                         error: None,
+                        reserved: need,
                     });
                 }
                 Err(e) => {
@@ -815,6 +852,79 @@ impl<B: AsyncReadback> Generator for Engine<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the engine until it is idle; returns each request's `(id, finish or error)`.
+    fn run_all(eng: &mut Engine<crate::testing::NullBackend>) -> Vec<(ReqId, Result<Finish, String>)> {
+        let mut ended = Vec::new();
+        while eng
+            .step(&mut |ev| {
+                match ev {
+                    Event::Done { id, finish, .. } => ended.push((id, Ok(finish))),
+                    Event::Error { id, message } => ended.push((id, Err(message))),
+                    Event::Token { .. } => {}
+                }
+                true
+            })
+            .unwrap()
+        {}
+        ended
+    }
+
+    fn request(id: ReqId, prompt_len: usize, max_new: usize) -> Request {
+        // Distinct prompts, so that no prefix is shared and the KV needs are plain.
+        Request::new(id, (0..prompt_len as u32).map(|t| t + id as u32 * 1000).collect(), max_new, vec![])
+    }
+
+    #[test]
+    fn a_request_waits_for_the_pages_of_the_others() {
+        // 2 pages of 128 tokens; each request below needs both.
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 3));
+        eng.submit(request(2, 130, 3));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (1, 1), "the second one waits instead of failing");
+        let ended = run_all(&mut eng);
+        assert_eq!(ended, [(1, Ok(Finish::Length)), (2, Ok(Finish::Length))]);
+        assert_eq!(eng.active() + eng.waiting(), 0);
+    }
+
+    #[test]
+    fn requests_that_fit_together_run_together() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 100, 20));
+        eng.submit(request(2, 100, 20));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (2, 0), "one page each");
+    }
+
+    #[test]
+    fn a_request_that_cannot_fit_alone_fails_at_once_and_blocks_nobody() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 250, 10)); // 260 tokens: 3 pages of the 2
+        eng.submit(request(2, 10, 3));
+        let ended = run_all(&mut eng);
+        assert_eq!(ended.len(), 2);
+        let (id, r) = &ended[0];
+        assert_eq!(*id, 1);
+        assert!(r.as_ref().unwrap_err().contains("KV pages"), "{r:?}");
+        assert_eq!(ended[1], (2, Ok(Finish::Length)));
+    }
+
+    #[test]
+    fn a_request_past_the_positions_of_the_model_fails_at_once() {
+        let mut eng = Engine::new(crate::testing::model_with_max_pos(4, 200), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 150, 100));
+        let ended = run_all(&mut eng);
+        assert!(ended[0].1.as_ref().unwrap_err().contains("positions"), "{ended:?}");
+    }
+
+    #[test]
+    fn a_request_may_take_the_whole_arena() {
+        // The page rule needs no spare page: 256 tokens fit in 2 pages of 128.
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 250, 6));
+        assert_eq!(run_all(&mut eng), [(1, Ok(Finish::Length))]);
+    }
 
     #[test]
     fn zero_row_budgets_are_rejected() {

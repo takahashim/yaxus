@@ -437,6 +437,11 @@ impl<B: Backend> Model<B> {
         self.seqs.free_pages()
     }
 
+    /// Pages in the KV arena, and the positions a sequence may reach.
+    pub fn arena(&self) -> (usize, usize) {
+        (self.seqs.total_pages(), self.seqs.max_pos())
+    }
+
     /// One forward pass over several sequences: `items[i] = (seq, tokens)` appends the
     /// tokens to the sequence. Returns logits for every row when `all_rows`, otherwise
     /// for the last row of each item (in item order).

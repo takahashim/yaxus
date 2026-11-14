@@ -251,6 +251,16 @@ impl KvCache {
         self.pool.free.len()
     }
 
+    /// Pages in the arena.
+    pub fn total_pages(&self) -> usize {
+        self.pool.refs.len()
+    }
+
+    /// Positions a sequence may reach.
+    pub fn max_pos(&self) -> usize {
+        self.max_pos
+    }
+
     /// Forgets the tokens at positions `>= len` (their pages beyond `len` are released).
     pub fn truncate(&mut self, id: SeqId, len: usize) {
         let Some(s) = self.seqs.get_mut(&id) else { return };
