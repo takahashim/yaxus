@@ -119,6 +119,8 @@ impl MetalCompiler {
             .unwrap_or_else(|| panic!("{name}: no function {entry}"));
         let pipeline =
             self.device.newComputePipelineStateWithFunction_error(&function).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let width = pipeline.threadExecutionWidth();
+        assert_eq!(width, 32, "{name}: SIMD-groups of {width} threads; the kernels are written for 32");
         MetalKernel { pipeline, threads, tg_memory, sized }
     }
 }
@@ -184,10 +186,14 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 impl MetalDev {
     pub(crate) fn open(timed: bool) -> Result<(MetalDev, DeviceCaps)> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
-        // The kernels need Apple's 8x8 simdgroup matrices and 32-lane simdgroups.
+        // The kernels need Apple's 8x8 simdgroup matrices and 32-lane simdgroups: an Apple7
+        // GPU (M1 and later), or Mac2 on Apple silicon, as a virtual machine's paravirtual
+        // GPU is (the Mac2 family also holds Intel and AMD GPUs, of other widths; each
+        // pipeline's width is checked as it compiles).
+        let apple_silicon = cfg!(target_arch = "aarch64");
         anyhow::ensure!(
-            device.supportsFamily(MTLGPUFamily::Apple7),
-            "YAXUS_DEVICE=metal needs an Apple GPU of the Apple7 family or later (M1 and later), not {}",
+            device.supportsFamily(MTLGPUFamily::Apple7) || (apple_silicon && device.supportsFamily(MTLGPUFamily::Mac2)),
+            "YAXUS_DEVICE=metal needs an Apple silicon GPU (M1 and later, or its virtual machines'), not {}",
             device.name()
         );
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
