@@ -179,6 +179,26 @@ async function translate(page, c) {
     let s = await state(page);
     check('a non-GGUF file is refused', s.err && !s.canTranslate, s.status);
 
+    // Counts and sizes beyond wasm32's usize are errors, not truncated (2^32 tensors
+    // would read as none).
+    const u32le = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
+    const u64le = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+    const str = (t) => Buffer.concat([u64le(t.length), Buffer.from(t)]);
+    const header = (tensors, kvs) => Buffer.concat([Buffer.from('GGUF'), u32le(3), u64le(tensors), u64le(kvs)]);
+    const bad = {
+      '2^32 tensors': header(2n ** 32n, 0),
+      'an alignment of 2^63': Buffer.concat([
+        header(1, 1), str('general.alignment'), u32le(10), u64le(2n ** 63n),
+        str('t'), u32le(1), u64le(4), u32le(0), u64le(0), Buffer.alloc(64),
+      ]),
+    };
+    for (const [name, buffer] of Object.entries(bad)) {
+      await page.locator('#file').setInputFiles({ name: 'bad.gguf', mimeType: 'application/octet-stream', buffer });
+      await settled(page);
+      s = await state(page);
+      check(`a GGUF with ${name} is refused on wasm32`, s.err && /does not fit/.test(s.status), s.status);
+    }
+
     const t0 = Date.now();
     await page.locator('#file').setInputFiles(gguf);
     await settled(page);

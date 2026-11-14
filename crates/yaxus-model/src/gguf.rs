@@ -15,7 +15,8 @@ use crate::{POST_MIXER_NORM_OFFSET, POST_MLP_NORM_OFFSET, PRE_NORM_OFFSET};
 
 #[derive(Debug, Clone)]
 pub enum Value {
-    Int(i64),
+    /// Any GGUF integer type, exactly (`i128` holds both `u64` and `i64`).
+    Int(i128),
     Float(f64),
     Bool(bool),
     Str(String),
@@ -25,7 +26,7 @@ pub enum Value {
 impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            Value::Int(i) if *i >= 0 => Some(*i as u64),
+            Value::Int(i) => u64::try_from(*i).ok(),
             _ => None,
         }
     }
@@ -70,6 +71,13 @@ struct Reader<'a> {
     at: usize,
 }
 
+/// A count, size or offset from the file as a `usize`. On wasm32 a `u64 as usize` would
+/// drop the upper 32 bits (2^32 tensors would read as none), so values that do not fit
+/// are errors.
+fn to_usize(v: u64, what: impl FnOnce() -> String) -> Result<usize> {
+    usize::try_from(v).map_err(|_| anyhow::anyhow!("{}: {v} does not fit in memory", what()))
+}
+
 impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8]> {
         // Lengths come from the file: checked so that a corrupt one cannot overflow.
@@ -85,31 +93,31 @@ impl Reader<'_> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
     fn string(&mut self) -> Result<String> {
-        let n = usize::try_from(self.u64()?).context("GGUF string is too long")?;
+        let n = to_usize(self.u64()?, || "GGUF string length".into())?;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
     fn value(&mut self, t: u32) -> Result<Value> {
         Ok(match t {
-            0 => Value::Int(self.take(1)?[0] as i64),
-            1 => Value::Int(self.take(1)?[0] as i8 as i64),
-            2 => Value::Int(u16::from_le_bytes(self.take(2)?.try_into()?) as i64),
-            3 => Value::Int(i16::from_le_bytes(self.take(2)?.try_into()?) as i64),
-            4 => Value::Int(self.u32()? as i64),
-            5 => Value::Int(self.u32()? as i32 as i64),
+            0 => Value::Int(self.take(1)?[0] as i128),
+            1 => Value::Int(self.take(1)?[0] as i8 as i128),
+            2 => Value::Int(u16::from_le_bytes(self.take(2)?.try_into()?) as i128),
+            3 => Value::Int(i16::from_le_bytes(self.take(2)?.try_into()?) as i128),
+            4 => Value::Int(self.u32()? as i128),
+            5 => Value::Int(self.u32()? as i32 as i128),
             6 => Value::Float(f32::from_le_bytes(self.take(4)?.try_into()?) as f64),
             7 => Value::Bool(self.take(1)?[0] != 0),
             8 => Value::Str(self.string()?),
             9 => {
                 let it = self.u32()?;
-                let n = self.u64()? as usize;
+                let n = to_usize(self.u64()?, || "GGUF array length".into())?;
                 let mut v = Vec::with_capacity(n.min(1 << 20));
                 for _ in 0..n {
                     v.push(self.value(it)?);
                 }
                 Value::Array(v)
             }
-            10 => Value::Int(self.u64()? as i64),
-            11 => Value::Int(self.u64()? as i64),
+            10 => Value::Int(self.u64()? as i128),
+            11 => Value::Int(self.u64()? as i64 as i128),
             12 => Value::Float(f64::from_le_bytes(self.take(8)?.try_into()?)),
             other => bail!("unknown GGUF value type {other}"),
         })
@@ -136,8 +144,8 @@ impl Gguf {
         ensure!(r.take(4)? == b"GGUF", "not a GGUF file");
         let version = r.u32()?;
         ensure!(version == 2 || version == 3, "GGUF version {version} is not supported");
-        let n_tensors = r.u64()? as usize;
-        let n_kv = r.u64()? as usize;
+        let n_tensors = to_usize(r.u64()?, || "GGUF tensor count".into())?;
+        let n_kv = to_usize(r.u64()?, || "GGUF metadata count".into())?;
         let mut meta = HashMap::new();
         for _ in 0..n_kv {
             let k = r.string()?;
@@ -152,15 +160,22 @@ impl Gguf {
             let nd = r.u32()? as usize;
             let mut dims = Vec::with_capacity(nd.min(8));
             for _ in 0..nd {
-                dims.push(r.u64()? as usize);
+                dims.push(to_usize(r.u64()?, || format!("{name}: dimension"))?);
             }
             let t = GgmlType::from_id(r.u32()?).with_context(|| format!("tensor {name}"))?;
-            let off = r.u64()? as usize;
+            let off = to_usize(r.u64()?, || format!("{name}: offset"))?;
             infos.push((name, dims, t, off));
         }
-        let align = meta.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
+        // An alignment that is there but not an unsigned integer is an error, not 32.
+        let align = match meta.get("general.alignment") {
+            None => 32,
+            Some(v) => {
+                let a = v.as_u64().context("GGUF alignment is not an unsigned integer")?;
+                to_usize(a, || "GGUF alignment".into())?
+            }
+        };
         ensure!(align.is_power_of_two(), "GGUF alignment {align} is not a power of two");
-        let data = r.at.div_ceil(align) * align;
+        let data = r.at.checked_next_multiple_of(align).context("GGUF alignment overflows")?;
         let mut tensors = Vec::with_capacity(n_tensors.min(1 << 16));
         for (name, dims, t, off) in infos {
             // GGUF lists dimensions innermost first.
@@ -172,6 +187,7 @@ impl Gguf {
             ensure!(n.is_multiple_of(t.block().0), "{name}: {n} elements do not fill {t:?} blocks");
             let len =
                 (n / t.block().0).checked_mul(t.block().1).with_context(|| format!("{name}: too many elements"))?;
+            ensure!(off.is_multiple_of(align), "{name}: offset {off} is not a multiple of the alignment {align}");
             let end = data.checked_add(off).and_then(|s| s.checked_add(len));
             ensure!(end.is_some_and(|e| e <= bytes.len()), "{name}: data beyond the end of the file");
             let start = data + off;
@@ -378,9 +394,9 @@ mod tests {
         b.extend(0u32.to_le_bytes());
         assert!(open_err("align", &b).contains("power of two"));
 
-        // A tensor offset that overflows.
+        // A tensor offset that overflows (aligned, so that the overflow is what fails).
         let mut b = head(1, 0);
-        tensor(&mut b, &[4], u64::MAX - 1);
+        tensor(&mut b, &[4], u64::MAX - 31);
         assert!(open_err("offset", &b).contains("beyond the end"));
 
         // Dimensions whose product overflows.
@@ -388,8 +404,49 @@ mod tests {
         tensor(&mut b, &[u64::MAX / 2, 4], 0);
         assert!(open_err("dims", &b).contains("too many elements"));
 
-        // A huge tensor count in a short file.
+        // A huge tensor count in a short file. On wasm32 the count itself does not fit (2^32
+        // would read as 0 with `as usize`).
         assert!(open_err("count", &head(u64::MAX, 0)).contains("truncated"));
+        let e = open_err("count32", &head(1 << 32, 0));
+        assert!(e.contains("truncated") || e.contains("does not fit"), "{e}");
+
+        // An alignment of 2^63 puts the data beyond the file (on wasm32 it does not even
+        // fit a `usize`).
+        let mut b = head(1, 1);
+        string(&mut b, "general.alignment");
+        b.extend(10u32.to_le_bytes());
+        b.extend((1u64 << 63).to_le_bytes());
+        tensor(&mut b, &[4], 0);
+        let e = open_err("align63", &b);
+        assert!(e.contains("beyond the end") || e.contains("does not fit"), "{e}");
+
+        // A negative (INT64) alignment is an error, not the default of 32.
+        let mut b = head(0, 1);
+        string(&mut b, "general.alignment");
+        b.extend(11u32.to_le_bytes());
+        b.extend((-64i64).to_le_bytes());
+        assert!(open_err("negalign", &b).contains("not an unsigned integer"));
+
+        // A tensor offset that is not a multiple of the alignment.
+        let mut b = head(1, 0);
+        tensor(&mut b, &[1], 4);
+        b.resize(b.len().div_ceil(32) * 32 + 8, 0);
+        assert!(open_err("misaligned", &b).contains("not a multiple of the alignment"));
+    }
+
+    #[test]
+    fn integers_keep_their_value() {
+        // UINT64 at and above 2^63, and a negative INT64.
+        let mut b = head(0, 3);
+        for (k, t, v) in [("a", 10u32, u64::MAX), ("b", 10, 1 << 63), ("c", 11, (-5i64) as u64)] {
+            string(&mut b, k);
+            b.extend(t.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        let g = Gguf::parse(b).unwrap();
+        assert_eq!(g.meta["a"].as_u64(), Some(u64::MAX));
+        assert_eq!(g.meta["b"].as_u64(), Some(1 << 63));
+        assert_eq!((g.meta["c"].as_u64(), g.meta["c"].as_f64()), (None, Some(-5.0)));
     }
 
     #[test]
