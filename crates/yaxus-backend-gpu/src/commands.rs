@@ -1,78 +1,108 @@
-//! Recording and submitting commands, uploads and read-backs, and the pooled tensors,
-//! through the device layer (`dev`).
+//! Recording and submitting commands: [`Recorder`] holds the device and decides when what
+//! is recorded is submitted; `Gpu`'s methods here dispatch kernels by [`KernelId`], hand
+//! out the pooled tensors and capture the device's errors.
 
+#[cfg(target_arch = "wasm32")]
 use anyhow::Result;
 
-use crate::dev::Buf;
+use crate::dev::{Buf, Dev, Kernel};
+use crate::device::Tuning;
+use crate::kernels::KernelId;
+use crate::profile::Profile;
 use crate::{Gpu, MetaBuf, Tensor};
 
-impl Gpu {
-    pub(crate) fn tensor(&mut self, rows: usize, cols: usize) -> Tensor {
-        self.tensor_padded(rows, cols, rows)
+/// Splits a 1-D workgroup count into a 2-D grid within the 65535 per-dimension limit.
+pub(crate) fn grid(groups: u32) -> (u32, u32) {
+    if groups <= 65535 { (groups.max(1), 1) } else { (65535, groups.div_ceil(65535)) }
+}
+
+/// When recorded commands are submitted (see the fields of [`Tuning`] they come from).
+#[derive(Debug, Clone, Copy)]
+struct SubmitPolicy {
+    /// Matmul FLOPs recorded before a submission (`Tuning::submit_flops`).
+    submit_flops: f64,
+    /// Dispatches of a small pass before its first submission
+    /// (`Tuning::early_submit_dispatches`).
+    early_dispatches: usize,
+    /// Rows up to which a pass is small (`Tuning::early_submit_max_rows`).
+    small_rows: usize,
+}
+
+/// The device, and the commands recorded on it since the last submission.
+pub(crate) struct Recorder {
+    pub(crate) dev: Dev,
+    policy: SubmitPolicy,
+    /// Matmul FLOPs recorded since the last submission.
+    pending_flops: f64,
+    /// Dispatches recorded since the pass began, and whether it is small enough to be
+    /// submitted early.
+    pass_dispatches: usize,
+    small_pass: bool,
+    /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
+    profile: Option<Profile>,
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        if let Some(p) = &self.profile {
+            p.report();
+        }
+    }
+}
+
+impl Recorder {
+    pub(crate) fn new(dev: Dev, tuning: &Tuning, profile: bool) -> Self {
+        let policy = SubmitPolicy {
+            submit_flops: tuning.submit_flops,
+            early_dispatches: tuning.early_submit_dispatches,
+            small_rows: tuning.early_submit_max_rows,
+        };
+        Recorder {
+            dev,
+            policy,
+            pending_flops: 0.0,
+            pass_dispatches: 0,
+            small_pass: false,
+            profile: profile.then(Profile::default),
+        }
     }
 
-    /// A tensor whose buffer has room for `cap_rows >= rows` rows.
-    pub(crate) fn tensor_padded(&mut self, rows: usize, cols: usize, cap_rows: usize) -> Tensor {
-        let size = ((cap_rows * cols * 4) as u64).next_power_of_two().max(256);
-        let pooled = self.pool.lock().unwrap().get_mut(&size).and_then(Vec::pop);
-        let buf = pooled.unwrap_or_else(|| self.dev.storage("tensor", size));
-        Tensor { buf: Some(buf), rows, cols, pool: self.pool.clone() }
+    /// A forward pass of `rows` rows begins.
+    pub(crate) fn begin_pass(&mut self, rows: usize) {
+        self.pass_dispatches = 0;
+        self.small_pass = rows <= self.policy.small_rows;
     }
 
-    pub(crate) fn dispatch(&mut self, name: &str, bufs: &[&Buf], params: &[u32], groups: (u32, u32)) {
-        self.dispatch_shaped(name, bufs, params, groups, None);
-    }
-
-    /// [`Gpu::dispatch`] of a matrix product over an `[n, k]` weight: the per-kernel
-    /// profile (`YAXUS_PROFILE=2`) labels it with that shape.
-    pub(crate) fn dispatch_matmul(
+    /// Records a dispatch of `k`; `label` names it for the per-kernel profile.
+    pub(crate) fn dispatch(
         &mut self,
-        name: &str,
+        k: &Kernel,
         bufs: &[&Buf],
         params: &[u32],
         groups: (u32, u32),
-        shape: (usize, usize),
+        label: impl FnOnce() -> String,
     ) {
-        self.dispatch_shaped(name, bufs, params, groups, Some(shape));
-    }
-
-    fn dispatch_shaped(
-        &mut self,
-        name: &str,
-        bufs: &[&Buf],
-        params: &[u32],
-        groups: (u32, u32),
-        shape: Option<(usize, usize)>,
-    ) {
-        let k = &self.kernels[name];
         let mut imm = [0u32; 8];
         imm[..params.len()].copy_from_slice(params);
         if let Some(p) = &mut self.profile {
             p.dispatches += 1;
         }
         let timing = self.dev.timing();
-        let label = timing.then(|| match shape {
-            Some((n, k)) => format!("{name} {n}x{k}"),
-            None => name.to_string(),
-        });
-        self.dev.dispatch(k, bufs, &imm, groups, label);
+        self.dev.dispatch(k, bufs, &imm, groups, timing.then(label));
         // Small passes (decode, verification) are recorded while the GPU already runs their
         // first layer: one early submission. More submissions cost more than they hide.
-        self.pass.dispatches += 1;
-        if self.pass.dispatches == self.tuning.early_submit_dispatches
-            && self.pass.rows <= self.tuning.split_attn_max_rows
-            && !timing
-        {
+        self.pass_dispatches += 1;
+        if self.pass_dispatches == self.policy.early_dispatches && self.small_pass && !timing {
             self.submit();
         }
     }
 
     /// Records that the commands just recorded do `flops` of matrix work, and submits
-    /// them once `Tuning::submit_flops` have accumulated (so that no submission runs long enough
-    /// for the driver to reset the GPU).
+    /// them once `Tuning::submit_flops` have accumulated (so that no submission runs long
+    /// enough for the driver to reset the GPU).
     pub(crate) fn account(&mut self, flops: f64) {
         self.pending_flops += flops;
-        if self.pending_flops >= self.tuning.submit_flops {
+        if self.pending_flops >= self.policy.submit_flops {
             self.submit();
         }
     }
@@ -82,6 +112,7 @@ impl Gpu {
         self.dev.submit();
     }
 
+    /// Submits, waits, and returns `size` bytes of `src` from `offset`.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read(&mut self, src: &Buf, offset: u64, size: u64) -> Vec<u8> {
         let t_rec = web_time::Instant::now();
@@ -106,42 +137,67 @@ impl Gpu {
         self.pending_flops = 0.0;
         self.dev.read_async(src, offset, size).await
     }
+}
 
-    pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {
-        self.loaded.weight_bytes += bytes.len();
-        // Binding it would fail at the first dispatch, long after loading.
-        if bytes.len() as u64 > self.dev.max_binding() {
-            self.loaded.oversized.get_or_insert((label.to_string(), bytes.len()));
-        }
-        self.dev.upload(label, bytes)
+impl Gpu {
+    pub(crate) fn tensor(&mut self, rows: usize, cols: usize) -> Tensor {
+        self.tensor_padded(rows, cols, rows)
+    }
+
+    /// A tensor whose buffer has room for `cap_rows >= rows` rows.
+    pub(crate) fn tensor_padded(&mut self, rows: usize, cols: usize, cap_rows: usize) -> Tensor {
+        let size = ((cap_rows * cols * 4) as u64).next_power_of_two().max(256);
+        let pooled = self.pool.lock().unwrap().get_mut(&size).and_then(Vec::pop);
+        let buf = pooled.unwrap_or_else(|| self.rec.dev.storage("tensor", size));
+        Tensor { buf: Some(buf), rows, cols, pool: self.pool.clone() }
+    }
+
+    pub(crate) fn dispatch(&mut self, id: KernelId, bufs: &[&Buf], params: &[u32], groups: (u32, u32)) {
+        let k = self.kernels.get(&self.rec.dev, &self.caps, &self.tuning, id);
+        self.rec.dispatch(k, bufs, params, groups, || id.name());
+    }
+
+    /// [`Gpu::dispatch`] of a matrix product over an `[n, k]` weight: the per-kernel
+    /// profile (`YAXUS_PROFILE=2`) labels it with that shape.
+    pub(crate) fn dispatch_matmul(
+        &mut self,
+        id: KernelId,
+        bufs: &[&Buf],
+        params: &[u32],
+        groups: (u32, u32),
+        (n, k): (usize, usize),
+    ) {
+        let kernel = self.kernels.get(&self.rec.dev, &self.caps, &self.tuning, id);
+        self.rec.dispatch(kernel, bufs, params, groups, || format!("{} {n}x{k}", id.name()));
     }
 
     /// Puts `data` in the pass metadata `slot` for the commands recorded from now on.
     pub(crate) fn upload_ordered(&mut self, slot: MetaBuf, data: &[u8]) {
-        self.dev.upload_meta(&mut self.pass.meta[slot as usize], data);
+        self.rec.dev.upload_meta(&mut self.pass.meta[slot as usize], data);
     }
 
     pub(crate) fn meta_buf(&self, slot: MetaBuf) -> Buf {
         self.pass.meta[slot as usize].clone().expect("begin_pass first")
     }
 
-    /// Runs `f` with the device's out-of-memory and validation errors captured, so that
-    /// a weight or KV arena that does not fit comes back as `Err` instead of panicking
-    /// in the device's default error handler.
-    pub(crate) fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        // Only report a buffer from this call (uploads outside `checked` also set it).
-        self.loaded.oversized = None;
-        let scope = self.dev.error_scope();
+    /// Runs `f` with the device's out-of-memory and validation errors captured. Returns
+    /// its result and the first error, so that a buffer that does not fit comes back as
+    /// an error instead of panicking in the device's default error handler.
+    pub(crate) fn captured<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Option<String>) {
+        let scope = self.rec.dev.error_scope();
         let r = f(self);
-        if let Some(e) = scope.finish().or_else(|| self.dev.take_failure()) {
-            anyhow::bail!("{what}: {e}");
+        (r, self.rec.dev.finish_errors(scope))
+    }
+
+    /// [`Gpu::captured`], with the device's error as the result's.
+    pub(crate) fn checked<T>(
+        &mut self,
+        what: &str,
+        f: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match self.captured(f) {
+            (_, Some(e)) => anyhow::bail!("{what}: {e}"),
+            (r, None) => r,
         }
-        if let Some((label, bytes)) = self.loaded.oversized.take() {
-            anyhow::bail!(
-                "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",
-                self.dev.max_binding()
-            );
-        }
-        r
     }
 }

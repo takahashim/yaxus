@@ -18,7 +18,7 @@ const GEMV2_SGS: usize = 2;
 
 /// A [`gemv2`] kernel: `t` rows, with `glu`, in the scalar kernel or on simdgroup matrices
 /// of `tiles` weight tiles a simdgroup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Gemv2 {
     pub(crate) t: usize,
     pub(crate) glu: bool,

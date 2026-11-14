@@ -126,7 +126,7 @@ pub(crate) struct MetalDev {
     enc: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     /// The command buffers committed since the last wait, in order.
     committed: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
-    /// Inside `Gpu::checked` (`capture` to `take_failure`): a failed allocation is reported
+    /// Inside `Gpu::checked` (`capture` to `take_failure`, through `Dev::finish_errors`): a failed allocation is reported
     /// there, with a small buffer standing in for it. Elsewhere it panics, as wgpu's
     /// uncaptured errors do.
     capturing: std::cell::Cell<bool>,

@@ -2,7 +2,7 @@
 //! kernels are compiled for it ([`CompileSettings`]) and the measured choices they are run
 //! with on it ([`Tuning`]). Nothing here depends on wgpu.
 
-use crate::{GemmKind, Gemv};
+use crate::kinds::{GEMVM_MAX_T, GemmKind, Gemv};
 
 /// GPU vendors the tuning distinguishes (PCI vendor ids; Apple's on Metal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +107,9 @@ pub struct Tuning {
     /// Dispatches of a small pass recorded before it is first submitted (about one layer):
     /// the GPU then runs while the host records the rest. 2B GGUF decode 44.0 -> 44.8 tok/s.
     pub early_submit_dispatches: usize,
+    /// Rows up to which a pass is small enough to be submitted early: decode and
+    /// verification passes, whose recording would otherwise wait for the GPU.
+    pub early_submit_max_rows: usize,
     /// Rows up to which a pass runs as integer GEMVs (when the handle's `Gemv` has them)
     /// rather than the prefill GEMM, with the int16 (or f16) and the int8 GEMM: reading the
     /// weights two or three times costs less than a GEMM tile. Measured on a 780M, ms per
@@ -141,7 +144,7 @@ pub struct Tuning {
     /// row and chunk of keys). Decode passes are rows of different requests, which the
     /// tiled attention of prompt passes handles badly: 16 requests in one pass took 74 ms
     /// with it against 38 ms (2B), so this covers every pass the decode kernels take in
-    /// one dispatch. Passes this small are also the ones submitted early.
+    /// one dispatch.
     pub split_attn_max_rows: usize,
     /// Workgroups the split attention aims for at most when it splits heads: few
     /// workgroups (short contexts, one KV head) leave the GPU idle, more reread the keys
@@ -167,7 +170,7 @@ pub struct Tuning {
 /// takes MSL (`DeviceCaps::msl`) and the switch is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppleTuning {
-    /// `rmsnorm`, `add_norm` and `qk_rope` in MSL (`msl::small_kernels`).
+    /// `rmsnorm`, `add_norm` and `qk_rope` in MSL (`msl::small`).
     pub msl_small: bool,
     /// Passes of up to 16 rows on `msl::gemv2` (for the formats it reads), in place of
     /// `gemv_f32`.
@@ -210,6 +213,7 @@ impl Tuning {
         Tuning {
             submit_flops: 32e9,
             early_submit_dispatches: 12,
+            early_submit_max_rows: 16,
             gemv_int_max_rows: 48,
             gemv_int8_max_rows: 24,
             multi_split_max_rows: 20,
@@ -268,7 +272,7 @@ impl Tuning {
                 // and a whole 64-row tile (32 rows: 197 ms) costs less than two 16-row
                 // f32 GEMVs (17 rows: 246 ms), so passes of more than 16 rows take it.
                 t.gemm = GemmKind::Coop;
-                t.multi_split_max_rows = crate::GEMVM_MAX_T;
+                t.multi_split_max_rows = GEMVM_MAX_T;
             }
         }
         t
@@ -278,7 +282,7 @@ impl Tuning {
     /// prefill GEMM.
     pub(crate) fn gemv_max_rows(&self, gemm: GemmKind) -> usize {
         match gemm {
-            GemmKind::F32 => crate::GEMVM_MAX_T,
+            GemmKind::F32 => GEMVM_MAX_T,
             GemmKind::Int8 => self.gemv_int8_max_rows,
             GemmKind::Coop | GemmKind::CoopF16 | GemmKind::Int16 => self.gemv_int_max_rows,
         }
@@ -309,25 +313,31 @@ impl CompileSettings {
     }
 }
 
-/// Diagnostics asked for in the environment, read once. Their reports (`YAXUS_PROFILE`,
-/// `YAXUS_COMPILE_LOG`) go to stderr directly: they were asked for by name, and a log
-/// filter set for warnings must not hide them. Warnings go through `tracing`.
+/// What the environment asks of the backend, read once: the device, and diagnostics.
+/// Their reports (`YAXUS_PROFILE`, `YAXUS_COMPILE_LOG`) go to stderr directly: they were
+/// asked for by name, and a log filter set for warnings must not hide them. Warnings go
+/// through `tracing`.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Diagnostics {
+pub(crate) struct Environment {
     /// `YAXUS_PROFILE=1`: time recording vs. waiting; `=2`: per-kernel GPU time too.
     pub profile: Option<u8>,
     /// `YAXUS_COMPILE_LOG`: kernel compilations and their times.
     pub compile_log: bool,
     /// `YAXUS_SOFTWARE_GPU=1`: accept a software adapter (lavapipe in CI).
     pub software: bool,
+    /// `YAXUS_DEVICE=metal` (macOS): Metal directly, without wgpu.
+    #[cfg(target_os = "macos")]
+    pub metal_direct: bool,
 }
 
-impl Diagnostics {
-    pub(crate) fn from_env() -> Self {
-        Diagnostics {
+impl Environment {
+    pub(crate) fn read() -> Self {
+        Environment {
             profile: std::env::var("YAXUS_PROFILE").ok().map(|v| if v == "2" { 2 } else { 1 }),
             compile_log: std::env::var_os("YAXUS_COMPILE_LOG").is_some(),
             software: std::env::var_os("YAXUS_SOFTWARE_GPU").is_some_and(|v| v == "1"),
+            #[cfg(target_os = "macos")]
+            metal_direct: std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal"),
         }
     }
 }

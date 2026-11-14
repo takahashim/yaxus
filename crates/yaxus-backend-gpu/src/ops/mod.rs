@@ -6,6 +6,8 @@ mod matmul;
 use anyhow::{Context, Result};
 use yaxus_model::{Config, LayerMeta, PAGE, PassMeta};
 
+use crate::commands::grid;
+use crate::kernels::{AddNormKind, KernelId};
 use crate::{Buf, Format, Gpu, HEAD_DIM, Kv, MetaBuf, Tensor, Weight, plan};
 
 /// Workgroups per row in the first argmax stage (stage 2 is one 64-wide workgroup).
@@ -18,11 +20,6 @@ pub(crate) const ARGMAX_ROWS: usize = 512;
 /// Columns `add_norm_sg` keeps in registers (16 per lane of its 256); wider rows take the
 /// plain `add_norm`.
 pub(crate) const ADD_NORM_SG_MAX_COLS: usize = 16 * 256;
-
-/// Splits a 1-D workgroup count into a 2-D grid within the 65535 per-dimension limit.
-pub(crate) fn grid(groups: u32) -> (u32, u32) {
-    if groups <= 65535 { (groups.max(1), 1) } else { (65535, groups.div_ceil(65535)) }
-}
 
 impl Gpu {
     pub(crate) fn name(&self) -> String {
@@ -50,14 +47,14 @@ impl Gpu {
         );
         let kv_dim = cfg.kv_dim();
         let size = (pages * PAGE * kv_dim * 4) as u64;
-        anyhow::ensure!(size <= self.dev.max_binding(), "KV arena too large per layer");
-        let k = metas.iter().map(|_| self.dev.storage("k", size)).collect();
-        let v = metas.iter().map(|_| self.dev.storage("v", size)).collect();
+        anyhow::ensure!(size <= self.rec.dev.max_binding(), "KV arena too large per layer");
+        let k = metas.iter().map(|_| self.rec.dev.storage("k", size)).collect();
+        let v = metas.iter().map(|_| self.rec.dev.storage("v", size)).collect();
         // A model may have only one kind of layer: the other table is then unused.
         let any = metas.first().context("a model without layers")?;
         let sliding = metas.iter().find(|m| !m.full_attn).unwrap_or(any);
         let full = metas.iter().find(|m| m.full_attn).unwrap_or(any);
-        let scratch = self.dev.storage("kv-page-scratch", (PAGE * kv_dim * 4) as u64);
+        let scratch = self.rec.dev.storage("kv-page-scratch", (PAGE * kv_dim * 4) as u64);
         Ok(Kv {
             k,
             v,
@@ -71,8 +68,8 @@ impl Gpu {
     pub(crate) fn copy_page(&mut self, kv: &mut Kv, src: u32, dst: u32) {
         let bytes = (PAGE * kv.kv_dim * 4) as u64;
         for b in kv.k.iter().chain(&kv.v) {
-            self.dev.copy(b, src as u64 * bytes, &kv.scratch, 0, bytes);
-            self.dev.copy(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
+            self.rec.dev.copy(b, src as u64 * bytes, &kv.scratch, 0, bytes);
+            self.rec.dev.copy(&kv.scratch, 0, b, dst as u64 * bytes, bytes);
         }
     }
 
@@ -97,7 +94,7 @@ impl Gpu {
         self.upload_ordered(MetaBuf::Tiles, bytemuck::cast_slice(&tiles));
         self.pass.tiles = tiles.len();
         self.pass.rows = rows;
-        self.pass.dispatches = 0;
+        self.rec.begin_pass(rows);
         self.pass.max_pos = pass.pos.iter().copied().max().unwrap_or(0) as usize;
     }
 
@@ -109,14 +106,14 @@ impl Gpu {
             // The Q4_K table is bound twice (nibbles and headers), as the matrix kernels do.
             Format::Q4K => {
                 self.dispatch(
-                    "embed_q4k",
+                    KernelId::EmbedQ4k,
                     &[y.buf(), &ids, table, table],
                     &[*h as u32, *h as u32],
                     (self.pass.rows as u32, 1),
                 );
             }
             _ => {
-                self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass.rows as u32, 1));
+                self.dispatch(KernelId::Embed, &[y.buf(), table, &ids], &[*h as u32], (self.pass.rows as u32, 1));
             }
         }
         y
@@ -125,9 +122,9 @@ impl Gpu {
     pub(crate) fn rmsnorm(&mut self, x: &Tensor, w: &Weight, offset: f32, eps: f32) -> Tensor {
         let Weight::Vector(wb) = w else { panic!("rmsnorm weight must be a vector") };
         let y = self.tensor(x.rows, x.cols);
-        let msl = self.tuning.apple.msl_small && self.caps.msl && x.cols.is_multiple_of(4);
+        let msl = plan::msl_small(&self.caps, &self.tuning) && x.cols.is_multiple_of(4);
         self.dispatch(
-            if msl { "rmsnorm_msl" } else { "rmsnorm" },
+            KernelId::RmsNorm { msl },
             &[y.buf(), x.buf(), wb],
             &[x.cols as u32, offset.to_bits(), eps.to_bits()],
             (x.rows as u32, 1),
@@ -151,15 +148,15 @@ impl Gpu {
         let h = self.tensor(x.rows, x.cols);
         let xb = x.buf().clone();
         // (the subgroup kernel holds a row in registers, which bounds its width)
-        let name = if self.tuning.apple.msl_small && self.caps.msl && x.cols.is_multiple_of(4) {
-            "add_norm_msl"
+        let kind = if plan::msl_small(&self.caps, &self.tuning) && x.cols.is_multiple_of(4) {
+            AddNormKind::Msl
         } else if self.caps.subgroups && x.cols <= ADD_NORM_SG_MAX_COLS {
-            "add_norm_sg"
+            AddNormKind::Subgroup
         } else {
-            "add_norm"
+            AddNormKind::Plain
         };
         self.dispatch(
-            name,
+            KernelId::AddNorm(kind),
             &[h.buf(), &xb, delta.buf(), w1, w2],
             &[x.cols as u32, post_offset.to_bits(), pre_offset.to_bits(), eps.to_bits()],
             (x.rows as u32, 1),
@@ -171,7 +168,7 @@ impl Gpu {
         let total = a.rows * a.cols;
         assert_eq!(total, b.rows * b.cols);
         let (ab, bb) = (a.buf().clone(), b.buf().clone());
-        self.dispatch("add", &[&ab, &bb], &[total as u32], grid(total.div_ceil(256) as u32));
+        self.dispatch(KernelId::Add, &[&ab, &bb], &[total as u32], grid(total.div_ceil(256) as u32));
     }
 
     pub(crate) fn select_rows(&mut self, x: &Tensor, rows: &[usize]) -> Tensor {
@@ -185,7 +182,7 @@ impl Gpu {
             while j < rows.len() && rows[j] == rows[j - 1] + 1 {
                 j += 1;
             }
-            self.dev.copy(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
+            self.rec.dev.copy(&src, rows[i] as u64 * bytes, &dst, i as u64 * bytes, (j - i) as u64 * bytes);
             i = j;
         }
         y
@@ -202,7 +199,7 @@ impl Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         let size = (x.rows * x.cols * 4) as u64;
-        let b = self.read(&x.buf().clone(), 0, size);
+        let b = self.rec.read(x.buf(), 0, size);
         bytemuck::cast_slice(&b).to_vec()
     }
 
@@ -220,7 +217,7 @@ impl Gpu {
             return out;
         }
         let (out, size) = self.argmax_prob_pending(logits);
-        let b = self.read(&out, 0, size);
+        let b = self.rec.read(&out, 0, size);
         parse_argmax(&b, logits.cols as u32)
     }
 
@@ -230,12 +227,12 @@ impl Gpu {
         let (out, part) = (self.argmax_out.clone(), self.argmax_part.clone());
         let slice = logits.cols.div_ceil(ARGMAX_SLICES);
         self.dispatch(
-            "argmax1",
+            KernelId::Argmax1,
             &[&part, logits.buf()],
             &[logits.cols as u32, slice as u32],
             (ARGMAX_SLICES as u32, logits.rows as u32),
         );
-        self.dispatch("argmax2", &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
+        self.dispatch(KernelId::Argmax2, &[&out, &part], &[ARGMAX_SLICES as u32], (logits.rows as u32, 1));
         (out, (logits.rows * 8) as u64)
     }
 }

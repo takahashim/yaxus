@@ -10,7 +10,7 @@
 use anyhow::{Context, Result, bail};
 
 use super::{Buf, PARAM_BINDING, WgpuDev, detect, wb};
-use crate::device::{CompileSettings, DeviceCaps, Diagnostics};
+use crate::device::{CompileSettings, DeviceCaps, Environment};
 
 /// The uniform ring: 4096 slots of 256 bytes (the usual offset alignment).
 const PARAM_BYTES: u64 = 1 << 20;
@@ -163,7 +163,7 @@ impl WgpuDev {
     /// reports a conservative set of limits; asking for more than the adapter supports
     /// makes `requestDevice` fail, so a smaller request is retried.
     pub(crate) async fn open_async(
-        diag: &Diagnostics,
+        env: &Environment,
         need_binding: u64,
         need_buffer: u64,
     ) -> Result<(WgpuDev, DeviceCaps)> {
@@ -181,7 +181,7 @@ impl WgpuDev {
             .await
             .context("WebGPU is not available (requestAdapter failed)")?;
         let info = adapter.get_info();
-        if !diag.software && info.device_type == wgpu::DeviceType::Cpu {
+        if !env.software && info.device_type == wgpu::DeviceType::Cpu {
             bail!("only a software WebGPU adapter is available");
         }
         let mut caps = detect(&adapter);

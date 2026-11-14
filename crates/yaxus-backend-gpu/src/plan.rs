@@ -1,5 +1,6 @@
 //! Which kernels run a matrix product or an attention, from the shapes, the device and
-//! its tuning only. The ops in `lib.rs` carry the plans out.
+//! its tuning only. `steps` turns a matrix product's plan into its dispatches, and the ops
+//! carry the plans out.
 
 use crate::device::{AppleTuning, DeviceCaps, Tuning};
 use crate::msl;
@@ -36,11 +37,56 @@ pub(crate) enum MatmulPlan {
 }
 
 impl MatmulPlan {
-    /// Whether it runs a GEMM, which reads the prefill layout of the weights (the
-    /// per-16 scales of Q6, Q3 and Q2); the GEMVs read the decode layout.
-    pub(crate) fn is_gemm(self) -> bool {
-        matches!(self, MatmulPlan::GemmInt { .. } | MatmulPlan::GemmCoop { .. } | MatmulPlan::GemmF32)
+    /// Rows the output of a `t`-row pass has room for: the tiled GEMMs store whole 64-row
+    /// tiles (the integer one's 128-row tiles and its rest stay within them).
+    pub(crate) fn output_rows(self, t: usize) -> usize {
+        match self {
+            MatmulPlan::GemmInt { .. } | MatmulPlan::GemmCoop { .. } | MatmulPlan::GemmMsl { .. } => {
+                t.div_ceil(64) * 64
+            }
+            _ => t,
+        }
     }
+}
+
+/// The integer GEMV dispatches of a `t`-row pass, `(first row, rows)`: up to 16 rows each
+/// (each reads the weights once), as even as they come.
+pub(crate) fn gemv_int_parts(t: usize) -> Vec<(usize, usize)> {
+    let parts = t.div_ceil(GEMVM_MAX_T);
+    let mut r0 = 0;
+    (0..parts)
+        .map(|i| {
+            let rows = (t - r0).div_ceil(parts - i);
+            r0 += rows;
+            (r0 - rows, rows)
+        })
+        .collect()
+}
+
+/// The integer GEMM tiles of a `t`-row pass, `(lanes tn, first row, tiles)`: 128-row
+/// tiles (`tn` 8), then one of 64 or 32 rows for the rest (a tile costs its full size
+/// whatever it holds); a rest of more than 64 rows takes another 128-row one.
+pub(crate) fn gemm_int_tiles(t: usize) -> Vec<(usize, usize, usize)> {
+    let rest = t % 128;
+    let wide = t / 128 + usize::from(rest > 64);
+    let tail = match rest {
+        0 | 65.. => None,
+        33.. => Some(4),
+        _ => Some(2),
+    };
+    let mut tiles = Vec::new();
+    if wide > 0 {
+        tiles.push((8, 0, wide));
+    }
+    if let Some(tn) = tail {
+        tiles.push((tn, wide * 128, 1));
+    }
+    tiles
+}
+
+/// Whether `rmsnorm`, `add_norm` and `qk_rope` run their MSL kernels.
+pub(crate) fn msl_small(caps: &DeviceCaps, tuning: &Tuning) -> bool {
+    tuning.apple.msl_small && caps.msl
 }
 
 /// What a matrix product's plan depends on besides the device.
@@ -135,9 +181,6 @@ pub(crate) fn gemv2_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format, k: us
 pub(crate) fn gemm_msl_takes(caps: &DeviceCaps, tuning: &Tuning, fmt: Format) -> bool {
     tuning.apple.gemm_msl && caps.msl && msl::gemm_reads(fmt)
 }
-
-/// The tile sizes of `msl::gemm`, in 32 rows of the pass.
-pub(crate) const GEMM_MSL_RB: [usize; 2] = [1, 2];
 
 /// One dispatch of a matrix product split over the pass's rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,8 +398,19 @@ mod tests {
             (p(1), p(8), p(9), p(100)),
             (MatmulPlan::Gemv1, MatmulPlan::Gemv8, MatmulPlan::GemmF32, MatmulPlan::GemmInt { planes: 2 })
         );
-        // 9..=16 rows there are a GEMM, which binds the prefill layout of the weights.
-        assert!(p(16).is_gemm() && !p(8).is_gemm());
+        // The tiled GEMMs' outputs have room for whole tiles.
+        assert_eq!((p(100).output_rows(100), p(8).output_rows(8)), (128, 8));
+    }
+
+    #[test]
+    fn integer_passes_are_cut_into_parts_and_tiles() {
+        assert_eq!(gemv_int_parts(16), [(0, 16)]);
+        assert_eq!(gemv_int_parts(33), [(0, 11), (11, 11), (22, 11)]);
+        assert_eq!(gemm_int_tiles(128), [(8, 0, 1)]);
+        assert_eq!(gemm_int_tiles(150), [(8, 0, 1), (2, 128, 1)]);
+        assert_eq!(gemm_int_tiles(170), [(8, 0, 1), (4, 128, 1)]);
+        assert_eq!(gemm_int_tiles(100), [(8, 0, 1)]);
+        assert_eq!(gemm_int_tiles(20), [(2, 0, 1)]);
     }
 
     #[test]

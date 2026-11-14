@@ -21,7 +21,7 @@ pub(crate) mod wgpu;
 use anyhow::Result;
 
 #[cfg(not(target_arch = "wasm32"))]
-use crate::device::{DeviceCaps, Diagnostics};
+use crate::device::{DeviceCaps, Environment};
 
 use crate::device::CompileSettings;
 
@@ -94,13 +94,13 @@ impl Dev {
     /// Opens the device the environment asks for: `YAXUS_DEVICE=metal` (macOS) for Metal
     /// without wgpu, else wgpu.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn open(diag: &Diagnostics) -> Result<(Dev, DeviceCaps)> {
+    pub(crate) fn open(env: &Environment) -> Result<(Dev, DeviceCaps)> {
         #[cfg(target_os = "macos")]
-        if std::env::var("YAXUS_DEVICE").is_ok_and(|v| v == "metal") {
-            let (d, caps) = metal::MetalDev::open(diag.profile == Some(2))?;
+        if env.metal_direct {
+            let (d, caps) = metal::MetalDev::open(env.profile == Some(2))?;
             return Ok((Dev::Metal(d), caps));
         }
-        let (d, caps) = wgpu::WgpuDev::open(diag)?;
+        let (d, caps) = wgpu::WgpuDev::open(env)?;
         Ok((Dev::Wgpu(Box::new(d)), caps))
     }
 
@@ -235,28 +235,29 @@ impl Dev {
         }
     }
 
-    /// An allocation that failed since the last call (devices that report them so).
-    pub(crate) fn take_failure(&self) -> Option<String> {
-        match self {
-            #[cfg(target_arch = "wasm32")]
-            Dev::Wgpu(d) => d.web.fault.get(),
-            #[cfg(not(target_arch = "wasm32"))]
-            Dev::Wgpu(_) => None,
-            #[cfg(target_os = "macos")]
-            Dev::Metal(d) => d.take_failure(),
-        }
-    }
-
-    /// Captures allocation and validation errors until `ErrorScope::finish` (see
-    /// `Gpu::checked`).
+    /// Captures allocation and validation errors until [`Dev::finish_errors`] (see
+    /// `Gpu::captured`).
     pub(crate) fn error_scope(&self) -> ErrorScope {
         match self {
             Dev::Wgpu(d) => ErrorScope::Wgpu(d.error_scope()),
             #[cfg(target_os = "macos")]
             Dev::Metal(d) => {
                 d.capture();
-                ErrorScope::None
+                ErrorScope::Metal
             }
+        }
+    }
+
+    /// The first error captured since `scope` began, which this ends: every device's
+    /// way of reporting one (an error scope, the browser's fault, a failed Metal
+    /// allocation) in one place.
+    pub(crate) fn finish_errors(&self, scope: ErrorScope) -> Option<String> {
+        match (self, scope) {
+            (Dev::Wgpu(d), ErrorScope::Wgpu(s)) => d.finish_errors(s),
+            #[cfg(target_os = "macos")]
+            (Dev::Metal(d), ErrorScope::Metal) => d.take_failure(),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("an error scope of another device"),
         }
     }
 }
@@ -264,16 +265,7 @@ impl Dev {
 /// Errors captured since `Dev::error_scope`.
 pub(crate) enum ErrorScope {
     Wgpu(wgpu::ErrorScope),
-    /// (Metal reports a failed allocation at the call)
-    #[allow(dead_code)]
-    None,
-}
-
-impl ErrorScope {
-    pub(crate) fn finish(self) -> Option<String> {
-        match self {
-            ErrorScope::Wgpu(s) => s.finish(),
-            ErrorScope::None => None,
-        }
-    }
+    /// Metal reports a failed allocation itself (see `MetalDev::capture`).
+    #[cfg(target_os = "macos")]
+    Metal,
 }

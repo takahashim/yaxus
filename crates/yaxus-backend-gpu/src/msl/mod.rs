@@ -2,7 +2,7 @@
 //! (`Features::PASSTHROUGH_SHADERS`). wgpu binds the immediates at `buffer(0)` and binding
 //! `i` of bind group 0 at `buffer(i + 1)`, and sets no threadgroup memory length, so the
 //! kernels declare their threadgroup arrays inside the function. A source starts with the
-//! line `// msl workgroup_size=N` (see `kernels::compile_kernel`).
+//! line `// msl workgroup_size=N` (see `dev::Compiler::compile`).
 //!
 //! Each source starts with `#pragma METAL fp math_mode(safe)`: Metal compiles WGSL with
 //! fast math, which wgpu cannot turn off; here the compiler keeps the arithmetic as written,
@@ -15,7 +15,7 @@ mod small;
 
 pub(crate) use gemm::{Gemm, gemm_reads};
 pub(crate) use gemv2::{Gemv2, gemv2_reads};
-pub(crate) use small::small_kernels;
+pub(crate) use small::{add_norm as add_norm_source, qk_rope as qk_rope_source, rmsnorm as rmsnorm_source};
 
 /// The marker line of an MSL source and its workgroup size.
 pub(crate) fn header(workgroup_size: u32) -> String {

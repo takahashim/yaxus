@@ -7,19 +7,27 @@ use super::{PRELUDE, header};
 /// partials, two threadgroup barriers per sum instead of the WGSL kernels' tree. Same
 /// bindings and immediates as `RMSNORM`, `ADD_NORM` and `QK_ROPE` (whose fourth immediate,
 /// unused there, gives the rope table's length here: MSL has no `arrayLength`).
-pub(crate) fn small_kernels() -> Vec<(&'static str, String, &'static [bool])> {
-    let k = |body: &str, size: u32| {
-        let mut s = header(size);
-        s.push_str(PRELUDE);
-        s.push_str(SUM);
-        s.push_str(body);
-        s
-    };
-    vec![
-        ("rmsnorm_msl", k(RMSNORM, 256), &[false, true, true]),
-        ("add_norm_msl", k(ADD_NORM, 256), &[false, false, true, true, true]),
-        ("qk_rope_msl", k(QK_ROPE, 128), &[false, false, false, true, true, true, true, true]),
-    ]
+fn kernel(body: &str, size: u32) -> String {
+    let mut s = header(size);
+    s.push_str(PRELUDE);
+    s.push_str(SUM);
+    s.push_str(body);
+    s
+}
+
+/// `rmsnorm` in MSL (see [`kernel`]).
+pub(crate) fn rmsnorm() -> String {
+    kernel(RMSNORM, 256)
+}
+
+/// `add_norm` in MSL.
+pub(crate) fn add_norm() -> String {
+    kernel(ADD_NORM, 256)
+}
+
+/// `qk_rope` in MSL.
+pub(crate) fn qk_rope() -> String {
+    kernel(QK_ROPE, 128)
 }
 
 const SUM: &str = "
