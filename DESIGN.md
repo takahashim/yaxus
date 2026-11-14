@@ -484,7 +484,11 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
 - 認証はトークン必須、TLS はローカル CA を自動生成。
 - 長文は段落単位で分け、文書のチェーンで並列に訳す (既定は自動のチェーン数 + チェーン内の履歴)。
-- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路と `Engine`、runtime の文書ループを再利用する (§2.2)。greedy、0.8B、1 セグメント 4096 トークン。push constants は uniform バッファで置き換え、読み戻しだけ async にする。Worker で動かし、GPU のエラーのあとは Worker ごと作り直す。
+- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路と `Engine`、runtime の文書ループを再利用する (§2.2)。greedy、0.8B、1 セグメントは最大 4096 トークン。チェーンは最大 4 本 (既定は 1) まで同じパスで進める。長文は段落に加えて文にも分ける (native は段落まで)。push constants は uniform バッファで置き換え、読み戻しだけ async にする。Worker で動かし、翻訳の中止はステップの合間に確かめ、GPU のエラーのあとは Worker ごと作り直す。
+- エンジンの 1 ステップは非同期 (`Generator::step_async`)。WebGPU は GPU の完了を待てないので、ブラウザ版が native と同じ `Engine` を使うために要る。native のバックエンドではステップがすぐ終わるので、CLI と server は `poll_once` / `block_on` で回す。同期の入口 (`SyncGenerator`、`score`) は native のバックエンドだけが持つ。
+- 取り消しは `Engine::cancel`。呼べるのはステップの合間だけ (ステップの Future がエンジンを借りている間は呼べない)。待機中の要求は始めず、実行中の要求は次のパスを受けず、どちらも次のステップで `Done { Cancelled }` で終わる。KV は prefix の再利用のために残す。文書が止まったとき (出力先が受け取りを拒んだ、セグメントが失敗した、クライアントが去った) は、その文書の待機中と実行中の要求をすべて取り消す。
+- モデルの読み込みは、プラットフォームごとの端が持つ。native は `yaxus-native` (解決、設定、読み込み)、ブラウザは `yaxus-browser` (非同期にデバイスを開き、メモリ上の GGUF から作る)。`yaxus-runtime` はバックエンドを知らず、読み込まれたエンジンを `Generator` として受け取る。`yaxus-native` と `yaxus-runtime` は互いに依存せず、フロントエンドが組み合わせる。
+- エンジンのステップが失敗した (バックエンドのエラー、または panic) ときは、そのエンジンの状態を信用せず、二度と呼ばない。生きていた要求はすべて失敗にし、server は推論スレッドを止めて、再起動に任せる (`/healthz` は ok でなくなる)。ブラウザ版は Worker ごと作り直す。要求ごとの失敗 (プロンプトが長すぎるなど) は、エンジンを使えなくしない。
 
 試して採らなかったもの (詳細は経緯):
 
@@ -502,3 +506,5 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 2B 本体の 4 ビット化の品質評価。
 - ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
 - ブラウザ版で、モデルの再選択を省くキャッシュ (OPFS)。
+- 文書を進める手順の置き場所。状態と反応は `DocRun` にあるが、停止時のエンジンの取り消しと、終わったセグメントの次の投入は、それを駆動するループ (CLI とブラウザの `DocRunner`、server の `scheduler`) がそれぞれに書いている。キャンセルを足したとき (経緯 14) に両方へ書き足す形になった。`DocRun` にステップの合間の処理を移し、出力先を trait にして 1 か所にする案がある。ジョブごとの async fn と Driver に作り直す案は、費用に見合わないとして取り下げた (経緯 14)。
+- ブラウザ版で独立した翻訳を並行して走らせること (今は 1 件ずつ)。前提は、ステップ単位の GPU のエラースコープ (複数の要求が同じパスに乗ると、遅れて届くエラーをどの翻訳のものか決められない) と、`&self` でジョブを積む `translate` (wasm-bindgen の `&mut self` を await 中に再入できない)。要件が出るまで保留する。ほかの未決の点は [discussions/async-engine.md](discussions/async-engine.md) の「決めきれていない点」。
