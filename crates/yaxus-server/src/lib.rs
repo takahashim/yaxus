@@ -30,9 +30,10 @@ use yaxus_api::{
     Collector, DocumentCollector, DocumentRequest, ErrorCode, Health, HealthStatus, LANGUAGES, Language,
     TranslateCollector, TranslateRequest,
 };
+use yaxus_native::{LoadOptions, load_generator, load_tokenizer, quant_label};
+use yaxus_runtime::Prompt;
 use yaxus_runtime::document::DocJob;
 use yaxus_runtime::scheduler::{Job, Sink, Work, prompt_error};
-use yaxus_runtime::{LoadOptions, Prompt, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
 use auth::{AccessToken, TokenSource};

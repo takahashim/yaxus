@@ -186,6 +186,13 @@ impl Tokenizer {
         Self::build(tokens, kinds, scores)
     }
 
+    /// [`from_vocab`](Self::from_vocab) for the `tokenizer.ggml.*` metadata of a GGUF file:
+    /// `types` are llama.cpp token types (see [`TokenKind::from_ggml_type`]).
+    pub fn from_ggml_vocab(tokens: Vec<String>, types: &[i32], scores: Vec<f64>) -> Result<Self, Error> {
+        let kinds = types.iter().map(|&t| TokenKind::from_ggml_type(t)).collect();
+        Self::from_vocab(tokens, kinds, scores)
+    }
+
     /// Builds the tokenizer from a vocabulary given as parallel arrays (e.g. the
     /// `tokenizer.ggml.*` metadata of a GGUF file).
     pub fn from_vocab(tokens: Vec<String>, kinds: Vec<TokenKind>, scores: Vec<f64>) -> Result<Self, Error> {

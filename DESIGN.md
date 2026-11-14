@@ -144,7 +144,8 @@ yaxus/
     yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・KV アリーナ・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32、rayon)。正しさの基準とフォールバック
     yaxus-backend-gpu/     # GPU バックエンド (wgpu で Vulkan / Metal、または Metal 直接。手書きの WGSL と MSL のカーネル)
-    yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。`native/` (モデルの解決、読み込みの設定、読み込み) 以外は wasm32 でも動く
+    yaxus-runtime/         # プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。ロード済みのエンジンの上で翻訳を走らせる部分で、サーバ・CLI・ブラウザが共有する。wasm32 でも動く
+    yaxus-native/          # native のバックエンド (CPU、Vulkan、Metal) へのモデルの解決 (ディレクトリ、GGUF、Hugging Face のキャッシュ)・読み込みの設定 (バックエンド、精度、下書き)・読み込み
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
       ui/                  # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
@@ -154,9 +155,45 @@ yaxus/
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
 ```
 
-`yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
+クレートの依存は次のとおり (通常の依存のうち、ほかの経路から導けるものは省いた。たとえば `yaxus-server` は `yaxus-runtime` を通じて `yaxus-api` や `yaxus-tokenizer` にも届く)。依存は上から下へ流れ、循環はない。`yaxus-runtime` はバックエンドを知らず、モデルの読み込みはプラットフォームごとの端 (native は `yaxus-native`、ブラウザは `yaxus-browser`) が受け持つ。
 
-サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
+```mermaid
+graph TD
+  subgraph front["フロントエンド"]
+    cli[yaxus-cli]
+    server[yaxus-server]
+    browser["yaxus-browser<br/>(wasm32 + WebGPU)"]
+  end
+  native[yaxus-native]
+  runtime[yaxus-runtime]
+  pfml[yaxus-pfml]
+  gpu[yaxus-backend-gpu]
+  cpu[yaxus-backend-cpu]
+  model[yaxus-model]
+  api[yaxus-api]
+  tok[yaxus-tokenizer]
+
+  cli --> server
+  cli -->|"feature local"| native
+  cli -->|"feature local"| runtime
+  server --> native
+  server --> runtime
+  browser --> runtime
+  browser --> gpu
+  native --> gpu
+  native --> cpu
+  native --> tok
+  runtime --> pfml
+  runtime --> model
+  pfml --> api
+  pfml --> tok
+  gpu --> model
+  cpu --> model
+```
+
+`yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-native` と `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
+
+サーバとローカル実行で共通の部分 (文書、翻訳メモリ、推論ループ) は `yaxus-runtime` に置き、モデルの読み込みは native 側の `yaxus-native` が受け持つ。ブラウザは読み込みだけを自前で持ち (`yaxus-browser`、非同期にデバイスを開き、メモリ上の GGUF から作る)、その上の部分は同じ `yaxus-runtime` を使う。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
 
 1 件の要求がエンジン上でたどる処理 (停止トークン、翻訳メモリのヒント、トークンから文字列への復号、終わったら出力をメモリへ) は `yaxus_runtime::Session<T>` の 1 か所にある。`T` はその要求の持ち主で、サーバのワーカーでは HTTP の接続 (単文) か文書の段落、`run_document` では段落の番号、`run_request` では無し。呼び出し側は `Session::step_async` が返す更新 (`Delta`、`Done`、`Failed`) を持ち主へ届けるだけ。エンジンは `Generator` (非同期の `step_async`、`Send` を要求しない)。同期の `step` と `generate` は `SyncGenerator` にあり、`SyncReadback` のバックエンドの `Engine` だけが実装する。`score` もそちらにある (読み戻しを待つため)。`run_document` と `run_request` はそれを使い、`DocRunner` (中止の確認つきで、await して文書を訳す) と `run_request_async` は `Generator` のすべてに使える。文書の進行は `DocRun` が持ち、`Session` の更新への反応 (`DocRun::on_update` が返す `Reaction`) は、`DocRunner` とサーバーの `scheduler` の両方が使う。
 
@@ -447,7 +484,11 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
 - 認証はトークン必須、TLS はローカル CA を自動生成。
 - 長文は段落単位で分け、文書のチェーンで並列に訳す (既定は自動のチェーン数 + チェーン内の履歴)。
-- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路と `Engine`、runtime の文書ループを再利用する (§2.2)。greedy、0.8B、1 セグメント 4096 トークン。push constants は uniform バッファで置き換え、読み戻しだけ async にする。Worker で動かし、GPU のエラーのあとは Worker ごと作り直す。
+- ブラウザ版は wasm32 + WebGPU で、GPU バックエンドの f32 経路と `Engine`、runtime の文書ループを再利用する (§2.2)。greedy、0.8B、1 セグメントは最大 4096 トークン。チェーンは最大 4 本 (既定は 1) まで同じパスで進める。長文は段落に加えて文にも分ける (native は段落まで)。push constants は uniform バッファで置き換え、読み戻しだけ async にする。Worker で動かし、翻訳の中止はステップの合間に確かめ、GPU のエラーのあとは Worker ごと作り直す。
+- エンジンの 1 ステップは非同期 (`Generator::step_async`)。WebGPU は GPU の完了を待てないので、ブラウザ版が native と同じ `Engine` を使うために要る。native のバックエンドではステップがすぐ終わるので、CLI と server は `poll_once` / `block_on` で回す。同期の入口 (`SyncGenerator`、`score`) は native のバックエンドだけが持つ。
+- 取り消しは `Engine::cancel`。呼べるのはステップの合間だけ (ステップの Future がエンジンを借りている間は呼べない)。待機中の要求は始めず、実行中の要求は次のパスを受けず、どちらも次のステップで `Done { Cancelled }` で終わる。KV は prefix の再利用のために残す。文書が止まったとき (出力先が受け取りを拒んだ、セグメントが失敗した、クライアントが去った) は、その文書の待機中と実行中の要求をすべて取り消す。
+- モデルの読み込みは、プラットフォームごとの端が持つ。native は `yaxus-native` (解決、設定、読み込み)、ブラウザは `yaxus-browser` (非同期にデバイスを開き、メモリ上の GGUF から作る)。`yaxus-runtime` はバックエンドを知らず、読み込まれたエンジンを `Generator` として受け取る。`yaxus-native` と `yaxus-runtime` は互いに依存せず、フロントエンドが組み合わせる。
+- エンジンのステップが失敗した (バックエンドのエラー、または panic) ときは、そのエンジンの状態を信用せず、二度と呼ばない。生きていた要求はすべて失敗にし、server は推論スレッドを止めて、再起動に任せる (`/healthz` は ok でなくなる)。ブラウザ版は Worker ごと作り直す。要求ごとの失敗 (プロンプトが長すぎるなど) は、エンジンを使えなくしない。
 
 試して採らなかったもの (詳細は経緯):
 
@@ -461,7 +502,8 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - Apple GPU の 1 行のパス (M2 の 2B で 21〜24 ms。llama.cpp は約 21 ms)。行列積はほぼ帯域の上限なので、残りは小さなカーネルの融合 (経緯 12.10)。
 - Metal 直接のデバイスを macOS の既定にするか (いまは wgpu と同じ速さ)。GPU に閉じたデコードループは、ホストの時間が 2% ほどなので後回し (経緯 12.10)。
 - 8×8 の行列演算が `fma` の鎖と一致する性質は M2 でしか測っていない。M1、M3 以降で `gemv2` が起動時の検査に通るか。
-- 16 並列のデコードの合計速度 (経緯 11.17 で 220 tok/s に届かなかった)。
 - 2B 本体の 4 ビット化の品質評価。
 - ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
 - ブラウザ版で、モデルの再選択を省くキャッシュ (OPFS)。
+- 文書を進める手順の置き場所。状態と反応は `DocRun` にあるが、停止時のエンジンの取り消しと、終わったセグメントの次の投入は、それを駆動するループ (CLI とブラウザの `DocRunner`、server の `scheduler`) がそれぞれに書いている。キャンセルを足したとき (経緯 14) に両方へ書き足す形になった。`DocRun` にステップの合間の処理を移し、出力先を trait にして 1 か所にする案がある。ジョブごとの async fn と Driver に作り直す案は、費用に見合わないとして取り下げた (経緯 14)。
+- ブラウザ版で独立した翻訳を並行して走らせること (今は 1 件ずつ)。前提は、ステップ単位の GPU のエラースコープ (複数の要求が同じパスに乗ると、遅れて届くエラーをどの翻訳のものか決められない) と、`&self` でジョブを積む `translate` (wasm-bindgen の `&mut self` を await 中に再入できない)。要件が出るまで保留する。ほかの未決の点は [discussions/async-engine.md](discussions/async-engine.md) の「決めきれていない点」。

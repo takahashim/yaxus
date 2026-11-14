@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Args;
 use yaxus_model::Quant;
-use yaxus_runtime::{
-    BackendKind, Prompt, ResolvedModel, STOP_TOKENS, Scheduling, load_tokenizer, quant_label, run_request,
-};
+use yaxus_native::{BackendKind, ResolvedModel, Scheduling, load_tokenizer, quant_label};
+use yaxus_runtime::{Prompt, STOP_TOKENS, run_request};
 
 use crate::LangArgs;
 
@@ -36,19 +35,19 @@ pub struct ModelArgs {
     /// to 15 bits), int8 (7 bits as llama.cpp does: 1.5x faster than int16, logits move
     /// ~100x more), f16 (matrix cores; on Metal, 8x8 matrices in f32) or f32 (reference).
     #[arg(global = true, long, default_value = "auto")]
-    prefill_precision: yaxus_runtime::Prefill,
+    prefill_precision: yaxus_native::Prefill,
     /// Arithmetic of GPU decoding (passes of up to 16 rows: decode steps, verification of
     /// drafts, short prompts): auto (the device's choice: int16 on AMD GPUs, f32 on Apple
     /// GPUs), int16 (integer dot products, activations rounded to 15 bits; several rows
     /// cost little more than one) or f32 (reference).
     #[arg(global = true, long, default_value = "auto")]
-    decode_precision: yaxus_runtime::Decode,
+    decode_precision: yaxus_native::Decode,
     /// Draft model for speculative decoding: a directory, repo id or size (see --model),
     /// `auto` (from the local cache: the Q2_K file of pfnet/plamo-3-translate-0.8b-GGUF, else
     /// pfnet/plamo-3-translate-0.8b, else the Q4_K_M file) or `none`.
     /// The output is identical with or without it; only the speed differs.
     #[arg(global = true, long, default_value = "auto")]
-    draft: yaxus_runtime::DraftSpec,
+    draft: yaxus_native::DraftSpec,
     /// Most tokens the draft model proposes per round (the length adapts to how often
     /// they are accepted).
     #[arg(global = true, long, default_value_t = 7)]
@@ -80,13 +79,13 @@ impl ModelArgs {
     /// changes the speed of generation, never its output, and would only be loaded.
     fn no_draft_unless_generating(&mut self, via: &crate::polish::Via) {
         if *via == crate::polish::Via::Direct {
-            self.draft = yaxus_runtime::DraftSpec::None;
+            self.draft = yaxus_native::DraftSpec::None;
         }
     }
 
     /// The draft model for the target at `target` (from [`ModelArgs::resolve`]).
-    fn draft_options(&self, target: &Path) -> Result<Option<yaxus_runtime::DraftOptions>> {
-        Ok(yaxus_runtime::resolve_draft(&self.draft, target)?.map(|dir| yaxus_runtime::DraftOptions {
+    fn draft_options(&self, target: &Path) -> Result<Option<yaxus_native::DraftOptions>> {
+        Ok(yaxus_native::resolve_draft(&self.draft, target)?.map(|dir| yaxus_native::DraftOptions {
             dir,
             k: self.draft_k,
             quant: self.draft_quant,
@@ -94,11 +93,11 @@ impl ModelArgs {
     }
 
     fn resolve(&self) -> Result<ResolvedModel> {
-        yaxus_runtime::resolve_model(&self.model)
+        yaxus_native::resolve_model(&self.model)
     }
 
-    fn load_options(&self, target: &Path) -> Result<yaxus_runtime::LoadOptions> {
-        Ok(yaxus_runtime::LoadOptions {
+    fn load_options(&self, target: &Path) -> Result<yaxus_native::LoadOptions> {
+        Ok(yaxus_native::LoadOptions {
             backend: self.backend,
             quant: self.quant,
             draft: self.draft_options(target)?,
@@ -120,7 +119,7 @@ impl ModelArgs {
 
     /// Loads the model at `dir` (from [`ModelArgs::resolve`]).
     fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::SyncGenerator + Send>> {
-        yaxus_runtime::load_generator(dir, &self.load_options(dir)?)
+        yaxus_native::load_generator(dir, &self.load_options(dir)?)
     }
 }
 

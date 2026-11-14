@@ -9,18 +9,16 @@ use yaxus_backend_gpu::{Gemv, GpuBackend};
 use yaxus_model::{Engine, Model, ModelOptions, Quant, SyncGenerator, SyncReadback};
 use yaxus_tokenizer::Tokenizer;
 
-use super::options::{BackendKind, DraftOptions, LoadOptions};
+use crate::options::{BackendKind, DraftOptions, LoadOptions};
 
 /// The tokenizer of a model: `tokenizer.jsonl` of a Hugging Face directory, or the
 /// vocabulary embedded in a GGUF file.
 pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
-    use yaxus_tokenizer::TokenKind;
     if !yaxus_model::gguf::is_gguf(model) {
         return Ok(Tokenizer::from_file(model.join("tokenizer.jsonl"))?);
     }
     let v = yaxus_model::gguf::Gguf::open(model)?.vocab()?;
-    let kinds = v.types.iter().map(|&t| TokenKind::from_ggml_type(t)).collect();
-    Ok(Tokenizer::from_vocab(v.tokens, kinds, v.scores)?)
+    Ok(Tokenizer::from_ggml_vocab(v.tokens, &v.types, v.scores)?)
 }
 
 /// Loads the model (and optional draft model) on the requested backend.

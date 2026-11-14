@@ -24,6 +24,7 @@ yaxus-pfml = { path = "../yaxus-pfml" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-model = { path = "../yaxus-model" }
 yaxus-runtime = { path = "../yaxus-runtime" }
+yaxus-native = { path = "../yaxus-native" }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
