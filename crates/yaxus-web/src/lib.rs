@@ -215,13 +215,23 @@ impl Translator {
         if self.broken {
             return Err(JsError::new("the GPU failed earlier; load the model again"));
         }
-        match self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await {
-            Ok(stats) => Ok(stats),
-            Err(Failure::Request(e)) => Err(e),
-            Err(Failure::Device(e)) => {
+        // The whole request runs inside an error scope, settled before it returns: an
+        // error WebGPU reports late fails this translation, not the next one (`Fault`
+        // and the read-backs only see what has arrived by then).
+        let watch = self.model.backend.watch_errors();
+        let result = self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await;
+        let scope = watch.finish().await;
+        match (result, scope) {
+            (Err(Failure::Device(e)), _) => {
                 self.broken = true;
                 Err(e)
             }
+            (_, Err(e)) => {
+                self.broken = true;
+                Err(jserr(e))
+            }
+            (Ok(stats), Ok(())) => Ok(stats),
+            (Err(Failure::Request(e)), Ok(())) => Err(e),
         }
     }
 }

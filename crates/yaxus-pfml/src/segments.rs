@@ -168,30 +168,53 @@ fn split_long(sentence: &str, tok: &Tokenizer, budget: usize) -> Vec<String> {
 }
 
 /// A word longer than the budget, cut at characters: each piece is the longest prefix
-/// of the rest within the budget, found by bisection (a few encodes per piece rather
-/// than one per character). A piece has at least one character, which may itself
-/// exceed a tiny budget.
+/// of the rest within the budget. The search looks only near the next cut, so a piece
+/// costs a few encodes of about its own length, whatever the length of the rest. It
+/// starts from the length of the piece before, and alternates a guess from the tokens
+/// per character just measured (text of one kind is nearly uniform, so this lands close)
+/// with a step that halves the bracket (or doubles the length while no prefix has been
+/// too long), which bounds it at twice a bisection. A piece has at least one character,
+/// which may itself exceed a tiny budget.
 fn split_chars(word: &str, tok: &Tokenizer, budget: usize) -> Vec<String> {
+    // The byte offset after the first `n` characters of `s` (all of `s` if shorter).
+    let end_of = |s: &str, n: usize| s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
     let mut out = Vec::new();
     let mut rest = word;
+    let mut guess = budget.max(1);
     while !rest.is_empty() {
-        if count(tok, rest) <= budget {
-            out.push(rest.to_string());
-            break;
-        }
-        // Ends of the prefixes of 1, 2, ... characters; the whole rest is too long.
-        let ends: Vec<usize> = rest.char_indices().skip(1).map(|(i, _)| i).chain([rest.len()]).collect();
-        let (mut fits, mut too_long) = (0, ends.len() - 1);
-        while too_long - fits > 1 {
-            let mid = (fits + too_long) / 2;
-            if count(tok, &rest[..ends[mid]]) <= budget {
-                fits = mid;
+        // `fits` characters are known to fit (0: none yet), `too_long` known not to.
+        let (mut fits, mut too_long) = (0usize, None::<usize>);
+        let mut probe = guess;
+        for step in 1.. {
+            let end = end_of(rest, probe);
+            let tokens = count(tok, &rest[..end]);
+            if tokens <= budget {
+                if end == rest.len() {
+                    out.push(rest.to_string());
+                    return out;
+                }
+                fits = probe;
             } else {
-                too_long = mid;
+                too_long = Some(probe);
             }
+            let hi = too_long.unwrap_or(usize::MAX);
+            if hi - fits <= 1 {
+                break;
+            }
+            probe = if step % 2 == 1 {
+                (probe * budget / tokens.max(1)).clamp(fits + 1, hi - 1)
+            } else {
+                match too_long {
+                    Some(hi) => fits + (hi - fits) / 2,
+                    None => fits * 2,
+                }
+            };
         }
-        out.push(rest[..ends[fits]].to_string());
-        rest = &rest[ends[fits]..];
+        let n = fits.max(1);
+        let end = end_of(rest, n);
+        out.push(rest[..end].to_string());
+        rest = &rest[end..];
+        guess = n;
     }
     out
 }
