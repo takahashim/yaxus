@@ -149,17 +149,44 @@ pub(crate) fn ggml_largest_buffer(dtype: yaxus_model::ggml::GgmlType, n: usize, 
     })
 }
 
-/// The largest buffer of matrix `t` loaded with `quant` when the format is left to the
-/// backend (`Auto`, `Auto4`): the file's GPU layout, else Q8 for `Auto`. `None` for an
-/// explicit format, a 4-bit one, or a vector.
-fn planned_largest_buffer(t: &TensorRef, quant: Quant) -> Option<usize> {
-    use yaxus_model::ggml::GgmlType;
-    let &[n, k] = &t.shape[..] else { return None };
-    let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
-    match quant {
-        Quant::Auto => ggml_largest_buffer(t.dtype, n, k).or_else(|| ggml_largest_buffer(GgmlType::Q8_0, n, k)),
-        Quant::Auto4 if low_bit => ggml_largest_buffer(t.dtype, n, k),
-        _ => None,
+/// How a matrix is stored, decided from the tensor and the requested `quant` alone, so
+/// that loading it ([`Gpu::load_weight`]) and sizing it before the device is open
+/// ([`GpuBackend::largest_weight_bytes`]) cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixPlan {
+    /// The file's GGUF blocks in their GPU layout (`load_ggml`).
+    FileLayout,
+    /// Converted from bf16 to `Q8`, `Q4` or kept as `Bf16` (`load_matrix`).
+    Convert(Quant),
+}
+
+impl MatrixPlan {
+    /// The plan for matrix `t` with `quant`: `Auto` keeps any GGUF type with a GPU layout,
+    /// `Auto4` only those of at most 4 bits; what is not kept becomes Q8 (`Auto`) or Q4
+    /// (`Auto4`).
+    fn of(t: &TensorRef, quant: Quant) -> Self {
+        use yaxus_model::ggml::GgmlType;
+        let has_layout = ggml_largest_buffer(t.dtype, 1, 256).is_some();
+        let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
+        match quant {
+            Quant::Auto if has_layout => MatrixPlan::FileLayout,
+            Quant::Auto4 if has_layout && low_bit => MatrixPlan::FileLayout,
+            Quant::Auto => MatrixPlan::Convert(Quant::Q8),
+            Quant::Auto4 => MatrixPlan::Convert(Quant::Q4),
+            q => MatrixPlan::Convert(q),
+        }
+    }
+
+    /// The largest buffer an `[n, k]` matrix of `dtype` takes with this plan.
+    fn largest_buffer(self, dtype: yaxus_model::ggml::GgmlType, n: usize, k: usize) -> usize {
+        use yaxus_model::ggml::GgmlType;
+        let largest = |t: GgmlType| ggml_largest_buffer(t, n, k).expect("a type with a GPU layout");
+        match self {
+            MatrixPlan::FileLayout => largest(dtype),
+            MatrixPlan::Convert(Quant::Q4) => largest(GgmlType::Q4_0),
+            MatrixPlan::Convert(Quant::Bf16) => n * k * 2,
+            MatrixPlan::Convert(_) => largest(GgmlType::Q8_0),
+        }
     }
 }
 
@@ -182,10 +209,10 @@ impl GpuBackend {
             .map(|(name, t)| {
                 let bytes = if name == yaxus_model::EMBED_TOKENS {
                     if embedding_stays_q4k(t) { t.bytes().len() } else { t.numel() * 2 }
-                } else if t.shape.len() == 1 {
-                    t.numel() * 4
+                } else if let &[n, k] = &t.shape[..] {
+                    MatrixPlan::of(t, Quant::Auto).largest_buffer(t.dtype, n, k)
                 } else {
-                    planned_largest_buffer(t, Quant::Auto).unwrap_or(t.numel() * 2)
+                    t.numel() * 4
                 };
                 bytes as u64
             })
@@ -219,16 +246,17 @@ impl Gpu {
             return Ok(Weight::Vector(self.upload("vector", bytemuck::cast_slice(&v))));
         }
         let (n, k) = (t.shape[0], t.shape[1]);
-        use yaxus_model::ggml::GgmlType;
-        let low_bit = matches!(t.dtype, GgmlType::Q4_0 | GgmlType::Q4K | GgmlType::Q3K | GgmlType::Q2K);
-        let file_format = quant == Quant::Auto || (quant == Quant::Auto4 && low_bit);
+        let plan = MatrixPlan::of(t, quant);
         // A matrix whose buffers one storage binding cannot cover in the format chosen for
         // it is read at 4 bits instead (only when the format was left to us). Each buffer
         // is bound on its own: the 0.8B's Q6_K output is 135 MB in the file but its
         // largest buffer is 124 MB, which a 128 MB binding covers. Native devices bind
         // far more.
-        let planned = planned_largest_buffer(t, quant);
-        if planned.is_some_and(|b| b as u64 > self.dev.max_binding()) {
+        let format_left_to_us = matches!(quant, Quant::Auto | Quant::Auto4);
+        if format_left_to_us
+            && plan != MatrixPlan::Convert(Quant::Q4)
+            && plan.largest_buffer(t.dtype, n, k) as u64 > self.dev.max_binding()
+        {
             eprintln!(
                 "[weights] a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
                 t.dtype.name(),
@@ -237,18 +265,23 @@ impl Gpu {
             self.reduced_to_q4 += 1;
             return self.load_matrix(&t.to_bf16_vec(), n, k, Quant::Q4).map(Weight::Matrix);
         }
-        if file_format && let Some(m) = self.load_gguf_matrix(t, n, k)? {
-            return Ok(Weight::Matrix(m));
-        }
-        let raw;
-        let bf16: &[u16] = match t.as_bf16() {
-            Some(b) => b,
-            None => {
-                raw = t.to_bf16_vec();
-                &raw
+        match plan {
+            MatrixPlan::FileLayout => {
+                let m = self.load_gguf_matrix(t, n, k)?;
+                Ok(Weight::Matrix(m.expect("`MatrixPlan::of` keeps only types with a GPU layout")))
             }
-        };
-        self.load_matrix(bf16, n, k, quant).map(Weight::Matrix)
+            MatrixPlan::Convert(q) => {
+                let raw;
+                let bf16: &[u16] = match t.as_bf16() {
+                    Some(b) => b,
+                    None => {
+                        raw = t.to_bf16_vec();
+                        &raw
+                    }
+                };
+                self.load_matrix(bf16, n, k, q).map(Weight::Matrix)
+            }
+        }
     }
 
     pub(crate) fn load_matrix(&mut self, bf16: &[u16], n: usize, k: usize, quant: Quant) -> Result<Matrix> {
@@ -378,5 +411,47 @@ mod tests {
         let (n, k) = (107520, 1536);
         assert!(GgmlType::Q6K.bytes_for(n * k) > 128 << 20);
         assert!(ggml_largest_buffer(GgmlType::Q6K, n, k).unwrap() < 128 << 20);
+    }
+
+    /// The plan of each quantization and type, and that the size estimate follows it.
+    #[test]
+    fn matrix_plans_keep_the_file_layout_only_where_asked() {
+        use MatrixPlan::*;
+        let t = |dtype: GgmlType| {
+            let n = 4;
+            let k = 256;
+            let mut b = b"GGUF".to_vec();
+            b.extend(3u32.to_le_bytes());
+            b.extend(1u64.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+            b.extend(1u64.to_le_bytes());
+            b.push(b't');
+            b.extend(2u32.to_le_bytes());
+            b.extend((k as u64).to_le_bytes());
+            b.extend((n as u64).to_le_bytes());
+            let id = match dtype {
+                GgmlType::Bf16 => 30u32,
+                GgmlType::Q6K => 14,
+                GgmlType::Q4K => 12,
+                _ => unreachable!(),
+            };
+            b.extend(id.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+            b.resize(b.len().div_ceil(32) * 32 + dtype.bytes_for(n * k), 0);
+            yaxus_model::gguf::Gguf::parse(b).unwrap().tensors.remove(0).1
+        };
+        let (q6, q4k, bf16) = (t(GgmlType::Q6K), t(GgmlType::Q4K), t(GgmlType::Bf16));
+        assert_eq!(MatrixPlan::of(&q6, Quant::Auto), FileLayout);
+        assert_eq!(MatrixPlan::of(&q6, Quant::Auto4), Convert(Quant::Q4));
+        assert_eq!(MatrixPlan::of(&q4k, Quant::Auto4), FileLayout);
+        assert_eq!(MatrixPlan::of(&bf16, Quant::Auto), Convert(Quant::Q8));
+        assert_eq!(MatrixPlan::of(&q6, Quant::Bf16), Convert(Quant::Bf16));
+        // Sizes: the layout of the plan, not of the file.
+        assert_eq!(
+            FileLayout.largest_buffer(GgmlType::Q6K, 4, 256),
+            ggml_largest_buffer(GgmlType::Q6K, 4, 256).unwrap()
+        );
+        assert_eq!(Convert(Quant::Q8).largest_buffer(GgmlType::Bf16, 4, 256), 4 * 256);
+        assert_eq!(Convert(Quant::Q4).largest_buffer(GgmlType::Q6K, 4, 256), 4 * 256 / 2);
     }
 }
