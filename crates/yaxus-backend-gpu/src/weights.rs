@@ -190,6 +190,15 @@ impl MatrixPlan {
     }
 }
 
+/// The values of `t` as bf16: borrowed from the file when they are stored so, else
+/// converted.
+fn bf16_of(t: &TensorRef) -> std::borrow::Cow<'_, [u16]> {
+    match t.as_bf16() {
+        Some(b) => std::borrow::Cow::Borrowed(b),
+        None => std::borrow::Cow::Owned(t.to_bf16_vec()),
+    }
+}
+
 /// Whether the embedding table is kept as the file's Q4_K blocks (93 MB for the 0.8B
 /// instead of 330 MB in bf16), on every device: the browser needs the room and WebGPU's
 /// buffer limits, and native keeps the same numbers (the rows are the exact dequantized
@@ -229,15 +238,8 @@ impl Gpu {
             let table = self.upload("embedding-q4k", &q.data);
             return Ok(Weight::Embedding { table, h, fmt: Format::Q4K });
         }
-        let raw;
-        let bf16: &[u16] = match t.as_bf16() {
-            Some(b) => b,
-            None => {
-                raw = t.to_bf16_vec();
-                &raw
-            }
-        };
-        Ok(Weight::Embedding { table: self.upload("embedding", bytemuck::cast_slice(bf16)), h, fmt: Format::Bf16 })
+        let table = self.upload("embedding", bytemuck::cast_slice(&bf16_of(t)));
+        Ok(Weight::Embedding { table, h, fmt: Format::Bf16 })
     }
 
     pub(crate) fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
@@ -263,24 +265,14 @@ impl Gpu {
                 self.dev.max_binding()
             );
             self.reduced_to_q4 += 1;
-            return self.load_matrix(&t.to_bf16_vec(), n, k, Quant::Q4).map(Weight::Matrix);
+            return self.load_matrix(&bf16_of(t), n, k, Quant::Q4).map(Weight::Matrix);
         }
         match plan {
             MatrixPlan::FileLayout => {
                 let m = self.load_gguf_matrix(t, n, k)?;
                 Ok(Weight::Matrix(m.expect("`MatrixPlan::of` keeps only types with a GPU layout")))
             }
-            MatrixPlan::Convert(q) => {
-                let raw;
-                let bf16: &[u16] = match t.as_bf16() {
-                    Some(b) => b,
-                    None => {
-                        raw = t.to_bf16_vec();
-                        &raw
-                    }
-                };
-                self.load_matrix(bf16, n, k, q).map(Weight::Matrix)
-            }
+            MatrixPlan::Convert(q) => self.load_matrix(&bf16_of(t), n, k, q).map(Weight::Matrix),
         }
     }
 
