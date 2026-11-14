@@ -4,7 +4,7 @@ use yaxus_api::{DEFAULT_MAX_NEW_TOKENS, TranslateRequest};
 use yaxus_pfml::{PromptError, TranslationRequest, ValidRequest};
 use yaxus_tokenizer::Tokenizer;
 
-use crate::memory;
+use crate::memory::{self, MemoryKey};
 
 /// The prompt fields of an API request.
 pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
@@ -24,7 +24,7 @@ pub fn prompt_request(r: &TranslateRequest) -> TranslationRequest {
 #[derive(Debug, Clone)]
 pub struct Prompt {
     ids: Vec<u32>,
-    memo: u64,
+    memo: MemoryKey,
 }
 
 impl Prompt {
@@ -78,11 +78,11 @@ impl Prompt {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_parts(ids: Vec<u32>, memo: u64) -> Self {
+    pub(crate) fn from_parts(ids: Vec<u32>, memo: MemoryKey) -> Self {
         Prompt { ids, memo }
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<u32>, u64) {
+    pub(crate) fn into_parts(self) -> (Vec<u32>, MemoryKey) {
         (self.ids, self.memo)
     }
 }

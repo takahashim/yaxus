@@ -14,7 +14,7 @@ use anyhow::Result;
 use yaxus_model::{Event, Finish, Generator, ReqId, Request, StartInfo};
 use yaxus_tokenizer::{EOS_ID, StreamDecoder, TAG_ID, Tokenizer};
 
-use crate::memory::Memory;
+use crate::memory::{Memory, MemoryKey};
 use crate::prompt::Prompt;
 
 /// Tokens that end a translation (not part of it).
@@ -69,7 +69,7 @@ struct Live<T> {
     dec: StreamDecoder,
     text: String,
     tokens: Vec<u32>,
-    memo: u64,
+    memo: MemoryKey,
     prompt_tokens: usize,
     submitted: Instant,
     first_token: Option<Instant>,
@@ -306,13 +306,13 @@ mod tests {
     fn tokens_become_text_and_a_stop_goes_into_memory() {
         let tok = tokenizer();
         let mut memory = Memory::new(8);
-        memory.put(42, vec![HEL]);
+        memory.put(MemoryKey::raw(42), vec![HEL]);
         let mut engine = Script::default();
         // "é" is two byte tokens: the first completes no character yet.
         engine.steps.push_back(vec![token(1, HEL), token(1, LO), token(1, byte(0xC3))]);
         engine.steps.push_back(vec![token(1, byte(0xA9)), done(1, Finish::Stop, 4)]);
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        session.submit(Prompt::from_parts(vec![5, 6], 42), 32, "a");
+        session.submit(Prompt::from_parts(vec![5, 6], MemoryKey::raw(42)), 32, "a");
         assert_eq!(run_step(&mut session, None), ["a:Hel", "a:lo", "a:"]);
         assert_eq!(run_step(&mut session, None), ["a:é", "a:done:Helloé"]);
         assert!(session.is_idle());
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!((req.prompt.as_slice(), req.max_new_tokens), (&[5, 6][..], 32));
         assert_eq!(req.stop, STOP_TOKENS);
         assert_eq!(req.hint, [HEL], "the memory's tokens are the hint");
-        assert_eq!(memory.get(42), [HEL, LO, byte(0xC3), byte(0xA9)]);
+        assert_eq!(memory.get(MemoryKey::raw(42)), [HEL, LO, byte(0xC3), byte(0xA9)]);
     }
 
     #[test]
@@ -332,13 +332,13 @@ mod tests {
         // Ends inside a character: the decoder's tail comes out as a last Delta.
         engine.steps.push_back(vec![token(1, HEL), token(1, byte(0xC3)), done(1, Finish::Length, 2)]);
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        session.submit(Prompt::from_parts(vec![5], 7), 2, "a");
+        session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(7)), 2, "a");
         let seen = run_step(&mut session, None);
         assert_eq!(seen[..2], ["a:Hel", "a:"]);
         assert!(seen[2].starts_with("a:") && seen[2].len() > 2, "tail delta: {seen:?}");
         assert!(seen[3].starts_with("a:done:Hel"), "{seen:?}");
         drop(session);
-        assert!(memory.get(7).is_empty(), "a length cut is not remembered");
+        assert!(memory.get(MemoryKey::raw(7)).is_empty(), "a length cut is not remembered");
     }
 
     #[test]
@@ -354,15 +354,15 @@ mod tests {
         ]);
         engine.steps.push_back(vec![done(1, Finish::Cancelled, 1), Event::Error { id: 2, message: "boom".into() }]);
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
-        session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
+        session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(1)), 8, "a");
+        session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(2)), 8, "b");
         assert_eq!(run_step(&mut session, Some("Hel")), ["a:Hel", "b:lo"]);
         assert_eq!(run_step(&mut session, None), ["a:done:Hel", "b:failed"]);
         assert!(session.is_idle());
         drop(session);
         // Hel cancelled (false); lo kept; unknown request 9 refused; its error ignored.
         assert_eq!(engine.answers, [false, true, false, true, true, true]);
-        assert!(memory.get(1).is_empty(), "a cancelled request is not remembered");
+        assert!(memory.get(MemoryKey::raw(1)).is_empty(), "a cancelled request is not remembered");
     }
 
     #[test]
@@ -371,8 +371,8 @@ mod tests {
         let mut memory = Memory::new(8);
         let mut engine = Script::default();
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        let a = session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
-        let b = session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
+        let a = session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(1)), 8, "a");
+        let b = session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(2)), 8, "b");
         assert_eq!(session.cancel_where(|tag| *tag == "b"), 1);
         assert!(!session.is_idle(), "a request ends when the engine says so, at its next step");
         drop(session);
@@ -386,7 +386,7 @@ mod tests {
         let mut memory = Memory::new(8);
         let mut engine = Script::default();
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
+        session.submit(Prompt::from_parts(vec![5], MemoryKey::raw(1)), 8, "a");
         assert_eq!(session.abandon(), ["a"]);
         assert!(engine.cancelled.is_empty(), "the engine is not asked for anything");
     }

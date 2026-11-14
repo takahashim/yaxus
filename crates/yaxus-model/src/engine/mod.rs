@@ -143,10 +143,37 @@ struct Stream {
     hint: HintCursor,
     tuning: StreamTuning,
     start: StartInfo,
-    finish: Option<Finish>,
-    error: Option<String>,
+    outcome: Outcome,
     /// KV pages kept for the request from its start to its end (see [`Engine::admit`]).
     reserved: usize,
+}
+
+/// Whether a stream is running, or how it ended: one way only, which [`Engine::sweep`]
+/// then reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    Running,
+    Finished(Finish),
+    /// A failure of this request (not of the whole batch).
+    Failed(String),
+}
+
+impl Stream {
+    fn is_running(&self) -> bool {
+        self.outcome == Outcome::Running
+    }
+
+    /// Ends the running stream with `finish`.
+    fn end(&mut self, finish: Finish) {
+        debug_assert!(self.is_running(), "stream {} ended twice", self.req.id);
+        self.outcome = Outcome::Finished(finish);
+    }
+
+    /// Ends the running stream with a failure.
+    fn fail(&mut self, message: String) {
+        debug_assert!(self.is_running(), "stream {} ended twice", self.req.id);
+        self.outcome = Outcome::Failed(message);
+    }
 }
 
 /// Where the tokens of a speculative round come from.
@@ -285,9 +312,9 @@ impl<B: AsyncReadback> Engine<B> {
             self.pending.push(Event::Done { id, finish: Finish::Cancelled, generated: 0, start: StartInfo::default() });
             return true;
         }
-        match self.streams.iter_mut().find(|s| s.req.id == id && s.finish.is_none() && s.error.is_none()) {
+        match self.streams.iter_mut().find(|s| s.req.id == id && s.is_running()) {
             Some(s) => {
-                s.finish = Some(Finish::Cancelled);
+                s.end(Finish::Cancelled);
                 // (the draft's next run does not continue the one before, as when requests
                 // are dropped)
                 self.tuner.lose_sync();
@@ -309,7 +336,8 @@ impl<B: AsyncReadback> Engine<B> {
     pub async fn step_async(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
         // The ends of requests cancelled since the last step come first, so that a
         // cancelled stream is not given another pass and its pages are free for admission.
-        let cancelled = !self.pending.is_empty() || self.streams.iter().any(|s| s.finish.is_some());
+        let cancelled =
+            !self.pending.is_empty() || self.streams.iter().any(|s| matches!(s.outcome, Outcome::Finished(_)));
         for event in std::mem::take(&mut self.pending) {
             emit(event);
         }
@@ -335,7 +363,7 @@ impl<B: AsyncReadback> Engine<B> {
                 {
                     for &i in &decoding {
                         if let Err(e) = self.spec_round(i, emit).await {
-                            self.streams[i].error = Some(request_failure(e)?);
+                            self.streams[i].fail(request_failure(e)?);
                         }
                     }
                 } else {
@@ -346,7 +374,7 @@ impl<B: AsyncReadback> Engine<B> {
                     if let Err(e) = self.decode_step(&picked, emit).await {
                         let message = request_failure(e)?;
                         for &i in &picked {
-                            self.streams[i].error = Some(message.clone());
+                            self.streams[i].fail(message.clone());
                         }
                     }
                 }
@@ -433,8 +461,7 @@ impl<B: AsyncReadback> Engine<B> {
                         hint: HintCursor::default(),
                         tuning: StreamTuning::default(),
                         start,
-                        finish: None,
-                        error: None,
+                        outcome: Outcome::Running,
                         reserved: need,
                     });
                 }
@@ -493,7 +520,7 @@ impl<B: AsyncReadback> Engine<B> {
             Err(e) => {
                 let message = request_failure(e)?;
                 for &(i, _, _) in &plan {
-                    self.streams[i].error = Some(message.clone());
+                    self.streams[i].fail(message.clone());
                 }
             }
         }
@@ -548,7 +575,7 @@ impl<B: AsyncReadback> Engine<B> {
         self.rewind(i, base + 1 + m);
         for &t in props[..m].iter().chain(std::iter::once(&g[m])) {
             self.on_token(i, t, emit);
-            if self.streams[i].finish.is_some() {
+            if !self.streams[i].is_running() {
                 break;
             }
         }
@@ -647,16 +674,16 @@ impl<B: AsyncReadback> Engine<B> {
     fn on_token(&mut self, i: usize, tok: u32, emit: &mut dyn FnMut(Event) -> bool) {
         let s = &mut self.streams[i];
         if s.req.stop.contains(&tok) {
-            s.finish = Some(Finish::Stop);
+            s.end(Finish::Stop);
             self.end_token = Some(tok);
             return;
         }
         s.generated += 1;
         s.out.push(tok);
         if !emit(Event::Token { id: s.req.id, token: tok }) {
-            s.finish = Some(Finish::Cancelled);
+            s.end(Finish::Cancelled);
         } else if s.generated >= s.req.max_new_tokens {
-            s.finish = Some(Finish::Length);
+            s.end(Finish::Length);
         } else {
             s.phase = Phase::Decode { next: tok };
         }
@@ -666,27 +693,26 @@ impl<B: AsyncReadback> Engine<B> {
     fn sweep(&mut self, emit: &mut dyn FnMut(Event) -> bool) {
         let mut i = 0;
         while i < self.streams.len() {
-            let s = &self.streams[i];
-            if s.finish.is_none() && s.error.is_none() {
+            if self.streams[i].is_running() {
                 i += 1;
                 continue;
             }
             let s = self.streams.swap_remove(i);
-            match &s.error {
-                Some(msg) => {
+            match s.outcome {
+                Outcome::Running => unreachable!("only ended streams are removed"),
+                Outcome::Failed(message) => {
                     self.target.free_seq(s.ts);
                     if let (Some(d), Some(dm)) = (s.ds, self.draft.as_mut()) {
                         dm.free_seq(d);
                     }
-                    emit(Event::Error { id: s.req.id, message: msg.clone() });
+                    emit(Event::Error { id: s.req.id, message });
                 }
-                None => {
+                Outcome::Finished(finish) => {
                     self.target.finish(s.ts);
                     if let (Some(d), Some(dm)) = (s.ds, self.draft.as_mut()) {
                         dm.finish(d);
                     }
                     self.last_start = s.start;
-                    let finish = s.finish.unwrap();
                     emit(Event::Done { id: s.req.id, finish, generated: s.generated, start: s.start });
                     if self.cfg.response_cache > 0 && finish != Finish::Cancelled {
                         self.cache.put(self.cfg.response_cache, s.req.prompt, s.req.stop, s.out, finish);
