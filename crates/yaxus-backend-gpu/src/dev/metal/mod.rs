@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use anyhow::{Context, Result};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
@@ -96,6 +96,11 @@ unsafe impl Sync for MetalCompiler {}
 
 impl MetalCompiler {
     pub(crate) fn compile(&self, name: &str, src: &str, read_only: &[bool]) -> MetalKernel {
+        // (the compiler's autoreleased objects go with this pool, on whichever thread)
+        autoreleasepool(|_| self.compile_pooled(name, src, read_only))
+    }
+
+    fn compile_pooled(&self, name: &str, src: &str, read_only: &[bool]) -> MetalKernel {
         let Translated { msl, entry, threads, tg_memory, sized } = match crate::msl::workgroup_size(src) {
             Some(size) => Translated::msl(src, size),
             None => translate(src, read_only, self.settings).unwrap_or_else(|e| panic!("{name}: {e:#}")),
@@ -114,6 +119,8 @@ impl MetalCompiler {
             .unwrap_or_else(|| panic!("{name}: no function {entry}"));
         let pipeline =
             self.device.newComputePipelineStateWithFunction_error(&function).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let width = pipeline.threadExecutionWidth();
+        assert_eq!(width, 32, "{name}: SIMD-groups of {width} threads; the kernels are written for 32");
         MetalKernel { pipeline, threads, tg_memory, sized }
     }
 }
@@ -179,10 +186,14 @@ const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
 impl MetalDev {
     pub(crate) fn open(timed: bool) -> Result<(MetalDev, DeviceCaps)> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
-        // The kernels need Apple's 8x8 simdgroup matrices and 32-lane simdgroups.
+        // The kernels need Apple's 8x8 simdgroup matrices and 32-lane simdgroups: an Apple7
+        // GPU (M1 and later), or Mac2 on Apple silicon, as a virtual machine's paravirtual
+        // GPU is (the Mac2 family also holds Intel and AMD GPUs, of other widths; each
+        // pipeline's width is checked as it compiles).
+        let apple_silicon = cfg!(target_arch = "aarch64");
         anyhow::ensure!(
-            device.supportsFamily(MTLGPUFamily::Apple7),
-            "YAXUS_DEVICE=metal needs an Apple GPU of the Apple7 family or later (M1 and later), not {}",
+            device.supportsFamily(MTLGPUFamily::Apple7) || (apple_silicon && device.supportsFamily(MTLGPUFamily::Mac2)),
+            "YAXUS_DEVICE=metal needs an Apple silicon GPU (M1 and later, or its virtual machines'), not {}",
             device.name()
         );
         let queue = device.newCommandQueue().context("creating a Metal command queue")?;
@@ -223,6 +234,12 @@ impl MetalDev {
         self.device.maxBufferLength() as u64
     }
 
+    /// The largest buffer a kernel may bind: naga's `_mslBufferSizes` holds u32 lengths,
+    /// so a larger binding would be clamped to a wrong length rather than rejected.
+    pub(crate) fn max_binding(&self) -> u64 {
+        self.max_buffer().min(u32::MAX as u64)
+    }
+
     /// A buffer of `size` bytes, or a small one in its place when Metal cannot allocate it
     /// (reported by `take_failure`, so `Gpu::checked` returns an error).
     fn alloc(&self, size: u64) -> Retained<Buffer> {
@@ -253,15 +270,19 @@ impl MetalDev {
     /// (the CPU need not touch every page of a KV arena).
     pub(crate) fn storage(&mut self, _label: &str, size: u64) -> Buf {
         let b = self.alloc(size);
-        self.end_compute();
-        let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
-        blit.fillBuffer_range_value(&b, NSRange { location: 0, length: b.length() }, 0);
-        blit.endEncoding();
+        autoreleasepool(|_| {
+            self.end_compute();
+            let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
+            blit.fillBuffer_range_value(&b, NSRange { location: 0, length: b.length() }, 0);
+            blit.endEncoding();
+        });
         Buf(BufImpl::Metal(MBuf(b)))
     }
 
     fn with_bytes(&self, bytes: &[u8]) -> Retained<Buffer> {
-        let len = bytes.len().max(16);
+        // (a whole number of u32s, as wgpu's buffers: kernels see the same array lengths,
+        // except under 16 bytes, where wgpu's buffers are as short as 4)
+        let len = bytes.len().max(16).next_multiple_of(4);
         if bytes.len() < len {
             let mut padded = bytes.to_vec();
             padded.resize(len, 0);
@@ -323,22 +344,42 @@ impl MetalDev {
     }
 
     pub(crate) fn copy(&mut self, src: &Buf, src_off: u64, dst: &Buf, dst_off: u64, size: u64) {
-        self.end_compute();
-        let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
-        // SAFETY: both ranges are within their buffers (the callers' offsets).
-        unsafe {
-            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                mb(src),
-                src_off as usize,
-                mb(dst),
-                dst_off as usize,
-                size as usize,
-            )
-        };
-        blit.endEncoding();
+        // (wgpu rejects a copy out of range or off 4-byte alignment; Metal would write past
+        // the buffer)
+        assert!(src_off + size <= src.size() && dst_off + size <= dst.size(), "a copy out of range");
+        assert!((src_off | dst_off | size).is_multiple_of(4), "a copy off 4-byte alignment");
+        autoreleasepool(|_| {
+            self.end_compute();
+            let blit = self.cmd().blitCommandEncoder().expect("a blit encoder");
+            // SAFETY: both ranges are within their buffers (checked above).
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    mb(src),
+                    src_off as usize,
+                    mb(dst),
+                    dst_off as usize,
+                    size as usize,
+                )
+            };
+            blit.endEncoding();
+        });
     }
 
     pub(crate) fn dispatch(
+        &mut self,
+        k: &MetalKernel,
+        bufs: &[&Buf],
+        imm: &[u32; 8],
+        groups: (u32, u32),
+        label: Option<String>,
+    ) {
+        // A new command buffer comes autoreleased (on the M2, 168 bytes each; encoders and
+        // the calls on them leave nothing): a thread that never ends (a server's worker)
+        // never drains its implicit pool, so each dispatch has its own.
+        autoreleasepool(|_| self.dispatch_pooled(k, bufs, imm, groups, label))
+    }
+
+    fn dispatch_pooled(
         &mut self,
         k: &MetalKernel,
         bufs: &[&Buf],
@@ -366,7 +407,12 @@ impl MetalDev {
                 e.setThreadgroupMemoryLength_atIndex(len, i);
             }
             if !k.sized.is_empty() {
-                let sizes: Vec<u32> = k.sized.iter().map(|&i| bufs[i].size() as u32).collect();
+                // (`max_binding` keeps weights and KV within u32; this catches the rest)
+                let sizes: Vec<u32> = k
+                    .sized
+                    .iter()
+                    .map(|&i| u32::try_from(bufs[i].size()).expect("a binding over u32::MAX bytes"))
+                    .collect();
                 let ptr = NonNull::new(sizes.as_ptr() as *mut c_void).unwrap();
                 e.setBytes_length_atIndex(ptr, 4 * sizes.len(), bufs.len() + 1);
             }

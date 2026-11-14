@@ -117,7 +117,7 @@ impl Dev {
         match self {
             Dev::Wgpu(d) => d.device.limits().max_storage_buffer_binding_size,
             #[cfg(target_os = "macos")]
-            Dev::Metal(d) => d.max_buffer(),
+            Dev::Metal(d) => d.max_binding(),
         }
     }
 
