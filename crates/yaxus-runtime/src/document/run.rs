@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use yaxus_api::DocumentUsage;
-use yaxus_model::{Finish, Generator};
+use yaxus_model::{Finish, Generator, poll_once};
 use yaxus_tokenizer::Tokenizer;
 
 use super::{DocJob, SegmentError};
@@ -140,7 +140,21 @@ pub enum DocEvent<'a> {
 /// further segments are started, the ones in flight are cancelled and drained from the
 /// engine, no more events are sent, and the document is returned unfinished. A failed
 /// segment also stops it; its error is returned once the engine is drained.
+///
+/// For an engine whose steps never wait (see [`Generator::step`]); [`run_document_async`]
+/// is the form for any.
 pub fn run_document(
+    engine: &mut dyn Generator,
+    tok: &Tokenizer,
+    job: DocJob,
+    memory: &mut Memory,
+    on: &mut dyn FnMut(DocEvent) -> bool,
+) -> Result<DocJob> {
+    poll_once(run_document_async(engine, tok, job, memory, on))
+}
+
+/// [`run_document`], awaiting the engine.
+pub async fn run_document_async(
     engine: &mut dyn Generator,
     tok: &Tokenizer,
     job: DocJob,
@@ -154,32 +168,34 @@ pub fn run_document(
         failure = Some(e.to_string());
     }
     while !run.is_over() {
-        let worked = session.step(&mut |u| {
-            match u {
-                Update::Delta { tag, text } => {
-                    if !run.accepts() {
-                        return false;
+        let worked = session
+            .step_async(&mut |u| {
+                match u {
+                    Update::Delta { tag, text } => {
+                        if !run.accepts() {
+                            return false;
+                        }
+                        if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
+                            run.stop();
+                            return false;
+                        }
                     }
-                    if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
-                        run.stop();
-                        return false;
+                    Update::Done { tag, done } => {
+                        if let Some(end) = run.on_done(tag, done)
+                            && !on(DocEvent::SegmentDone(end))
+                        {
+                            run.stop();
+                        }
+                    }
+                    Update::Failed { tag, message } => {
+                        if run.on_failed() {
+                            failure.get_or_insert(format!("segment {tag}: {message}"));
+                        }
                     }
                 }
-                Update::Done { tag, done } => {
-                    if let Some(end) = run.on_done(tag, done)
-                        && !on(DocEvent::SegmentDone(end))
-                    {
-                        run.stop();
-                    }
-                }
-                Update::Failed { tag, message } => {
-                    if run.on_failed() {
-                        failure.get_or_insert(format!("segment {tag}: {message}"));
-                    }
-                }
-            }
-            true
-        })?;
+                true
+            })
+            .await?;
         if let Err(e) = run.submit_ready(&mut session, |s| s) {
             failure.get_or_insert(e.to_string());
         }

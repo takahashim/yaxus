@@ -2868,9 +2868,11 @@ name = "yaxus-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
+ "web-time",
  "yaxus-api",
  "yaxus-backend-cpu",
  "yaxus-backend-gpu",
@@ -2888,6 +2890,7 @@ dependencies = [
  "axum-server",
  "futures-util",
  "getrandom 0.3.4",
+ "pollster",
  "rcgen",
  "rustls",
  "serde",

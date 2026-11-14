@@ -636,11 +636,24 @@ impl<B: AsyncReadback> Engine<B> {
     }
 }
 
+/// A boxed future that need not be `Send` (WebGPU's are not).
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
+
 /// Object-safe view of an engine, so callers can pick the backend at run time.
-pub trait Generator: Send {
+///
+/// It is not `Send`: a WebGPU engine cannot move between threads, and its steps are
+/// awaited. An engine that is handed to another thread (the server's inference thread)
+/// is a `Box<dyn Generator + Send>`, which the native backends allow.
+pub trait Generator {
     fn submit(&mut self, req: Request);
-    /// See [`Engine::step`].
-    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool>;
+    /// See [`Engine::step_async`].
+    fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>>;
+    /// [`step_async`](Generator::step_async) for an engine whose steps never wait (every
+    /// native backend): it is polled once. Panics for one that does wait (WebGPU), which
+    /// has to be driven by `step_async` from an async context.
+    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        poll_once(self.step_async(emit))
+    }
     fn fresh_id(&mut self) -> ReqId;
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
@@ -701,11 +714,18 @@ impl<B: SyncReadback> Engine<B> {
     /// [`Engine::step_async`] for a backend that reads back without waiting, where the
     /// step never has to wait for anything.
     pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        let mut step = std::pin::pin!(self.step_async(emit));
-        match step.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(r) => r,
-            Poll::Pending => unreachable!("a SyncReadback backend reads back at once"),
-        }
+        poll_once(self.step_async(emit))
+    }
+}
+
+/// The output of a future that is ready at its first poll, as the steps of an engine on
+/// a native backend are. Panics if it is not: that one waits for something (WebGPU) and
+/// has to be awaited.
+pub fn poll_once<F: Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(r) => r,
+        Poll::Pending => unreachable!("the future waits: drive it from an async context"),
     }
 }
 
@@ -735,13 +755,12 @@ fn request_failure(e: anyhow::Error) -> Result<String> {
     }
 }
 
-impl<B: SyncReadback + Send> Generator for Engine<B>
-where
-    B::Weight: Send,
-    B::Kv: Send,
-{
+impl<B: SyncReadback> Generator for Engine<B> {
     fn submit(&mut self, req: Request) {
         Engine::submit(self, req)
+    }
+    fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>> {
+        Box::pin(Engine::step_async(self, emit))
     }
     fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
         Engine::step(self, emit)

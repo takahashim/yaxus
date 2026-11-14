@@ -29,7 +29,6 @@ use yaxus_api::{
     ApiError, DocumentEvent, DocumentRequest, DocumentResponse, ErrorCode, ErrorResponse, Health, HealthStatus,
     LANGUAGES, Language, StreamEvent, TranslateRequest, TranslateResponse,
 };
-use yaxus_pfml::{PromptError, PromptErrorKind};
 use yaxus_runtime::document::{self, DocError};
 use yaxus_runtime::{LoadOptions, Prompt, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
@@ -37,7 +36,7 @@ use yaxus_tokenizer::Tokenizer;
 use auth::AccessToken;
 use queue::{JobQueue, Rejected, job_queue};
 pub use tls::default_sans;
-use worker::{Job, Work};
+use worker::{Events, Job, Work};
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 
@@ -87,17 +86,7 @@ fn error(code: ErrorCode, msg: impl Into<String>) -> Response {
 }
 
 /// A request whose prompt cannot be built, as the API reports it.
-pub(crate) fn prompt_error(e: PromptError) -> ApiError {
-    let code = match e.kind {
-        PromptErrorKind::Invalid => ErrorCode::InvalidRequest,
-        PromptErrorKind::TooLong => ErrorCode::PromptTooLong,
-    };
-    ApiError::new(code, e.message)
-}
-
-pub(crate) fn segment_error(e: document::SegmentError) -> ApiError {
-    prompt_error(e.error).in_segment(e.segment)
-}
+pub(crate) use yaxus_runtime::scheduler::{prompt_error, segment_error};
 
 async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Html(INDEX_HTML))
@@ -152,7 +141,7 @@ async fn translate(
     };
     let (events, mut rx) = mpsc::unbounded_channel();
     let job = Job {
-        work: Work::Single { prompt, max_new_tokens, events },
+        work: Work::Single { prompt, max_new_tokens, events: Box::new(Events(events)) },
         enqueued: Instant::now(),
         label: label(req.source_lang.as_deref(), &req.target_lang),
     };
@@ -208,7 +197,11 @@ async fn translate_document(
         });
     }
     let (events, mut rx) = mpsc::unbounded_channel();
-    let job = Job { work: Work::Document { job: Box::new(doc), events }, enqueued: Instant::now(), label };
+    let job = Job {
+        work: Work::Document { job: Box::new(doc), events: Box::new(Events(events)) },
+        enqueued: Instant::now(),
+        label,
+    };
     if let Err(r) = enqueue(&st, job) {
         return r;
     }

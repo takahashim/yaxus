@@ -17,6 +17,7 @@ getrandom = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
 tokio-stream = "0.1"
 futures-util = "0.3"
+pollster = "0.4"
 tracing = "0.1"
 yaxus-api = { path = "../yaxus-api" }
 yaxus-pfml = { path = "../yaxus-pfml" }

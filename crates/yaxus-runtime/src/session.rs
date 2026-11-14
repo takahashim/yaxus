@@ -6,7 +6,9 @@
 //! differ only in where the text goes, which is what the tag `T` of each request tells.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use anyhow::Result;
 use yaxus_model::{Event, Finish, Generator, ReqId, Request, StartInfo};
@@ -114,48 +116,16 @@ impl<'a, T> Session<'a, T> {
     }
 
     /// Runs one engine step and reports what it did to the requests. Returns whether
-    /// there was work.
+    /// there was work. For an engine whose steps never wait (see [`Generator::step`]).
     pub fn step(&mut self, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> Result<bool> {
         let Session { engine, tok, memory, live } = self;
-        engine.step(&mut |ev| match ev {
-            Event::Token { id, token } => {
-                let Some(l) = live.get_mut(&id) else { return false };
-                l.first_token.get_or_insert_with(Instant::now);
-                l.tokens.push(token);
-                let start = l.text.len();
-                l.dec.push_into(tok, token, &mut l.text);
-                on(Update::Delta { tag: &l.tag, text: &l.text[start..] })
-            }
-            Event::Done { id, finish, generated, start } => {
-                let Some(mut l) = live.remove(&id) else { return true };
-                if finish == Finish::Stop {
-                    memory.put(l.memo, std::mem::take(&mut l.tokens));
-                }
-                let tail = l.dec.finish();
-                if !tail.is_empty() {
-                    on(Update::Delta { tag: &l.tag, text: &tail });
-                    l.text += &tail;
-                }
-                let done = Finished {
-                    text: l.text,
-                    finish,
-                    prompt_tokens: l.prompt_tokens,
-                    generated,
-                    start,
-                    submitted: l.submitted,
-                    first_token: l.first_token,
-                    ended: Instant::now(),
-                };
-                on(Update::Done { tag: l.tag, done });
-                true
-            }
-            Event::Error { id, message } => {
-                if let Some(l) = live.remove(&id) {
-                    on(Update::Failed { tag: l.tag, message });
-                }
-                true
-            }
-        })
+        engine.step(&mut |ev| on_event(live, tok, memory, ev, on))
+    }
+
+    /// [`step`](Session::step), awaiting the engine (the only form for WebGPU).
+    pub async fn step_async(&mut self, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> Result<bool> {
+        let Session { engine, tok, memory, live } = self;
+        engine.step_async(&mut |ev| on_event(live, tok, memory, ev, on)).await
     }
 
     /// No request is in flight.
@@ -183,6 +153,56 @@ impl<'a, T> Session<'a, T> {
     }
 }
 
+/// What the engine's event `ev` does to the requests in `live`; returns the answer to
+/// give the engine (`false` cancels the request of a token).
+fn on_event<T>(
+    live: &mut HashMap<ReqId, Live<T>>,
+    tok: &Tokenizer,
+    memory: &mut Memory,
+    ev: Event,
+    on: &mut dyn FnMut(Update<'_, T>) -> bool,
+) -> bool {
+    match ev {
+        Event::Token { id, token } => {
+            let Some(l) = live.get_mut(&id) else { return false };
+            l.first_token.get_or_insert_with(Instant::now);
+            l.tokens.push(token);
+            let start = l.text.len();
+            l.dec.push_into(tok, token, &mut l.text);
+            on(Update::Delta { tag: &l.tag, text: &l.text[start..] })
+        }
+        Event::Done { id, finish, generated, start } => {
+            let Some(mut l) = live.remove(&id) else { return true };
+            if finish == Finish::Stop {
+                memory.put(l.memo, std::mem::take(&mut l.tokens));
+            }
+            let tail = l.dec.finish();
+            if !tail.is_empty() {
+                on(Update::Delta { tag: &l.tag, text: &tail });
+                l.text += &tail;
+            }
+            let done = Finished {
+                text: l.text,
+                finish,
+                prompt_tokens: l.prompt_tokens,
+                generated,
+                start,
+                submitted: l.submitted,
+                first_token: l.first_token,
+                ended: Instant::now(),
+            };
+            on(Update::Done { tag: l.tag, done });
+            true
+        }
+        Event::Error { id, message } => {
+            if let Some(l) = live.remove(&id) {
+                on(Update::Failed { tag: l.tag, message });
+            }
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -204,12 +224,15 @@ mod tests {
         fn submit(&mut self, req: Request) {
             self.submitted.push(req);
         }
-        fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-            let Some(events) = self.steps.pop_front() else { return Ok(false) };
+        fn step_async<'a>(
+            &'a mut self,
+            emit: &'a mut dyn FnMut(Event) -> bool,
+        ) -> yaxus_model::LocalBoxFuture<'a, Result<bool>> {
+            let Some(events) = self.steps.pop_front() else { return Box::pin(std::future::ready(Ok(false))) };
             for ev in events {
                 self.answers.push(emit(ev));
             }
-            Ok(true)
+            Box::pin(std::future::ready(Ok(true)))
         }
         fn fresh_id(&mut self) -> ReqId {
             self.next_id += 1;

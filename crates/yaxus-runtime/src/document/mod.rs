@@ -13,7 +13,7 @@ use crate::prompt::Prompt;
 mod run;
 mod schedule;
 
-pub use run::{DocEvent, DocRun, SegmentEnd, run_document};
+pub use run::{DocEvent, DocRun, SegmentEnd, run_document, run_document_async};
 use schedule::ChainSchedule;
 
 /// Why a document cannot be translated: an option every segment shares, or one
@@ -319,6 +319,13 @@ mod tests {
         fn submit(&mut self, req: Request) {
             self.submitted += 1;
             self.running.push((req.id, 0));
+        }
+
+        fn step_async<'a>(
+            &'a mut self,
+            emit: &'a mut dyn FnMut(Event) -> bool,
+        ) -> yaxus_model::LocalBoxFuture<'a, Result<bool>> {
+            Box::pin(std::future::ready(Generator::step(self, emit)))
         }
 
         fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {

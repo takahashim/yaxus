@@ -119,7 +119,7 @@ impl ModelArgs {
     }
 
     /// Loads the model at `dir` (from [`ModelArgs::resolve`]).
-    fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::Generator>> {
+    fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::Generator + Send>> {
         yaxus_runtime::load_generator(dir, &self.load_options(dir)?)
     }
 }
