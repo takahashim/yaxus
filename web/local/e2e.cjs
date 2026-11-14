@@ -208,6 +208,8 @@ async function translate(page, c) {
     console.log(`loaded in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
     console.log((await page.locator('#info').textContent()).replace(/^/gm, '  '));
 
+    // As in the server's page, the segments of a document are translated side by side by default.
+    check('the default is the automatic number of chains', (await page.locator('#chains').inputValue()) === '0', '');
     for (const c of CASES) {
       s = await translate(page, c);
       const ok = !s.err && (c.want ? s.out === c.want : c.check(s.out)) && (!c.reused || /再利用/.test(s.stats));

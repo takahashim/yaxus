@@ -153,7 +153,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
         max_binding,
         reduced_to_q4,
         broken: false,
-        chains: 1,
+        chains: 0,
         neighbor_context: false,
     })
 }
@@ -203,7 +203,7 @@ impl Translator {
     }
 
     /// How many segments of a document are translated side by side: 1 to 4, or 0 for the
-    /// CLI's and the server's rule (a chain per 4 segments), at most 4. One by default.
+    /// CLI's and the server's rule (a chain per 4 segments), at most 4. The rule by default.
     /// With more, a segment's history is only that of its own chain, so the translation
     /// differs from the one in a single chain.
     pub fn set_chains(&mut self, chains: u32) {
