@@ -146,18 +146,22 @@ pub struct Translator {
     broken: bool,
 }
 
-/// An error of `translate`: whether the device (and so the model) is still usable.
+/// An error of `translate`, by whether the model is still usable.
 enum Failure {
-    Input(JsError),
-    Gpu(JsError),
+    /// An error of this request (its input, a limit of the KV or the context): the model
+    /// and its KV bookkeeping are as before.
+    Request(JsError),
+    /// An error of the device, which only a read-back reports (the recorded passes do
+    /// not fail on their own): the model cannot be trusted any more.
+    Device(JsError),
 }
 
-fn gpu(e: impl Display) -> Failure {
-    Failure::Gpu(jserr(e))
+fn device_err(e: impl Display) -> Failure {
+    Failure::Device(jserr(e))
 }
 
-fn input(e: impl Display) -> Failure {
-    Failure::Input(jserr(e))
+fn request_err(e: impl Display) -> Failure {
+    Failure::Request(jserr(e))
 }
 
 #[wasm_bindgen]
@@ -212,8 +216,8 @@ impl Translator {
         }
         match self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await {
             Ok(stats) => Ok(stats),
-            Err(Failure::Input(e)) => Err(e),
-            Err(Failure::Gpu(e)) => {
+            Err(Failure::Request(e)) => Err(e),
+            Err(Failure::Device(e)) => {
                 self.broken = true;
                 Err(e)
             }
@@ -231,18 +235,18 @@ impl Translator {
         on_progress: Option<&Function>,
     ) -> Result<Stats, Failure> {
         if !matches!(target, "ja" | "en") {
-            return Err(input(format!("unsupported target language {target:?}")));
+            return Err(request_err(format!("unsupported target language {target:?}")));
         }
         let form = match form {
             _ if target != "ja" => None,
             None | Some("") | Some("none") => None,
             Some("polite") => Some(Form::Polite),
             Some("plain") => Some(Form::Plain),
-            Some(other) => return Err(input(format!("unknown form {other:?}"))),
+            Some(other) => return Err(request_err(format!("unknown form {other:?}"))),
         };
         let segments = split_for_context(text, &self.tokenizer, SEGMENT_INPUT_TOKENS);
         if segments.is_empty() {
-            return Err(input("the text is empty or only whitespace"));
+            return Err(request_err("the text is empty or only whitespace"));
         }
         // Sentences of one paragraph are translated apart and joined: with a space in
         // English, directly in Japanese.
@@ -272,7 +276,9 @@ impl Translator {
             }
             let prompt_len = ids.len() as u32;
             let started = Instant::now();
-            let (id, first) = self.model.start(&ids).map_err(gpu)?;
+            // `start` and `forward` fail only on host-side limits (KV pages, positions);
+            // a GPU error shows at the read-back in `decode_segment`.
+            let (id, first) = self.model.start(&ids).map_err(request_err)?;
             let decoded = self.decode_segment(id, first, max_new, on_text, &mut chars).await?;
             let (translated, stop, generated) = (decoded.text, decoded.stop, decoded.tokens);
             // The prompt's pass ends with the first token's read-back: until then the GPU
@@ -334,14 +340,14 @@ impl Translator {
                 glossary: Vec::new(),
                 history: history.clone(),
             };
-            let req = req.validate().map_err(input)?;
+            let req = req.validate().map_err(request_err)?;
             let ids = self.tokenizer.encode(&req.render(), false);
             let len = ids.len();
             if len < MAX_CONTEXT && (history.is_empty() || len + MIN_NEW <= MAX_CONTEXT) {
                 return Ok((ids, MAX_NEW_TOKENS.min(MAX_CONTEXT - len)));
             }
             if history.is_empty() {
-                return Err(input(format!("a segment needs {len} prompt tokens; the limit is {MAX_CONTEXT}")));
+                return Err(request_err(format!("a segment needs {len} prompt tokens; the limit is {MAX_CONTEXT}")));
             }
             history.remove(0);
         }
@@ -364,7 +370,7 @@ impl Translator {
         let mut first_token = None;
         let result = async {
             while (output_tokens as usize) < max_new {
-                let next = self.model.backend.argmax_async(&logits).await.map_err(gpu)?;
+                let next = self.model.backend.argmax_async(&logits).await.map_err(device_err)?;
                 first_token.get_or_insert_with(Instant::now);
                 if next == EOS_ID {
                     stop = "eos";
@@ -384,7 +390,7 @@ impl Translator {
                 if output_tokens as usize >= max_new {
                     break;
                 }
-                logits = self.model.forward(&[(id, &[next])], false).map_err(gpu)?;
+                logits = self.model.forward(&[(id, &[next])], false).map_err(request_err)?;
             }
             // A character split across byte tokens is held until the next token; there is
             // no next token at the end, so emit its replacement here.
@@ -426,7 +432,7 @@ fn emit(on_text: &Function, text: &str) -> Result<(), Failure> {
     on_text
         .call1(&JsValue::NULL, &JsValue::from_str(text))
         .map(|_| ())
-        .map_err(|e| input(format!("on_text callback failed: {e:?}")))
+        .map_err(|e| request_err(format!("on_text callback failed: {e:?}")))
 }
 
 /// The newest pairs within the history budget (at most two).
