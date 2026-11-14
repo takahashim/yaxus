@@ -251,17 +251,12 @@ impl<B: Backend> Model<B> {
         } else {
             (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
         };
-        Self::build(cfg, w, backend, opts)
+        Self::from_parts(cfg, w, backend, opts)
     }
 
-    /// Loads a model from a GGUF file already in memory (browser mode).
-    pub fn from_gguf(g: gguf::Gguf, backend: B, opts: &ModelOptions) -> Result<Self> {
-        let cfg = g.config()?;
-        let w = g.weights()?;
-        Self::build(cfg, w, backend, opts)
-    }
-
-    fn build(cfg: Config, w: Weights, mut backend: B, opts: &ModelOptions) -> Result<Self> {
+    /// Loads a model from its configuration and tensors (the browser has them from a
+    /// GGUF file in memory, and looks at the tensors before the device is open).
+    pub fn from_parts(cfg: Config, w: Weights, mut backend: B, opts: &ModelOptions) -> Result<Self> {
         let quant = opts.quant;
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);

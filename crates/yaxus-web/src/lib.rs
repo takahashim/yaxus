@@ -97,7 +97,8 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     report(&on_progress, "GGUF を解析しています…");
     let g = Gguf::parse(file.bytes).map_err(jserr)?;
     let vocab = g.vocab().map_err(jserr)?;
-    g.config().map_err(jserr)?;
+    let cfg = g.config().map_err(jserr)?;
+    let weights = g.weights().map_err(jserr)?;
 
     report(&on_progress, "トークナイザを構築しています…");
     let kinds = vocab.types.iter().copied().map(TokenKind::from_ggml_type).collect();
@@ -107,7 +108,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     // output matrix's 124 MB of 6-bit values). A device that cannot bind a matrix's
     // buffer gets that matrix at Q4.
     report(&on_progress, "WebGPU デバイスを開いています…");
-    let need_binding = GpuBackend::largest_weight_bytes(&g.weights().map_err(jserr)?);
+    let need_binding = GpuBackend::largest_weight_bytes(&weights);
     let backend = GpuBackend::new_async(need_binding, need_binding.max(64 << 20)).await.map_err(jserr)?;
     let name = backend.caps().name.clone();
     let max_binding = backend.max_binding_bytes();
@@ -123,7 +124,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     // around the uploads makes such a failure a load error, not a broken first
     // translation.
     let watch = backend.watch_errors();
-    let mut model = Model::from_gguf(g, backend, &opts).map_err(jserr)?;
+    let mut model = Model::from_parts(cfg, weights, backend, &opts).map_err(jserr)?;
     watch.finish().await.map_err(jserr)?;
     model.backend.sync_async().await.map_err(jserr)?;
     report(&on_progress, "準備できました");
