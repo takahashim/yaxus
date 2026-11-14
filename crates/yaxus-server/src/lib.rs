@@ -1,6 +1,7 @@
 //! `yaxus serve`: HTTPS + bearer-token API, SSE streaming and an embedded web UI.
 
 mod auth;
+mod error;
 mod queue;
 mod secret_file;
 mod tls;
@@ -10,7 +11,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,17 +27,20 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use yaxus_api::{
-    ApiError, DocumentEvent, DocumentRequest, DocumentResponse, ErrorCode, ErrorResponse, Health, HealthStatus,
-    LANGUAGES, Language, StreamEvent, TranslateRequest, TranslateResponse,
+    Collector, DocumentCollector, DocumentRequest, ErrorCode, Health, HealthStatus, LANGUAGES, Language,
+    TranslateCollector, TranslateRequest,
 };
-use yaxus_runtime::document::{self, DocError};
+use yaxus_runtime::document::DocJob;
+use yaxus_runtime::scheduler::{Job, Sink, Work, prompt_error};
 use yaxus_runtime::{LoadOptions, Prompt, load_generator, load_tokenizer, quant_label};
 use yaxus_tokenizer::Tokenizer;
 
-use auth::AccessToken;
-use queue::{JobQueue, Rejected, job_queue};
+use auth::{AccessToken, TokenSource};
+use error::{ApiFailure, ApiJson};
+use queue::JobQueue;
+use tls::TlsFiles;
 pub use tls::default_sans;
-use worker::{Events, Job, Work};
+use worker::{Events, Failure};
 
 const INDEX_HTML: &str = include_str!("../../../web/index.html");
 
@@ -60,47 +64,62 @@ pub struct ServeOptions {
 struct AppState {
     tok: Arc<Tokenizer>,
     jobs: JobQueue,
+    /// What `/healthz` reports besides the state of the queue.
     health: Health,
     max_context: usize,
 }
 
 type Shared = Arc<AppState>;
 
-/// The HTTP status of each error code.
-fn status_of(code: ErrorCode) -> StatusCode {
-    match code {
-        ErrorCode::InvalidRequest | ErrorCode::PromptTooLong => StatusCode::BAD_REQUEST,
-        ErrorCode::Unauthorized => StatusCode::UNAUTHORIZED,
-        ErrorCode::QueueFull => StatusCode::TOO_MANY_REQUESTS,
-        ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+impl AppState {
+    /// The health report, with the queue as it is now.
+    fn health(&self) -> Health {
+        let stopped = self.jobs.is_closed();
+        Health {
+            queue: self.jobs.len(),
+            // The inference thread has stopped (after a panic): report it instead of "ok".
+            status: if stopped { HealthStatus::Stopped } else { self.health.status },
+            ..self.health.clone()
+        }
+    }
+
+    /// Queues the job of `work` (given its events' channel) and answers with its events:
+    /// as an SSE stream, or as one response that `collect` builds from them.
+    async fn run<C>(
+        &self,
+        label: String,
+        stream: bool,
+        mut collect: C,
+        work: impl FnOnce(Box<dyn Sink<C::Event>>) -> Work,
+    ) -> Result<Response, ApiFailure>
+    where
+        C: Collector,
+        C::Event: Serialize + Send + 'static,
+        C::Response: Serialize,
+    {
+        let (events, mut rx) = mpsc::unbounded_channel();
+        self.jobs.push(Job::new(work(Box::new(Events(events))), label))?;
+        if stream {
+            return Ok(sse_response(rx));
+        }
+        while let Some(ev) = rx.recv().await {
+            if let Some(r) = collect.push(ev) {
+                return Ok(Json(r?).into_response());
+            }
+        }
+        // The worker dropped the channel without a final event.
+        Err(ApiFailure::worker_stopped())
     }
 }
-
-fn error_response(error: ApiError) -> Response {
-    (status_of(error.code), Json(ErrorResponse { error })).into_response()
-}
-
-fn error(code: ErrorCode, msg: impl Into<String>) -> Response {
-    error_response(ApiError::new(code, msg))
-}
-
-/// A request whose prompt cannot be built, as the API reports it.
-pub(crate) use yaxus_runtime::scheduler::{prompt_error, segment_error};
 
 async fn index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache"), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], Html(INDEX_HTML))
 }
 
 async fn healthz(State(st): State<Shared>) -> Response {
-    let mut h = st.health.clone();
-    h.queue = st.jobs.len();
-    // The inference thread has stopped (after a panic): report it instead of "ok".
-    if st.jobs.is_closed() {
-        h.status = HealthStatus::Stopped;
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(h)).into_response();
-    }
-    Json(h).into_response()
+    let h = st.health();
+    let status = if h.status == HealthStatus::Ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(h)).into_response()
 }
 
 async fn languages() -> Json<Vec<Language>> {
@@ -122,104 +141,34 @@ fn sse_response<E: Serialize + Send + 'static>(rx: mpsc::UnboundedReceiver<E>) -
     r
 }
 
-/// The worker dropped a job's channel without a final event.
-fn worker_stopped() -> Response {
-    error(ErrorCode::Unavailable, "inference worker stopped")
+async fn translate(State(st): State<Shared>, ApiJson(req): ApiJson<TranslateRequest>) -> Result<Response, ApiFailure> {
+    let (prompt, max_new_tokens) = Prompt::for_request(&st.tok, &req, st.max_context).map_err(prompt_error)?;
+    let label = label(req.source_lang.as_deref(), &req.target_lang);
+    st.run(label, req.stream, TranslateCollector::default(), |events| Work::Single { prompt, max_new_tokens, events })
+        .await
 }
 
-async fn translate(
-    State(st): State<Shared>,
-    body: Result<Json<TranslateRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => return error(ErrorCode::InvalidRequest, e.body_text()),
-    };
-    let (prompt, max_new_tokens) = match Prompt::for_request(&st.tok, &req, st.max_context) {
-        Ok(p) => p,
-        Err(e) => return error_response(prompt_error(e)),
-    };
-    let (events, mut rx) = mpsc::unbounded_channel();
-    let job = Job {
-        work: Work::Single { prompt, max_new_tokens, events: Box::new(Events(events)) },
-        enqueued: Instant::now(),
-        label: label(req.source_lang.as_deref(), &req.target_lang),
-    };
-    if let Err(r) = enqueue(&st, job) {
-        return r;
-    }
-    if req.stream {
-        return sse_response(rx);
-    }
-    let mut text = String::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            StreamEvent::Delta { text: t } => text.push_str(&t),
-            StreamEvent::Done { usage } => return Json(TranslateResponse { text, usage }).into_response(),
-            StreamEvent::Error { error } => return error_response(error),
-        }
-    }
-    worker_stopped()
-}
-
-// (the error is the response to send; boxing it buys nothing on this path)
-#[allow(clippy::result_large_err)]
-fn enqueue(st: &AppState, job: Job) -> std::result::Result<(), Response> {
-    st.jobs.push(job).map_err(|e| match e {
-        Rejected::Full => error(ErrorCode::QueueFull, "translation queue is full; retry later"),
-        Rejected::Stopped => error(ErrorCode::Unavailable, "inference worker stopped"),
-    })
-}
-
-/// Most segments accepted in one document request.
+/// Most segments accepted in one document request (a limit of this server: the browser
+/// build has its own).
 const MAX_SEGMENTS: usize = 2000;
 
 async fn translate_document(
     State(st): State<Shared>,
-    body: Result<Json<DocumentRequest>, axum::extract::rejection::JsonRejection>,
-) -> Response {
-    let Json(req) = match body {
-        Ok(b) => b,
-        Err(e) => return error(ErrorCode::InvalidRequest, e.body_text()),
-    };
+    ApiJson(req): ApiJson<DocumentRequest>,
+) -> Result<Response, ApiFailure> {
     if req.segments.is_empty() || req.segments.len() > MAX_SEGMENTS {
-        return error(ErrorCode::InvalidRequest, format!("segments must contain 1..={MAX_SEGMENTS} items"));
+        return Err(ApiFailure::new(
+            ErrorCode::InvalidRequest,
+            format!("segments must contain 1..={MAX_SEGMENTS} items"),
+        ));
     }
     let (n, stream, label) = (req.segments.len(), req.stream, label(req.source_lang.as_deref(), &req.target_lang));
-    let doc = document::DocJob::from_request(req, st.max_context);
+    let doc = DocJob::from_request(req, st.max_context);
     // Options and every segment's prompt without history are checked up front, against the
     // context too (blank segments come back empty); history that does not fit is dropped
     // when the segment is submitted.
-    if let Err(e) = doc.validate(&st.tok) {
-        return error_response(match e {
-            DocError::Options(e) => prompt_error(e),
-            DocError::Segment(e) => segment_error(e),
-        });
-    }
-    let (events, mut rx) = mpsc::unbounded_channel();
-    let job = Job {
-        work: Work::Document { job: Box::new(doc), events: Box::new(Events(events)) },
-        enqueued: Instant::now(),
-        label,
-    };
-    if let Err(r) = enqueue(&st, job) {
-        return r;
-    }
-    if stream {
-        return sse_response(rx);
-    }
-    let mut out = vec![String::new(); n];
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            DocumentEvent::Delta { segment, text } => out[segment].push_str(&text),
-            DocumentEvent::SegmentDone { .. } => {}
-            DocumentEvent::Done { usage } => {
-                return Json(DocumentResponse { segments: out, usage }).into_response();
-            }
-            DocumentEvent::Error { error } => return error_response(error),
-        }
-    }
-    worker_stopped()
+    doc.validate(&st.tok).map_err(yaxus_api::ApiError::from)?;
+    st.run(label, stream, DocumentCollector::new(n), |events| Work::Document { job: Box::new(doc), events }).await
 }
 
 fn router(st: Shared, token: Arc<AccessToken>) -> Router {
@@ -236,32 +185,34 @@ fn router(st: Shared, token: Arc<AccessToken>) -> Router {
 }
 
 /// Loads the model, starts the inference thread and serves until Ctrl-C.
+///
+/// Everything that can fail on the options alone (the token, the certificate) is done
+/// before the model is loaded.
 pub fn serve(opts: ServeOptions) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     opts.check()?;
-    let (token, created) = match opts.token.as_deref() {
-        Some(t) => (AccessToken::new(t)?, false),
-        None => AccessToken::load_or_create(&opts.config_dir)?,
-    };
-    let tls = opts.tls_files()?;
-    let (st, failed) = start_inference(&opts)?;
+    let (token, token_source) = AccessToken::resolve(opts.token.as_deref(), &opts.config_dir)?;
+    let tls = TlsFiles::resolve(opts.cert.as_deref(), opts.key.as_deref(), &opts.extra_sans, &opts.config_dir)?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
+    let config = rt.block_on(tls.load())?;
+
+    let (tok, engine, health) = load_model(&opts)?;
+    let (jobs, failure) = worker::spawn(engine, tok.clone(), opts.queue_limit)?;
+    let st = AppState { tok, jobs, health, max_context: opts.max_context };
     let token = Arc::new(token);
     let app = router(Arc::new(st), token.clone());
 
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
     rt.block_on(async move {
-        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert, &tls.key)
-            .await
-            .context("loading TLS certificate")?;
         let handle = axum_server::Handle::new();
-        let inference_failed = shut_down_on(handle.clone(), failed);
-        print_banner(&opts, &tls, &token, created);
+        let failed = failure.reported();
+        shut_down_on(handle.clone(), failure);
+        print_banner(&opts, &tls, &token, &token_source);
         axum_server::bind_rustls(opts.listen, config)
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .context("server error")?;
-        anyhow::ensure!(!inference_failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
+        anyhow::ensure!(!failed.load(Ordering::SeqCst), "the inference thread failed (see the log above)");
         Ok(())
     })
 }
@@ -278,24 +229,10 @@ impl ServeOptions {
         );
         Ok(())
     }
-
-    /// The user's certificate, or the self-signed one in `config_dir` (created if needed).
-    fn tls_files(&self) -> Result<tls::TlsFiles> {
-        match (&self.cert, &self.key) {
-            (Some(c), Some(k)) => Ok(tls::TlsFiles { cert: c.clone(), key: k.clone(), ca: None, sans: vec![] }),
-            (None, None) => {
-                let mut sans = default_sans();
-                sans.extend(self.extra_sans.iter().cloned());
-                tls::ensure_self_signed(&self.config_dir, sans)
-            }
-            _ => anyhow::bail!("--cert and --key must be given together"),
-        }
-    }
 }
 
-/// Loads the model and starts the inference thread on it. Returns the handlers' state,
-/// and the channel on which the thread reports a fatal failure.
-fn start_inference(opts: &ServeOptions) -> Result<(AppState, tokio::sync::oneshot::Receiver<()>)> {
+/// Loads the tokenizer and the model. Returns them and what `/healthz` says about them.
+fn load_model(opts: &ServeOptions) -> Result<(Arc<Tokenizer>, Box<dyn yaxus_model::Generator + Send>, Health)> {
     let tok = Arc::new(load_tokenizer(&opts.model_dir)?);
     let t0 = Instant::now();
     let model = load_generator(&opts.model_dir, &opts.load)
@@ -315,19 +252,13 @@ fn start_inference(opts: &ServeOptions) -> Result<(AppState, tokio::sync::onesho
         quant,
         queue: 0,
     };
-    let (jobs, queue) = job_queue(opts.queue_limit);
-    let (failed_tx, failed_rx) = tokio::sync::oneshot::channel();
-    let worker_tok = tok.clone();
-    std::thread::Builder::new()
-        .name("inference".into())
-        .spawn(move || worker::run(model, worker_tok, queue, failed_tx))?;
-    Ok((AppState { tok, jobs, health, max_context: opts.max_context }, failed_rx))
+    Ok((tok, model, health))
 }
 
 /// Shuts the server down gracefully on Ctrl-C, or when the inference thread reports a
-/// fatal failure on `failed` (then `serve` returns an error, so that a supervisor can
-/// restart the process). Returns the flag set in that case.
-fn shut_down_on(handle: axum_server::Handle, failed: tokio::sync::oneshot::Receiver<()>) -> Arc<AtomicBool> {
+/// fatal failure (then `serve` returns an error, so that a supervisor can restart the
+/// process).
+fn shut_down_on(handle: axum_server::Handle, failure: Failure) {
     const GRACE: Duration = Duration::from_secs(5);
     let h = handle.clone();
     tokio::spawn(async move {
@@ -335,35 +266,38 @@ fn shut_down_on(handle: axum_server::Handle, failed: tokio::sync::oneshot::Recei
         tracing::info!("shutting down");
         h.graceful_shutdown(Some(GRACE));
     });
-    let flag = Arc::new(AtomicBool::new(false));
-    let f = flag.clone();
     tokio::spawn(async move {
-        // (an Err means the thread ended normally and dropped the sender)
-        if failed.await.is_ok() {
+        if failure.wait().await {
             tracing::error!("the inference thread stopped after an internal error; shutting down");
-            f.store(true, Ordering::SeqCst);
             handle.graceful_shutdown(Some(GRACE));
         }
     });
-    flag
 }
 
-/// Where to reach the server, and how to trust it and authenticate.
-fn print_banner(opts: &ServeOptions, tls: &tls::TlsFiles, token: &AccessToken, created: bool) {
+/// Where to reach the server, and how to trust it and authenticate. Printed to the
+/// terminal rather than logged, since it may show the token.
+fn print_banner(opts: &ServeOptions, tls: &TlsFiles, token: &AccessToken, source: &TokenSource) {
     let port = opts.listen.port();
     eprintln!();
     eprintln!("yaxus listening on https://{}", opts.listen);
-    for san in tls.sans.iter().filter(|s| !s.contains(':')) {
-        eprintln!("  https://{san}:{port}/");
+    for san in &tls.sans {
+        // (an IPv6 address goes in brackets)
+        if san.contains(':') {
+            eprintln!("  https://[{san}]:{port}/");
+        } else {
+            eprintln!("  https://{san}:{port}/");
+        }
     }
     if let Some(ca) = &tls.ca {
         eprintln!("CA certificate (for `yaxus client --ca` or to import into a browser): {}", ca.display());
     }
-    if created {
-        eprintln!("Generated access token (saved to {}):", opts.config_dir.join("token").display());
-        eprintln!("  {}", token.as_str());
-    } else if opts.token.is_none() {
-        eprintln!("Access token: {}", opts.config_dir.join("token").display());
+    match source {
+        TokenSource::Given => {}
+        TokenSource::Stored(path) => eprintln!("Access token: {}", path.display()),
+        TokenSource::Created(path) => {
+            eprintln!("Generated access token (saved to {}):", path.display());
+            eprintln!("  {}", token.as_str());
+        }
     }
     eprintln!();
 }
@@ -385,7 +319,7 @@ mod tests {
         let tok = Arc::new(yaxus_tokenizer::testing::plamo_like(&[("x", 0.0)]));
         let x = TranslateRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let max_context = Prompt::for_request(&tok, &x, usize::MAX).unwrap().0.len() + 20;
-        let (jobs, queue) = job_queue(limit);
+        let (jobs, queue) = queue::job_queue(limit);
         let health =
             Health { status: HealthStatus::Ok, model: "m".into(), backend: "b".into(), quant: "q".into(), queue: 0 };
         let st = Arc::new(AppState { tok, jobs, health, max_context });

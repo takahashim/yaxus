@@ -27,7 +27,7 @@ mod clients;
 mod report;
 
 use clients::{Clients, Owner};
-pub use report::{prompt_error, segment_error};
+pub use report::prompt_error;
 
 /// `Send` where there are threads (not on wasm, where a page's values often are not).
 #[cfg(not(target_arch = "wasm32"))]
@@ -61,6 +61,11 @@ pub struct Job {
 }
 
 impl Job {
+    /// `work`, enqueued now.
+    pub fn new(work: Work, label: impl Into<String>) -> Self {
+        Job { work, enqueued: Instant::now(), label: label.into() }
+    }
+
     /// The client left while the job waited.
     pub(super) fn is_abandoned(&self) -> bool {
         match &self.work {

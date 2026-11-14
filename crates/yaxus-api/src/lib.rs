@@ -171,6 +171,71 @@ pub enum DocumentEvent {
     Error { error: ApiError },
 }
 
+/// Builds the response for `stream: false` from the events of the stream, in order.
+pub trait Collector {
+    type Event;
+    type Response;
+    /// Takes the next event: the response, or the error, once the stream has ended.
+    fn push(&mut self, event: Self::Event) -> Option<Result<Self::Response, ApiError>>;
+}
+
+/// The [`TranslateResponse`] of a stream of [`StreamEvent`]s.
+#[derive(Debug, Default)]
+pub struct TranslateCollector {
+    text: String,
+}
+
+impl Collector for TranslateCollector {
+    type Event = StreamEvent;
+    type Response = TranslateResponse;
+
+    fn push(&mut self, event: StreamEvent) -> Option<Result<TranslateResponse, ApiError>> {
+        match event {
+            StreamEvent::Delta { text } => {
+                self.text.push_str(&text);
+                None
+            }
+            StreamEvent::Done { usage } => Some(Ok(TranslateResponse { text: std::mem::take(&mut self.text), usage })),
+            StreamEvent::Error { error } => Some(Err(error)),
+        }
+    }
+}
+
+/// The [`DocumentResponse`] of a stream of [`DocumentEvent`]s.
+#[derive(Debug)]
+pub struct DocumentCollector {
+    segments: Vec<String>,
+}
+
+impl DocumentCollector {
+    /// For a document of `segments` segments.
+    pub fn new(segments: usize) -> Self {
+        DocumentCollector { segments: vec![String::new(); segments] }
+    }
+}
+
+impl Collector for DocumentCollector {
+    type Event = DocumentEvent;
+    type Response = DocumentResponse;
+
+    fn push(&mut self, event: DocumentEvent) -> Option<Result<DocumentResponse, ApiError>> {
+        match event {
+            DocumentEvent::Delta { segment, text } => {
+                // (the stream only names the document's segments)
+                if let Some(s) = self.segments.get_mut(segment) {
+                    s.push_str(&text);
+                }
+                None
+            }
+            DocumentEvent::SegmentDone { .. } => None,
+            DocumentEvent::Done { usage } => {
+                Some(Ok(DocumentResponse { segments: std::mem::take(&mut self.segments), usage }))
+            }
+            DocumentEvent::Error { error } => Some(Err(error)),
+        }
+    }
+}
+
 /// What went wrong, for programs (`message` is for people).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -373,6 +438,31 @@ pub fn split_paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collectors_build_the_response_of_a_stream() {
+        let mut c = TranslateCollector::default();
+        assert!(c.push(StreamEvent::Delta { text: "a".into() }).is_none());
+        assert!(c.push(StreamEvent::Delta { text: "b".into() }).is_none());
+        let r = c.push(StreamEvent::Done { usage: Usage::default() }).unwrap().unwrap();
+        assert_eq!(r.text, "ab");
+        let e = ApiError::new(ErrorCode::Internal, "x");
+        assert_eq!(
+            TranslateCollector::default().push(StreamEvent::Error { error: e.clone() }).unwrap().unwrap_err(),
+            e
+        );
+
+        let mut d = DocumentCollector::new(2);
+        for ev in [
+            DocumentEvent::Delta { segment: 1, text: "b".into() },
+            DocumentEvent::Delta { segment: 0, text: "a".into() },
+            DocumentEvent::SegmentDone { segment: 0 },
+        ] {
+            assert!(d.push(ev).is_none());
+        }
+        let r = d.push(DocumentEvent::Done { usage: DocumentUsage::default() }).unwrap().unwrap();
+        assert_eq!(r.segments, ["a", "b"]);
+    }
 
     #[test]
     fn forms_are_a_closed_set() {
