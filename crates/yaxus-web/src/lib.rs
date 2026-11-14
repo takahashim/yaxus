@@ -129,7 +129,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let opts = ModelOptions {
         kv_tokens: MAX_CONTEXT,
         max_pos: MAX_CONTEXT,
-        prefix_cache: false,
+        prefix_cache: true,
         ..ModelOptions::new(Quant::Auto)
     };
     // WebGPU reports a failed allocation after the call that made it: the error scope
@@ -282,6 +282,7 @@ impl Translator {
         let mut prompt_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut decode_steps = 0u32;
+        let mut reused_tokens = 0u32;
         let mut out = Output { on_text, chars: 0, owed: "" };
         let mut prefill_ms = 0.0;
         let mut decode_ms = 0.0;
@@ -309,6 +310,7 @@ impl Translator {
             prompt_tokens += prompt_len;
             output_tokens += generated;
             decode_steps += decoded.steps;
+            reused_tokens += decoded.reused;
             last_max_new = max_new as u32;
             if stop == "limit" {
                 any_limit = true;
@@ -335,6 +337,7 @@ impl Translator {
             stop: (if any_limit { "limit" } else { last_stop }).into(),
             chars: out.chars as u32,
             decode_steps,
+            reused_tokens,
             prefill_ms,
             decode_ms,
         })
@@ -380,6 +383,7 @@ impl Translator {
         let mut finish = None;
         let mut error = None;
         let mut write_failure = None;
+        let mut reused = 0u32;
         while finish.is_none() && error.is_none() {
             let worked = self
                 .engine
@@ -397,8 +401,9 @@ impl Translator {
                             }
                         }
                     }
-                    Event::Done { finish: f, .. } => {
+                    Event::Done { finish: f, start, .. } => {
                         finish = Some(f);
+                        reused = start.reused as u32;
                         true
                     }
                     Event::Error { message, .. } => {
@@ -432,6 +437,7 @@ impl Translator {
             stop,
             tokens,
             steps: tokens.saturating_sub(1),
+            reused,
             first_token: first_token.unwrap_or_else(Instant::now),
         })
     }
@@ -445,6 +451,8 @@ struct Decoded {
     tokens: u32,
     /// Decode passes after the first token (each one read back one more token).
     steps: u32,
+    /// Prompt tokens whose KV an earlier segment had computed (prefix reuse).
+    reused: u32,
     /// When the first token was read back.
     first_token: Instant,
 }
@@ -496,6 +504,8 @@ pub struct Stats {
     chars: u32,
     /// Decode passes (see [`Stats::tokens_per_second`]).
     decode_steps: u32,
+    /// Prompt tokens served from the KV of earlier segments.
+    reused_tokens: u32,
     prefill_ms: f64,
     decode_ms: f64,
 }
@@ -533,6 +543,13 @@ impl Stats {
     #[wasm_bindgen(getter)]
     pub fn chars(&self) -> u32 {
         self.chars
+    }
+
+    /// Prompt tokens that were not computed again because an earlier segment's prompt
+    /// began the same way.
+    #[wasm_bindgen(getter)]
+    pub fn reused_tokens(&self) -> u32 {
+        self.reused_tokens
     }
 
     #[wasm_bindgen(getter)]

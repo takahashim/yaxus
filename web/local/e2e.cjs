@@ -49,7 +49,8 @@ const CASES = [
   },
   { name: 'en->ja polite', to: 'ja', form: 'polite', text: 'The cat is sleeping on the sofa.', want: '猫がソファで寝ています。' },
   // 12 paragraphs: 12 segments, joined by blank lines.
-  { name: 'en->ja document', to: 'ja', text: LONG_EN, check: (out) => out.split('\n\n').length === 12 },
+  // Each paragraph's prompt begins with the earlier ones, so most of its KV is reused.
+  { name: 'en->ja document', to: 'ja', text: LONG_EN, check: (out) => out.split('\n\n').length === 12, reused: true },
 ];
 
 // Test-only: keeps the worker's GPUDevice where the test can reach it, to break it.
@@ -209,7 +210,7 @@ async function translate(page, c) {
 
     for (const c of CASES) {
       s = await translate(page, c);
-      const ok = !s.err && (c.want ? s.out === c.want : c.check(s.out));
+      const ok = !s.err && (c.want ? s.out === c.want : c.check(s.out)) && (!c.reused || /再利用/.test(s.stats));
       check(c.name, ok, ok ? s.stats : `${s.status} | got ${JSON.stringify(s.out.slice(0, 200))}`);
     }
 

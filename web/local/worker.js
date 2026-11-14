@@ -98,6 +98,7 @@ async function translate({ text, target, form }) {
     segments: stats.segments,
     stop: stats.stop,
     chars: stats.chars,
+    reusedTokens: stats.reused_tokens,
     prefillMs: stats.prefill_ms,
     decodeMs: stats.decode_ms,
     tokensPerSecond: stats.tokens_per_second,
