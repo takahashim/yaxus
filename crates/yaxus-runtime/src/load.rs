@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
 use yaxus_backend_gpu::{Gemv, GpuBackend};
-use yaxus_model::{Engine, Generator, Model, ModelOptions, Quant, SyncReadback};
+use yaxus_model::{Engine, Model, ModelOptions, Quant, SyncGenerator, SyncReadback};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::options::{BackendKind, DraftOptions, LoadOptions};
@@ -24,7 +24,7 @@ pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
 }
 
 /// Loads the model (and optional draft model) on the requested backend.
-pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn Generator>> {
+pub fn load_generator(dir: &Path, o: &LoadOptions) -> Result<Box<dyn SyncGenerator + Send>> {
     match gpu(o.backend)? {
         Some(mut gpu) => {
             // One device for the target and the draft model, with their own kernels.
@@ -74,7 +74,7 @@ fn load_engine<B>(
     draft: Option<(&DraftOptions, B)>,
     gemv: Gemv,
     warm: impl Fn(&B),
-) -> Result<Box<dyn Generator>>
+) -> Result<Box<dyn SyncGenerator + Send>>
 where
     B: SyncReadback + Send + 'static,
     B::Weight: Send,

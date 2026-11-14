@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use yaxus_api::TranslateRequest;
-use yaxus_model::Generator;
+use yaxus_model::{Generator, SyncGenerator, poll_once};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::memory::Memory;
@@ -22,8 +22,19 @@ pub struct RunStats {
 }
 
 /// Translates one request on `model` (with nothing else in flight, and without the
-/// translation memory), streaming text pieces to `emit`.
+/// translation memory), streaming text pieces to `emit`. For an engine whose steps never
+/// wait (see [`SyncGenerator`]); [`run_request_async`] is the form for any.
 pub fn run_request(
+    model: &mut dyn SyncGenerator,
+    tok: &Tokenizer,
+    req: &TranslateRequest,
+    emit: &mut dyn FnMut(&str),
+) -> Result<(String, RunStats)> {
+    poll_once(run_request_async(model, tok, req, emit))
+}
+
+/// [`run_request`], awaiting the engine.
+pub async fn run_request_async(
     model: &mut dyn Generator,
     tok: &Tokenizer,
     req: &TranslateRequest,
@@ -35,14 +46,16 @@ pub fn run_request(
     session.submit(prompt, req.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS), ());
     let (mut done, mut failed) = (None, None);
     while done.is_none() && failed.is_none() {
-        let worked = session.step(&mut |u| {
-            match u {
-                Update::Delta { text, .. } => emit(text),
-                Update::Done { done: d, .. } => done = Some(d),
-                Update::Failed { message, .. } => failed = Some(message),
-            }
-            true
-        })?;
+        let worked = session
+            .step_async(&mut |u| {
+                match u {
+                    Update::Delta { text, .. } => emit(text),
+                    Update::Done { done: d, .. } => done = Some(d),
+                    Update::Failed { message, .. } => failed = Some(message),
+                }
+                true
+            })
+            .await?;
         anyhow::ensure!(worked || session.is_idle(), "engine idle with the request unfinished");
     }
     if let Some(message) = failed {

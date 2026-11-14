@@ -2,10 +2,12 @@
 // page, and the page can throw the whole worker away (wasm memory, WebGPU device and
 // all) after an error it cannot trust, or before loading another file.
 //
-// Messages in:  {type: 'load', file}  {type: 'translate', text, target, form}
+// Messages in:  {type: 'load', file}  {type: 'translate', text, target, form, chains}
+//               {type: 'cancel'}  (stops the translation in progress)
 // Messages out: {type: 'status', message}  {type: 'read', done, total}
 //               {type: 'ready', info}  {type: 'progress', done, total}
-//               {type: 'text', text}  {type: 'done', stats}
+//               {type: 'plan', breaks}  {type: 'text', segment, text}
+//               {type: 'done', stats}
 //               {type: 'error', message, fatal}
 import init, { ModelBuffer, load_model } from './pkg/yaxus_web.js';
 
@@ -17,7 +19,15 @@ let queue = Promise.resolve();
 const post = (msg) => postMessage(msg);
 const status = (message) => post({ type: 'status', message });
 
+// A stop asked for while a translation runs is not queued behind it: the translation asks
+// `cancelled` between its steps.
+let cancelled = false;
+
 onmessage = ({ data }) => {
+  if (data.type === 'cancel') {
+    cancelled = true;
+    return;
+  }
   queue = queue.then(() => handle(data));
 };
 
@@ -82,23 +92,27 @@ async function adapterName() {
   }
 }
 
-async function translate({ text, target, form }) {
+async function translate({ text, target, form, chains, neighbor }) {
   if (!translator) throw new Error('モデルが読み込まれていません。');
-  const stats = await translator.translate(
-    text,
-    target,
-    form || null,
-    (text) => post({ type: 'text', text }),
-    (done, total) => post({ type: 'progress', done, total }),
-  );
+  // 0 is the automatic number of chains.
+  translator.set_chains(chains ?? 1);
+  cancelled = false;
+  translator.set_neighbor_context(!!neighbor);
+  const stats = await translator.translate(text, target, form || null, {
+    plan: (breaks) => post({ type: 'plan', breaks: Array.from(breaks) }),
+    text: (segment, text) => post({ type: 'text', segment, text }),
+    cancelled: () => cancelled,
+    progress: (done, total) => post({ type: 'progress', done, total }),
+  });
   const plain = {
     promptTokens: stats.prompt_tokens,
     outputTokens: stats.output_tokens,
     maxNew: stats.max_new,
     segments: stats.segments,
     stop: stats.stop,
-    chars: stats.chars,
     reusedTokens: stats.reused_tokens,
+    cancelled: stats.cancelled,
+    elapsedMs: stats.elapsed_ms,
     prefillMs: stats.prefill_ms,
     decodeMs: stats.decode_ms,
     tokensPerSecond: stats.tokens_per_second,

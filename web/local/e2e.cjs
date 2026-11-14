@@ -118,7 +118,7 @@ const settled = (page) =>
   page.waitForFunction(
     () => {
       const s = document.querySelector('#status');
-      return /準備できました|^完了$/.test(s.textContent) || s.classList.contains('err');
+      return /準備できました|^完了$|^中止しました$/.test(s.textContent) || s.classList.contains('err');
     },
     null,
     { timeout: 600_000 },
@@ -208,11 +208,55 @@ async function translate(page, c) {
     console.log(`loaded in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
     console.log((await page.locator('#info').textContent()).replace(/^/gm, '  '));
 
+    // As in the server's page, the segments of a document are translated side by side by default.
+    check('the default is the automatic number of chains', (await page.locator('#chains').inputValue()) === '0', '');
     for (const c of CASES) {
       s = await translate(page, c);
       const ok = !s.err && (c.want ? s.out === c.want : c.check(s.out)) && (!c.reused || /再利用/.test(s.stats));
       check(c.name, ok, ok ? s.stats : `${s.status} | got ${JSON.stringify(s.out.slice(0, 200))}`);
     }
+
+    // The document again with segments translated side by side: all of them, in order, and the
+    // choice is the page's own (`#chains`).
+    for (const [value, label] of [['2', '2 chains'], ['0', 'automatic chains (3 for 12 segments)']]) {
+      await page.locator('#chains').selectOption(value);
+      s = await translate(page, CASES[4]);
+      const parts = s.out.split('\n\n');
+      // Side by side, a chain's first segment has no history: the prompts are not those of one chain (2888 tokens).
+      const side = !/prompt 2888 tokens/.test(s.stats);
+      check(`${label}: the document is translated in full`, !s.err && parts.length === 12 && parts.every((p) => p.trim()) && side, s.stats);
+    }
+    await page.locator('#chains').selectOption('1');
+
+    // A stop: the translation ends with what it has, soon after, and the model is still there.
+    await page.locator('#chains').selectOption('0');
+    await page.locator('#target').selectOption('ja');
+    // (a long one: 36 paragraphs, about 3,500 characters when done)
+    await page.locator('#source').fill([CASES[4].text, CASES[4].text, CASES[4].text].join('\n\n'));
+    await page.locator('#translate').click();
+    await page.waitForFunction(() => document.querySelector('#output').textContent.length > 0, null, { timeout: 120_000 });
+    const stopAt = Date.now();
+    await page.locator('#stop').click();
+    await settled(page);
+    s = await state(page);
+    check('a stop ends the translation with what it had', !s.err && s.status === '中止しました' && /中止/.test(s.stats) && s.out.length > 0 && s.out.length < 3000, `${s.status} (${Date.now() - stopAt} ms) ${s.out.length} chars`);
+    s = await translate(page, CASES[0]);
+    check('after a stop the model translates again', !s.err && s.out === CASES[0].want, s.out);
+
+    // Segments may be translated side by side: the text of each is kept apart and laid out in order.
+    const laid = await page.evaluate(async () => {
+      const { Layout } = await import('./layout.js');
+      const el = document.createElement('div');
+      const layout = new Layout(el);
+      layout.plan(['\n\n', '\n\n', ' ', '\n\n']);
+      layout.add(2, 'C');
+      layout.add(0, 'A');
+      layout.add(3, 'D');
+      layout.add(1, 'B');
+      layout.flush();
+      return el.textContent;
+    });
+    check('segments that arrive out of order are laid out in order', laid === 'A\n\nB C\n\nD', JSON.stringify(laid));
 
     for (const [name, fault] of Object.entries(FAULTS)) {
       await page.workers().at(-1).evaluate(fault);
@@ -239,6 +283,23 @@ async function translate(page, c) {
     s = await state(page);
     check('a late GPU error fails the translation it happened in', s.err && !s.canTranslate, s.status.split('\n')[0]);
     await load(page);
+
+    // The same with segments translated side by side (the automatic number of chains): one
+    // error fails the whole translation, once, and the model loads again.
+    await page.locator('#chains').selectOption('0');
+    await page.locator('#target').selectOption('ja');
+    await page.locator('#source').fill([CASES[4].text, CASES[4].text].join('\n\n'));
+    await page.locator('#translate').click();
+    await page.waitForFunction(() => document.querySelector('#output').textContent.length > 0, null, { timeout: 120_000 });
+    await page.workers().at(-1).evaluate(() => {
+      self.__failNextSubmit = true;
+    });
+    await settled(page);
+    s = await state(page);
+    check('a GPU error while segments run side by side fails the translation', s.err && !s.canTranslate, s.status.split('\n')[0]);
+    await load(page);
+    s = await translate(page, CASES[0]);
+    check('side by side: works after loading again', !s.err && s.out === CASES[0].want, s.out);
 
     // A buffer that fails while the weights are uploaded is a load error.
     flags = 'self.__failBigBuffers = true;\n';

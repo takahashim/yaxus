@@ -6,18 +6,22 @@
 //! server (`yaxus-server`) and the local commands of the CLI are built on it.
 
 pub mod document;
+// Loading puts a model on the native backends; the browser loads its own (`yaxus-web`).
+#[cfg(not(target_arch = "wasm32"))]
 mod load;
 pub mod memory;
 mod options;
 mod prompt;
 mod resolve;
 mod run;
+pub mod scheduler;
 pub mod score;
 mod session;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use load::{load_generator, load_tokenizer};
 pub use options::{BackendKind, Decode, DraftOptions, LoadOptions, Prefill, Scheduling, default_decode_rows};
 pub use prompt::{Prompt, prompt_request};
 pub use resolve::{DraftSpec, ResolvedModel, quant_label, resolve_draft, resolve_model};
-pub use run::{RunStats, run_request};
+pub use run::{RunStats, run_request, run_request_async};
 pub use session::{Finished, STOP_TOKENS, Session, Update};

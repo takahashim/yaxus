@@ -2,9 +2,11 @@
 //! ends and failures do to the document, and when it is over. The server's worker and
 //! [`run_document`] differ only in where the text and the reports go.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use yaxus_api::DocumentUsage;
-use yaxus_model::{Finish, Generator};
+use yaxus_model::{Finish, Generator, SyncGenerator, poll_once};
 use yaxus_tokenizer::Tokenizer;
 
 use super::{DocJob, SegmentError};
@@ -19,6 +21,12 @@ pub struct SegmentEnd {
     /// Prompt tokens whose KV was reused.
     pub reused: usize,
     pub generated: usize,
+    /// How it ended: `Stop` (complete) or `Length` (cut at the output budget).
+    pub finish: Finish,
+    /// Submission to the first token (prompt processing), as the session measured it.
+    pub prefill: Duration,
+    /// First token to the end.
+    pub decode: Duration,
 }
 
 /// A document in progress on a session.
@@ -100,11 +108,14 @@ impl DocRun {
             prompt_tokens: done.prompt_tokens,
             reused: done.start.reused,
             generated: done.generated,
+            finish: done.finish,
+            prefill: done.prefill(),
+            decode: done.decode(),
         };
         self.usage.total.prompt_tokens += end.prompt_tokens;
         self.usage.total.reused_tokens += end.reused;
         self.usage.total.completion_tokens += end.generated;
-        self.job.finished(segment, done.text);
+        self.job.finished(segment, done.text, done.finish == Finish::Length);
         Some(end)
     }
 
@@ -126,6 +137,17 @@ impl DocRun {
     }
 }
 
+/// Why [`run_document_async`] failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DocRunError {
+    /// The engine failed (a read-back of its backend): it is not to be used again.
+    #[error("{0:#}")]
+    Engine(anyhow::Error),
+    /// A segment failed, or its prompt could not be built. The engine is as before.
+    #[error("{0}")]
+    Segment(String),
+}
+
 /// Events of [`run_document`].
 pub enum DocEvent<'a> {
     Delta { segment: usize, text: &'a str },
@@ -140,53 +162,95 @@ pub enum DocEvent<'a> {
 /// further segments are started, the ones in flight are cancelled and drained from the
 /// engine, no more events are sent, and the document is returned unfinished. A failed
 /// segment also stops it; its error is returned once the engine is drained.
+///
+/// For an engine whose steps never wait (see [`SyncGenerator`]); [`run_document_async`]
+/// is the form for any.
 pub fn run_document(
-    engine: &mut dyn Generator,
+    engine: &mut dyn SyncGenerator,
     tok: &Tokenizer,
     job: DocJob,
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<DocJob> {
+    Ok(poll_once(run_document_async(engine, tok, job, memory, on))?)
+}
+
+/// [`run_document`], awaiting the engine.
+pub async fn run_document_async(
+    engine: &mut dyn Generator,
+    tok: &Tokenizer,
+    job: DocJob,
+    memory: &mut Memory,
+    on: &mut dyn FnMut(DocEvent) -> bool,
+) -> Result<DocJob, DocRunError> {
+    run_document_until(engine, tok, job, memory, on, &mut || false).await
+}
+
+/// [`run_document_async`] that also asks `cancelled` between the engine's steps, and
+/// stops the document when it says `true`. Stopping, whichever way it comes about,
+/// cancels the segments that are waiting or running in the engine at once, rather than
+/// when they next produce text.
+pub async fn run_document_until(
+    engine: &mut dyn Generator,
+    tok: &Tokenizer,
+    job: DocJob,
+    memory: &mut Memory,
+    on: &mut dyn FnMut(DocEvent) -> bool,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DocJob, DocRunError> {
     let mut session = Session::new(engine, tok, memory);
     let mut run = DocRun::new(job);
     let mut failure: Option<String> = None;
+    let mut cancelled_all = false;
     if let Err(e) = run.submit_ready(&mut session, |s| s) {
         failure = Some(e.to_string());
     }
     while !run.is_over() {
-        let worked = session.step(&mut |u| {
-            match u {
-                Update::Delta { tag, text } => {
-                    if !run.accepts() {
-                        return false;
+        let worked = session
+            .step_async(&mut |u| {
+                match u {
+                    Update::Delta { tag, text } => {
+                        if !run.accepts() {
+                            return false;
+                        }
+                        if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
+                            run.stop();
+                            return false;
+                        }
                     }
-                    if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
-                        run.stop();
-                        return false;
+                    Update::Done { tag, done } => {
+                        if let Some(end) = run.on_done(tag, done)
+                            && !on(DocEvent::SegmentDone(end))
+                        {
+                            run.stop();
+                        }
+                    }
+                    Update::Failed { tag, message } => {
+                        if run.on_failed() {
+                            failure.get_or_insert(format!("segment {tag}: {message}"));
+                        }
                     }
                 }
-                Update::Done { tag, done } => {
-                    if let Some(end) = run.on_done(tag, done)
-                        && !on(DocEvent::SegmentDone(end))
-                    {
-                        run.stop();
-                    }
-                }
-                Update::Failed { tag, message } => {
-                    if run.on_failed() {
-                        failure.get_or_insert(format!("segment {tag}: {message}"));
-                    }
-                }
-            }
-            true
-        })?;
+                true
+            })
+            .await
+            .map_err(DocRunError::Engine)?;
+        if run.accepts() && cancelled() {
+            run.stop();
+        }
+        if !run.accepts() && !cancelled_all {
+            cancelled_all = true;
+            session.cancel_where(|_| true);
+        }
         if let Err(e) = run.submit_ready(&mut session, |s| s) {
             failure.get_or_insert(e.to_string());
         }
-        anyhow::ensure!(worked || run.is_over() || !session.is_idle(), "engine idle with segments left");
+        if !(worked || run.is_over() || !session.is_idle()) {
+            return Err(DocRunError::Engine(anyhow::anyhow!("engine idle with segments left")));
+        }
     }
     if let Some(e) = failure {
-        anyhow::bail!(e);
+        return Err(DocRunError::Segment(e));
     }
     Ok(run.into_job())
 }

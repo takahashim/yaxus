@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 
-use crate::worker::Job;
+use yaxus_runtime::scheduler::{Job, JobSource, Next};
 
 /// Why a job was not queued.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,17 +63,6 @@ impl JobQueue {
 }
 
 impl Jobs {
-    /// How many jobs the queue holds, which is also how many requests the inference thread
-    /// keeps waiting in the engine.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-
-    /// The next job, waiting for one; `None` when every handle of the queue is gone.
-    pub fn recv(&mut self) -> Option<Job> {
-        self.rx.blocking_recv().inspect(|_| self.taken())
-    }
-
     pub fn try_recv(&mut self) -> Result<Job, TryRecvError> {
         self.rx.try_recv().inspect(|_| self.taken())
     }
@@ -83,19 +72,44 @@ impl Jobs {
     }
 }
 
+impl JobSource for Jobs {
+    /// The next job, waiting for one; `None` when every handle of the queue is gone.
+    async fn next(&mut self) -> Option<Job> {
+        self.rx.recv().await.inspect(|_| self.taken())
+    }
+
+    fn try_next(&mut self) -> Next {
+        match self.try_recv() {
+            Ok(job) => Next::Job(job),
+            Err(TryRecvError::Empty) => Next::Empty,
+            Err(TryRecvError::Disconnected) => Next::Closed,
+        }
+    }
+
+    /// How many jobs the queue holds, which is also how many requests the loop keeps
+    /// waiting in the engine.
+    fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::worker::Work;
+    use crate::worker::{Events, Work};
 
     fn job() -> Job {
         let tok = yaxus_tokenizer::testing::plamo_like(&[]);
         let req = yaxus_pfml::TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let prompt = yaxus_runtime::Prompt::new(&tok, &req.validate().unwrap());
         let (events, _) = mpsc::unbounded_channel();
-        Job { work: Work::Single { prompt, max_new_tokens: 1, events }, enqueued: Instant::now(), label: "t".into() }
+        Job {
+            work: Work::Single { prompt, max_new_tokens: 1, events: Box::new(Events(events)) },
+            enqueued: Instant::now(),
+            label: "t".into(),
+        }
     }
 
     #[test]

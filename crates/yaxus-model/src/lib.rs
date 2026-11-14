@@ -14,7 +14,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub use config::{Config, LayerMeta, Rope};
-pub use engine::{Engine, EngineConfig, Event, Finish, Generator, ReqId, Request};
+pub use engine::{
+    Engine, EngineConfig, Event, Finish, Generator, LocalBoxFuture, ReqId, Request, SyncGenerator, poll_once,
+};
 pub use kv::{KvCache, MAX_CACHED, MIN_REUSE, PAGE, PageCopy, SeqId};
 pub use weights::{TensorRef, Weights, bf16_to_f32};
 
@@ -192,6 +194,17 @@ pub trait AsyncReadback: Backend {
         &'a mut self,
         logits: &'a Self::Tensor,
     ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a;
+
+    /// Scoring a text ([`Model::score`]) reads the logits back to the host and waits for
+    /// them: only a backend that can wait has it. WebGPU does not, so its engine does not
+    /// score.
+    #[allow(clippy::type_complexity)]
+    fn scorer() -> Option<fn(&mut Model<Self>, &[u32], &[u32]) -> Result<Vec<TokenScore>>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl<B: SyncReadback> AsyncReadback for B {
@@ -200,6 +213,11 @@ impl<B: SyncReadback> AsyncReadback for B {
         logits: &'a Self::Tensor,
     ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a {
         std::future::ready(Ok(self.argmax_rows(logits)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn scorer() -> Option<fn(&mut Model<Self>, &[u32], &[u32]) -> Result<Vec<TokenScore>>> {
+        Some(Model::<B>::score)
     }
 }
 
@@ -419,6 +437,11 @@ impl<B: Backend> Model<B> {
     /// Free pages left in the KV arena.
     pub fn free_pages(&self) -> usize {
         self.seqs.free_pages()
+    }
+
+    /// Pages in the KV arena, and the positions a sequence may reach.
+    pub fn arena(&self) -> (usize, usize) {
+        (self.seqs.total_pages(), self.seqs.max_pos())
     }
 
     /// One forward pass over several sequences: `items[i] = (seq, tokens)` appends the

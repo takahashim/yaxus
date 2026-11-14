@@ -145,6 +145,8 @@ struct Stream {
     start: StartInfo,
     finish: Option<Finish>,
     error: Option<String>,
+    /// KV pages kept for the request from its start to its end (see [`Engine::admit`]).
+    reserved: usize,
 }
 
 /// Where the tokens of a speculative round come from.
@@ -173,6 +175,8 @@ pub struct Engine<B: Backend> {
     /// The stop token that ended the last stopped request: hints (outputs without their
     /// stop token) are extended by it, so the end of an output is verified with the hint.
     end_token: Option<u32>,
+    /// Events of requests cancelled while they waited, delivered at the next step.
+    pending: Vec<Event>,
 }
 
 impl<B: AsyncReadback> Engine<B> {
@@ -206,6 +210,7 @@ impl<B: AsyncReadback> Engine<B> {
             cache: ResponseCache::default(),
             tuner: DraftTuner::default(),
             end_token: None,
+            pending: Vec::new(),
         })
     }
 
@@ -265,7 +270,28 @@ impl<B: AsyncReadback> Engine<B> {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.waiting.is_empty() && self.streams.is_empty()
+        self.waiting.is_empty() && self.streams.is_empty() && self.pending.is_empty()
+    }
+
+    /// Cancels request `id`; `false` if it is not waiting or running (it has ended, or
+    /// never existed). It ends with `Event::Done { finish: Cancelled }` at the next
+    /// [`step_async`](Engine::step_async), whichever state it is in: a waiting request
+    /// never starts, and a running one is not given another pass (its KV is kept for
+    /// prefix reuse, as for one that ended on its own). Callable only between steps,
+    /// which the borrow of a step in progress guarantees.
+    pub fn cancel(&mut self, id: ReqId) -> bool {
+        if let Some(at) = self.waiting.iter().position(|r| r.id == id) {
+            self.waiting.remove(at);
+            self.pending.push(Event::Done { id, finish: Finish::Cancelled, generated: 0, start: StartInfo::default() });
+            return true;
+        }
+        match self.streams.iter_mut().find(|s| s.req.id == id && s.finish.is_none() && s.error.is_none()) {
+            Some(s) => {
+                s.finish = Some(Finish::Cancelled);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drops every request, waiting or running, without events, and frees their KV (for
@@ -293,9 +319,16 @@ impl<B: AsyncReadback> Engine<B> {
     /// The step is never dropped half-way: its pass has already changed the KV by the
     /// time the read-back is awaited. Cancel a request through `emit`.
     pub async fn step_async(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        // The ends of requests cancelled since the last step come first, so that a
+        // cancelled stream is not given another pass and its pages are free for admission.
+        let cancelled = !self.pending.is_empty() || self.streams.iter().any(|s| s.finish.is_some());
+        for event in std::mem::take(&mut self.pending) {
+            emit(event);
+        }
+        self.sweep(emit);
         self.admit(emit);
         if self.streams.is_empty() {
-            return Ok(false);
+            return Ok(cancelled);
         }
         let decoding: Vec<usize> =
             (0..self.streams.len()).filter(|&i| matches!(self.streams[i].phase, Phase::Decode { .. })).collect();
@@ -335,17 +368,34 @@ impl<B: AsyncReadback> Engine<B> {
         Ok(true)
     }
 
+    /// Starts waiting requests while there is room for them.
+    ///
+    /// A request is started only when the KV pages it can need are free of the other
+    /// requests: `ceil(min(prompt + max_new, max_pos) / PAGE)`, kept for it until it ends.
+    /// That bound holds for speculation too, whose proposals never go past `max_new`. The
+    /// pages of a prefix it reuses are not subtracted (a shared page is counted once for
+    /// each request that holds it), which keeps the rule simple and a little cautious.
+    /// Sequences kept for prefix reuse are not counted: they are evicted when needed.
+    ///
+    /// A request that waits stays at the front of the queue. One that cannot fit even in
+    /// an empty arena would wait for ever, and fails at once instead.
     fn admit(&mut self, emit: &mut dyn FnMut(Event) -> bool) {
+        let (mut total, max_pos) = self.target.arena();
+        if let Some(draft) = &self.draft {
+            total = total.min(draft.arena().0);
+        }
         while self.streams.len() < self.cfg.max_streams
-            && let Some(req) = self.waiting.pop_front()
+            && let Some(req) = self.waiting.front()
         {
             if req.prompt.is_empty() || req.max_new_tokens == 0 {
+                let req = self.waiting.pop_front().unwrap();
                 emit(Event::Done { id: req.id, finish: Finish::Length, generated: 0, start: StartInfo::default() });
                 continue;
             }
             if self.cfg.response_cache > 0
-                && let Some((out, mut finish)) = self.cache.get(&req)
+                && let Some((out, mut finish)) = self.cache.get(req)
             {
+                let req = self.waiting.pop_front().unwrap();
                 self.spec.cache_hits += 1;
                 let mut generated = 0;
                 for &token in &out {
@@ -360,6 +410,23 @@ impl<B: AsyncReadback> Engine<B> {
                 emit(Event::Done { id: req.id, finish, generated, start });
                 continue;
             }
+            let tokens = req.prompt.len() + req.max_new_tokens;
+            let need = tokens.min(max_pos).div_ceil(crate::PAGE);
+            if tokens > max_pos || need > total {
+                let req = self.waiting.pop_front().unwrap();
+                let message = if tokens > max_pos {
+                    format!("the request needs {tokens} positions, more than the {max_pos} the model's KV covers")
+                } else {
+                    format!("the request needs {need} KV pages, more than the {total} the arena has")
+                };
+                emit(Event::Error { id: req.id, message });
+                continue;
+            }
+            let reserved: usize = self.streams.iter().map(|s| s.reserved).sum();
+            if reserved + need > total {
+                break;
+            }
+            let req = self.waiting.pop_front().unwrap();
             match self.target.begin(&req.prompt) {
                 Ok((ts, reused)) => {
                     let start = StartInfo { reused, computed: req.prompt.len() - reused, cached: false };
@@ -375,6 +442,7 @@ impl<B: AsyncReadback> Engine<B> {
                         start,
                         finish: None,
                         error: None,
+                        reserved: need,
                     });
                 }
                 Err(e) => {
@@ -636,12 +704,24 @@ impl<B: AsyncReadback> Engine<B> {
     }
 }
 
+/// A boxed future that need not be `Send` (WebGPU's are not).
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + 'a>>;
+
 /// Object-safe view of an engine, so callers can pick the backend at run time.
-pub trait Generator: Send {
+///
+/// It is not `Send`: a WebGPU engine cannot move between threads, and its steps are
+/// awaited. An engine that is handed to another thread (the server's inference thread)
+/// is a `Box<dyn Generator + Send>`, which the native backends allow.
+pub trait Generator {
     fn submit(&mut self, req: Request);
-    /// See [`Engine::step`].
-    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool>;
+    /// See [`Engine::step_async`].
+    fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>>;
     fn fresh_id(&mut self) -> ReqId;
+    /// See [`Engine::cancel`]. An engine that cannot cancel says `false`: the request
+    /// then ends when its next token is refused, as before.
+    fn cancel(&mut self, _id: ReqId) -> bool {
+        false
+    }
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
     /// See [`Engine::abort_all`].
@@ -656,6 +736,16 @@ pub trait Generator: Send {
     /// [`Model::score`](crate::Model::score)). Runs at once, between steps.
     fn score(&mut self, _prompt: &[u32], _forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
         anyhow::bail!("this engine does not score text")
+    }
+}
+
+/// A [`Generator`] whose steps never wait, which can therefore also be stepped without
+/// an async context: the engines of the native backends (`SyncReadback`). A WebGPU engine
+/// is not one: its step waits for the device, so it can only be awaited.
+pub trait SyncGenerator: Generator {
+    /// [`step_async`](Generator::step_async), polled once.
+    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        poll_once(self.step_async(emit))
     }
 
     /// Runs one request to completion on its own. `on_token` returns `false` to stop.
@@ -697,15 +787,24 @@ pub trait Generator: Send {
     }
 }
 
+impl<B: SyncReadback> SyncGenerator for Engine<B> {}
+
 impl<B: SyncReadback> Engine<B> {
     /// [`Engine::step_async`] for a backend that reads back without waiting, where the
     /// step never has to wait for anything.
     pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        let mut step = std::pin::pin!(self.step_async(emit));
-        match step.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(r) => r,
-            Poll::Pending => unreachable!("a SyncReadback backend reads back at once"),
-        }
+        poll_once(self.step_async(emit))
+    }
+}
+
+/// The output of a future that is ready at its first poll, as the steps of an engine on
+/// a native backend are. Panics if it is not: that one waits for something (WebGPU) and
+/// has to be awaited.
+pub fn poll_once<F: Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(r) => r,
+        Poll::Pending => unreachable!("the future waits: drive it from an async context"),
     }
 }
 
@@ -735,19 +834,18 @@ fn request_failure(e: anyhow::Error) -> Result<String> {
     }
 }
 
-impl<B: SyncReadback + Send> Generator for Engine<B>
-where
-    B::Weight: Send,
-    B::Kv: Send,
-{
+impl<B: AsyncReadback> Generator for Engine<B> {
     fn submit(&mut self, req: Request) {
         Engine::submit(self, req)
     }
-    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        Engine::step(self, emit)
+    fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>> {
+        Box::pin(Engine::step_async(self, emit))
     }
     fn fresh_id(&mut self) -> ReqId {
         Engine::fresh_id(self)
+    }
+    fn cancel(&mut self, id: ReqId) -> bool {
+        Engine::cancel(self, id)
     }
     fn waiting(&self) -> usize {
         Engine::waiting(self)
@@ -789,13 +887,130 @@ where
         self.last_start
     }
     fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
-        self.target.score(prompt, forced)
+        match B::scorer() {
+            Some(score) => score(&mut self.target, prompt, forced),
+            None => anyhow::bail!("this backend cannot score text"),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs the engine until it is idle; returns each request's `(id, finish or error)`.
+    fn run_all(eng: &mut Engine<crate::testing::NullBackend>) -> Vec<(ReqId, Result<Finish, String>)> {
+        let mut ended = Vec::new();
+        while eng
+            .step(&mut |ev| {
+                match ev {
+                    Event::Done { id, finish, .. } => ended.push((id, Ok(finish))),
+                    Event::Error { id, message } => ended.push((id, Err(message))),
+                    Event::Token { .. } => {}
+                }
+                true
+            })
+            .unwrap()
+        {}
+        ended
+    }
+
+    fn request(id: ReqId, prompt_len: usize, max_new: usize) -> Request {
+        // Distinct prompts, so that no prefix is shared and the KV needs are plain.
+        Request::new(id, (0..prompt_len as u32).map(|t| t + id as u32 * 1000).collect(), max_new, vec![])
+    }
+
+    #[test]
+    fn a_waiting_request_is_cancelled_before_it_starts() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 3));
+        eng.submit(request(2, 130, 3));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (1, 1));
+        assert!(eng.cancel(2), "it waits");
+        assert!(!eng.cancel(2), "and only once");
+        assert!(!eng.cancel(99), "an unknown request");
+        let ended = run_all(&mut eng);
+        assert!(ended.contains(&(2, Ok(Finish::Cancelled))), "{ended:?}");
+        assert!(ended.contains(&(1, Ok(Finish::Length))), "the other runs on: {ended:?}");
+        assert!(eng.is_idle());
+    }
+
+    #[test]
+    fn a_running_request_is_cancelled_and_its_pages_serve_the_next() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 120)); // would run for 120 more steps
+        eng.submit(request(2, 130, 3)); // waits for 1's pages
+        eng.step(&mut |_| true).unwrap();
+        assert!(eng.cancel(1));
+        let mut tokens_of_1_after = 0;
+        let mut ended = Vec::new();
+        while eng
+            .step(&mut |ev| {
+                match ev {
+                    Event::Token { id: 1, .. } => tokens_of_1_after += 1,
+                    Event::Done { id, finish, .. } => ended.push((id, finish)),
+                    _ => {}
+                }
+                true
+            })
+            .unwrap()
+        {}
+        assert_eq!(tokens_of_1_after, 0, "a cancelled request is not given another pass");
+        assert_eq!(ended, [(1, Finish::Cancelled), (2, Finish::Length)]);
+        assert!(eng.is_idle());
+    }
+
+    #[test]
+    fn a_request_waits_for_the_pages_of_the_others() {
+        // 2 pages of 128 tokens; each request below needs both.
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 3));
+        eng.submit(request(2, 130, 3));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (1, 1), "the second one waits instead of failing");
+        let ended = run_all(&mut eng);
+        assert_eq!(ended, [(1, Ok(Finish::Length)), (2, Ok(Finish::Length))]);
+        assert_eq!(eng.active() + eng.waiting(), 0);
+    }
+
+    #[test]
+    fn requests_that_fit_together_run_together() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 100, 20));
+        eng.submit(request(2, 100, 20));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (2, 0), "one page each");
+    }
+
+    #[test]
+    fn a_request_that_cannot_fit_alone_fails_at_once_and_blocks_nobody() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 250, 10)); // 260 tokens: 3 pages of the 2
+        eng.submit(request(2, 10, 3));
+        let ended = run_all(&mut eng);
+        assert_eq!(ended.len(), 2);
+        let (id, r) = &ended[0];
+        assert_eq!(*id, 1);
+        assert!(r.as_ref().unwrap_err().contains("KV pages"), "{r:?}");
+        assert_eq!(ended[1], (2, Ok(Finish::Length)));
+    }
+
+    #[test]
+    fn a_request_past_the_positions_of_the_model_fails_at_once() {
+        let mut eng = Engine::new(crate::testing::model_with_max_pos(4, 200), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 150, 100));
+        let ended = run_all(&mut eng);
+        assert!(ended[0].1.as_ref().unwrap_err().contains("positions"), "{ended:?}");
+    }
+
+    #[test]
+    fn a_request_may_take_the_whole_arena() {
+        // The page rule needs no spare page: 256 tokens fit in 2 pages of 128.
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 250, 6));
+        assert_eq!(run_all(&mut eng), [(1, Ok(Finish::Length))]);
+    }
 
     #[test]
     fn zero_row_budgets_are_rejected() {

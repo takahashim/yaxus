@@ -9,6 +9,8 @@ description = "Model resolution, loading and translation jobs for yaxus (shared 
 anyhow.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
+web-time = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-pfml = { path = "../yaxus-pfml" }
