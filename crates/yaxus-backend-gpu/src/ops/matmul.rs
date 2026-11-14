@@ -6,6 +6,16 @@ use crate::kernels::name;
 use crate::plan::{self, GluPlan, MatmulCase, MatmulPlan, Piece};
 use crate::{GEMV_MAX_T, GEMVM_MAX_T, GemmKind, Gemv, Gpu, Tensor, Weight, gemm_int, gemv_int};
 
+/// How an integer GEMV runs: activations in `planes` int8 planes, rounded inside the
+/// kernel with `inline` (a single row, see `plan::gemv_int_inline`), and `swiglu` of the
+/// product with `glu`.
+#[derive(Debug, Clone, Copy)]
+struct IntGemv {
+    planes: usize,
+    inline: bool,
+    glu: bool,
+}
+
 impl Gpu {
     /// Whether `msl::gemv2` gives a row the same bits alone (the scalar kernel) and in
     /// passes of 8 and 16 rows (simdgroup matrices), on a Q8_0 matrix of varied values.
@@ -70,15 +80,8 @@ impl Gpu {
         let (n32, k32) = (n as u32, k as u32);
         let plan = case.plan(&self.caps, &self.tuning);
         match plan {
-            MatmulPlan::GemvInt { planes, inline } => {
-                let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
-                self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
-            }
-            MatmulPlan::GemmInt { planes } => {
-                // The integer GEMM reads the per-16 scale arrays where a format has them.
-                let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
-                self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
-            }
+            MatmulPlan::GemvInt { planes, inline } => self.gemv_int(x, &y, m, IntGemv { planes, inline, glu: false }),
+            MatmulPlan::GemmInt { planes } => self.gemm_int(x, &y, m, planes),
             MatmulPlan::GemvF32 => self.gemv_f32(x, &y, m, n, false),
             MatmulPlan::Gemv2 => self.run_pieces(x, &y, m, n, false, &plan::gemv2_pieces(0, t, false, &apple)),
             MatmulPlan::GemmMsl { f16, gemv2 } => {
@@ -151,8 +154,7 @@ impl Gpu {
         match case.plan_glu(&self.caps, &self.tuning) {
             GluPlan::GemvInt { planes, inline } => {
                 let y = self.tensor(x.rows, n2 / 2);
-                let [q, s] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
-                self.gemv_int(x, &y, &q, &s, n2 / 2, m.fmt.gemv_int().unwrap(), (planes, inline), true);
+                self.gemv_int(x, &y, m, IntGemv { planes, inline, glu: true });
                 return y;
             }
             GluPlan::GemvF32 => {
@@ -218,20 +220,13 @@ impl Gpu {
     }
 
     /// `y = x W^T` for more than 16 rows with integer dot products (`gemm_int`): the rows
-    /// are quantized to int8 planes, then tiles of 128 tokens and one of 64 or 32 for the
-    /// rest (a tile costs its full size whatever it holds).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gemm_int(
-        &mut self,
-        x: &Tensor,
-        y: &Tensor,
-        wq: &Buf,
-        scales: &Buf,
-        n: usize,
-        f: &'static gemm_int::IntFmt,
-        planes: usize,
-    ) {
-        let (t, k) = (x.rows, x.cols);
+    /// are quantized to `planes` int8 planes, then tiles of 128 tokens and one of 64 or 32
+    /// for the rest (a tile costs its full size whatever it holds).
+    fn gemm_int(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, planes: usize) {
+        let (t, k, n) = (x.rows, x.cols, m.n);
+        let f = m.fmt.gemm_int().expect("the plan takes the integer GEMM only for its formats");
+        // The integer GEMM reads the per-16 scale arrays where a format has them.
+        let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
         let tp = t.div_ceil(128) * 128;
         let xq = self.tensor(tp, planes * k / 4);
         let xs = self.tensor(tp, k / 8);
@@ -270,22 +265,15 @@ impl Gpu {
         self.account(2.0 * (t * n * k) as f64);
     }
 
-    /// `y = x W^T` for up to 16 rows with integer dot products (`gemv_int`), or
-    /// `swiglu` of it with `glu` (`n` is then the intermediate size); activations in
-    /// `planes` int8 planes, rounded inside the kernel with `inline` (a single row).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gemv_int(
-        &mut self,
-        x: &Tensor,
-        y: &Tensor,
-        wq: &Buf,
-        wsc: &Buf,
-        n: usize,
-        f: &'static gemv_int::IntFmt,
-        (planes, inline): (usize, bool),
-        glu: bool,
-    ) {
+    /// `y = x W^T` for up to 16 rows with integer dot products (`gemv_int`), or `swiglu`
+    /// of it (see [`IntGemv`]).
+    fn gemv_int(&mut self, x: &Tensor, y: &Tensor, m: &crate::Matrix, IntGemv { planes, inline, glu }: IntGemv) {
         let (t, k) = (x.rows, x.cols);
+        // (with `glu` the matrix is [gate; up], and the output the intermediate size)
+        let n = if glu { m.n / 2 } else { m.n };
+        let f = m.fmt.gemv_int().expect("the plan takes the integer GEMV only for its formats");
+        let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
+        let (wq, wsc) = (&wq, &wsc);
         if inline {
             debug_assert_eq!(t, 1);
             let rw = self.tuning.gemvi_rows;
