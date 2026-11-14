@@ -3,6 +3,10 @@
 //! Paragraphs (blank lines) are kept whole when they fit. A paragraph that does not fit
 //! is split at sentence endings, then at words, and the pieces are packed greedily up to
 //! the token budget.
+//!
+//! Each sentence and word is tokenized once: a packed segment counts as the sum of its
+//! pieces plus one token per join (the budget is a target, and the caller measures the
+//! final prompt exactly), so packing stays linear in the text.
 
 use yaxus_api::split_paragraphs;
 use yaxus_tokenizer::Tokenizer;
@@ -33,12 +37,14 @@ pub fn split_for_context(text: &str, tok: &Tokenizer, budget: usize) -> Vec<Segm
 
         let mut first = true;
         let mut current = String::new();
+        let mut current_tokens = 0;
         for sentence in split_sentences(paragraph) {
             let sentence = sentence.trim();
             if sentence.is_empty() {
                 continue;
             }
-            if count(tok, sentence) > budget {
+            let n = count(tok, sentence);
+            if n > budget {
                 flush(&mut current, &mut first, &mut out);
                 for piece in split_long(sentence, tok, budget) {
                     if piece.is_empty() {
@@ -49,12 +55,14 @@ pub fn split_for_context(text: &str, tok: &Tokenizer, budget: usize) -> Vec<Segm
                 }
                 continue;
             }
-            let candidate = join_sentences(&current, sentence);
-            if count(tok, &candidate) <= budget {
-                current = candidate;
+            let joined = if current.is_empty() { n } else { current_tokens + n + 1 };
+            if joined <= budget {
+                current = join_sentences(&current, sentence);
+                current_tokens = joined;
             } else {
                 flush(&mut current, &mut first, &mut out);
                 current = sentence.to_string();
+                current_tokens = n;
             }
         }
         flush(&mut current, &mut first, &mut out);
@@ -88,7 +96,7 @@ fn flush(current: &mut String, first: &mut bool, out: &mut Vec<Segment>) {
 }
 
 /// Sentence endings keep their punctuation; a closing quote or bracket stays with the
-/// sentence. A line break ends a sentence too.
+/// sentence. A line break ends a sentence too (a quote after it opens the next line).
 pub fn split_sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -98,7 +106,9 @@ pub fn split_sentences(text: &str) -> Vec<String> {
             continue;
         }
         let mut end = i + c.len_utf8();
-        while let Some(&(j, q)) = chars.peek() {
+        while c != '\n'
+            && let Some(&(j, q)) = chars.peek()
+        {
             if matches!(q, '"' | '\'' | '”' | '’' | ')' | ']' | '）' | '】' | '」' | '』') {
                 chars.next();
                 end = j + q.len_utf8();
@@ -127,39 +137,61 @@ pub fn split_sentences(text: &str) -> Vec<String> {
 fn split_long(sentence: &str, tok: &Tokenizer, budget: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut current_tokens = 0;
     for word in sentence.split_whitespace() {
-        let candidate = if current.is_empty() { word.to_string() } else { format!("{current} {word}") };
-        if count(tok, &candidate) <= budget {
-            current = candidate;
-            continue;
-        }
-        if !current.is_empty() {
-            out.push(std::mem::take(&mut current));
-        }
-        if count(tok, word) <= budget {
-            current = word.to_string();
-            continue;
-        }
-        // A single "word" longer than the budget (a URL, a long identifier): split it by
-        // characters. One character may itself exceed a tiny budget; it still has to go
-        // somewhere.
-        let mut piece = String::new();
-        for ch in word.chars() {
-            piece.push(ch);
-            if count(tok, &piece) > budget && piece.chars().count() > 1 {
-                piece.pop();
-                if !piece.is_empty() {
-                    out.push(std::mem::take(&mut piece));
-                }
-                piece.push(ch);
+        let n = count(tok, word);
+        if n > budget {
+            // A single "word" longer than the budget (a URL, a long identifier, Japanese
+            // without punctuation).
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
             }
+            out.extend(split_chars(word, tok, budget));
+            continue;
         }
-        if !piece.is_empty() {
-            out.push(piece);
+        let joined = if current.is_empty() { n } else { current_tokens + n + 1 };
+        if joined <= budget {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_tokens = joined;
+        } else {
+            out.push(std::mem::replace(&mut current, word.to_string()));
+            current_tokens = n;
         }
     }
     if !current.is_empty() {
         out.push(current);
+    }
+    out
+}
+
+/// A word longer than the budget, cut at characters: each piece is the longest prefix
+/// of the rest within the budget, found by bisection (a few encodes per piece rather
+/// than one per character). A piece has at least one character, which may itself
+/// exceed a tiny budget.
+fn split_chars(word: &str, tok: &Tokenizer, budget: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = word;
+    while !rest.is_empty() {
+        if count(tok, rest) <= budget {
+            out.push(rest.to_string());
+            break;
+        }
+        // Ends of the prefixes of 1, 2, ... characters; the whole rest is too long.
+        let ends: Vec<usize> = rest.char_indices().skip(1).map(|(i, _)| i).chain([rest.len()]).collect();
+        let (mut fits, mut too_long) = (0, ends.len() - 1);
+        while too_long - fits > 1 {
+            let mid = (fits + too_long) / 2;
+            if count(tok, &rest[..ends[mid]]) <= budget {
+                fits = mid;
+            } else {
+                too_long = mid;
+            }
+        }
+        out.push(rest[..ends[fits]].to_string());
+        rest = &rest[ends[fits]..];
     }
     out
 }
@@ -201,9 +233,34 @@ mod tests {
     }
 
     #[test]
+    fn a_quote_after_a_line_break_opens_the_next_sentence() {
+        assert_eq!(split_sentences("He said.\n\"Hello,\" she replied."), ["He said.", "\"Hello,\" she replied."]);
+        assert_eq!(split_sentences("「行く。」\n（次）"), ["「行く。」", "（次）"]);
+    }
+
+    #[test]
+    fn a_long_word_is_cut_into_pieces_within_the_budget() {
+        let tok = plamo_like(&[]);
+        let word: String = "あいうえおかきくけこ".chars().cycle().take(5000).collect();
+        let pieces = split_for_context(&word, &tok, 300);
+        assert!(pieces.len() > 1);
+        assert!(
+            pieces.iter().all(|p| count(&tok, &p.text) <= 300),
+            "{:?}",
+            pieces.iter().map(|p| count(&tok, &p.text)).collect::<Vec<_>>()
+        );
+        assert_eq!(pieces.iter().map(|p| p.text.as_str()).collect::<String>(), word);
+        // Longest prefixes: every piece but the last is full up to one character.
+        for p in &pieces[..pieces.len() - 1] {
+            assert!(count(&tok, &p.text) > 300 - 4, "{}", count(&tok, &p.text));
+        }
+    }
+
+    #[test]
     fn japanese_sentences_are_packed_without_spaces() {
         let tok = plamo_like(&[]);
-        let budget = count(&tok, "これは一つ。これは二つ。");
+        // Two sentences and the join's token, not three.
+        let budget = 2 * count(&tok, "これは一つ。") + 1;
         let segments = split_for_context("これは一つ。これは二つ。これは三つ。", &tok, budget);
         assert_eq!(
             segments.iter().map(|s| (s.text.as_str(), s.paragraph)).collect::<Vec<_>>(),
