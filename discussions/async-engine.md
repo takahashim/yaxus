@@ -190,7 +190,7 @@ pub enum Job {
 
 共通化には、挙動を変えない部分と、訳を変える部分がある。**別の段階にする。**
 
-**挙動を変えない共通化 (段階 1)。** Web の `Translator` を共有の実行ループ (`run_document_async`) に載せる。
+**挙動を変えない共通化 (段階 1)。** Web の `Translator` を共有の実行ループ (`DocRunner`) に載せる。
 分割、履歴、チェーンの方針は、今のそれぞれのものをそのまま使う。
 
 - Web: セグメントは今の `split_for_context` で作り (`Segment { text, paragraph }` を `DocJob` に渡せるようにする)、
@@ -212,7 +212,7 @@ pub enum Job {
 
 ### 6. Web: 薄いグルー
 
-**段階 1〜4 では、`Translator` が一文書を最後まで駆動する** (`translate` が `run_document_async` を await する)。
+**段階 1〜4 では、`Translator` が一文書を最後まで駆動する** (`translate` が `DocRunner` を await する)。
 次は、段階 5 (常駐 `Scheduler`) での形である。
 
 `yaxus-web` に残すのは次だけ。
@@ -250,7 +250,7 @@ pub enum Job {
 
 当面の目的は **Web の文書翻訳の高速化** である。それには、常駐 `Scheduler` も `JobSource` も、
 独立した文書の同時実行も要らない。今の `Translator` が一文書を最後まで駆動する形のまま、
-共有の実行ループ (`run_document_async`) に載せ、同じ文書のチェーンから複数のセグメントを Engine に
+共有の実行ループ (`DocRunner`) に載せ、同じ文書のチェーンから複数のセグメントを Engine に
 投入すれば、バッチになる。翻訳全体を覆う現行の GPU エラースコープも、そのまま使える。
 常駐 `Scheduler` は、独立した翻訳を並行して走らせる要件が出たときに導入する。
 
@@ -260,8 +260,8 @@ pub enum Job {
 
 1. **一文書を共有の実行ループに載せる (訳は変えない)。**
    - `Generator` を非同期にし (`Send` は外す)、`Session`、`DocRun` / `run_document` を async にする
-     (`run_document_async`)。runtime の wasm で動く部分と、ネイティブだけの部分 (`load`) を分ける。
-   - Web の `Translator` を、`run_document_async` で一文書を駆動する形に替える。分割、履歴、チェーンの方針は
+     (`DocRunner`)。runtime の wasm で動く部分と、ネイティブだけの部分 (`load`) を分ける。
+   - Web の `Translator` を、`DocRunner` で一文書を駆動する形に替える。分割、履歴、チェーンの方針は
      今の Web のまま (チェーン 1 本、`split_for_context` のセグメント、上限に達した訳は履歴に入れない)。
    - 確かめること: 各セグメントのプロンプトと出力のトークン列が、現行の Web と一致する。
 2. **KV の予約と、文書内のバッチ。** 予約の規則 (4,096 トークンの要求が 32 ページに収まる式) で
@@ -286,10 +286,10 @@ pub enum Job {
 
 - 出発点の `Engine::step_async` と Web の prefix 再利用は main に入っている。
 - **段階 1 は実装済み** (ブランチ `async-engine`、訳は変えていない)。
-  - `Generator` の非同期化、`Session::step_async`、`run_document_async`、`run_request_async`、
+  - `Generator` の非同期化、`Session::step_async`、`DocRunner`、`run_request_async`、
     runtime の wasm ビルド。`Engine` は WebGPU を含む `AsyncReadback` の全バックエンドで `Generator` になる
     (`score` はバックエンドが待てるときだけ)。
-  - Web の `Translator` は、一文書を `run_document_async` で最後まで駆動する (チェーン 1 本)。
+  - Web の `Translator` は、一文書を `DocRunner` で最後まで駆動する (チェーン 1 本)。
     分割 (`split_for_context`) だけが Web に残り、履歴、プロンプト、エンジンの駆動は runtime のもの。
     今の Web の履歴の扱いは `DocOptions` の `HistoryRules` (訳の trim、上限に達した訳の除外) で表し、
     native の既定は変えていない。
@@ -308,7 +308,7 @@ pub enum Job {
   - 同期の `step` と `generate` は、`Generator` から外して `SyncGenerator` (`SyncReadback` の `Engine` だけが実装)
     に移した。WebGPU の `Engine` は `Generator` だけで、同期の入口を持たない (誤って呼ぶと、KV を更新したあと
     読み戻しで panic する、という事故を型で防ぐ)。`run_document`、`run_request`、`load_generator` はこちらを使い、
-    非同期版 (`run_document_async` など) は `Generator` を取る。
+    非同期版 (`DocRunner` など) は `Generator` を取る。
 - 段階 5 の `Scheduler` の取り出し (server の worker を runtime の `scheduler` に移した) も実装し、
   ネイティブで検証した。上の順序より先に進んだ部分で、Web はまだ使わない (server だけが使う)。
 - **Web の出力はセグメントごとに分けた (済み)。** `on_plan` (各セグメントの前に置く区切り) と
@@ -353,7 +353,7 @@ pub enum Job {
     `Done { Cancelled }` で終える (KV は prefix の再利用のために残す)。`NullBackend` の単体テストで、待機中、
     実行中、2 度目と未知の要求を確かめた。
   - `Session::cancel_where`。文書は、止まったとき (sink が `false`、セグメントの失敗、外からの取り消し) に、
-    待機中と実行中のセグメントを、次の text を待たずにエンジンで取り消す (`run_document_until`)。
+    待機中と実行中のセグメントを、次の text を待たずにエンジンで取り消す (`DocRunner::cancel_when`)。
   - server の `scheduler` は、クライアントが去った要求と、止まった文書の要求を、待機中のものも含めて取り消す。
   - Web のページに「中止」ボタンを足した。worker は取り消しのメッセージを、実行中の翻訳の後ろに並べず、
     翻訳がステップの合間に確かめる。Chrome E2E で、36 段落の翻訳が、クリックの 71 ms 後に終わり、
@@ -373,3 +373,24 @@ pub enum Job {
 - 完了しないチャンクの `end_pass` が、prefill の速度にどれだけ影響するか (見積もりでは小さい)。段階 5 で測る。
 - server の UI と Web のページを 1 つの UI にまとめるか (トランスポートだけの差し替え)。
   この設計の範囲外だが、イベントを `yaxus-api` に揃えたことで可能になる。
+
+## 実装の状況 (設計レビューを受けた整理)
+
+runtime の設計レビューを受けて、次を整理した (挙動は変えていない: server の出力は変更前とバイト単位で同じ、
+ネイティブの 19 文は 19/19 一致で速度も同じ、Chrome E2E は全件通過)。
+
+- `DocRun::on_update` が `Reaction` を返し、「文書がセグメントの更新にどう反応するか」を 1 か所にした
+  (`DocRunner` と server の `scheduler` が両方使う)。
+- `DocRunner` (`new(..).cancel_when(..).run(job, on)`) が `run_document_async` と `run_document_until` を置き換えた。
+  失敗は `DocRunError::{Engine, Prompt, Segment { segment, message }}` で型を持つ。
+- `scheduler` を `mod.rs` (入口の型とループ)、`clients.rs` (配送と文書の進行: `Doc::advance`)、`report.rs`
+  (使用量とログ) に分けた。
+- `ChainHistories` (チェーンごとの履歴の記録と選択) と `Chains` (自動か本数) を足し、`DocJob::ready` は、
+  空のセグメントを完了させる副作用があることが分かる `take_ready` にした。
+- `score` を `SyncGenerator` に移し、`AsyncReadback::scorer` を削除した。
+- `Session` の要求の状態を `Requests` に分けた (`on_event` が 5 引数の自由関数でなくなった)。
+- モデルの解決、読み込みの設定、読み込みを `native/` にまとめ、wasm のための `cfg_attr` を無くした。
+- 見送ったもの: 出力を `Router` トレイトで抽象化すること (API のイベントは、server と Web が共有する言語として
+  意図的に使っている)、`FromStr` の CLI への移動 (孤児規則で、runtime の型には実装できない)、`Scheduling` と
+  `EngineConfig` の統合 (前者は利用者が選ぶ 3 項目で、後者は導出値を含む)、`Prompt` からの `memo` の分離
+  (翻訳メモリのキーは、エンジンに渡す要求と一緒に決まる)、時計の注入 (偽のエンジンのテストが時間に依存しない)。

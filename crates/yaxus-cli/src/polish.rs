@@ -184,7 +184,7 @@ pub struct ScoreRequest<'a> {
 pub trait Polisher {
     /// Translates a document: `stage` names the step (`ja→en`) for progress messages.
     fn translate(&mut self, stage: &str, req: DocumentRequest) -> Result<Vec<String>>;
-    /// The pieces of `r.output` with their log-probabilities (see `Generator::score`).
+    /// The pieces of `r.output` with their log-probabilities (see `SyncGenerator::score`).
     fn score(&mut self, r: &ScoreRequest) -> Result<Vec<Scored>>;
 }
 

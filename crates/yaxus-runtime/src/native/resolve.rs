@@ -73,23 +73,7 @@ impl ModelSpec {
             ModelSpec::GgufFile { repo, quant } => {
                 let hint = format!("download it with `hf download {repo} --include '*{quant}.gguf'`");
                 let dir = yaxus_model::hub::snapshot(&repo).context(hint.clone())?;
-                // The quantization is the last `-` part of the file name (`...-2b-Q4_K_M.gguf`),
-                // so `Q2_K` does not pick `IQ2_K` or `Q2_K_L`.
-                let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)?
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|f| gguf_quant(f).is_some_and(|q| q.eq_ignore_ascii_case(&quant)))
-                    .collect();
-                found.sort();
-                let file = match found.len() {
-                    0 => anyhow::bail!("no *-{quant}.gguf in {}; {hint}", dir.display()),
-                    1 => found.remove(0),
-                    _ => anyhow::bail!(
-                        "several files in {} are {quant}: {}; give the path of one",
-                        dir.display(),
-                        found.iter().filter_map(|f| f.file_name()?.to_str()).collect::<Vec<_>>().join(", ")
-                    ),
-                };
+                let file = find_gguf(&dir, &quant, &hint)?;
                 ModelSpec::File(file).locate(arg)
             }
             ModelSpec::Repo(repo) => {
@@ -108,6 +92,26 @@ impl ModelSpec {
                 Ok(ResolvedModel { path: snapshot, name })
             }
         }
+    }
+}
+
+/// The GGUF file of quantization `quant` in `dir`: the one whose name ends in
+/// `-<quant>.gguf`, so `Q2_K` does not pick `IQ2_K` or `Q2_K_L`. `hint` says how to get one.
+fn find_gguf(dir: &Path, quant: &str, hint: &str) -> Result<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|f| gguf_quant(f).is_some_and(|q| q.eq_ignore_ascii_case(quant)))
+        .collect();
+    found.sort();
+    match found.len() {
+        0 => anyhow::bail!("no *-{quant}.gguf in {}; {hint}", dir.display()),
+        1 => Ok(found.remove(0)),
+        _ => anyhow::bail!(
+            "several files in {} are {quant}: {}; give the path of one",
+            dir.display(),
+            found.iter().filter_map(|f| f.file_name()?.to_str()).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 

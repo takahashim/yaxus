@@ -9,7 +9,7 @@ use yaxus_backend_gpu::{Gemv, GpuBackend};
 use yaxus_model::{Engine, Model, ModelOptions, Quant, SyncGenerator, SyncReadback};
 use yaxus_tokenizer::Tokenizer;
 
-use crate::options::{BackendKind, DraftOptions, LoadOptions};
+use super::options::{BackendKind, DraftOptions, LoadOptions};
 
 /// The tokenizer of a model: `tokenizer.jsonl` of a Hugging Face directory, or the
 /// vocabulary embedded in a GGUF file.

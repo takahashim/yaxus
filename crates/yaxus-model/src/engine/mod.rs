@@ -732,17 +732,18 @@ pub trait Generator {
     fn stats(&self) -> Option<String>;
     /// Prefix reuse of the last finished request.
     fn last_start(&self) -> StartInfo;
-    /// How likely the target model finds `forced` as the output for `prompt` (see
-    /// [`Model::score`](crate::Model::score)). Runs at once, between steps.
-    fn score(&mut self, _prompt: &[u32], _forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
-        anyhow::bail!("this engine does not score text")
-    }
 }
 
 /// A [`Generator`] whose steps never wait, which can therefore also be stepped without
 /// an async context: the engines of the native backends (`SyncReadback`). A WebGPU engine
 /// is not one: its step waits for the device, so it can only be awaited.
 pub trait SyncGenerator: Generator {
+    /// How likely the target model finds `forced` as the output for `prompt` (see
+    /// [`Model::score`](crate::Model::score)). It reads the logits back to the host and
+    /// waits for them, which only an engine that can be stepped synchronously can do.
+    /// Runs at once, between steps.
+    fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>>;
+
     /// [`step_async`](Generator::step_async), polled once.
     fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
         poll_once(self.step_async(emit))
@@ -787,7 +788,11 @@ pub trait SyncGenerator: Generator {
     }
 }
 
-impl<B: SyncReadback> SyncGenerator for Engine<B> {}
+impl<B: SyncReadback> SyncGenerator for Engine<B> {
+    fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
+        self.target.score(prompt, forced)
+    }
+}
 
 impl<B: SyncReadback> Engine<B> {
     /// [`Engine::step_async`] for a backend that reads back without waiting, where the
@@ -885,12 +890,6 @@ impl<B: AsyncReadback> Generator for Engine<B> {
     }
     fn last_start(&self) -> StartInfo {
         self.last_start
-    }
-    fn score(&mut self, prompt: &[u32], forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
-        match B::scorer() {
-            Some(score) => score(&mut self.target, prompt, forced),
-            None => anyhow::bail!("this backend cannot score text"),
-        }
     }
 }
 

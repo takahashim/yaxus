@@ -21,9 +21,7 @@ use web_time::Instant;
 use yaxus_backend_gpu::GpuBackend;
 use yaxus_model::{Engine, EngineConfig, Finish, Model, ModelOptions, Quant, gguf::Gguf};
 use yaxus_pfml::{Form, TranslationRequest, segments::split_for_context};
-use yaxus_runtime::document::{
-    DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, auto_chains, run_document_until,
-};
+use yaxus_runtime::document::{Chains, DocEvent, DocJob, DocOptions, DocRunError, DocRunner, HistoryRules};
 use yaxus_runtime::memory::Memory;
 use yaxus_tokenizer::{TokenKind, Tokenizer};
 
@@ -153,7 +151,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
         max_binding,
         reduced_to_q4,
         broken: false,
-        chains: 0,
+        chains: Chains::Auto,
         neighbor_context: false,
     })
 }
@@ -171,7 +169,7 @@ pub struct Translator {
     /// Set by an error of the GPU (see the crate documentation).
     broken: bool,
     /// Chains of the next translation: the segments translated side by side.
-    chains: usize,
+    chains: Chains,
     /// Give each segment the source of its neighbours as context.
     neighbor_context: bool,
 }
@@ -207,7 +205,11 @@ impl Translator {
     /// With more, a segment's history is only that of its own chain, so the translation
     /// differs from the one in a single chain.
     pub fn set_chains(&mut self, chains: u32) {
-        self.chains = if chains == 0 { 0 } else { (chains as usize).clamp(1, MAX_CHAINS) };
+        // (at most as many as the engine and its KV arena take)
+        self.chains = match Chains::from(chains as usize) {
+            Chains::Auto => Chains::Auto,
+            Chains::Fixed(n) => Chains::from(n.get().min(MAX_CHAINS)),
+        };
     }
 
     /// Whether each segment of a document gets the source of the segments before and after
@@ -321,7 +323,7 @@ impl Translator {
         let opts = DocOptions {
             request: TranslationRequest { target_lang: target.into(), form, ..Default::default() },
             history_chars: HISTORY_CHARS,
-            chains: if self.chains == 0 { auto_chains(total).min(MAX_CHAINS) } else { self.chains },
+            chains: Chains::from(self.chains.count(total).min(MAX_CHAINS)),
             neighbor_context: self.neighbor_context,
             max_new_tokens: MAX_NEW_TOKENS,
             history_rules: HistoryRules { skip_truncated: true, trim: true },
@@ -349,12 +351,14 @@ impl Translator {
         // The page keeps no translation memory: a repeated translation is computed again.
         let mut memory = Memory::new(0);
         let mut was_cancelled = false;
-        let result = run_document_until(
-            &mut self.engine,
-            &self.tokenizer,
-            job,
-            &mut memory,
-            &mut |event| {
+        let mut cancelled = || {
+            let yes = page.cancelled.call0(&JsValue::NULL).map(|v| v.is_truthy()).unwrap_or(false);
+            was_cancelled |= yes;
+            yes
+        };
+        let result = DocRunner::new(&mut self.engine, &self.tokenizer, &mut memory)
+            .cancel_when(&mut cancelled)
+            .run(job, &mut |event| {
                 match event {
                     DocEvent::Delta { segment, text } => {
                         let sent = page.text.call2(
@@ -381,14 +385,8 @@ impl Translator {
                     }
                 }
                 true
-            },
-            &mut || {
-                let yes = page.cancelled.call0(&JsValue::NULL).map(|v| v.is_truthy()).unwrap_or(false);
-                was_cancelled |= yes;
-                yes
-            },
-        )
-        .await;
+            })
+            .await;
         if let Some(e) = write_failure {
             return Err(e);
         }
@@ -396,7 +394,7 @@ impl Translator {
             Ok(_) => {}
             // The engine's step failed: only a read-back reports an error of the device.
             Err(DocRunError::Engine(e)) => return Err(device_err(format!("{e:#}"))),
-            Err(DocRunError::Segment(message)) => return Err(request_err(message)),
+            Err(e @ (DocRunError::Prompt(_) | DocRunError::Segment { .. })) => return Err(request_err(e)),
         }
         Ok(Stats {
             prompt_tokens,

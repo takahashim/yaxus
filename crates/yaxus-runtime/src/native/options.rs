@@ -62,7 +62,6 @@ pub enum Prefill {
 
 impl Prefill {
     /// The GPU kernels for it; `None`: the device's choice.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn gemm_kind(self) -> Option<GemmKind> {
         match self {
             Prefill::Auto => None,
@@ -108,7 +107,6 @@ pub enum Decode {
 impl Decode {
     /// The GPU kernels for it (of the target model; see [`Gemv::for_draft`]), with
     /// `device` the device's choice.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn gemv(self, device: Gemv) -> Gemv {
         match self {
             Decode::Auto => device,
@@ -189,7 +187,6 @@ impl Default for LoadOptions {
 impl LoadOptions {
     /// The engine's configuration, with or without the draft model, for the target's
     /// decode kernels `gemv`.
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn engine_config(&self, draft: Option<&DraftOptions>, gemv: Gemv) -> EngineConfig {
         let s = &self.scheduling;
         let mut cfg = EngineConfig {

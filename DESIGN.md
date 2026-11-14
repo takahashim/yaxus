@@ -144,7 +144,7 @@ yaxus/
     yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・KV アリーナ・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32、rayon)。正しさの基準とフォールバック
     yaxus-backend-gpu/     # GPU バックエンド (wgpu で Vulkan / Metal、または Metal 直接。手書きの WGSL と MSL のカーネル)
-    yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。読み込み以外は wasm32 でも動く
+    yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。`native/` (モデルの解決、読み込みの設定、読み込み) 以外は wasm32 でも動く
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
     yaxus-web/             # ブラウザ用 (wasm32 + WebGPU)。native では空のライブラリ
@@ -156,15 +156,15 @@ yaxus/
 
 `yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
 
-サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る)。
+サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
 
-1 件の要求がエンジン上でたどる処理 (停止トークン、翻訳メモリのヒント、トークンから文字列への復号、終わったら出力をメモリへ) は `yaxus_runtime::Session<T>` の 1 か所にある。`T` はその要求の持ち主で、サーバのワーカーでは HTTP の接続 (単文) か文書の段落、`run_document` では段落の番号、`run_request` では無し。呼び出し側は `Session::step_async` が返す更新 (`Delta`、`Done`、`Failed`) を持ち主へ届けるだけ。エンジンは `Generator` (非同期の `step_async`、`Send` を要求しない)。同期の `step` と `generate` は `SyncGenerator` にあり、`SyncReadback` のバックエンドの `Engine` だけが実装する。`run_document` と `run_request` はそれを使い、`run_document_async` / `run_document_until` / `run_request_async` は `Generator` のすべてに使える。
+1 件の要求がエンジン上でたどる処理 (停止トークン、翻訳メモリのヒント、トークンから文字列への復号、終わったら出力をメモリへ) は `yaxus_runtime::Session<T>` の 1 か所にある。`T` はその要求の持ち主で、サーバのワーカーでは HTTP の接続 (単文) か文書の段落、`run_document` では段落の番号、`run_request` では無し。呼び出し側は `Session::step_async` が返す更新 (`Delta`、`Done`、`Failed`) を持ち主へ届けるだけ。エンジンは `Generator` (非同期の `step_async`、`Send` を要求しない)。同期の `step` と `generate` は `SyncGenerator` にあり、`SyncReadback` のバックエンドの `Engine` だけが実装する。`score` もそちらにある (読み戻しを待つため)。`run_document` と `run_request` はそれを使い、`DocRunner` (中止の確認つきで、await して文書を訳す) と `run_request_async` は `Generator` のすべてに使える。文書の進行は `DocRun` が持ち、`Session` の更新への反応 (`DocRun::on_update` が返す `Reaction`) は、`DocRunner` とサーバーの `scheduler` の両方が使う。
 
 ### 2.2 ブラウザ (wasm32 + WebGPU)
 
 `crates/yaxus-web` は `yaxus-model` と `yaxus-backend-gpu` を wasm32 に載せ、ユーザーが選んだ GGUF をタブの中だけで動かす。サーバも CLI も使わない。Cloudflare などに置くのは静的ファイル (wasm 約 0.8 MB と HTML) だけで、モデルと計算はユーザーのマシンに残る。
 
-- **範囲:** 英→日と日→英、greedy、f32、0.8B。native と同じ `Engine` と runtime の文書ループ (`run_document_until`) で動く。draft と翻訳メモリは持たず、応答キャッシュも切る (障害の確認が GPU を通るように)。1 セグメントは 4096 トークン (プロンプト + 出力)、KV のアリーナは 4 セグメント分 (16,384 トークン)。入口は `load_model(file, on_progress)` と `Translator::translate(text, target, form, callbacks)` (`callbacks` は `{plan, text, cancelled, progress}`) の 2 つ。原文の言語は渡さない (CLI で `--from` を省いたときと同じプロンプト)。`Translator::set_chains` で並列の本数を替える。
+- **範囲:** 英→日と日→英、greedy、f32、0.8B。native と同じ `Engine` と runtime の文書ループ (`DocRunner`) で動く。draft と翻訳メモリは持たず、応答キャッシュも切る (障害の確認が GPU を通るように)。1 セグメントは 4096 トークン (プロンプト + 出力)、KV のアリーナは 4 セグメント分 (16,384 トークン)。入口は `load_model(file, on_progress)` と `Translator::translate(text, target, form, callbacks)` (`callbacks` は `{plan, text, cancelled, progress}`) の 2 つ。原文の言語は渡さない (CLI で `--from` を省いたときと同じプロンプト)。`Translator::set_chains` で並列の本数を替える。
 - **Worker:** wasm はページのスレッドではなく専用 Worker (`web/local/worker.js`) で動く。読み込みも翻訳もページを止めない。ファイルは Worker が `File.stream()` で読み、`ModelBuffer` (wasm 側の `Vec<u8>`) へチャンクごとに足すので、メモリ上のコピーは wasm の 1 つだけ。読み込みのたびに新しい Worker を作り、前のモデルのメモリを返す。
 - **モデル:** `Gguf::parse(Vec<u8>)` でメモリ上の GGUF を読み、`TensorRef` の実体を mmap か `Arc<Vec<u8>>` の enum にする。トークナイザは GGUF の語彙から `Tokenizer::from_vocab`。埋め込み表は Q4_K のまま GPU に置き (`embed_q4k`)、bf16 に展開しない (0.8B で 330 MB → 93 MB)。
 - **デバイス:** `WgpuDev::open_async` が WebGPU の adapter/device を await で開く。`Tuning` は f32 固定。必要な `maxBufferSize` と `maxStorageBufferBindingSize` を要求し、受け入れられなければ WebGPU の基本の上限 (buffer 256 MB、binding 128 MB) で開き直す。要求する大きさは `GpuBackend::largest_weight_bytes` が、GPU に置く形式で見積もる。行列はファイルの大きさではなく、読み替えたあとの最大のバッファ (`ggml_largest_buffer`) で数える。binding はバッファごとなので、0.8B Q4_K_M の Q6_K 出力行列 (ファイルでは 135 MB) も最大のバッファは 124 MB で、128 MB に収まる。開いたデバイスの binding 上限を超えるバッファを持つ行列があれば、バックエンドの `load_weight` がその行列だけを Q4 で読む (形式を `Auto` / `Auto4` に任されたときだけ)。ページはその有無を `GpuBackend::reduced_to_q4` で知る。

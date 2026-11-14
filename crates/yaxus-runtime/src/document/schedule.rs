@@ -47,7 +47,7 @@ impl ChainSchedule {
 
     /// The next segment of every idle chain, which is then busy. A segment for which
     /// `skip` returns true is finished on the spot and the chain moves on.
-    pub(crate) fn ready(&mut self, mut skip: impl FnMut(usize) -> bool) -> Vec<usize> {
+    pub(crate) fn take_ready(&mut self, mut skip: impl FnMut(usize) -> bool) -> Vec<usize> {
         let mut out = Vec::new();
         for chain in self.chains.iter_mut().filter(|c| !c.busy) {
             while let Some(&i) = chain.segs.get(chain.next) {
@@ -86,21 +86,21 @@ mod tests {
     fn chains_split_contiguously_and_advance_in_order() {
         let mut s = ChainSchedule::new(10, 3);
         assert_eq!(s.chains(), 3);
-        assert_eq!(s.ready(|_| false), [0, 4, 7]); // chains of 4, 3, 3
-        assert!(s.ready(|_| false).is_empty(), "busy chains offer nothing");
+        assert_eq!(s.take_ready(|_| false), [0, 4, 7]); // chains of 4, 3, 3
+        assert!(s.take_ready(|_| false).is_empty(), "busy chains offer nothing");
         s.finish(4);
-        assert_eq!(s.ready(|_| false), [5]);
+        assert_eq!(s.take_ready(|_| false), [5]);
         // A segment that is not its chain's busy one is ignored.
         s.finish(9);
-        assert!(s.ready(|_| false).is_empty());
+        assert!(s.take_ready(|_| false).is_empty());
     }
 
     #[test]
     fn skipped_segments_finish_at_once() {
         let mut s = ChainSchedule::new(4, 1);
-        assert_eq!(s.ready(|i| i < 2), [2]);
+        assert_eq!(s.take_ready(|i| i < 2), [2]);
         s.finish(2);
-        assert_eq!(s.ready(|_| true), Vec::<usize>::new());
+        assert_eq!(s.take_ready(|_| true), Vec::<usize>::new());
         assert!(s.is_done());
     }
 

@@ -2,7 +2,7 @@
 //! text with its log-probability and what the model would have written there instead.
 
 use anyhow::Result;
-use yaxus_model::Generator;
+use yaxus_model::SyncGenerator;
 use yaxus_pfml::ValidRequest;
 use yaxus_tokenizer::{SPECIAL_PREFIX, Tokenizer};
 
@@ -64,8 +64,13 @@ pub struct Piece {
 }
 
 /// Scores `output` as the model's translation for `req` (see
-/// [`Generator::score`]): the pieces cover `output` in order.
-pub fn score_text(engine: &mut dyn Generator, tok: &Tokenizer, req: &ValidRequest, output: &str) -> Result<Vec<Piece>> {
+/// [`SyncGenerator::score`]): the pieces cover `output` in order.
+pub fn score_text(
+    engine: &mut dyn SyncGenerator,
+    tok: &Tokenizer,
+    req: &ValidRequest,
+    output: &str,
+) -> Result<Vec<Piece>> {
     let prompt = Prompt::new(tok, req).into_ids();
     let forced = tok.encode(output, false);
     let scores = engine.score(&prompt, &forced)?;

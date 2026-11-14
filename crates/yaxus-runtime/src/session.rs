@@ -75,22 +75,75 @@ struct Live<T> {
     first_token: Option<Instant>,
 }
 
-/// The requests of one engine, each with a tag `T` saying whose it is.
-pub struct Session<'a, T> {
-    engine: &'a mut dyn Generator,
+/// The requests in flight, each with a tag `T` saying whose it is: what the engine's
+/// events do to them (decoding, the translation memory), apart from the engine itself, so
+/// that a step can borrow the engine and the requests together.
+struct Requests<'a, T> {
     tok: &'a Tokenizer,
     memory: &'a mut Memory,
     live: HashMap<ReqId, Live<T>>,
 }
 
+impl<T> Requests<'_, T> {
+    /// What the engine's event `ev` does to the requests; returns the answer to give the
+    /// engine (`false` cancels the request of a token).
+    fn on_event(&mut self, ev: Event, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> bool {
+        match ev {
+            Event::Token { id, token } => {
+                let Some(l) = self.live.get_mut(&id) else { return false };
+                l.first_token.get_or_insert_with(Instant::now);
+                l.tokens.push(token);
+                let start = l.text.len();
+                l.dec.push_into(self.tok, token, &mut l.text);
+                on(Update::Delta { tag: &l.tag, text: &l.text[start..] })
+            }
+            Event::Done { id, finish, generated, start } => {
+                let Some(mut l) = self.live.remove(&id) else { return true };
+                if finish == Finish::Stop {
+                    self.memory.put(l.memo, std::mem::take(&mut l.tokens));
+                }
+                let tail = l.dec.finish();
+                if !tail.is_empty() {
+                    on(Update::Delta { tag: &l.tag, text: &tail });
+                    l.text += &tail;
+                }
+                let done = Finished {
+                    text: l.text,
+                    finish,
+                    prompt_tokens: l.prompt_tokens,
+                    generated,
+                    start,
+                    submitted: l.submitted,
+                    first_token: l.first_token,
+                    ended: Instant::now(),
+                };
+                on(Update::Done { tag: l.tag, done });
+                true
+            }
+            Event::Error { id, message } => {
+                if let Some(l) = self.live.remove(&id) {
+                    on(Update::Failed { tag: l.tag, message });
+                }
+                true
+            }
+        }
+    }
+}
+
+/// An engine and the requests in flight on it.
+pub struct Session<'a, T> {
+    engine: &'a mut dyn Generator,
+    requests: Requests<'a, T>,
+}
+
 impl<'a, T> Session<'a, T> {
     /// `engine` must have no requests of its own in flight.
     pub fn new(engine: &'a mut dyn Generator, tok: &'a Tokenizer, memory: &'a mut Memory) -> Self {
-        Session { engine, tok, memory, live: HashMap::new() }
+        Session { engine, requests: Requests { tok, memory, live: HashMap::new() } }
     }
 
     pub fn tokenizer(&self) -> &'a Tokenizer {
-        self.tok
+        self.requests.tok
     }
 
     /// Hands `prompt` to the engine, with the translation memory's hint for it.
@@ -99,7 +152,7 @@ impl<'a, T> Session<'a, T> {
         let prompt_tokens = prompt.len();
         let (ids, memo) = prompt.into_parts();
         let mut req = Request::new(id, ids, max_new_tokens, STOP_TOKENS.to_vec());
-        req.hint = self.memory.get(memo);
+        req.hint = self.requests.memory.get(memo);
         self.engine.submit(req);
         let live = Live {
             tag,
@@ -111,28 +164,28 @@ impl<'a, T> Session<'a, T> {
             submitted: Instant::now(),
             first_token: None,
         };
-        self.live.insert(id, live);
+        self.requests.live.insert(id, live);
         id
     }
 
     /// Runs one engine step and reports what it did to the requests. Returns whether
     /// there was work.
     pub async fn step_async(&mut self, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> Result<bool> {
-        let Session { engine, tok, memory, live } = self;
-        engine.step_async(&mut |ev| on_event(live, tok, memory, ev, on)).await
+        let Session { engine, requests } = self;
+        engine.step_async(&mut |ev| requests.on_event(ev, on)).await
     }
 
     /// Cancels the requests whose tag `pred` accepts, waiting or running, in the engine
     /// too: each ends at the next step as `Update::Done` with [`Finish::Cancelled`].
     /// Returns how many were cancelled.
     pub fn cancel_where(&mut self, mut pred: impl FnMut(&T) -> bool) -> usize {
-        let ids: Vec<ReqId> = self.live.iter().filter(|(_, l)| pred(&l.tag)).map(|(id, _)| *id).collect();
+        let ids: Vec<ReqId> = self.requests.live.iter().filter(|(_, l)| pred(&l.tag)).map(|(id, _)| *id).collect();
         ids.into_iter().filter(|&id| self.engine.cancel(id)).count()
     }
 
     /// No request is in flight.
     pub fn is_idle(&self) -> bool {
-        self.live.is_empty()
+        self.requests.live.is_empty()
     }
 
     /// Requests the engine has not started yet.
@@ -140,68 +193,19 @@ impl<'a, T> Session<'a, T> {
         self.engine.waiting()
     }
 
-    /// Drops every request, in the engine too (after a failed [`step_async`](Session::step_async)),
-    /// and returns their tags, so that their owners can be told.
+    /// Drops every request, in the engine too (after a failed
+    /// [`step_async`](Session::step_async)), and returns their tags, so that their owners
+    /// can be told.
     pub fn abort_all(&mut self) -> Vec<T> {
         self.engine.abort_all();
-        self.live.drain().map(|(_, l)| l.tag).collect()
+        self.requests.live.drain().map(|(_, l)| l.tag).collect()
     }
 
-    /// Gives up on the engine (after a panic in [`step_async`](Session::step_async), when its state
-    /// cannot be trusted and it must not be called again): returns the tags of the
-    /// requests in flight without telling the engine.
+    /// Gives up on the engine (after a panic in [`step_async`](Session::step_async), when
+    /// its state cannot be trusted and it must not be called again): returns the tags of
+    /// the requests in flight without telling the engine.
     pub fn abandon(self) -> Vec<T> {
-        self.live.into_values().map(|l| l.tag).collect()
-    }
-}
-
-/// What the engine's event `ev` does to the requests in `live`; returns the answer to
-/// give the engine (`false` cancels the request of a token).
-fn on_event<T>(
-    live: &mut HashMap<ReqId, Live<T>>,
-    tok: &Tokenizer,
-    memory: &mut Memory,
-    ev: Event,
-    on: &mut dyn FnMut(Update<'_, T>) -> bool,
-) -> bool {
-    match ev {
-        Event::Token { id, token } => {
-            let Some(l) = live.get_mut(&id) else { return false };
-            l.first_token.get_or_insert_with(Instant::now);
-            l.tokens.push(token);
-            let start = l.text.len();
-            l.dec.push_into(tok, token, &mut l.text);
-            on(Update::Delta { tag: &l.tag, text: &l.text[start..] })
-        }
-        Event::Done { id, finish, generated, start } => {
-            let Some(mut l) = live.remove(&id) else { return true };
-            if finish == Finish::Stop {
-                memory.put(l.memo, std::mem::take(&mut l.tokens));
-            }
-            let tail = l.dec.finish();
-            if !tail.is_empty() {
-                on(Update::Delta { tag: &l.tag, text: &tail });
-                l.text += &tail;
-            }
-            let done = Finished {
-                text: l.text,
-                finish,
-                prompt_tokens: l.prompt_tokens,
-                generated,
-                start,
-                submitted: l.submitted,
-                first_token: l.first_token,
-                ended: Instant::now(),
-            };
-            on(Update::Done { tag: l.tag, done });
-            true
-        }
-        Event::Error { id, message } => {
-            if let Some(l) = live.remove(&id) {
-                on(Update::Failed { tag: l.tag, message });
-            }
-            true
-        }
+        self.requests.live.into_values().map(|l| l.tag).collect()
     }
 }
 

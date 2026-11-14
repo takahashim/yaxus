@@ -3,17 +3,19 @@
 //! order, each with the earlier ones of the chain as history (see [`HistoryWindow`]); the
 //! chains run in parallel on the engine ([`DocRun`], [`run_document`]).
 
-use yaxus_api::{DocumentRequest, HistoryWindow, Pair};
+use yaxus_api::DocumentRequest;
 use yaxus_model::DEFAULT_MAX_POS;
-use yaxus_pfml::{PromptError, TranslationRequest, is_blank, validate_history_pair};
+use yaxus_pfml::{PromptError, TranslationRequest, is_blank};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::prompt::Prompt;
 
+mod history;
 mod run;
 mod schedule;
 
-pub use run::{DocEvent, DocRun, DocRunError, SegmentEnd, run_document, run_document_async, run_document_until};
+pub use history::{ChainHistories, HistoryRules};
+pub use run::{DocEvent, DocRun, DocRunError, DocRunner, Reaction, SegmentEnd, run_document};
 use schedule::ChainSchedule;
 
 /// Why a document cannot be translated: an option every segment shares, or one
@@ -39,15 +41,30 @@ pub fn auto_chains(segments: usize) -> usize {
     segments.div_ceil(4).clamp(1, 8)
 }
 
-/// Which earlier translations of a chain go into the history of the next segment, and how.
-/// The default is the CLI's and the server's: every one, as the model wrote it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct HistoryRules {
-    /// Leave out a translation that was cut at the output budget: it would be a
-    /// misleading example for the next segment.
-    pub skip_truncated: bool,
-    /// Put a translation in without the whitespace around it.
-    pub trim: bool,
+/// How many chains a document is split into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Chains {
+    /// [`auto_chains`]: one per 4 segments.
+    #[default]
+    Auto,
+    Fixed(std::num::NonZeroUsize),
+}
+
+impl From<usize> for Chains {
+    /// For a count that says 0 for the automatic number (a command-line option).
+    fn from(n: usize) -> Self {
+        std::num::NonZeroUsize::new(n).map_or(Chains::Auto, Chains::Fixed)
+    }
+}
+
+impl Chains {
+    /// The number of chains for a document of `segments` segments.
+    pub fn count(self, segments: usize) -> usize {
+        match self {
+            Chains::Auto => auto_chains(segments),
+            Chains::Fixed(n) => n.get(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -57,8 +74,7 @@ pub struct DocOptions {
     pub request: TranslationRequest,
     /// History budget per chain in characters (0: no history).
     pub history_chars: usize,
-    /// Number of chains (0: `auto_chains`).
-    pub chains: usize,
+    pub chains: Chains,
     /// Pass the neighbouring source segments as context.
     pub neighbor_context: bool,
     pub max_new_tokens: usize,
@@ -71,7 +87,7 @@ impl DocOptions {
         DocOptions {
             request: TranslationRequest { target_lang: target_lang.into(), ..Default::default() },
             history_chars: yaxus_api::DEFAULT_HISTORY_CHARS,
-            chains: 0,
+            chains: Chains::Auto,
             neighbor_context: false,
             max_new_tokens: yaxus_api::DEFAULT_MAX_NEW_TOKENS,
             history_rules: HistoryRules::default(),
@@ -85,8 +101,6 @@ struct SegmentPrompter {
     /// The shared options, with empty text and history.
     base: TranslationRequest,
     neighbor_context: bool,
-    /// History window of each chain.
-    windows: Vec<HistoryWindow>,
     /// Most prompt + generated tokens per segment.
     max_context: usize,
     max_new_tokens: usize,
@@ -113,11 +127,8 @@ impl SegmentPrompter {
         TranslationRequest { text: segments[i].clone(), context, ..self.base.clone() }
     }
 
-    /// The request for segment `i` with the history `chain`'s window keeps of `pairs`
-    /// (the chain's finished pairs a prompt may hold, oldest first). Only those pairs
-    /// are copied.
-    fn with_history(&mut self, segments: &[String], i: usize, chain: usize, pairs: &[Pair]) -> TranslationRequest {
-        let history = self.windows[chain].select(pairs).to_vec();
+    /// The request for segment `i` with `history`, the pairs its chain keeps.
+    fn with_history(&self, segments: &[String], i: usize, history: Vec<yaxus_api::Pair>) -> TranslationRequest {
         TranslationRequest { history, ..self.bare(segments, i) }
     }
 
@@ -133,12 +144,7 @@ impl SegmentPrompter {
 pub struct DocJob {
     segments: Vec<String>,
     outputs: Vec<Option<String>>,
-    /// The pairs each chain's next segment may take as history, oldest first: the source
-    /// and translation of the segments it finished, checked once when they were added. No
-    /// blank segment or translation is in them, and no translation with a reserved token
-    /// (a control token the model emitted), nor one the rules leave out.
-    pairs: Vec<Vec<Pair>>,
-    history_rules: HistoryRules,
+    history: ChainHistories,
     schedule: ChainSchedule,
     prompter: SegmentPrompter,
 }
@@ -159,7 +165,7 @@ impl DocJob {
         let opts = DocOptions {
             request,
             history_chars: r.history_chars.unwrap_or(yaxus_api::DEFAULT_HISTORY_CHARS),
-            chains: r.chains.map_or(0, |c| c.get()),
+            chains: r.chains.map_or(Chains::Auto, Chains::Fixed),
             neighbor_context: r.neighbor_context,
             max_new_tokens: r.max_new_tokens.unwrap_or(yaxus_api::DEFAULT_MAX_NEW_TOKENS).min(max_context / 2).max(1),
             history_rules: HistoryRules::default(),
@@ -177,19 +183,17 @@ impl DocJob {
     /// positions the model's KV covers.
     pub fn new(segments: Vec<String>, opts: DocOptions) -> Self {
         let n = segments.len();
-        let schedule = ChainSchedule::new(n, if opts.chains == 0 { auto_chains(n) } else { opts.chains });
+        let schedule = ChainSchedule::new(n, opts.chains.count(n));
         let base = TranslationRequest { text: String::new(), history: Vec::new(), ..opts.request };
         let prompter = SegmentPrompter {
             base,
             neighbor_context: opts.neighbor_context,
-            windows: vec![HistoryWindow::new(opts.history_chars); schedule.chains()],
             max_context: DEFAULT_MAX_POS,
             max_new_tokens: opts.max_new_tokens,
         };
         DocJob {
             outputs: vec![None; n],
-            pairs: vec![Vec::new(); schedule.chains()],
-            history_rules: opts.history_rules,
+            history: ChainHistories::new(schedule.chains(), opts.history_chars, opts.history_rules),
             segments,
             schedule,
             prompter,
@@ -244,11 +248,12 @@ impl DocJob {
         self.schedule.is_done()
     }
 
-    /// Segments that can start now (the next one of every idle chain), with their
-    /// requests. Segments without text are completed at once with an empty translation.
-    pub(crate) fn ready(&mut self) -> Vec<(usize, TranslationRequest)> {
-        let DocJob { segments, outputs, pairs, schedule, prompter, .. } = self;
-        let ready = schedule.ready(|i| {
+    /// Takes the segments that can start now (the next one of every idle chain, which is
+    /// then busy), with their requests. Taking also completes the segments without text,
+    /// at once with an empty translation, and moves on in their chains.
+    pub(crate) fn take_ready(&mut self) -> Vec<(usize, TranslationRequest)> {
+        let DocJob { segments, outputs, history, schedule, prompter } = self;
+        let ready = schedule.take_ready(|i| {
             let blank = is_blank(&segments[i]);
             if blank {
                 outputs[i] = Some(String::new());
@@ -257,24 +262,13 @@ impl DocJob {
         });
         ready
             .into_iter()
-            .map(|i| {
-                let chain = schedule.chain_of(i);
-                (i, prompter.with_history(segments, i, chain, &pairs[chain]))
-            })
+            .map(|i| (i, prompter.with_history(segments, i, history.select(schedule.chain_of(i)))))
             .collect()
     }
 
     /// Records the translation of segment `i`; its chain may continue (see `ready`).
     pub(crate) fn finished(&mut self, i: usize, text: String, truncated: bool) {
-        let rules = self.history_rules;
-        if !(rules.skip_truncated && truncated) {
-            let target = if rules.trim { text.trim().to_string() } else { text.clone() };
-            let pair = Pair { source: self.segments[i].clone(), target };
-            if validate_history_pair(&pair).is_ok() {
-                let chain = self.schedule.chain_of(i);
-                self.pairs[chain].push(pair);
-            }
-        }
+        self.history.record(self.schedule.chain_of(i), &self.segments[i], &text, truncated);
         self.outputs[i] = Some(text);
         self.schedule.finish(i);
     }
@@ -286,11 +280,13 @@ mod tests {
     use yaxus_model::{Event, Finish, Generator, ReqId, Request};
     use yaxus_pfml::ValidRequest;
 
+    use yaxus_api::Pair;
+
     use super::*;
     use crate::memory::Memory;
 
     fn opts(chains: usize, history_chars: usize) -> DocOptions {
-        DocOptions { history_chars, chains, ..DocOptions::new("en") }
+        DocOptions { history_chars, chains: Chains::from(chains), ..DocOptions::new("en") }
     }
 
     #[test]
@@ -304,7 +300,7 @@ mod tests {
         let job = DocJob::from_request(r.clone(), 512);
         assert_eq!(job.prompter.base.source_lang, None);
         assert_eq!((job.max_new_tokens(), job.prompter.max_context), (256, 512));
-        assert_eq!(job.prompter.windows[0].budget_chars, yaxus_api::DEFAULT_HISTORY_CHARS);
+        assert_eq!(job.history.budget_chars(), yaxus_api::DEFAULT_HISTORY_CHARS);
         // A context of 1 still allows one token, without panicking.
         assert_eq!(DocJob::from_request(r, 1).max_new_tokens(), 1);
         assert_eq!(DocJob::new(vec![], opts(0, 0)).prompter.max_context, DEFAULT_MAX_POS);
@@ -406,6 +402,10 @@ mod tests {
     }
 
     impl yaxus_model::SyncGenerator for FakeEngine {
+        fn score(&mut self, _: &[u32], _: &[u32]) -> Result<Vec<yaxus_model::TokenScore>> {
+            anyhow::bail!("the fake engine does not score")
+        }
+
         fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
             for id in std::mem::take(&mut self.to_cancel) {
                 self.cancelled_at_once += 1;
@@ -531,18 +531,15 @@ mod tests {
         let mut memory = Memory::new(8);
         let mut steps = 0;
         let mut texts = 0;
-        let job = yaxus_model::poll_once(run_document_until(
-            &mut engine,
-            &tok,
+        let mut cancel = || {
+            steps += 1;
+            steps >= 3 // asked after each step: the third step is the last
+        };
+        let job = yaxus_model::poll_once(DocRunner::new(&mut engine, &tok, &mut memory).cancel_when(&mut cancel).run(
             DocJob::new(segs, opts(4, 1000)),
-            &mut memory,
             &mut |ev| {
                 texts += usize::from(matches!(ev, DocEvent::Delta { .. }));
                 true
-            },
-            &mut || {
-                steps += 1;
-                steps >= 3 // asked after each step: the third step is the last
             },
         ))
         .unwrap();
@@ -607,11 +604,11 @@ mod tests {
         let segs: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
         let mut job = DocJob::new(segs, opts(3, 1000));
         assert_eq!(job.chains(), 3);
-        let first: Vec<usize> = job.ready().into_iter().map(|(i, _)| i).collect();
+        let first: Vec<usize> = job.take_ready().into_iter().map(|(i, _)| i).collect();
         assert_eq!(first, vec![0, 4, 7]); // chains of 4, 3, 3
-        assert!(job.ready().is_empty(), "in-flight segments are not offered again");
+        assert!(job.take_ready().is_empty(), "in-flight segments are not offered again");
         job.finished(4, "t4".into(), false);
-        let next = job.ready();
+        let next = job.take_ready();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].0, 5);
         assert_eq!(next[0].1.history.len(), 1);
@@ -622,9 +619,9 @@ mod tests {
     fn blank_segments_complete_empty_and_stay_out_of_history() {
         let segs = vec!["a".to_string(), "  ".to_string(), "b".to_string()];
         let mut job = DocJob::new(segs, opts(1, 1000));
-        assert_eq!(job.ready()[0].0, 0);
+        assert_eq!(job.take_ready()[0].0, 0);
         job.finished(0, "A".into(), false);
-        let next = job.ready();
+        let next = job.take_ready();
         assert_eq!(next[0].0, 2);
         assert_eq!(next[0].1.history.len(), 1);
         assert_eq!(job.outputs()[1].as_deref(), Some(""));
@@ -637,22 +634,22 @@ mod tests {
         let segs = vec!["a".to_string(), "\u{1f}".to_string()];
         let mut job = DocJob::new(segs, opts(1, 1000));
         assert!(job.validate(&tokenizer().0).is_ok());
-        assert_eq!(job.ready()[0].0, 0);
+        assert_eq!(job.take_ready()[0].0, 0);
         job.finished(0, "A".into(), false);
-        assert!(job.ready().is_empty() && job.is_done(), "the blank segment completes empty");
+        assert!(job.take_ready().is_empty() && job.is_done(), "the blank segment completes empty");
     }
 
     #[test]
     fn translations_with_reserved_tokens_stay_out_of_history() {
         let segs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut job = DocJob::new(segs, opts(1, 1000));
-        job.ready();
+        job.take_ready();
         job.finished(0, "A<|plamo:msg|>".into(), false); // a control token the model emitted
-        let next = job.ready();
+        let next = job.take_ready();
         assert!(next[0].1.history.is_empty());
         assert!(next[0].1.clone().validate().is_ok());
         job.finished(1, "B".into(), false);
-        assert_eq!(job.ready()[0].1.history.len(), 1, "later pairs are kept");
+        assert_eq!(job.take_ready()[0].1.history.len(), 1, "later pairs are kept");
     }
 
     #[test]
@@ -660,22 +657,22 @@ mod tests {
         let segs: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         let rules = HistoryRules { skip_truncated: true, trim: true };
         let mut job = DocJob::new(segs.clone(), DocOptions { history_rules: rules, ..opts(1, 1000) });
-        job.ready();
+        job.take_ready();
         job.finished(0, " A\n".into(), false);
-        let next = job.ready();
+        let next = job.take_ready();
         assert_eq!(next[0].1.history[0].target, "A", "trimmed");
         job.finished(1, "B".into(), true);
-        let next = job.ready();
+        let next = job.take_ready();
         let sources: Vec<&str> = next[0].1.history.iter().map(|p| p.source.as_str()).collect();
         assert_eq!(sources, ["a"], "the one cut at the budget is left out");
 
         // The default keeps every translation as the model wrote it.
         let mut job = DocJob::new(segs, opts(1, 1000));
-        job.ready();
+        job.take_ready();
         job.finished(0, " A\n".into(), false);
-        assert_eq!(job.ready()[0].1.history[0].target, " A\n");
+        assert_eq!(job.take_ready()[0].1.history[0].target, " A\n");
         job.finished(1, "B".into(), true);
-        assert_eq!(job.ready()[0].1.history.len(), 2);
+        assert_eq!(job.take_ready()[0].1.history.len(), 2);
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl DocRun {
         if self.stopped {
             return Ok(());
         }
-        for (segment, req) in self.job.ready() {
+        for (segment, req) in self.job.take_ready() {
             match self.job.prompt(session.tokenizer(), req) {
                 Ok((prompt, max_new)) => {
                     self.live += 1;
@@ -126,6 +126,22 @@ impl DocRun {
         !std::mem::replace(&mut self.stopped, true)
     }
 
+    /// What a [`Session`] update means for the document, which the caller then shows or
+    /// reports in its own way: this is where a document reacts to its segments, once for
+    /// every caller. A caller that cannot deliver a [`Reaction::Show`] stops the document
+    /// ([`stop`](Self::stop)) and refuses the token.
+    pub fn on_update<'u>(&mut self, update: Update<'u, usize>) -> Reaction<'u> {
+        match update {
+            Update::Delta { .. } if !self.accepts() => Reaction::Refuse,
+            // A token that completes no character yet has nothing to show.
+            Update::Delta { text: "", .. } => Reaction::Quiet,
+            Update::Delta { tag, text } => Reaction::Show { segment: *tag, text },
+            Update::Done { tag, done } => self.on_done(tag, done).map_or(Reaction::Quiet, Reaction::Ended),
+            Update::Failed { tag, message } if self.on_failed() => Reaction::Failed { segment: tag, message },
+            Update::Failed { .. } => Reaction::Quiet,
+        }
+    }
+
     /// No segment is in flight and none will be submitted.
     pub fn is_over(&self) -> bool {
         self.live == 0 && (self.stopped || self.job.is_done())
@@ -137,34 +153,127 @@ impl DocRun {
     }
 }
 
-/// Why [`run_document_async`] failed.
+/// What a document makes of one update of its segments' requests ([`DocRun::on_update`]).
+#[derive(Debug)]
+pub enum Reaction<'u> {
+    /// New text of `segment` to deliver.
+    Show { segment: usize, text: &'u str },
+    /// The document has stopped: refuse the token, which cancels the segment's request.
+    Refuse,
+    /// A segment ended and counts: its report.
+    Ended(SegmentEnd),
+    /// A segment failed, which stops the document: to be reported once.
+    Failed { segment: usize, message: String },
+    /// Nothing to do.
+    Quiet,
+}
+
+/// Why a document run failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DocRunError {
     /// The engine failed (a read-back of its backend): it is not to be used again.
     #[error("{0:#}")]
     Engine(anyhow::Error),
-    /// A segment failed, or its prompt could not be built. The engine is as before.
-    #[error("{0}")]
-    Segment(String),
+    /// A segment's prompt could not be built. The engine is as before.
+    #[error(transparent)]
+    Prompt(SegmentError),
+    /// A segment's request failed. The engine is as before.
+    #[error("segment {segment}: {message}")]
+    Segment { segment: usize, message: String },
 }
 
-/// Events of [`run_document`].
+/// Events of a document run.
 pub enum DocEvent<'a> {
     Delta { segment: usize, text: &'a str },
     SegmentDone(SegmentEnd),
 }
 
-/// Translates a document on `engine` (which must not have other requests in flight) and
-/// returns it with the translations. Earlier translations in `memory` serve as hints; the
+/// Translates a document on `engine` (which must not have other requests in flight):
+/// the segments of every chain run side by side in its passes. The finished document is
+/// returned with the translations. Earlier translations in `memory` serve as hints; the
 /// new ones are added to it.
 ///
-/// `on` returns `false` to stop (e.g. when the output it writes to has gone away): no
-/// further segments are started, the ones in flight are cancelled and drained from the
-/// engine, no more events are sent, and the document is returned unfinished. A failed
-/// segment also stops it; its error is returned once the engine is drained.
-///
-/// For an engine whose steps never wait (see [`SyncGenerator`]); [`run_document_async`]
-/// is the form for any.
+/// `on` returns `false` to stop (e.g. when the output it writes to has gone away). So
+/// does the `cancelled` callback, which is asked between the engine's steps. Stopping
+/// starts no further segment, cancels in the engine the ones waiting or running, sends no
+/// more events once it has happened, and returns the document unfinished. A failed
+/// segment stops it too; its error is returned once the engine is drained.
+pub struct DocRunner<'a> {
+    engine: &'a mut dyn Generator,
+    tok: &'a Tokenizer,
+    memory: &'a mut Memory,
+    cancelled: Option<&'a mut dyn FnMut() -> bool>,
+}
+
+impl<'a> DocRunner<'a> {
+    pub fn new(engine: &'a mut dyn Generator, tok: &'a Tokenizer, memory: &'a mut Memory) -> Self {
+        DocRunner { engine, tok, memory, cancelled: None }
+    }
+
+    /// Asks `cancelled` between the engine's steps, and stops the document when it says
+    /// `true`.
+    pub fn cancel_when(mut self, cancelled: &'a mut dyn FnMut() -> bool) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    pub async fn run(self, job: DocJob, on: &mut dyn FnMut(DocEvent) -> bool) -> Result<DocJob, DocRunError> {
+        let DocRunner { engine, tok, memory, mut cancelled } = self;
+        let mut session = Session::new(engine, tok, memory);
+        let mut run = DocRun::new(job);
+        let mut failure: Option<DocRunError> = None;
+        let mut cancelled_all = false;
+        if let Err(e) = run.submit_ready(&mut session, |s| s) {
+            failure = Some(DocRunError::Prompt(e));
+        }
+        while !run.is_over() {
+            let worked = session
+                .step_async(&mut |update| {
+                    match run.on_update(update) {
+                        Reaction::Refuse => return false,
+                        Reaction::Show { segment, text } => {
+                            if !on(DocEvent::Delta { segment, text }) {
+                                run.stop();
+                                return false;
+                            }
+                        }
+                        Reaction::Ended(end) => {
+                            if !on(DocEvent::SegmentDone(end)) {
+                                run.stop();
+                            }
+                        }
+                        Reaction::Failed { segment, message } => {
+                            failure.get_or_insert(DocRunError::Segment { segment, message });
+                        }
+                        Reaction::Quiet => {}
+                    }
+                    true
+                })
+                .await
+                .map_err(DocRunError::Engine)?;
+            if run.accepts() && cancelled.as_mut().is_some_and(|c| c()) {
+                run.stop();
+            }
+            if !run.accepts() && !cancelled_all {
+                cancelled_all = true;
+                session.cancel_where(|_| true);
+            }
+            if let Err(e) = run.submit_ready(&mut session, |s| s) {
+                failure.get_or_insert(DocRunError::Prompt(e));
+            }
+            if !(worked || run.is_over() || !session.is_idle()) {
+                return Err(DocRunError::Engine(anyhow::anyhow!("engine idle with segments left")));
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(run.into_job()),
+        }
+    }
+}
+
+/// [`DocRunner`] without a cancel callback, for an engine whose steps never wait (see
+/// [`SyncGenerator`]): the CLI's way to translate a document.
 pub fn run_document(
     engine: &mut dyn SyncGenerator,
     tok: &Tokenizer,
@@ -172,85 +281,75 @@ pub fn run_document(
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<DocJob> {
-    Ok(poll_once(run_document_async(engine, tok, job, memory, on))?)
+    Ok(poll_once(DocRunner::new(engine, tok, memory).run(job, on))?)
 }
 
-/// [`run_document`], awaiting the engine.
-pub async fn run_document_async(
-    engine: &mut dyn Generator,
-    tok: &Tokenizer,
-    job: DocJob,
-    memory: &mut Memory,
-    on: &mut dyn FnMut(DocEvent) -> bool,
-) -> Result<DocJob, DocRunError> {
-    run_document_until(engine, tok, job, memory, on, &mut || false).await
-}
+#[cfg(test)]
+mod tests {
+    use web_time::Instant;
+    use yaxus_model::StartInfo;
 
-/// [`run_document_async`] that also asks `cancelled` between the engine's steps, and
-/// stops the document when it says `true`. Stopping, whichever way it comes about,
-/// cancels the segments that are waiting or running in the engine at once, rather than
-/// when they next produce text.
-pub async fn run_document_until(
-    engine: &mut dyn Generator,
-    tok: &Tokenizer,
-    job: DocJob,
-    memory: &mut Memory,
-    on: &mut dyn FnMut(DocEvent) -> bool,
-    cancelled: &mut dyn FnMut() -> bool,
-) -> Result<DocJob, DocRunError> {
-    let mut session = Session::new(engine, tok, memory);
-    let mut run = DocRun::new(job);
-    let mut failure: Option<String> = None;
-    let mut cancelled_all = false;
-    if let Err(e) = run.submit_ready(&mut session, |s| s) {
-        failure = Some(e.to_string());
+    use super::*;
+    use crate::document::{Chains, DocOptions};
+
+    fn run_with_one_segment_in_flight() -> DocRun {
+        let opts = DocOptions { chains: Chains::from(1), ..DocOptions::new("en") };
+        let mut run = DocRun::new(DocJob::new(vec!["a".into(), "b".into()], opts));
+        run.live = 1;
+        run
     }
-    while !run.is_over() {
-        let worked = session
-            .step_async(&mut |u| {
-                match u {
-                    Update::Delta { tag, text } => {
-                        if !run.accepts() {
-                            return false;
-                        }
-                        if !text.is_empty() && !on(DocEvent::Delta { segment: *tag, text }) {
-                            run.stop();
-                            return false;
-                        }
-                    }
-                    Update::Done { tag, done } => {
-                        if let Some(end) = run.on_done(tag, done)
-                            && !on(DocEvent::SegmentDone(end))
-                        {
-                            run.stop();
-                        }
-                    }
-                    Update::Failed { tag, message } => {
-                        if run.on_failed() {
-                            failure.get_or_insert(format!("segment {tag}: {message}"));
-                        }
-                    }
-                }
-                true
-            })
-            .await
-            .map_err(DocRunError::Engine)?;
-        if run.accepts() && cancelled() {
-            run.stop();
-        }
-        if !run.accepts() && !cancelled_all {
-            cancelled_all = true;
-            session.cancel_where(|_| true);
-        }
-        if let Err(e) = run.submit_ready(&mut session, |s| s) {
-            failure.get_or_insert(e.to_string());
-        }
-        if !(worked || run.is_over() || !session.is_idle()) {
-            return Err(DocRunError::Engine(anyhow::anyhow!("engine idle with segments left")));
+
+    fn finished(finish: Finish) -> Finished {
+        let now = Instant::now();
+        Finished {
+            text: "A".into(),
+            finish,
+            prompt_tokens: 3,
+            generated: 2,
+            start: StartInfo::default(),
+            submitted: now,
+            first_token: Some(now),
+            ended: now,
         }
     }
-    if let Some(e) = failure {
-        return Err(DocRunError::Segment(e));
+
+    #[test]
+    fn text_is_shown_and_an_empty_token_is_not() {
+        let mut run = run_with_one_segment_in_flight();
+        assert!(matches!(
+            run.on_update(Update::Delta { tag: &0, text: "x" }),
+            Reaction::Show { segment: 0, text: "x" }
+        ));
+        assert!(matches!(run.on_update(Update::Delta { tag: &0, text: "" }), Reaction::Quiet));
     }
-    Ok(run.into_job())
+
+    #[test]
+    fn a_stopped_document_refuses_text_and_does_not_count_ends() {
+        let mut run = run_with_one_segment_in_flight();
+        run.stop();
+        assert!(matches!(run.on_update(Update::Delta { tag: &0, text: "x" }), Reaction::Refuse));
+        assert!(matches!(run.on_update(Update::Done { tag: 0, done: finished(Finish::Stop) }), Reaction::Quiet));
+        assert!(run.is_over(), "nothing is left in flight");
+    }
+
+    #[test]
+    fn an_end_is_reported_unless_it_was_cancelled() {
+        let mut run = run_with_one_segment_in_flight();
+        let Reaction::Ended(end) = run.on_update(Update::Done { tag: 0, done: finished(Finish::Length) }) else {
+            panic!("a finished segment ends")
+        };
+        assert_eq!((end.segment, end.prompt_tokens, end.generated, end.finish), (0, 3, 2, Finish::Length));
+        let mut run = run_with_one_segment_in_flight();
+        assert!(matches!(run.on_update(Update::Done { tag: 0, done: finished(Finish::Cancelled) }), Reaction::Quiet));
+    }
+
+    #[test]
+    fn only_the_first_failure_is_reported_and_it_stops_the_document() {
+        let mut run = run_with_one_segment_in_flight();
+        run.live = 2;
+        let fail = |run: &mut DocRun| run.on_update(Update::Failed { tag: 1, message: "boom".into() });
+        assert!(matches!(fail(&mut run), Reaction::Failed { segment: 1, .. }));
+        assert!(!run.accepts());
+        assert!(matches!(fail(&mut run), Reaction::Quiet), "a second failure has nothing new to say");
+    }
 }

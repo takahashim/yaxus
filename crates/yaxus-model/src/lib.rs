@@ -194,17 +194,6 @@ pub trait AsyncReadback: Backend {
         &'a mut self,
         logits: &'a Self::Tensor,
     ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a;
-
-    /// Scoring a text ([`Model::score`]) reads the logits back to the host and waits for
-    /// them: only a backend that can wait has it. WebGPU does not, so its engine does not
-    /// score.
-    #[allow(clippy::type_complexity)]
-    fn scorer() -> Option<fn(&mut Model<Self>, &[u32], &[u32]) -> Result<Vec<TokenScore>>>
-    where
-        Self: Sized,
-    {
-        None
-    }
 }
 
 impl<B: SyncReadback> AsyncReadback for B {
@@ -213,11 +202,6 @@ impl<B: SyncReadback> AsyncReadback for B {
         logits: &'a Self::Tensor,
     ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a {
         std::future::ready(Ok(self.argmax_rows(logits)))
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn scorer() -> Option<fn(&mut Model<Self>, &[u32], &[u32]) -> Result<Vec<TokenScore>>> {
-        Some(Model::<B>::score)
     }
 }
 

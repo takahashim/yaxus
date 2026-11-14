@@ -1004,7 +1004,7 @@ fn bench_doc(
     }
     let mut model = m.load(&dir)?;
     header(&name, &dir, &m, model.as_ref());
-    let opts = DocOptions { history_chars, chains, neighbor_context, ..DocOptions::new(&to) };
+    let opts = DocOptions { history_chars, chains: chains.into(), neighbor_context, ..DocOptions::new(&to) };
     let mut memory = Memory::new(DEFAULT_ENTRIES);
     let mut run = |paras: Vec<String>, memory: &mut Memory| -> Result<DocJob> {
         let chars: usize = paras.iter().map(|p| p.chars().count()).sum();
