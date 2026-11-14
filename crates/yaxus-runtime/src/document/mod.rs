@@ -113,13 +113,11 @@ impl SegmentPrompter {
         TranslationRequest { text: segments[i].clone(), context, ..self.base.clone() }
     }
 
-    /// The request for segment `i` with the history `chain`'s window keeps of `earlier`
-    /// (the chain's finished pairs, oldest first). Only pairs a prompt may hold are used:
-    /// no blank segments or translations, and no translation with reserved tokens (a
-    /// control token the model emitted).
-    fn with_history(&mut self, segments: &[String], i: usize, chain: usize, earlier: Vec<Pair>) -> TranslationRequest {
-        let usable: Vec<Pair> = earlier.into_iter().filter(|p| validate_history_pair(p).is_ok()).collect();
-        let history = self.windows[chain].select(&usable).to_vec();
+    /// The request for segment `i` with the history `chain`'s window keeps of `pairs`
+    /// (the chain's finished pairs a prompt may hold, oldest first). Only those pairs
+    /// are copied.
+    fn with_history(&mut self, segments: &[String], i: usize, chain: usize, pairs: &[Pair]) -> TranslationRequest {
+        let history = self.windows[chain].select(pairs).to_vec();
         TranslationRequest { history, ..self.bare(segments, i) }
     }
 
@@ -135,8 +133,11 @@ impl SegmentPrompter {
 pub struct DocJob {
     segments: Vec<String>,
     outputs: Vec<Option<String>>,
-    /// Whether each translation was cut at the output budget.
-    truncated: Vec<bool>,
+    /// The pairs each chain's next segment may take as history, oldest first: the source
+    /// and translation of the segments it finished, checked once when they were added. No
+    /// blank segment or translation is in them, and no translation with a reserved token
+    /// (a control token the model emitted), nor one the rules leave out.
+    pairs: Vec<Vec<Pair>>,
     history_rules: HistoryRules,
     schedule: ChainSchedule,
     prompter: SegmentPrompter,
@@ -187,7 +188,7 @@ impl DocJob {
         };
         DocJob {
             outputs: vec![None; n],
-            truncated: vec![false; n],
+            pairs: vec![Vec::new(); schedule.chains()],
             history_rules: opts.history_rules,
             segments,
             schedule,
@@ -246,7 +247,7 @@ impl DocJob {
     /// Segments that can start now (the next one of every idle chain), with their
     /// requests. Segments without text are completed at once with an empty translation.
     pub(crate) fn ready(&mut self) -> Vec<(usize, TranslationRequest)> {
-        let DocJob { segments, outputs, truncated, history_rules, schedule, prompter } = self;
+        let DocJob { segments, outputs, pairs, schedule, prompter, .. } = self;
         let ready = schedule.ready(|i| {
             let blank = is_blank(&segments[i]);
             if blank {
@@ -257,24 +258,24 @@ impl DocJob {
         ready
             .into_iter()
             .map(|i| {
-                let earlier = schedule
-                    .earlier(i)
-                    .filter(|&s| !(history_rules.skip_truncated && truncated[s]))
-                    .map(|s| {
-                        let target = outputs[s].clone().unwrap_or_default();
-                        let target = if history_rules.trim { target.trim().to_string() } else { target };
-                        Pair { source: segments[s].clone(), target }
-                    })
-                    .collect();
-                (i, prompter.with_history(segments, i, schedule.chain_of(i), earlier))
+                let chain = schedule.chain_of(i);
+                (i, prompter.with_history(segments, i, chain, &pairs[chain]))
             })
             .collect()
     }
 
     /// Records the translation of segment `i`; its chain may continue (see `ready`).
     pub(crate) fn finished(&mut self, i: usize, text: String, truncated: bool) {
+        let rules = self.history_rules;
+        if !(rules.skip_truncated && truncated) {
+            let target = if rules.trim { text.trim().to_string() } else { text.clone() };
+            let pair = Pair { source: self.segments[i].clone(), target };
+            if validate_history_pair(&pair).is_ok() {
+                let chain = self.schedule.chain_of(i);
+                self.pairs[chain].push(pair);
+            }
+        }
         self.outputs[i] = Some(text);
-        self.truncated[i] = truncated;
         self.schedule.finish(i);
     }
 }
@@ -359,9 +360,37 @@ mod tests {
             &'a mut self,
             emit: &'a mut dyn FnMut(Event) -> bool,
         ) -> yaxus_model::LocalBoxFuture<'a, Result<bool>> {
-            Box::pin(std::future::ready(Generator::step(self, emit)))
+            Box::pin(std::future::ready(yaxus_model::SyncGenerator::step(self, emit)))
         }
 
+        fn fresh_id(&mut self) -> ReqId {
+            self.next_id += 1;
+            self.next_id
+        }
+        fn waiting(&self) -> usize {
+            0
+        }
+        fn active(&self) -> usize {
+            self.running.len()
+        }
+        fn abort_all(&mut self) {
+            self.running.clear();
+        }
+        fn backend_name(&self) -> String {
+            "fake".into()
+        }
+        fn weight_bytes(&self) -> usize {
+            0
+        }
+        fn stats(&self) -> Option<String> {
+            None
+        }
+        fn last_start(&self) -> yaxus_model::StartInfo {
+            Default::default()
+        }
+    }
+
+    impl yaxus_model::SyncGenerator for FakeEngine {
         fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
             if self.running.is_empty() {
                 return Ok(false);
@@ -389,32 +418,6 @@ mod tests {
             }
             self.running = keep;
             Ok(true)
-        }
-
-        fn fresh_id(&mut self) -> ReqId {
-            self.next_id += 1;
-            self.next_id
-        }
-        fn waiting(&self) -> usize {
-            0
-        }
-        fn active(&self) -> usize {
-            self.running.len()
-        }
-        fn abort_all(&mut self) {
-            self.running.clear();
-        }
-        fn backend_name(&self) -> String {
-            "fake".into()
-        }
-        fn weight_bytes(&self) -> usize {
-            0
-        }
-        fn stats(&self) -> Option<String> {
-            None
-        }
-        fn last_start(&self) -> yaxus_model::StartInfo {
-            Default::default()
         }
     }
 

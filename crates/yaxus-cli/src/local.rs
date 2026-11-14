@@ -119,7 +119,7 @@ impl ModelArgs {
     }
 
     /// Loads the model at `dir` (from [`ModelArgs::resolve`]).
-    fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::Generator + Send>> {
+    fn load(&self, dir: &Path) -> Result<Box<dyn yaxus_model::SyncGenerator + Send>> {
         yaxus_runtime::load_generator(dir, &self.load_options(dir)?)
     }
 }
@@ -267,7 +267,7 @@ pub fn translate(m: ModelArgs, lang: LangArgs, verbose: bool) -> Result<()> {
 
 /// The model `polish` runs on, loaded in this process.
 struct Local<'a> {
-    model: &'a mut dyn yaxus_model::Generator,
+    model: &'a mut dyn yaxus_model::SyncGenerator,
     tok: &'a yaxus_tokenizer::Tokenizer,
     verbose: bool,
 }

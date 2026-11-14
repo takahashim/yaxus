@@ -2,9 +2,11 @@
 //! ends and failures do to the document, and when it is over. The server's worker and
 //! [`run_document`] differ only in where the text and the reports go.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use yaxus_api::DocumentUsage;
-use yaxus_model::{Finish, Generator, poll_once};
+use yaxus_model::{Finish, Generator, SyncGenerator, poll_once};
 use yaxus_tokenizer::Tokenizer;
 
 use super::{DocJob, SegmentError};
@@ -21,6 +23,10 @@ pub struct SegmentEnd {
     pub generated: usize,
     /// How it ended: `Stop` (complete) or `Length` (cut at the output budget).
     pub finish: Finish,
+    /// Submission to the first token (prompt processing), as the session measured it.
+    pub prefill: Duration,
+    /// First token to the end.
+    pub decode: Duration,
 }
 
 /// A document in progress on a session.
@@ -103,6 +109,8 @@ impl DocRun {
             reused: done.start.reused,
             generated: done.generated,
             finish: done.finish,
+            prefill: done.prefill(),
+            decode: done.decode(),
         };
         self.usage.total.prompt_tokens += end.prompt_tokens;
         self.usage.total.reused_tokens += end.reused;
@@ -155,10 +163,10 @@ pub enum DocEvent<'a> {
 /// engine, no more events are sent, and the document is returned unfinished. A failed
 /// segment also stops it; its error is returned once the engine is drained.
 ///
-/// For an engine whose steps never wait (see [`Generator::step`]); [`run_document_async`]
+/// For an engine whose steps never wait (see [`SyncGenerator`]); [`run_document_async`]
 /// is the form for any.
 pub fn run_document(
-    engine: &mut dyn Generator,
+    engine: &mut dyn SyncGenerator,
     tok: &Tokenizer,
     job: DocJob,
     memory: &mut Memory,

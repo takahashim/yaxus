@@ -303,9 +303,6 @@ impl Translator {
         let (mut prompt_tokens, mut output_tokens, mut decode_steps, mut reused_tokens) = (0u32, 0u32, 0u32, 0u32);
         let (mut prefill_ms, mut decode_ms) = (0.0, 0.0);
         let (mut any_limit, mut last_max_new) = (false, MAX_NEW_TOKENS as u32);
-        // The segments run one after another: the current one started when the last ended.
-        let mut segment_start = Instant::now();
-        let mut first_text: Option<Instant> = None;
 
         // The page keeps no translation memory: a repeated translation is computed again.
         let mut memory = Memory::new(0);
@@ -320,20 +317,16 @@ impl Translator {
             }
             match event {
                 DocEvent::Delta { text, .. } => {
-                    first_text.get_or_insert_with(Instant::now);
                     if let Err(e) = out.text(text) {
                         write_failure = Some(e);
                         return false;
                     }
                 }
                 DocEvent::SegmentDone(end) => {
-                    let now = Instant::now();
-                    // The prompt's pass ends with the first token: until then the GPU has
-                    // only been given the work, so that is where prefill ends.
-                    let first_ms = (first_text.take().unwrap_or(now) - segment_start).as_secs_f64() * 1e3;
-                    prefill_ms += first_ms;
-                    decode_ms += (now - segment_start).as_secs_f64() * 1e3 - first_ms;
-                    segment_start = now;
+                    // As the session measured them: the prompt's pass ends with the first
+                    // token, until then the GPU has only been given the work.
+                    prefill_ms += end.prefill.as_secs_f64() * 1e3;
+                    decode_ms += end.decode.as_secs_f64() * 1e3;
                     prompt_tokens += end.prompt_tokens as u32;
                     reused_tokens += end.reused as u32;
                     output_tokens += end.generated as u32;

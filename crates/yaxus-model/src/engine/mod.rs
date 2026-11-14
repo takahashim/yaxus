@@ -685,12 +685,6 @@ pub trait Generator {
     fn submit(&mut self, req: Request);
     /// See [`Engine::step_async`].
     fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>>;
-    /// [`step_async`](Generator::step_async) for an engine whose steps never wait (every
-    /// native backend): it is polled once. Panics for one that does wait (WebGPU), which
-    /// has to be driven by `step_async` from an async context.
-    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        poll_once(self.step_async(emit))
-    }
     fn fresh_id(&mut self) -> ReqId;
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
@@ -706,6 +700,16 @@ pub trait Generator {
     /// [`Model::score`](crate::Model::score)). Runs at once, between steps.
     fn score(&mut self, _prompt: &[u32], _forced: &[u32]) -> Result<Vec<crate::TokenScore>> {
         anyhow::bail!("this engine does not score text")
+    }
+}
+
+/// A [`Generator`] whose steps never wait, which can therefore also be stepped without
+/// an async context: the engines of the native backends (`SyncReadback`). A WebGPU engine
+/// is not one: its step waits for the device, so it can only be awaited.
+pub trait SyncGenerator: Generator {
+    /// [`step_async`](Generator::step_async), polled once.
+    fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        poll_once(self.step_async(emit))
     }
 
     /// Runs one request to completion on its own. `on_token` returns `false` to stop.
@@ -746,6 +750,8 @@ pub trait Generator {
         }
     }
 }
+
+impl<B: SyncReadback> SyncGenerator for Engine<B> {}
 
 impl<B: SyncReadback> Engine<B> {
     /// [`Engine::step_async`] for a backend that reads back without waiting, where the

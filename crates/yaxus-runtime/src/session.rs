@@ -116,13 +116,7 @@ impl<'a, T> Session<'a, T> {
     }
 
     /// Runs one engine step and reports what it did to the requests. Returns whether
-    /// there was work. For an engine whose steps never wait (see [`Generator::step`]).
-    pub fn step(&mut self, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> Result<bool> {
-        let Session { engine, tok, memory, live } = self;
-        engine.step(&mut |ev| on_event(live, tok, memory, ev, on))
-    }
-
-    /// [`step`](Session::step), awaiting the engine (the only form for WebGPU).
+    /// there was work.
     pub async fn step_async(&mut self, on: &mut dyn FnMut(Update<'_, T>) -> bool) -> Result<bool> {
         let Session { engine, tok, memory, live } = self;
         engine.step_async(&mut |ev| on_event(live, tok, memory, ev, on)).await
@@ -138,14 +132,14 @@ impl<'a, T> Session<'a, T> {
         self.engine.waiting()
     }
 
-    /// Drops every request, in the engine too (after a failed [`step`](Session::step)),
+    /// Drops every request, in the engine too (after a failed [`step_async`](Session::step_async)),
     /// and returns their tags, so that their owners can be told.
     pub fn abort_all(&mut self) -> Vec<T> {
         self.engine.abort_all();
         self.live.drain().map(|(_, l)| l.tag).collect()
     }
 
-    /// Gives up on the engine (after a panic in [`step`](Session::step), when its state
+    /// Gives up on the engine (after a panic in [`step_async`](Session::step_async), when its state
     /// cannot be trusted and it must not be called again): returns the tags of the
     /// requests in flight without telling the engine.
     pub fn abandon(self) -> Vec<T> {
@@ -284,22 +278,21 @@ mod tests {
     /// The updates of one step, as text: `tag:delta`, `tag:done:text` or `tag:failed`.
     fn run_step(session: &mut Session<'_, &'static str>, cancel_on: Option<&str>) -> Vec<String> {
         let mut seen = Vec::new();
-        session
-            .step(&mut |u| match u {
-                Update::Delta { tag, text } => {
-                    seen.push(format!("{tag}:{text}"));
-                    cancel_on != Some(text)
-                }
-                Update::Done { tag, done } => {
-                    seen.push(format!("{tag}:done:{}", done.text));
-                    true
-                }
-                Update::Failed { tag, .. } => {
-                    seen.push(format!("{tag}:failed"));
-                    true
-                }
-            })
-            .unwrap();
+        yaxus_model::poll_once(session.step_async(&mut |u| match u {
+            Update::Delta { tag, text } => {
+                seen.push(format!("{tag}:{text}"));
+                cancel_on != Some(text)
+            }
+            Update::Done { tag, done } => {
+                seen.push(format!("{tag}:done:{}", done.text));
+                true
+            }
+            Update::Failed { tag, .. } => {
+                seen.push(format!("{tag}:failed"));
+                true
+            }
+        }))
+        .unwrap();
         seen
     }
 

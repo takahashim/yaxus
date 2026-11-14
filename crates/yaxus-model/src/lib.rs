@@ -14,7 +14,9 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub use config::{Config, LayerMeta, Rope};
-pub use engine::{Engine, EngineConfig, Event, Finish, Generator, LocalBoxFuture, ReqId, Request, poll_once};
+pub use engine::{
+    Engine, EngineConfig, Event, Finish, Generator, LocalBoxFuture, ReqId, Request, SyncGenerator, poll_once,
+};
 pub use kv::{KvCache, MAX_CACHED, MIN_REUSE, PAGE, PageCopy, SeqId};
 pub use weights::{TensorRef, Weights, bf16_to_f32};
 

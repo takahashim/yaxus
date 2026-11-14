@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use yaxus_api::TranslateRequest;
-use yaxus_model::{Generator, poll_once};
+use yaxus_model::{Generator, SyncGenerator, poll_once};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::memory::Memory;
@@ -23,9 +23,9 @@ pub struct RunStats {
 
 /// Translates one request on `model` (with nothing else in flight, and without the
 /// translation memory), streaming text pieces to `emit`. For an engine whose steps never
-/// wait (see [`Generator::step`]); [`run_request_async`] is the form for any.
+/// wait (see [`SyncGenerator`]); [`run_request_async`] is the form for any.
 pub fn run_request(
-    model: &mut dyn Generator,
+    model: &mut dyn SyncGenerator,
     tok: &Tokenizer,
     req: &TranslateRequest,
     emit: &mut dyn FnMut(&str),

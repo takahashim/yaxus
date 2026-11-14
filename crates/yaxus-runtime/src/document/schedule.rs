@@ -72,11 +72,6 @@ impl ChainSchedule {
         }
     }
 
-    /// The segments of `segment`'s chain before it, in order.
-    pub(crate) fn earlier(&self, segment: usize) -> impl Iterator<Item = usize> + '_ {
-        self.chains[self.chain_of[segment]].segs.iter().copied().take_while(move |&s| s != segment)
-    }
-
     /// Every segment is finished.
     pub(crate) fn is_done(&self) -> bool {
         self.chains.iter().all(|c| c.next == c.segs.len())
@@ -95,10 +90,8 @@ mod tests {
         assert!(s.ready(|_| false).is_empty(), "busy chains offer nothing");
         s.finish(4);
         assert_eq!(s.ready(|_| false), [5]);
-        assert_eq!(s.earlier(6).collect::<Vec<_>>(), [4, 5]);
         // A segment that is not its chain's busy one is ignored.
         s.finish(9);
-        assert_eq!(s.earlier(9).collect::<Vec<_>>(), [7, 8]);
         assert!(s.ready(|_| false).is_empty());
     }
 
