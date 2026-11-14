@@ -2823,6 +2823,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "yaxus-browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "console_error_panic_hook",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-time",
+ "yaxus-api",
+ "yaxus-backend-gpu",
+ "yaxus-model",
+ "yaxus-pfml",
+ "yaxus-runtime",
+ "yaxus-tokenizer",
+]
+
+[[package]]
 name = "yaxus-cli"
 version = "0.1.0"
 dependencies = [
@@ -2913,24 +2931,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "yaxus-web"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "console_error_panic_hook",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-time",
- "yaxus-api",
- "yaxus-backend-gpu",
- "yaxus-model",
- "yaxus-pfml",
- "yaxus-runtime",
- "yaxus-tokenizer",
 ]
 
 [[package]]

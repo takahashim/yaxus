@@ -146,10 +146,10 @@ yaxus/
     yaxus-backend-gpu/     # GPU バックエンド (wgpu で Vulkan / Metal、または Metal 直接。手書きの WGSL と MSL のカーネル)
     yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。`native/` (モデルの解決、読み込みの設定、読み込み) 以外は wasm32 でも動く
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
+      ui/                  # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
-    yaxus-web/             # ブラウザ用 (wasm32 + WebGPU)。native では空のライブラリ
-  web/                       # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
-  web/local/                 # ブラウザでモデルを動かす実験版 (wasm-bindgen の pkg と HTML)
+    yaxus-browser/         # ブラウザ用 (wasm32 + WebGPU)。native では空のライブラリ
+      www/                 # ブラウザでモデルを動かす実験版のページ (HTML、Worker、ビルドと E2E のスクリプト、wasm-bindgen の pkg)
   tests/golden/              # Python 側で生成した tokenizer / logits のゴールデンデータ
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
 ```
@@ -162,19 +162,19 @@ yaxus/
 
 ### 2.2 ブラウザ (wasm32 + WebGPU)
 
-`crates/yaxus-web` は `yaxus-model` と `yaxus-backend-gpu` を wasm32 に載せ、ユーザーが選んだ GGUF をタブの中だけで動かす。サーバも CLI も使わない。Cloudflare などに置くのは静的ファイル (wasm 約 0.8 MB と HTML) だけで、モデルと計算はユーザーのマシンに残る。
+`crates/yaxus-browser` は `yaxus-model` と `yaxus-backend-gpu` を wasm32 に載せ、ユーザーが選んだ GGUF をタブの中だけで動かす。サーバも CLI も使わない。Cloudflare などに置くのは静的ファイル (wasm 約 0.8 MB と HTML) だけで、モデルと計算はユーザーのマシンに残る。
 
 - **範囲:** 英→日と日→英、greedy、f32、0.8B。native と同じ `Engine` と runtime の文書ループ (`DocRunner`) で動く。draft と翻訳メモリは持たず、応答キャッシュも切る (障害の確認が GPU を通るように)。1 セグメントは 4096 トークン (プロンプト + 出力)、KV のアリーナは 4 セグメント分 (16,384 トークン)。入口は `load_model(file, on_progress)` と `Translator::translate(text, target, form, callbacks)` (`callbacks` は `{plan, text, cancelled, progress}`) の 2 つ。原文の言語は渡さない (CLI で `--from` を省いたときと同じプロンプト)。`Translator::set_chains` で並列の本数を替える。
-- **Worker:** wasm はページのスレッドではなく専用 Worker (`web/local/worker.js`) で動く。読み込みも翻訳もページを止めない。ファイルは Worker が `File.stream()` で読み、`ModelBuffer` (wasm 側の `Vec<u8>`) へチャンクごとに足すので、メモリ上のコピーは wasm の 1 つだけ。読み込みのたびに新しい Worker を作り、前のモデルのメモリを返す。
+- **Worker:** wasm はページのスレッドではなく専用 Worker (`crates/yaxus-browser/www/worker.js`) で動く。読み込みも翻訳もページを止めない。ファイルは Worker が `File.stream()` で読み、`ModelBuffer` (wasm 側の `Vec<u8>`) へチャンクごとに足すので、メモリ上のコピーは wasm の 1 つだけ。読み込みのたびに新しい Worker を作り、前のモデルのメモリを返す。
 - **モデル:** `Gguf::parse(Vec<u8>)` でメモリ上の GGUF を読み、`TensorRef` の実体を mmap か `Arc<Vec<u8>>` の enum にする。トークナイザは GGUF の語彙から `Tokenizer::from_vocab`。埋め込み表は Q4_K のまま GPU に置き (`embed_q4k`)、bf16 に展開しない (0.8B で 330 MB → 93 MB)。
 - **デバイス:** `WgpuDev::open_async` が WebGPU の adapter/device を await で開く。`Tuning` は f32 固定。必要な `maxBufferSize` と `maxStorageBufferBindingSize` を要求し、受け入れられなければ WebGPU の基本の上限 (buffer 256 MB、binding 128 MB) で開き直す。要求する大きさは `GpuBackend::largest_weight_bytes` が、GPU に置く形式で見積もる。行列はファイルの大きさではなく、読み替えたあとの最大のバッファ (`ggml_largest_buffer`) で数える。binding はバッファごとなので、0.8B Q4_K_M の Q6_K 出力行列 (ファイルでは 135 MB) も最大のバッファは 124 MB で、128 MB に収まる。開いたデバイスの binding 上限を超えるバッファを持つ行列があれば、バックエンドの `load_weight` がその行列だけを Q4 で読む (形式を `Auto` / `Auto4` に任されたときだけ)。ページはその有無を `GpuBackend::reduced_to_q4` で知る。
 - **push constants の代わり:** WebGPU に push constants はない。カーネルの `var<immediate> p` を `@group(0) @binding(15) var<uniform> p` に置き換え、1 MB の uniform バッファに 256 バイトずつ書いて dynamic offset で渡す。送信ごとにリングを先頭へ戻す。
 - **読み戻し:** WebGPU の `Device::poll` は no-op なので、`map_async` の完了を `read_async` で await する。同期の `read` は wasm にはない (`SyncReadback` は native だけ)。argmax の 2 ディスパッチだけを記録する `argmax_prob_pending` を挟み、`AsyncReadback` の `argmax_rows_async` (`GpuBackend`) が読み戻す。`Engine` は `AsyncReadback` だけに頼るので、WebGPU の `Engine` は同期の `step` を持たず、`step_async` を await する。prefill の時間は、プロンプトのパスから最初のトークンの読み戻しまで (記録しただけでは GPU はまだ計算していない)。
 - **エラー:** WebGPU の error scope は pop が async で、読み込み中の同期の `Gpu::checked` からは待てない。そこで wasm では scope を使わず、デバイスの uncaptured-error と device-lost のコールバックが最初のエラーを `Fault` に残し、`read_async` が読み戻しの前後でそれを返す (失敗した map もエラーで、panic しない)。読み込みは `GpuBackend::watch_errors` の error scope で囲み、その pop を await する。pop はそれまでの操作のエラーがすべて分かってから解決するので、確保の失敗は必ず読み込みのエラーになる (`Fault` だけでは、uncaptured-error のイベントが読み戻しの完了より後に届くことがある)。翻訳も 1 要求全体を同じ error scope で囲み、結果を返す前に pop を await するので、推論中のエラーが遅れて届いても、次の翻訳ではなくその翻訳のエラーになる。入力の誤り (空の文、GGUF でないファイル) はモデルをそのまま使えるが、GPU のエラーと panic のあとは `Translator::broken` が真になり、ページは Worker を作り直して「読み込む」を促す。
-- **長文:** `yaxus_pfml::segments::split_for_context` が、空行で段落に分け、1 段落が 768 入力トークンを超えるときは文末 (`.`、`!`、`?`、`。`、改行) で文に分け、さらに語・文字で切って 768 トークン以下に詰める。セグメントは `DocJob` (チェーン数は並列の設定、自動なら 4 段落に 1 本で最大 4) で訳す。履歴は同じチェーンの前のセグメントの組を `HistoryWindow` (上限 1600 文字) で選ぶ。`HistoryRules` で、訳は trim し、出力上限で切れた訳は入れない (native の既定は、どちらもしない)。プロンプトと出力の予算を 4096 に収めるのは native と同じ `fit_prompt` で、予算が足りなければ履歴を捨てる。同時に走れるセグメントは、予約したページ数が KV に収まる分だけ (`Engine::admit`)。`translate` は、最初に `plan(breaks)` (各セグメントの前に置く区切り: 段落の後は空行、同じ段落の文の間は、英語の出力ならスペース、日本語なら区切りなし) を呼び、そのあと `text(segment, text)` を、セグメントごとの断片として返す。ページ (`web/local/layout.js`) が、順序が前後しても、区切りを入れて出力に並べる。`progress(done, total)` で進み具合を返す。チェーンが分かれると、チェーンの先頭の段落は履歴なしで始まるので、訳が変わる (サーバーの UI も同じ設計)。
+- **長文:** `yaxus_pfml::segments::split_for_context` が、空行で段落に分け、1 段落が 768 入力トークンを超えるときは文末 (`.`、`!`、`?`、`。`、改行) で文に分け、さらに語・文字で切って 768 トークン以下に詰める。セグメントは `DocJob` (チェーン数は並列の設定、自動なら 4 段落に 1 本で最大 4) で訳す。履歴は同じチェーンの前のセグメントの組を `HistoryWindow` (上限 1600 文字) で選ぶ。`HistoryRules` で、訳は trim し、出力上限で切れた訳は入れない (native の既定は、どちらもしない)。プロンプトと出力の予算を 4096 に収めるのは native と同じ `fit_prompt` で、予算が足りなければ履歴を捨てる。同時に走れるセグメントは、予約したページ数が KV に収まる分だけ (`Engine::admit`)。`translate` は、最初に `plan(breaks)` (各セグメントの前に置く区切り: 段落の後は空行、同じ段落の文の間は、英語の出力ならスペース、日本語なら区切りなし) を呼び、そのあと `text(segment, text)` を、セグメントごとの断片として返す。ページ (`crates/yaxus-browser/www/layout.js`) が、順序が前後しても、区切りを入れて出力に並べる。`progress(done, total)` で進み具合を返す。チェーンが分かれると、チェーンの先頭の段落は履歴なしで始まるので、訳が変わる (サーバーの UI も同じ設計)。
 - **中止:** ページの「中止」は Worker に `cancel` を送る。Worker はそれを実行中の翻訳の後ろに並べず、翻訳が `cancelled` をステップの合間に確かめる。止まった文書は、待機中と実行中のセグメントをエンジンで取り消す (`Engine::cancel`)。
 - **スレッド:** wasm では rayon は逐次に落ち、カーネルの並列コンパイル (`compile_all`) も逐次。時間は `web-time` で測る (std の `Instant` は wasm32-unknown-unknown で使えない)。
-- **ビルド:** `web/local/build.sh` が `cargo build --target wasm32-unknown-unknown --release` と `wasm-bindgen --target web` を実行する。`web/local/serve.sh` で配る。`web/local/pkg` は生成物なので git に入れない。
+- **ビルド:** `crates/yaxus-browser/www/build.sh` が `cargo build --target wasm32-unknown-unknown --release` と `wasm-bindgen --target web` を実行する。`crates/yaxus-browser/www/serve.sh` で配る。`crates/yaxus-browser/www/pkg` は生成物なので git に入れない。
 
 ---
 

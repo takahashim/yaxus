@@ -42,7 +42,7 @@ use tls::TlsFiles;
 pub use tls::default_sans;
 use worker::{Events, Failure};
 
-const INDEX_HTML: &str = include_str!("../../../web/index.html");
+const INDEX_HTML: &str = include_str!("../ui/index.html");
 
 pub struct ServeOptions {
     pub model_dir: PathBuf,

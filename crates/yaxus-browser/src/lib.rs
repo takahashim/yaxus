@@ -1,9 +1,10 @@
 //! yaxus in the browser: a chosen GGUF file is read into wasm memory, the weights go to
 //! WebGPU, and translation streams back into the page. It runs in a dedicated worker
-//! (`web/local/worker.js`), so a long load or translation never blocks the page.
+//! (`www/worker.js`), so a long load or translation never blocks the page.
 //!
 //! The browser path runs the CLI's engine (`yaxus_model::Engine`, awaited step by step,
-//! since WebGPU cannot be waited on) with one request at a time, without a draft model.
+//! since WebGPU cannot be waited on) without a draft model. One translation runs at a
+//! time; with several chains, its segments advance side by side in the same passes.
 //! Everything above the GPU is the same code as the CLI (`yaxus-model` and the kernels
 //! of `yaxus-backend-gpu`).
 //!

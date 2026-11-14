@@ -30,7 +30,7 @@ Web 固有のコードは、GGUF の読み込みと JS との接続だけにす�
 Backend ─ Model ─ Engine ─ Generator (dyn、同期、Send) ─ Session<T> ─┬─ DocRun / run_document (CLI)
                                                                      ├─ server の worker (Docs、jobs)
                                                                      └─ run_request
-yaxus-web: Translator が Model→Engine を直接使い、分割・履歴・出力・統計を自前で持つ (約 300 行の重複)
+yaxus-browser: Translator が Model→Engine を直接使い、分割・履歴・出力・統計を自前で持つ (約 300 行の重複)
 ```
 
 - Web の `translate_inner`、`fit_segment`、`decode_segment`、`Output`、`Stats` は、runtime の
@@ -217,7 +217,7 @@ pub enum Job {
 **段階 1〜4 では、`Translator` が一文書を最後まで駆動する** (`translate` が `DocRunner` を await する)。
 次は、段階 5 (常駐 `Scheduler`) での形である。
 
-`yaxus-web` に残すのは次だけ。
+`yaxus-browser` に残すのは次だけ。
 
 - GGUF のストリーミング読み込みと WebGPU の初期化 (今のまま)。
 - `Rc<RefCell<..>>` を持たず、**投入と駆動を分ける**。`load_model` が `Runtime` を返し、
@@ -314,7 +314,7 @@ pub enum Job {
 - 段階 5 の `Scheduler` の取り出し (server の worker を runtime の `scheduler` に移した) も実装し、
   ネイティブで検証した。上の順序より先に進んだ部分で、Web はまだ使わない (server だけが使う)。
 - **Web の出力はセグメントごとに分けた (済み)。** `on_plan` (各セグメントの前に置く区切り) と
-  `on_text(segment, text)` で、ページ (`web/local/layout.js`) が、セグメントごとの本文から出力を組み立てる。
+  `on_text(segment, text)` で、ページ (`crates/yaxus-browser/www/layout.js`) が、セグメントごとの本文から出力を組み立てる。
   順序が前後して届いても正しく並ぶ (E2E に検査を足した)。
 - **Web でチェーン数を変えられるようにした (既定は 1)。** `?chains=N` (1〜4)。エンジンは最大 4 セグメント
   (`max_streams`、`decode_rows`)、KV のアリーナは 4 セグメントの文脈 (16,384 トークン、`max_pos` は 4,096 のまま)。
