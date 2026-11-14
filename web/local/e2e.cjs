@@ -214,6 +214,21 @@ async function translate(page, c) {
       check(c.name, ok, ok ? s.stats : `${s.status} | got ${JSON.stringify(s.out.slice(0, 200))}`);
     }
 
+    // Segments may be translated side by side: the text of each is kept apart and laid out in order.
+    const laid = await page.evaluate(async () => {
+      const { Layout } = await import('./layout.js');
+      const el = document.createElement('div');
+      const layout = new Layout(el);
+      layout.plan(['\n\n', '\n\n', ' ', '\n\n']);
+      layout.add(2, 'C');
+      layout.add(0, 'A');
+      layout.add(3, 'D');
+      layout.add(1, 'B');
+      layout.flush();
+      return el.textContent;
+    });
+    check('segments that arrive out of order are laid out in order', laid === 'A\n\nB C\n\nD', JSON.stringify(laid));
+
     for (const [name, fault] of Object.entries(FAULTS)) {
       await page.workers().at(-1).evaluate(fault);
       s = await translate(page, CASES[0]);

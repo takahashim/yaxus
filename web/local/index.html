@@ -109,6 +109,7 @@ button:disabled { opacity: .45; cursor: default; }
 </main>
 
 <script type="module">
+import { Layout } from './layout.js';
 const $ = (id) => document.getElementById(id);
 const statusEl = $('status');
 const fileEl = $('file');
@@ -179,8 +180,11 @@ function onMessage(msg) {
     case 'progress':
       if (msg.total > 1) setStatus(`翻訳しています… ${Math.min(msg.done + 1, msg.total)}/${msg.total} 段落`);
       break;
+    case 'plan':
+      request?.onPlan?.(msg.breaks);
+      break;
     case 'text':
-      request?.onText?.(msg.text);
+      request?.onText?.(msg.segment, msg.text);
       break;
     default:
       finish(msg);
@@ -204,9 +208,10 @@ function finish(msg) {
   }
 }
 
-function send(msg, onText) {
+// `handlers`: {onPlan(breaks), onText(segment, text)} for a translation.
+function send(msg, handlers = {}) {
   return new Promise((resolve, reject) => {
-    request = { onText, resolve, reject };
+    request = { ...handlers, resolve, reject };
     worker.postMessage(msg);
   });
 }
@@ -276,19 +281,22 @@ translateEl.addEventListener('click', async () => {
     outputEl.textContent = '';
     statsEl.textContent = '';
     setStatus('翻訳しています…');
-    const { stats } = await send(
-      { type: 'translate', text, target: targetEl.value, form: targetEl.value === 'ja' ? formEl.value : '' },
-      (delta) => {
-        outputEl.textContent += delta;
-        outputEl.scrollTop = outputEl.scrollHeight;
-      },
-    );
+    const layout = new Layout(outputEl);
+    let stats;
+    try {
+      ({ stats } = await send(
+        { type: 'translate', text, target: targetEl.value, form: targetEl.value === 'ja' ? formEl.value : '' },
+        { onPlan: (breaks) => layout.plan(breaks), onText: (segment, text) => layout.add(segment, text) },
+      ));
+    } finally {
+      layout.flush();
+    }
     const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
     const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.maxNew} tokens`;
     statsEl.textContent =
       `prompt ${stats.promptTokens} tokens${stats.reusedTokens ? ` (${stats.reusedTokens} 再利用)` : ''} · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
       `${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode · ` +
-      `${stats.tokensPerSecond.toFixed(1)} tok/s · ${stats.chars} 文字`;
+      `${stats.tokensPerSecond.toFixed(1)} tok/s · ${[...outputEl.textContent].length} 文字`;
     if (stats.stop === 'limit') {
       statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';
     }

@@ -5,7 +5,8 @@
 // Messages in:  {type: 'load', file}  {type: 'translate', text, target, form}
 // Messages out: {type: 'status', message}  {type: 'read', done, total}
 //               {type: 'ready', info}  {type: 'progress', done, total}
-//               {type: 'text', text}  {type: 'done', stats}
+//               {type: 'plan', breaks}  {type: 'text', segment, text}
+//               {type: 'done', stats}
 //               {type: 'error', message, fatal}
 import init, { ModelBuffer, load_model } from './pkg/yaxus_web.js';
 
@@ -88,7 +89,8 @@ async function translate({ text, target, form }) {
     text,
     target,
     form || null,
-    (text) => post({ type: 'text', text }),
+    (breaks) => post({ type: 'plan', breaks: Array.from(breaks) }),
+    (segment, text) => post({ type: 'text', segment, text }),
     (done, total) => post({ type: 'progress', done, total }),
   );
   const plain = {
@@ -97,7 +99,6 @@ async function translate({ text, target, form }) {
     maxNew: stats.max_new,
     segments: stats.segments,
     stop: stats.stop,
-    chars: stats.chars,
     reusedTokens: stats.reused_tokens,
     prefillMs: stats.prefill_ms,
     decodeMs: stats.decode_ms,

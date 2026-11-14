@@ -211,14 +211,20 @@ impl Translator {
     /// Translates `text` into `target` (`ja` or `en`; the source language is left to
     /// the model, as the CLI does without `--from`). `form` (`polite`, `plain`, or
     /// none) applies to Japanese output. Long text is split into paragraphs and
-    /// sentences; each segment is translated in order, with the previous segments as
-    /// history, and `on_text` receives text as it is produced. `on_progress` gets
+    /// sentences; each segment is translated with the earlier ones as history.
+    ///
+    /// `on_plan` is called once, before any text, with what the page needs to lay the
+    /// output out: for each segment, the separator that goes before its text (a blank line
+    /// after a paragraph, a space or nothing between sentences). `on_text` receives
+    /// `(segment, text)` as the text is produced: the text of different segments may
+    /// interleave, so the page keeps each segment's text apart. `on_progress` gets
     /// `(segments_done, segments_total)`.
     pub async fn translate(
         &mut self,
         text: String,
         target: String,
         form: Option<String>,
+        on_plan: Function,
         on_text: Function,
         on_progress: Option<Function>,
     ) -> Result<Stats, JsError> {
@@ -229,7 +235,8 @@ impl Translator {
         // error WebGPU reports late fails this translation, not the next one (`Fault`
         // and the read-backs only see what has arrived by then).
         let watch = self.engine.backend().watch_errors();
-        let result = self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await;
+        let callbacks = Callbacks { plan: &on_plan, text: &on_text, progress: on_progress.as_ref() };
+        let result = self.translate_inner(&text, &target, form.as_deref(), &callbacks).await;
         let scope = watch.finish().await;
         match (result, scope) {
             (Err(Failure::Device(e)), _) => {
@@ -252,8 +259,7 @@ impl Translator {
         text: &str,
         target: &str,
         form: Option<&str>,
-        on_text: &Function,
-        on_progress: Option<&Function>,
+        page: &Callbacks<'_>,
     ) -> Result<Stats, Failure> {
         if !matches!(target, "ja" | "en") {
             return Err(request_err(format!("unsupported target language {target:?}")));
@@ -287,18 +293,17 @@ impl Translator {
         let job = DocJob::new(segments.iter().map(|s| s.text.clone()).collect(), opts).with_max_context(MAX_CONTEXT);
         job.validate(&self.tokenizer).map_err(request_err)?;
 
+        let breaks: js_sys::Array =
+            segments.iter().map(|s| JsValue::from_str(if s.paragraph { "\n\n" } else { sentence_gap })).collect();
+        page.plan.call1(&JsValue::NULL, &breaks).map_err(|e| request_err(format!("on_plan callback failed: {e:?}")))?;
         let progress = |done: usize| {
-            if let Some(progress) = on_progress {
+            if let Some(progress) = page.progress {
                 let _ =
                     progress.call2(&JsValue::NULL, &JsValue::from_f64(done as f64), &JsValue::from_f64(total as f64));
             }
         };
         progress(0);
 
-        let mut out = Output { on_text, chars: 0, owed: "" };
-        // The separator a segment owes is set before its text, in order, also for a
-        // segment that has none.
-        let mut owed_upto = 0;
         let mut write_failure = None;
         let (mut prompt_tokens, mut output_tokens, mut decode_steps, mut reused_tokens) = (0u32, 0u32, 0u32, 0u32);
         let (mut prefill_ms, mut decode_ms) = (0.0, 0.0);
@@ -307,18 +312,12 @@ impl Translator {
         // The page keeps no translation memory: a repeated translation is computed again.
         let mut memory = Memory::new(0);
         let result = run_document_async(&mut self.engine, &self.tokenizer, job, &mut memory, &mut |event| {
-            let segment = match &event {
-                DocEvent::Delta { segment, .. } => *segment,
-                DocEvent::SegmentDone(end) => end.segment,
-            };
-            while owed_upto <= segment {
-                out.owe(if segments[owed_upto].paragraph { "\n\n" } else { sentence_gap });
-                owed_upto += 1;
-            }
             match event {
-                DocEvent::Delta { text, .. } => {
-                    if let Err(e) = out.text(text) {
-                        write_failure = Some(e);
+                DocEvent::Delta { segment, text } => {
+                    let sent =
+                        page.text.call2(&JsValue::NULL, &JsValue::from_f64(segment as f64), &JsValue::from_str(text));
+                    if let Err(e) = sent {
+                        write_failure = Some(request_err(format!("on_text callback failed: {e:?}")));
                         return false;
                     }
                 }
@@ -354,7 +353,6 @@ impl Translator {
             max_new: last_max_new,
             segments: total as u32,
             stop: (if any_limit { "limit" } else { "tag" }).into(),
-            chars: out.chars as u32,
             decode_steps,
             reused_tokens,
             prefill_ms,
@@ -363,40 +361,11 @@ impl Translator {
     }
 }
 
-/// The page's output. The separator a segment owes the text before it is written just
-/// before its own first text, so a segment that produces nothing adds no separator.
-struct Output<'a> {
-    on_text: &'a Function,
-    /// Characters sent so far.
-    chars: usize,
-    owed: &'static str,
-}
-
-impl Output<'_> {
-    /// The next segment follows the text so far after `separator` (a paragraph break
-    /// owed by a segment with no text is kept).
-    fn owe(&mut self, separator: &'static str) {
-        if self.chars > 0 && (self.owed.is_empty() || separator == "\n\n") {
-            self.owed = separator;
-        }
-    }
-
-    fn text(&mut self, text: &str) -> Result<(), Failure> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let owed = std::mem::take(&mut self.owed);
-        for part in [owed, text] {
-            if part.is_empty() {
-                continue;
-            }
-            self.chars += part.chars().count();
-            self.on_text
-                .call1(&JsValue::NULL, &JsValue::from_str(part))
-                .map_err(|e| request_err(format!("on_text callback failed: {e:?}")))?;
-        }
-        Ok(())
-    }
+/// What the page gave `translate`.
+struct Callbacks<'a> {
+    plan: &'a Function,
+    text: &'a Function,
+    progress: Option<&'a Function>,
 }
 
 /// What one translation cost (shown under the output).
@@ -407,7 +376,6 @@ pub struct Stats {
     max_new: u32,
     segments: u32,
     stop: String,
-    chars: u32,
     /// Decode passes (see [`Stats::tokens_per_second`]).
     decode_steps: u32,
     /// Prompt tokens served from the KV of earlier segments.
@@ -444,11 +412,6 @@ impl Stats {
     #[wasm_bindgen(getter)]
     pub fn stop(&self) -> String {
         self.stop.clone()
-    }
-
-    #[wasm_bindgen(getter)]
-    pub fn chars(&self) -> u32 {
-        self.chars
     }
 
     /// Prompt tokens that were not computed again because an earlier segment's prompt
