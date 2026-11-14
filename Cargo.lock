@@ -2920,6 +2920,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
+ "yaxus-api",
  "yaxus-backend-gpu",
  "yaxus-model",
  "yaxus-pfml",

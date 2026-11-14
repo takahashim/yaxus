@@ -17,10 +17,11 @@ use std::fmt::Display;
 use js_sys::Function;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
+use yaxus_api::HistoryWindow;
 use yaxus_backend_gpu::{GpuBackend, Tensor};
 use yaxus_model::{Model, ModelOptions, Quant, SeqId, gguf::Gguf};
 use yaxus_pfml::{
-    Form, Pair, TranslationRequest,
+    Form, Pair, TranslationRequest, fit_prompt,
     segments::{Segment, split_for_context},
     validate_history_pair,
 };
@@ -33,10 +34,9 @@ const MAX_CONTEXT: usize = 4096;
 /// Input tokens one segment aims for. A paragraph that fits stays whole; a longer one is
 /// split at sentences. Paragraphs/history/output all live inside `MAX_CONTEXT`.
 const SEGMENT_INPUT_TOKENS: usize = 768;
-/// Characters of earlier source/translation pairs sent as history (at most two pairs).
+/// Characters of earlier source/translation pairs sent as history (`HistoryWindow`, as
+/// the CLI's document mode; smaller than its default to leave room in `MAX_CONTEXT`).
 const HISTORY_CHARS: usize = 1600;
-/// Room a prompt must leave for the answer before history is dropped.
-const MIN_NEW: usize = 256;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -252,7 +252,9 @@ impl Translator {
         // English, directly in Japanese.
         let sentence_gap = if target == "en" { " " } else { "" };
         let total = segments.len();
+        // Every finished pair a prompt may hold, oldest first, and the window of them sent.
         let mut history: Vec<Pair> = Vec::new();
+        let mut window = HistoryWindow::new(HISTORY_CHARS);
         let mut prompt_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut decode_steps = 0u32;
@@ -267,7 +269,7 @@ impl Translator {
             if let Some(progress) = on_progress {
                 let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(i as f64), &JsValue::from_f64(total as f64));
             }
-            let (ids, max_new) = self.fit_segment(segment, target, form, &history)?;
+            let (ids, max_new) = self.fit_segment(segment, target, form, window.select(&history))?;
             out.owe(if segment.paragraph { "\n\n" } else { sentence_gap });
             let prompt_len = ids.len() as u32;
             let started = Instant::now();
@@ -296,9 +298,6 @@ impl Translator {
                 let pair = Pair { source: segment.text.clone(), target: translated.trim().to_string() };
                 if validate_history_pair(&pair).is_ok() {
                     history.push(pair);
-                    if history.len() > 4 {
-                        history.remove(0);
-                    }
                 }
             }
         }
@@ -318,36 +317,27 @@ impl Translator {
         })
     }
 
-    /// The prompt for `segment` with as much history as fits, and the output budget.
+    /// The prompt for `segment` with `history` (dropped when it leaves too little room
+    /// for the answer, as in the CLI), and the output budget.
     fn fit_segment(
         &self,
         segment: &Segment,
         target: &str,
         form: Option<Form>,
-        earlier: &[Pair],
+        history: &[Pair],
     ) -> Result<(Vec<u32>, usize), Failure> {
-        let mut history = select_history(earlier);
-        loop {
-            let req = TranslationRequest {
-                text: segment.text.clone(),
-                target_lang: target.into(),
-                source_lang: None,
-                form,
-                context: None,
-                glossary: Vec::new(),
-                history: history.clone(),
-            };
-            let req = req.validate().map_err(request_err)?;
-            let ids = self.tokenizer.encode(&req.render(), false);
-            let len = ids.len();
-            if len < MAX_CONTEXT && (history.is_empty() || len + MIN_NEW <= MAX_CONTEXT) {
-                return Ok((ids, MAX_NEW_TOKENS.min(MAX_CONTEXT - len)));
-            }
-            if history.is_empty() {
-                return Err(request_err(format!("a segment needs {len} prompt tokens; the limit is {MAX_CONTEXT}")));
-            }
-            history.remove(0);
-        }
+        let req = TranslationRequest {
+            text: segment.text.clone(),
+            target_lang: target.into(),
+            source_lang: None,
+            form,
+            context: None,
+            glossary: Vec::new(),
+            history: history.to_vec(),
+        };
+        let req = req.validate().map_err(request_err)?;
+        let (_, ids, max_new) = fit_prompt(&self.tokenizer, req, MAX_CONTEXT, MAX_NEW_TOKENS).map_err(request_err)?;
+        Ok((ids, max_new))
     }
 
     /// Greedy generation of one segment. The text goes to `on_text` as it is produced.
@@ -455,25 +445,6 @@ impl Output<'_> {
         }
         Ok(())
     }
-}
-
-/// The newest pairs within the history budget (at most two).
-fn select_history(all: &[Pair]) -> Vec<Pair> {
-    let mut selected = Vec::new();
-    let mut chars = 0;
-    for pair in all.iter().rev().take(2) {
-        if validate_history_pair(pair).is_err() {
-            continue;
-        }
-        let n = pair.source.chars().count() + pair.target.chars().count();
-        if !selected.is_empty() && chars + n > HISTORY_CHARS {
-            break;
-        }
-        selected.push(pair.clone());
-        chars += n;
-    }
-    selected.reverse();
-    selected
 }
 
 /// What one translation cost (shown under the output).
