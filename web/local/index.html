@@ -286,7 +286,7 @@ translateEl.addEventListener('click', async () => {
     const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
     const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.maxNew} tokens`;
     statsEl.textContent =
-      `prompt ${stats.promptTokens} tokens · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
+      `prompt ${stats.promptTokens} tokens${stats.reusedTokens ? ` (${stats.reusedTokens} 再利用)` : ''} · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
       `${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode · ` +
       `${stats.tokensPerSecond.toFixed(1)} tok/s · ${stats.chars} 文字`;
     if (stats.stop === 'limit') {

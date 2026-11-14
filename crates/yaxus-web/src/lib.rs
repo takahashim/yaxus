@@ -2,9 +2,10 @@
 //! WebGPU, and translation streams back into the page. It runs in a dedicated worker
 //! (`web/local/worker.js`), so a long load or translation never blocks the page.
 //!
-//! The browser path deliberately keeps one request and one model: no engine, draft
-//! model, document chains, batching or KV-prefix cache. Everything above the GPU is the
-//! same code as the CLI (`yaxus-model` and the kernels of `yaxus-backend-gpu`).
+//! The browser path runs the CLI's engine (`yaxus_model::Engine`, awaited step by step,
+//! since WebGPU cannot be waited on) with one request at a time, without a draft model.
+//! Everything above the GPU is the same code as the CLI (`yaxus-model` and the kernels
+//! of `yaxus-backend-gpu`).
 //!
 //! Errors come in two kinds. A bad input (no text, a file that is not a PLaMo GGUF) is an
 //! ordinary error and the model stays usable. An error of the GPU (a failed allocation,
@@ -18,8 +19,8 @@ use js_sys::Function;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 use yaxus_api::HistoryWindow;
-use yaxus_backend_gpu::{GpuBackend, Tensor};
-use yaxus_model::{Model, ModelOptions, Quant, SeqId, gguf::Gguf};
+use yaxus_backend_gpu::GpuBackend;
+use yaxus_model::{Engine, EngineConfig, Event, Finish, Model, ModelOptions, Quant, Request, gguf::Gguf};
 use yaxus_pfml::{
     Form, Pair, TranslationRequest, fit_prompt,
     segments::{Segment, split_for_context},
@@ -37,6 +38,17 @@ const SEGMENT_INPUT_TOKENS: usize = 768;
 /// Characters of earlier source/translation pairs sent as history (`HistoryWindow`, as
 /// the CLI's document mode; smaller than its default to leave room in `MAX_CONTEXT`).
 const HISTORY_CHARS: usize = 1600;
+/// One request at a time, no response cache (a repeated translation runs again, so a
+/// fault of the device shows), no draft model.
+const ENGINE: EngineConfig = EngineConfig {
+    max_streams: 1,
+    decode_rows: 1,
+    busy_prefill_rows: 64,
+    draft_k: 7,
+    spec_max_streams: 1,
+    hint_k: 7,
+    response_cache: 0,
+};
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -117,7 +129,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let opts = ModelOptions {
         kv_tokens: MAX_CONTEXT,
         max_pos: MAX_CONTEXT,
-        prefix_cache: false,
+        prefix_cache: true,
         ..ModelOptions::new(Quant::Auto)
     };
     // WebGPU reports a failed allocation after the call that made it: the error scope
@@ -130,14 +142,15 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     report(&on_progress, "準備できました");
     let load_ms = total.elapsed().as_secs_f64() * 1e3;
     let reduced_to_q4 = model.backend.reduced_to_q4() > 0;
-    Ok(Translator { model, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false })
+    let engine = Engine::new(model, None, ENGINE).map_err(jserr)?;
+    Ok(Translator { engine, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false })
 }
 
 /// One loaded model. Only one translation runs at a time (the page's button is disabled
 /// while it does).
 #[wasm_bindgen]
 pub struct Translator {
-    model: Model<GpuBackend>,
+    engine: Engine<GpuBackend>,
     tokenizer: Tokenizer,
     name: String,
     load_ms: f64,
@@ -218,7 +231,7 @@ impl Translator {
         // The whole request runs inside an error scope, settled before it returns: an
         // error WebGPU reports late fails this translation, not the next one (`Fault`
         // and the read-backs only see what has arrived by then).
-        let watch = self.model.backend.watch_errors();
+        let watch = self.engine.backend().watch_errors();
         let result = self.translate_inner(&text, &target, form.as_deref(), &on_text, on_progress.as_ref()).await;
         let scope = watch.finish().await;
         match (result, scope) {
@@ -269,6 +282,7 @@ impl Translator {
         let mut prompt_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut decode_steps = 0u32;
+        let mut reused_tokens = 0u32;
         let mut out = Output { on_text, chars: 0, owed: "" };
         let mut prefill_ms = 0.0;
         let mut decode_ms = 0.0;
@@ -284,10 +298,9 @@ impl Translator {
             out.owe(if segment.paragraph { "\n\n" } else { sentence_gap });
             let prompt_len = ids.len() as u32;
             let started = Instant::now();
-            // `start` and `forward` fail only on host-side limits (KV pages, positions);
-            // a GPU error shows at the read-back in `decode_segment`.
-            let (id, first) = self.model.start(&ids).map_err(request_err)?;
-            let decoded = self.decode_segment(id, first, max_new, &mut out).await?;
+            // A request fails on its own only at host-side limits (KV pages, positions); a
+            // GPU error shows at a read-back, which fails the step.
+            let decoded = self.decode_segment(ids, max_new, &mut out).await?;
             let (translated, stop, generated) = (decoded.text, decoded.stop, decoded.tokens);
             // The prompt's pass ends with the first token's read-back: until then the GPU
             // has only been given the work, so that is where prefill ends.
@@ -297,6 +310,7 @@ impl Translator {
             prompt_tokens += prompt_len;
             output_tokens += generated;
             decode_steps += decoded.steps;
+            reused_tokens += decoded.reused;
             last_max_new = max_new as u32;
             if stop == "limit" {
                 any_limit = true;
@@ -323,6 +337,7 @@ impl Translator {
             stop: (if any_limit { "limit" } else { last_stop }).into(),
             chars: out.chars as u32,
             decode_steps,
+            reused_tokens,
             prefill_ms,
             decode_ms,
         })
@@ -354,59 +369,77 @@ impl Translator {
     /// Greedy generation of one segment. The text goes to `on_text` as it is produced.
     async fn decode_segment(
         &mut self,
-        id: SeqId,
-        first: Tensor,
+        ids: Vec<u32>,
         max_new: usize,
         out: &mut Output<'_>,
     ) -> Result<Decoded, Failure> {
-        let mut logits = first;
+        let id = self.engine.fresh_id();
+        self.engine.submit(Request::new(id, ids, max_new, vec![EOS_ID, TAG_ID]));
+        let tokenizer = &self.tokenizer;
         let mut decoder = StreamDecoder::new();
         let mut translated = String::new();
-        let mut output_tokens = 0u32;
-        let mut steps = 0u32;
-        let mut stop = "limit";
+        let mut tokens = 0u32;
         let mut first_token = None;
-        let result = async {
-            while (output_tokens as usize) < max_new {
-                let next = self.model.backend.argmax_async(&logits).await.map_err(device_err)?;
-                first_token.get_or_insert_with(Instant::now);
-                if next == EOS_ID {
-                    stop = "eos";
-                    break;
-                }
-                if next == TAG_ID {
-                    stop = "tag";
-                    break;
-                }
-                let delta = decoder.push(&self.tokenizer, next);
-                translated.push_str(&delta);
-                out.text(&delta)?;
-                output_tokens += 1;
-                if output_tokens as usize >= max_new {
-                    break;
-                }
-                logits = self.model.forward(&[(id, &[next])], false).map_err(request_err)?;
-                steps += 1;
-            }
-            // A character split across byte tokens is held until the next token; there is
-            // no next token at the end, so emit its replacement here.
-            let tail = decoder.finish();
-            translated.push_str(&tail);
-            out.text(&tail)?;
-            Ok::<(), Failure>(())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                self.model.finish(id);
-                let first_token = first_token.unwrap_or_else(Instant::now);
-                Ok(Decoded { text: translated, stop, tokens: output_tokens, steps, first_token })
-            }
-            Err(e) => {
-                self.model.free_seq(id);
-                Err(e)
+        let mut finish = None;
+        let mut error = None;
+        let mut write_failure = None;
+        let mut reused = 0u32;
+        while finish.is_none() && error.is_none() {
+            let worked = self
+                .engine
+                .step_async(&mut |event| match event {
+                    Event::Token { token, .. } => {
+                        first_token.get_or_insert_with(Instant::now);
+                        tokens += 1;
+                        let delta = decoder.push(tokenizer, token);
+                        translated.push_str(&delta);
+                        match out.text(&delta) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                write_failure = Some(e);
+                                false
+                            }
+                        }
+                    }
+                    Event::Done { finish: f, start, .. } => {
+                        finish = Some(f);
+                        reused = start.reused as u32;
+                        true
+                    }
+                    Event::Error { message, .. } => {
+                        error = Some(message);
+                        true
+                    }
+                })
+                .await
+                .map_err(device_err)?;
+            if !worked {
+                break;
             }
         }
+        if let Some(e) = write_failure {
+            return Err(e);
+        }
+        if let Some(message) = error {
+            return Err(request_err(message));
+        }
+        // A character split across byte tokens is held until the next token; there is
+        // no next token at the end, so emit its replacement here.
+        let tail = decoder.finish();
+        translated.push_str(&tail);
+        out.text(&tail)?;
+        let stop = match finish {
+            Some(Finish::Stop) => "tag",
+            _ => "limit",
+        };
+        Ok(Decoded {
+            text: translated,
+            stop,
+            tokens,
+            steps: tokens.saturating_sub(1),
+            reused,
+            first_token: first_token.unwrap_or_else(Instant::now),
+        })
     }
 }
 
@@ -418,6 +451,8 @@ struct Decoded {
     tokens: u32,
     /// Decode passes after the first token (each one read back one more token).
     steps: u32,
+    /// Prompt tokens whose KV an earlier segment had computed (prefix reuse).
+    reused: u32,
     /// When the first token was read back.
     first_token: Instant,
 }
@@ -469,6 +504,8 @@ pub struct Stats {
     chars: u32,
     /// Decode passes (see [`Stats::tokens_per_second`]).
     decode_steps: u32,
+    /// Prompt tokens served from the KV of earlier segments.
+    reused_tokens: u32,
     prefill_ms: f64,
     decode_ms: f64,
 }
@@ -506,6 +543,13 @@ impl Stats {
     #[wasm_bindgen(getter)]
     pub fn chars(&self) -> u32 {
         self.chars
+    }
+
+    /// Prompt tokens that were not computed again because an earlier segment's prompt
+    /// began the same way.
+    #[wasm_bindgen(getter)]
+    pub fn reused_tokens(&self) -> u32 {
+        self.reused_tokens
     }
 
     #[wasm_bindgen(getter)]

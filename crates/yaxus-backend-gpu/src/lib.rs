@@ -42,6 +42,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+#[cfg(target_arch = "wasm32")]
+use yaxus_model::AsyncReadback;
 #[cfg(not(target_arch = "wasm32"))]
 use yaxus_model::SyncReadback;
 use yaxus_model::{Backend, Config, LayerMeta, PassMeta, Quant, TensorRef};
@@ -354,20 +356,6 @@ impl GpuBackend {
         self.g().loaded.reduced_to_q4
     }
 
-    /// The greedy token of a one-row logits tensor, awaiting the read-back (browser).
-    /// The lock is held across the await on purpose: wasm is single-threaded, and the
-    /// recorded pass and its read-back must not interleave with another request.
-    #[cfg(target_arch = "wasm32")]
-    #[allow(clippy::await_holding_lock)]
-    pub async fn argmax_async(&mut self, logits: &Tensor) -> Result<u32> {
-        debug_assert_eq!(logits.rows, 1, "the browser path decodes one request");
-        let gpu = self.gpu.clone();
-        let mut g = gpu.lock().unwrap();
-        let (out, size) = g.argmax_prob_pending(logits);
-        let bytes = g.read_async(&out, 0, size).await?;
-        Ok(parse_argmax(&bytes, logits.cols as u32).first().map_or(0, |&(id, _)| id))
-    }
-
     /// Starts capturing every error of the device, for [`ErrorWatch::finish`] to report
     /// (browser). Wrap the model's loading in it: WebGPU reports a failed allocation after
     /// `create_buffer` has returned, and only an error scope says for certain that no
@@ -520,7 +508,35 @@ impl Backend for GpuBackend {
     }
 }
 
-/// Native only: the browser reads back asynchronously (`argmax_async`).
+/// The browser's read-back: what the engine awaits for the greedy tokens of a pass.
+/// (Native has it through [`SyncReadback`].) The lock is held across the awaits on
+/// purpose: wasm is single-threaded, and the recorded pass and its read-back must not
+/// interleave with another's.
+#[cfg(target_arch = "wasm32")]
+impl AsyncReadback for GpuBackend {
+    #[allow(clippy::await_holding_lock)]
+    async fn argmax_rows_async(&mut self, logits: &Tensor) -> Result<Vec<u32>> {
+        let gpu = self.gpu.clone();
+        let mut g = gpu.lock().unwrap();
+        let mut out = Vec::with_capacity(logits.rows);
+        // One dispatch covers `ARGMAX_ROWS` rows; more streams go in several.
+        for start in (0..logits.rows).step_by(ARGMAX_ROWS) {
+            let end = (start + ARGMAX_ROWS).min(logits.rows);
+            let (buf, size) = if end - start == logits.rows {
+                g.argmax_prob_pending(logits)
+            } else {
+                let rows: Vec<usize> = (start..end).collect();
+                let part = g.select_rows(logits, &rows);
+                g.argmax_prob_pending(&part)
+            };
+            let bytes = g.read_async(&buf, 0, size).await?;
+            out.extend(parse_argmax(&bytes, logits.cols as u32).into_iter().map(|(id, _)| id));
+        }
+        Ok(out)
+    }
+}
+
+/// Native only: the browser reads back asynchronously (`AsyncReadback`).
 #[cfg(not(target_arch = "wasm32"))]
 impl SyncReadback for GpuBackend {
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
