@@ -24,7 +24,7 @@ use yaxus_model::{Engine, EngineConfig, Finish, Model, ModelOptions, Quant, gguf
 use yaxus_pfml::{Form, TranslationRequest, segments::split_for_context};
 use yaxus_runtime::document::{Chains, DocEvent, DocJob, DocOptions, DocRunError, DocRunner, HistoryRules};
 use yaxus_runtime::memory::Memory;
-use yaxus_tokenizer::{TokenKind, Tokenizer};
+use yaxus_tokenizer::Tokenizer;
 
 /// The longest output one segment asks for.
 const MAX_NEW_TOKENS: usize = 1024;
@@ -114,8 +114,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let weights = g.weights().map_err(jserr)?;
 
     report(&on_progress, "トークナイザを構築しています…");
-    let kinds = vocab.types.iter().copied().map(TokenKind::from_ggml_type).collect();
-    let tokenizer = Tokenizer::from_vocab(vocab.tokens, kinds, vocab.scores).map_err(jserr)?;
+    let tokenizer = Tokenizer::from_ggml_vocab(vocab.tokens, &vocab.types, vocab.scores).map_err(jserr)?;
 
     // The largest buffer a single binding has to cover (for the 0.8B Q4_K_M, the Q6_K
     // output matrix's 124 MB of 6-bit values). A device that cannot bind a matrix's

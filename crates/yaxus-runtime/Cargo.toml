@@ -3,7 +3,7 @@ name = "yaxus-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model resolution, loading and translation jobs for yaxus (shared by the server and local mode)"
+description = "Translation jobs on a loaded engine for yaxus: requests, documents, translation memory, the inference loop (shared by the server, the CLI and the browser)"
 
 [dependencies]
 anyhow.workspace = true
@@ -15,9 +15,6 @@ yaxus-api = { path = "../yaxus-api" }
 yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 yaxus-pfml = { path = "../yaxus-pfml" }
 yaxus-model = { path = "../yaxus-model" }
-yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
-yaxus-backend-gpu = { path = "../yaxus-backend-gpu" }
 
 [dev-dependencies]
 yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }
-serde_json.workspace = true

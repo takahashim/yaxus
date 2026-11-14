@@ -2851,6 +2851,7 @@ dependencies = [
  "tracing-subscriber",
  "yaxus-api",
  "yaxus-model",
+ "yaxus-native",
  "yaxus-pfml",
  "yaxus-runtime",
  "yaxus-server",
@@ -2872,6 +2873,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "yaxus-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tracing",
+ "yaxus-backend-cpu",
+ "yaxus-backend-gpu",
+ "yaxus-model",
+ "yaxus-tokenizer",
+]
+
+[[package]]
 name = "yaxus-pfml"
 version = "0.1.0"
 dependencies = [
@@ -2887,13 +2901,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures-util",
- "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "web-time",
  "yaxus-api",
- "yaxus-backend-cpu",
- "yaxus-backend-gpu",
  "yaxus-model",
  "yaxus-pfml",
  "yaxus-tokenizer",
@@ -2919,6 +2930,7 @@ dependencies = [
  "tracing",
  "yaxus-api",
  "yaxus-model",
+ "yaxus-native",
  "yaxus-pfml",
  "yaxus-runtime",
  "yaxus-tokenizer",

@@ -144,7 +144,8 @@ yaxus/
     yaxus-model/           # 設定・safetensors / GGUF のロード・plamo3 の計算グラフ・Backend トレイト・KV アリーナ・エンジン
     yaxus-backend-cpu/     # 参照実装 (f32、rayon)。正しさの基準とフォールバック
     yaxus-backend-gpu/     # GPU バックエンド (wgpu で Vulkan / Metal、または Metal 直接。手書きの WGSL と MSL のカーネル)
-    yaxus-runtime/         # モデル名の解決・読み込み (バックエンド、精度、下書き)・プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。`native/` (モデルの解決、読み込みの設定、読み込み) 以外は wasm32 でも動く
+    yaxus-runtime/         # プロンプト・実行中の要求 (Session)・文書のチェーン・翻訳メモリ・推論ループ (scheduler)。ロード済みのエンジンの上で翻訳を走らせる部分で、サーバ・CLI・ブラウザが共有する。wasm32 でも動く
+    yaxus-native/          # native のバックエンド (CPU、Vulkan、Metal) へのモデルの解決 (ディレクトリ、GGUF、Hugging Face のキャッシュ)・読み込みの設定 (バックエンド、精度、下書き)・読み込み
     yaxus-server/          # axum + rustls、認証、推論ワーカー、Web UI の埋め込み
       ui/                  # Web UI (素の HTML/JS 1 ファイル。ビルド不要、include_str! で埋め込み)
     yaxus-cli/             # バイナリ `yaxus` (serve / translate / bench / client)
@@ -154,9 +155,9 @@ yaxus/
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
 ```
 
-`yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
+`yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-native` と `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
 
-サーバとローカル実行で共通の部分 (読み込み、文書、翻訳メモリ) は `yaxus-runtime` に置く。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
+サーバとローカル実行で共通の部分 (文書、翻訳メモリ、推論ループ) は `yaxus-runtime` に置き、モデルの読み込みは native 側の `yaxus-native` が受け持つ。ブラウザは読み込みだけを自前で持ち (`yaxus-browser`、非同期にデバイスを開き、メモリ上の GGUF から作る)、その上の部分は同じ `yaxus-runtime` を使う。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
 
 1 件の要求がエンジン上でたどる処理 (停止トークン、翻訳メモリのヒント、トークンから文字列への復号、終わったら出力をメモリへ) は `yaxus_runtime::Session<T>` の 1 か所にある。`T` はその要求の持ち主で、サーバのワーカーでは HTTP の接続 (単文) か文書の段落、`run_document` では段落の番号、`run_request` では無し。呼び出し側は `Session::step_async` が返す更新 (`Delta`、`Done`、`Failed`) を持ち主へ届けるだけ。エンジンは `Generator` (非同期の `step_async`、`Send` を要求しない)。同期の `step` と `generate` は `SyncGenerator` にあり、`SyncReadback` のバックエンドの `Engine` だけが実装する。`score` もそちらにある (読み戻しを待つため)。`run_document` と `run_request` はそれを使い、`DocRunner` (中止の確認つきで、await して文書を訳す) と `run_request_async` は `Generator` のすべてに使える。文書の進行は `DocRun` が持ち、`Session` の更新への反応 (`DocRun::on_update` が返す `Reaction`) は、`DocRunner` とサーバーの `scheduler` の両方が使う。
 
