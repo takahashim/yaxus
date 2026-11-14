@@ -119,9 +119,12 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
         prefix_cache: false,
         ..ModelOptions::new(Quant::Auto)
     };
+    // WebGPU reports a failed allocation after the call that made it: the error scope
+    // around the uploads makes such a failure a load error, not a broken first
+    // translation.
+    let watch = backend.watch_errors();
     let mut model = Model::from_gguf(g, backend, &opts).map_err(jserr)?;
-    // WebGPU reports a failed allocation after the call that made it; wait for the
-    // uploads so that such a failure is a load error, not a broken first translation.
+    watch.finish().await.map_err(jserr)?;
     model.backend.sync_async().await.map_err(jserr)?;
     report(&on_progress, "準備できました");
     let load_ms = total.elapsed().as_secs_f64() * 1e3;

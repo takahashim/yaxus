@@ -55,8 +55,14 @@ const CASES = [
 // Test-only: keeps the worker's GPUDevice where the test can reach it, to break it.
 // `self.__rejectFirst` makes the first device request fail (an adapter that advertises
 // more than it grants); `self.__fakeBinding` makes the device report a smaller storage
-// binding than it has (WebGPU never grants less than 128 MB, which the 0.8B fits).
+// binding than it has (WebGPU never grants less than 128 MB, which the 0.8B fits);
+// `self.__failBigBuffers` makes every buffer over 64 MB invalid (an allocation that fails).
 const SHIM =
+  'const __createBuffer = GPUDevice.prototype.createBuffer;\n' +
+  'GPUDevice.prototype.createBuffer = function (d) {\n' +
+  '  if (self.__failBigBuffers && d.size > (64 << 20)) d = { ...d, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.STORAGE };\n' +
+  '  return __createBuffer.call(this, d);\n' +
+  '};\n' +
   'const __requestDevice = GPUAdapter.prototype.requestDevice;\n' +
   'GPUAdapter.prototype.requestDevice = async function (d) {\n' +
   '  if (self.__rejectFirst && !self.__rejected) { self.__rejected = true; throw new DOMException("test: rejected", "OperationError"); }\n' +
@@ -179,6 +185,13 @@ async function translate(page, c) {
       s = await translate(page, CASES[0]);
       check(`${name}: works after loading again`, !s.err && s.out === CASES[0].want, s.out);
     }
+
+    // A buffer that fails while the weights are uploaded is a load error.
+    flags = 'self.__failBigBuffers = true;\n';
+    await page.locator('#load').click();
+    await settled(page);
+    s = await state(page);
+    check('a failed allocation while loading is a load error', s.err && !s.canTranslate, s.status.split('\n')[0]);
 
     // The first device request is rejected: the retry with the base limits (a 128 MB
     // binding) works, and the 0.8B fits it whole (its largest buffer is 124 MB).

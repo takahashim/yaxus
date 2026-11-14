@@ -283,6 +283,21 @@ impl Gpu {
     }
 }
 
+/// The errors of a stretch of browser work (see [`GpuBackend::watch_errors`]).
+#[cfg(target_arch = "wasm32")]
+pub struct ErrorWatch(dev::wgpu::AsyncErrorScope);
+
+#[cfg(target_arch = "wasm32")]
+impl ErrorWatch {
+    /// The first error of the work since the watch began.
+    pub async fn finish(self) -> Result<()> {
+        match self.0.finish().await {
+            Some(e) => anyhow::bail!("{e}"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// A handle to a shared [`Gpu`] context. Every model loaded through a handle shares the
 /// device, kernels and command encoder with the other handles of the same context, so
 /// work of several models (e.g. target and draft) can be recorded into one submission.
@@ -344,9 +359,19 @@ impl GpuBackend {
         Ok(parse_argmax(&bytes, logits.cols as u32).first().map_or(0, |&(id, _)| id))
     }
 
+    /// Starts capturing every error of the device, for [`ErrorWatch::finish`] to report
+    /// (browser). Wrap the model's loading in it: WebGPU reports a failed allocation after
+    /// `create_buffer` has returned, and only an error scope says for certain that no
+    /// error of the work before it is still on its way.
+    #[cfg(target_arch = "wasm32")]
+    pub fn watch_errors(&self) -> ErrorWatch {
+        let dev::Dev::Wgpu(d) = &self.g().dev;
+        ErrorWatch(d.async_error_scope())
+    }
+
     /// Waits until the GPU has done everything submitted so far, and returns the first
-    /// error WebGPU reported for it (a failed allocation while loading, for example: the
-    /// browser reports those after `create_buffer` has returned).
+    /// error WebGPU has reported by then (see [`GpuBackend::watch_errors`] for one that
+    /// cannot be missed).
     #[cfg(target_arch = "wasm32")]
     #[allow(clippy::await_holding_lock)]
     pub async fn sync_async(&mut self) -> Result<()> {

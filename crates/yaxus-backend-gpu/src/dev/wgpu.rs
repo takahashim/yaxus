@@ -107,6 +107,29 @@ impl Fault {
     }
 }
 
+/// Error scopes pushed around a stretch of work in the browser (see
+/// `WgpuDev::async_error_scope`).
+#[cfg(target_arch = "wasm32")]
+pub(crate) struct AsyncErrorScope {
+    scopes: [wgpu::ErrorScopeGuard; 3],
+}
+
+#[cfg(target_arch = "wasm32")]
+impl AsyncErrorScope {
+    /// Pops the scopes (innermost first) and returns the first error they captured.
+    pub(crate) async fn finish(self) -> Option<String> {
+        let [oom, invalid, internal] = self.scopes;
+        let popped = [internal.pop(), invalid.pop(), oom.pop()];
+        let mut first = None;
+        for p in popped {
+            if let Some(e) = p.await {
+                first.get_or_insert_with(|| format!("WebGPU: {e}"));
+            }
+        }
+        first
+    }
+}
+
 /// Allocation and validation errors captured around a closure (see `Gpu::checked`).
 pub(crate) struct ErrorScope {
     #[cfg(not(target_arch = "wasm32"))]
@@ -624,6 +647,16 @@ impl WgpuDev {
         let out = staging.get_mapped_range(..size).context("reading back from the GPU")?.to_vec();
         staging.unmap();
         Ok(out)
+    }
+
+    /// Captures every error of the device until [`AsyncErrorScope::finish`], which
+    /// resolves only after the errors of all earlier work are known (unlike `Fault`, which
+    /// an uncaptured-error event may reach after a read-back has already completed).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn async_error_scope(&self) -> AsyncErrorScope {
+        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Validation, wgpu::ErrorFilter::Internal]
+            .map(|f| self.device.push_error_scope(f));
+        AsyncErrorScope { scopes }
     }
 
     pub(crate) fn error_scope(&self) -> ErrorScope {
