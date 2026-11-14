@@ -155,6 +155,42 @@ yaxus/
   tests/bench/               # ベンチの文セットと参照出力、Ollama との比較スクリプト
 ```
 
+クレートの依存は次のとおり (通常の依存のうち、ほかの経路から導けるものは省いた。たとえば `yaxus-server` は `yaxus-runtime` を通じて `yaxus-api` や `yaxus-tokenizer` にも届く)。依存は上から下へ流れ、循環はない。`yaxus-runtime` はバックエンドを知らず、モデルの読み込みはプラットフォームごとの端 (native は `yaxus-native`、ブラウザは `yaxus-browser`) が受け持つ。
+
+```mermaid
+graph TD
+  subgraph front["フロントエンド"]
+    cli[yaxus-cli]
+    server[yaxus-server]
+    browser["yaxus-browser<br/>(wasm32 + WebGPU)"]
+  end
+  native[yaxus-native]
+  runtime[yaxus-runtime]
+  pfml[yaxus-pfml]
+  gpu[yaxus-backend-gpu]
+  cpu[yaxus-backend-cpu]
+  model[yaxus-model]
+  api[yaxus-api]
+  tok[yaxus-tokenizer]
+
+  cli --> server
+  cli -->|"feature local"| native
+  cli -->|"feature local"| runtime
+  server --> native
+  server --> runtime
+  browser --> runtime
+  browser --> gpu
+  native --> gpu
+  native --> cpu
+  native --> tok
+  runtime --> pfml
+  runtime --> model
+  pfml --> api
+  pfml --> tok
+  gpu --> model
+  cpu --> model
+```
+
 `yaxus-cli` の feature: `local` (`translate`、`bench`: `yaxus-native` と `yaxus-runtime` だけを使う) と `server` (`serve` も。既定)。`--no-default-features` ならクライアントだけで、GPU 依存も入らない。
 
 サーバとローカル実行で共通の部分 (文書、翻訳メモリ、推論ループ) は `yaxus-runtime` に置き、モデルの読み込みは native 側の `yaxus-native` が受け持つ。ブラウザは読み込みだけを自前で持ち (`yaxus-browser`、非同期にデバイスを開き、メモリ上の GGUF から作る)、その上の部分は同じ `yaxus-runtime` を使う。`yaxus-server` は HTTP と推論スレッドへの受け渡しだけを持つ (推論ループそのものは `yaxus_runtime::scheduler::run`。入口の `JobSource` とイベントの出口の `Sink` を渡すと、非同期に回る。ループ、クライアントへの配送 (`clients.rs`)、使用量とログ (`report.rs`) に分けてある)。
