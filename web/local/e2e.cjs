@@ -56,8 +56,24 @@ const CASES = [
 // `self.__rejectFirst` makes the first device request fail (an adapter that advertises
 // more than it grants); `self.__fakeBinding` makes the device report a smaller storage
 // binding than it has (WebGPU never grants less than 128 MB, which the 0.8B fits);
-// `self.__failBigBuffers` makes every buffer over 64 MB invalid (an allocation that fails).
+// `self.__failBigBuffers` makes every buffer over 64 MB invalid (an allocation that fails);
+// `self.__failNextSubmit` makes an invalid buffer at the next submission (an error in the
+// middle of a translation), and `self.__delayErrors` holds uncaptured-error events back
+// that many milliseconds (WebGPU does not say when they arrive).
 const SHIM =
+  'const __onerror = Object.getOwnPropertyDescriptor(GPUDevice.prototype, "onuncapturederror");\n' +
+  'Object.defineProperty(GPUDevice.prototype, "onuncapturederror", {\n' +
+  '  get() { return __onerror.get.call(this); },\n' +
+  '  set(h) { __onerror.set.call(this, h && ((e) => (self.__delayErrors ? setTimeout(() => h(e), self.__delayErrors) : h(e)))); },\n' +
+  '});\n' +
+  'const __submit = GPUQueue.prototype.submit;\n' +
+  'GPUQueue.prototype.submit = function (b) {\n' +
+  '  if (self.__failNextSubmit) {\n' +
+  '    self.__failNextSubmit = false;\n' +
+  '    self.__device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.STORAGE });\n' +
+  '  }\n' +
+  '  return __submit.call(this, b);\n' +
+  '};\n' +
   'const __createBuffer = GPUDevice.prototype.createBuffer;\n' +
   'GPUDevice.prototype.createBuffer = function (d) {\n' +
   '  if (self.__failBigBuffers && d.size > (64 << 20)) d = { ...d, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.STORAGE };\n' +
@@ -185,6 +201,23 @@ async function translate(page, c) {
       s = await translate(page, CASES[0]);
       check(`${name}: works after loading again`, !s.err && s.out === CASES[0].want, s.out);
     }
+
+    // An error in the middle of a translation, reported late: that translation fails,
+    // not the next one.
+    await page.workers().at(-1).evaluate(() => {
+      self.__delayErrors = 2000;
+    });
+    await page.locator('#target').selectOption('ja');
+    await page.locator('#source').fill(CASES[2].text);
+    await page.locator('#translate').click();
+    await page.waitForFunction(() => /翻訳しています/.test(document.querySelector('#status').textContent));
+    await page.workers().at(-1).evaluate(() => {
+      self.__failNextSubmit = true;
+    });
+    await settled(page);
+    s = await state(page);
+    check('a late GPU error fails the translation it happened in', s.err && !s.canTranslate, s.status.split('\n')[0]);
+    await load(page);
 
     // A buffer that fails while the weights are uploaded is a load error.
     flags = 'self.__failBigBuffers = true;\n';
