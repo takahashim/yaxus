@@ -264,11 +264,15 @@ impl WgpuDev {
         let (device, queue) = match adapter.request_device(&desc).await {
             Ok(x) => x,
             Err(e) => {
-                // Some adapters report the default tier but reject a request above it;
-                // the model then has to fit what they do support.
+                // Some adapters advertise more than `requestDevice` grants. Fall back to the
+                // buffer sizes every WebGPU device has (256 MB, a 128 MB binding); a matrix
+                // that does not fit one binding then loads as Q4 (`Gpu::load_weight`).
+                let base = wgpu::Limits::default();
                 let limits = wgpu::Limits {
-                    max_buffer_size: alimits.max_buffer_size,
-                    max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size,
+                    max_buffer_size: base.max_buffer_size.min(alimits.max_buffer_size),
+                    max_storage_buffer_binding_size: base
+                        .max_storage_buffer_binding_size
+                        .min(alimits.max_storage_buffer_binding_size),
                     ..limits
                 };
                 let desc = wgpu::DeviceDescriptor { required_limits: limits, ..desc };
