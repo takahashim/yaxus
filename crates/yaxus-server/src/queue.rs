@@ -95,21 +95,16 @@ impl JobSource for Jobs {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
-    use crate::worker::{Events, Work};
+    use crate::worker::Events;
+    use yaxus_runtime::scheduler::Work;
 
     fn job() -> Job {
         let tok = yaxus_tokenizer::testing::plamo_like(&[]);
         let req = yaxus_pfml::TranslationRequest { text: "x".into(), target_lang: "en".into(), ..Default::default() };
         let prompt = yaxus_runtime::Prompt::new(&tok, &req.validate().unwrap());
         let (events, _) = mpsc::unbounded_channel();
-        Job {
-            work: Work::Single { prompt, max_new_tokens: 1, events: Box::new(Events(events)) },
-            enqueued: Instant::now(),
-            label: "t".into(),
-        }
+        Job::new(Work::Single { prompt, max_new_tokens: 1, events: Box::new(Events(events)) }, "t")
     }
 
     #[test]

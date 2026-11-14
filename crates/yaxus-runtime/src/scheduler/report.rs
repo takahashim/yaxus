@@ -7,7 +7,7 @@ use yaxus_model::Finish;
 use yaxus_pfml::{PromptError, PromptErrorKind};
 
 use crate::Finished;
-use crate::document::SegmentError;
+use crate::document::{DocError, SegmentError};
 
 /// The usage report of a single request that waited in the queue since `enqueued`.
 pub(super) fn usage(done: &Finished, enqueued: Instant) -> Usage {
@@ -60,6 +60,18 @@ pub fn prompt_error(e: PromptError) -> ApiError {
 }
 
 /// The API error for a segment whose prompt cannot be built.
-pub fn segment_error(e: SegmentError) -> ApiError {
-    prompt_error(e.error).in_segment(e.segment)
+impl From<SegmentError> for ApiError {
+    fn from(e: SegmentError) -> Self {
+        prompt_error(e.error).in_segment(e.segment)
+    }
+}
+
+/// The API error for a document that cannot be translated.
+impl From<DocError> for ApiError {
+    fn from(e: DocError) -> Self {
+        match e {
+            DocError::Options(e) => prompt_error(e),
+            DocError::Segment(e) => e.into(),
+        }
+    }
 }

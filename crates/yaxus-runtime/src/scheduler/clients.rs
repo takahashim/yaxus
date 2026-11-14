@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use web_time::Instant;
 use yaxus_api::{ApiError, DocumentEvent, DocumentUsage, ErrorCode, StreamEvent};
 
-use super::report::{log_document, log_single, segment_error, usage};
+use super::report::{log_document, log_single, usage};
 use super::{Job, Sink, Work};
 use crate::document::{DocRun, Reaction};
 use crate::{Session, Update};
@@ -42,7 +42,7 @@ impl Doc {
     /// be reported to the client, and the document goes on draining what is in flight.
     fn advance(&mut self, key: u64, session: &mut Session<Owner>) -> (Option<ApiError>, Progress) {
         // A history that leaves too little room is dropped.
-        let error = self.run.submit_ready(session, |segment| Owner::Doc { key, segment }).err().map(segment_error);
+        let error = self.run.submit_ready(session, |segment| Owner::Doc { key, segment }).err().map(ApiError::from);
         let progress = if !self.run.is_over() {
             Progress::Running
         } else if self.run.is_complete() {

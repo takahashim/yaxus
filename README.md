@@ -167,8 +167,9 @@ yaxus serve --san host.example  # add a name to the server certificate
 ```
 
 The first start creates an access token and a local CA under `~/.config/yaxus/`. The
-server certificate is signed by that CA. Copy `ca.pem` to the client machines, or import
-it into a browser to avoid certificate warnings.
+server certificate is signed by that CA; it is valid for 397 days (Apple's platforms
+refuse longer ones) and is issued again at a start in its last 30 days. Copy `ca.pem` to
+the client machines, or import it into a browser to avoid certificate warnings.
 
 On another machine:
 
