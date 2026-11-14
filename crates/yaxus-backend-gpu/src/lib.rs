@@ -276,7 +276,7 @@ impl Gpu {
         };
         b.build_kernels();
         if b.tuning.apple.gemv2 && b.caps.msl && !b.gemv2_rows_agree() {
-            eprintln!("[gemv2] rows differ between its kernels on this device; using gemv_f32");
+            tracing::warn!("gemv2: rows differ between its kernels on this device; using gemv_f32");
             b.tuning.apple.gemv2 = false;
         }
         b

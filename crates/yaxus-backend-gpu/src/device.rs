@@ -309,7 +309,9 @@ impl CompileSettings {
     }
 }
 
-/// Diagnostics asked for in the environment, read once.
+/// Diagnostics asked for in the environment, read once. Their reports (`YAXUS_PROFILE`,
+/// `YAXUS_COMPILE_LOG`) go to stderr directly: they were asked for by name, and a log
+/// filter set for warnings must not hide them. Warnings go through `tracing`.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Diagnostics {
     /// `YAXUS_PROFILE=1`: time recording vs. waiting; `=2`: per-kernel GPU time too.

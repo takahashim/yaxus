@@ -11,6 +11,7 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
+tracing = "0.1"
 web-time = "1"
 yaxus-model = { path = "../yaxus-model" }
 

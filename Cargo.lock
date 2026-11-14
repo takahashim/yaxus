@@ -2814,6 +2814,7 @@ dependencies = [
  "objc2-metal",
  "pollster",
  "serde_json",
+ "tracing",
  "web-time",
  "wgpu",
  "yaxus-backend-cpu",

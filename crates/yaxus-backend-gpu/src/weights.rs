@@ -259,8 +259,8 @@ impl Gpu {
             && plan != MatrixPlan::Convert(Quant::Q4)
             && plan.largest_buffer(t.dtype, n, k) as u64 > self.dev.max_binding()
         {
-            eprintln!(
-                "[weights] a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
+            tracing::warn!(
+                "a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
                 t.dtype.name(),
                 self.dev.max_binding()
             );
