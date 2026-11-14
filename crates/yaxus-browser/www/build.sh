@@ -1,7 +1,7 @@
 #!/bin/sh
-# Builds the browser front end into web/local/pkg.
+# Builds the browser front end into crates/yaxus-browser/www/pkg.
 #
-#   ./web/local/build.sh          # release wasm + wasm-bindgen
+#   ./crates/yaxus-browser/www/build.sh   # release wasm + wasm-bindgen
 #
 # Needs the wasm32-unknown-unknown target and a wasm-bindgen CLI whose version matches
 # the crate (0.2.130):
@@ -9,20 +9,21 @@
 #   cargo install wasm-bindgen-cli --version 0.2.130
 set -eu
 
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
+out=crates/yaxus-browser/www/pkg
 
 # SIMD128 helps the tokenizer and Q6_K repacking; every current Chrome has it.
 # Thin LTO is a few percent on the host-side parsing and quantization.
 RUSTFLAGS="${RUSTFLAGS:--C target-feature=+simd128}" \
 CARGO_PROFILE_RELEASE_LTO=thin \
-  cargo build -p yaxus-web --target wasm32-unknown-unknown --release "$@"
+  cargo build -p yaxus-browser --target wasm32-unknown-unknown --release "$@"
 
-wasm-bindgen --target web --out-dir web/local/pkg \
-  target/wasm32-unknown-unknown/release/yaxus_web.wasm
+wasm-bindgen --target web --out-dir "$out" \
+  target/wasm32-unknown-unknown/release/yaxus_browser.wasm
 
 # Optional size/speed pass (Binaryen).
 if command -v wasm-opt >/dev/null 2>&1; then
-  wasm-opt -O3 -o web/local/pkg/yaxus_web_bg.wasm web/local/pkg/yaxus_web_bg.wasm
+  wasm-opt -O3 -o "$out/yaxus_browser_bg.wasm" "$out/yaxus_browser_bg.wasm"
 fi
 
-echo "built web/local/pkg"
+echo "built $out"

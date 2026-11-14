@@ -2,9 +2,9 @@
 // translations against the CLI's, and checks that a GPU error is reported and recovered
 // from. Not run by CI (it needs a GPU, Chrome and the model).
 //
-//   ./web/local/build.sh
+//   ./crates/yaxus-browser/www/build.sh
 //   npm install --prefix /tmp/pw playwright-core
-//   NODE_PATH=/tmp/pw/node_modules node web/local/e2e.cjs <plamo-3-translate-0.8b-Q4_K_M.gguf>
+//   NODE_PATH=/tmp/pw/node_modules node crates/yaxus-browser/www/e2e.cjs <plamo-3-translate-0.8b-Q4_K_M.gguf>
 //
 // CHROME overrides the browser path; HEADFUL=1 shows the window.
 const http = require('node:http');
@@ -14,7 +14,7 @@ const { chromium } = require('playwright-core');
 
 const gguf = process.argv[2];
 if (!gguf) {
-  console.error('usage: node web/local/e2e.cjs <gguf>');
+  console.error('usage: node crates/yaxus-browser/www/e2e.cjs <gguf>');
   process.exit(2);
 }
 const CHROME = process.env.CHROME || {
@@ -150,7 +150,7 @@ async function translate(page, c) {
 
 (async () => {
   const root = path.resolve(__dirname);
-  if (!fs.existsSync(path.join(root, 'pkg', 'yaxus_web.js'))) throw new Error('run ./web/local/build.sh first');
+  if (!fs.existsSync(path.join(root, 'pkg', 'yaxus_browser.js'))) throw new Error('run ./crates/yaxus-browser/www/build.sh first');
   const server = await serve(root);
   const browser = await chromium.launch({
     executablePath: CHROME,

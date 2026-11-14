@@ -70,15 +70,16 @@ yaxus translate --model 2b:Q4_K_M --to en < document.txt   # a GGUF file from th
 
 ### Browser (experimental)
 
-`web/local` runs the model in a desktop Chrome tab: wasm32 for the code, WebGPU for the
-kernels. The model is a GGUF file the page asks you to choose; it is read in the tab and
-never uploaded. English to Japanese and Japanese to English, one request at a time, no
-draft model. The model runs in a Web Worker, so the page stays responsive; after a GPU
-error (a lost device, a failed allocation) the page asks you to load the model again.
+`crates/yaxus-browser/www` runs the model in a desktop Chrome tab: wasm32 for the code,
+WebGPU for the kernels. The model is a GGUF file the page asks you to choose; it is read
+in the tab and never uploaded. English to Japanese and Japanese to English, one
+translation at a time (its segments can run side by side with `?chains=N`), no draft
+model. The model runs in a Web Worker, so the page stays responsive; after a GPU error (a
+lost device, a failed allocation) the page asks you to load the model again.
 
 ```sh
-./web/local/build.sh      # needs wasm32-unknown-unknown and wasm-bindgen 0.2.130
-./web/local/serve.sh      # http://localhost:8000
+./crates/yaxus-browser/www/build.sh      # needs wasm32-unknown-unknown and wasm-bindgen 0.2.130
+./crates/yaxus-browser/www/serve.sh      # http://localhost:8000
 ```
 
 Choose `plamo-3-translate-0.8b-Q4_K_M.gguf` (about 573 MB). The weights take about
@@ -87,12 +88,12 @@ file, builds the tokenizer and uploads the tensors (about 3 s on an M2). The pag
 the adapter, the load time, prefill and decode speed (70–80 tok/s on an M2). With the
 style left unset, the translations are the CLI's, word for word.
 
-The browser path reuses the GPU kernels but not the server's engine: greedy decoding,
-f32 arithmetic, and a 4096-token context. Long text is split into paragraphs, then into
-sentences (or words) that fit one prompt; the segments are translated in order, with the
-previous segments as history, so a document can be longer than the context. It needs
-WebGPU, which desktop Chrome provides; the wasm-bindgen output is built by
-`web/local/build.sh`.
+The browser path runs the same engine as the CLI and the server (`yaxus_model::Engine`,
+awaited step by step), with greedy decoding, f32 arithmetic, and a 4096-token context.
+Long text is split into paragraphs, then into sentences (or words) that fit one prompt;
+the segments are translated in order, with the previous segments as history, so a
+document can be longer than the context. It needs WebGPU, which desktop Chrome provides;
+the wasm-bindgen output is built by `crates/yaxus-browser/www/build.sh`.
 
 Proofreading help for Japanese: `yaxus polish` rewrites each paragraph and shows what
 changed (`[-removed-]{+added+}`). By default (`--via en`) it goes through English and back,
@@ -216,10 +217,11 @@ A single stream without a draft model decodes at about the same speed as Ollama
 
 - **Default tests:** `cargo test --workspace`. Tests that need model files are ignored, or
   skip themselves when the files are missing.
-- **Browser build:** `RUSTFLAGS="" cargo check -p yaxus-web --target wasm32-unknown-unknown`
-  (and `./web/local/build.sh` for the page's `pkg/`). `web/local/e2e.cjs` drives the page
-  in desktop Chrome with Playwright: it checks the translations against the CLI's and
-  that a lost device is reported and recovered from (see the file for how to run it).
+- **Browser build:** `RUSTFLAGS="" cargo check -p yaxus-browser --target wasm32-unknown-unknown`
+  (and `./crates/yaxus-browser/www/build.sh` for the page's `pkg/`).
+  `crates/yaxus-browser/www/e2e.cjs` drives the page in desktop Chrome with Playwright: it
+  checks the translations against the CLI's and that a lost device is reported and
+  recovered from (see the file for how to run it).
 - **GPU and model tests:** `cargo test --release -p yaxus-backend-gpu -- --ignored`.
   These need a GPU and the models in the Hugging Face cache.
 - **Software Vulkan:** the kernel tests also run on lavapipe, as in CI:

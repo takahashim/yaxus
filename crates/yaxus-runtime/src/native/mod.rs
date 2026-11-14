@@ -1,6 +1,6 @@
 //! What puts a model on the native backends: finding it on disk, the options of loading
 //! it, and loading it. The browser has no files, backends or options to choose: it loads
-//! its own model (`yaxus-web`), so none of this is built for wasm32.
+//! its own model (`yaxus-browser`), so none of this is built for wasm32.
 
 mod load;
 mod options;

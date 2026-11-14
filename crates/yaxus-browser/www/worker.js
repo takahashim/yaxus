@@ -9,7 +9,7 @@
 //               {type: 'plan', breaks}  {type: 'text', segment, text}
 //               {type: 'done', stats}
 //               {type: 'error', message, fatal}
-import init, { ModelBuffer, load_model } from './pkg/yaxus_web.js';
+import init, { ModelBuffer, load_model } from './pkg/yaxus_browser.js';
 
 let translator = null;
 // One request at a time, in order (the page disables its buttons meanwhile, but a
