@@ -284,6 +284,23 @@ async function translate(page, c) {
     check('a late GPU error fails the translation it happened in', s.err && !s.canTranslate, s.status.split('\n')[0]);
     await load(page);
 
+    // The same with segments translated side by side (the automatic number of chains): one
+    // error fails the whole translation, once, and the model loads again.
+    await page.locator('#chains').selectOption('0');
+    await page.locator('#target').selectOption('ja');
+    await page.locator('#source').fill([CASES[4].text, CASES[4].text].join('\n\n'));
+    await page.locator('#translate').click();
+    await page.waitForFunction(() => document.querySelector('#output').textContent.length > 0, null, { timeout: 120_000 });
+    await page.workers().at(-1).evaluate(() => {
+      self.__failNextSubmit = true;
+    });
+    await settled(page);
+    s = await state(page);
+    check('a GPU error while segments run side by side fails the translation', s.err && !s.canTranslate, s.status.split('\n')[0]);
+    await load(page);
+    s = await translate(page, CASES[0]);
+    check('side by side: works after loading again', !s.err && s.out === CASES[0].want, s.out);
+
     // A buffer that fails while the weights are uploaded is a load error.
     flags = 'self.__failBigBuffers = true;\n';
     await page.locator('#load').click();
