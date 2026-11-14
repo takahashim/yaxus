@@ -284,7 +284,7 @@ graph TD
 ### 4.1 構成
 
 - `Gpu` が `Recorder` (デバイスと、記録した命令をいつ投入するか)、`KernelCache` (コンパイル済みのカーネル)、バッファプールを持つ。本体と下書きは `GpuBackend` ハンドル (`Arc<Mutex<Gpu>>`) で同じ `Gpu` を共有し、2 つのモデルの命令が 1 回の投入に混ざる。
-- `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定はまだ wgpu (速さは同じ)。wasm32 では `dev::wgpu` の WebGPU だけを使い、オープンと読み戻しが async になる (§2.2)。
+- `dev/`: デバイス層。バッファ、書き込み、コピー、ディスパッチ、投入、読み戻し、カーネルのコンパイルを、2 つの実装で同じ形にする。`dev::wgpu` は wgpu (Vulkan、または wgpu を通した Metal)、`dev::metal` は objc2-metal で Metal を直接使う (macOS、`YAXUS_DEVICE=metal`)。直接の場合、バッファは共有ストレージで、WGSL のカーネルは naga で MSL に変換し、fast math を切ってコンパイルする。既定は wgpu (速さは同じ。§10)。wasm32 では `dev::wgpu` の WebGPU だけを使い、オープンと読み戻しが async になる (§2.2)。
 - `msl/`: Apple GPU 用に MSL で書いたカーネル。`access` (形式ごとの重みの展開)、`gemv2` (1〜16 行の GEMV)、`gemm` (prefill の GEMM)、`small` (`rmsnorm`・`add_norm`・`qk_rope`)。カーネルは値 (`msl::Gemv2 { t, glu, tiles }`、`msl::Gemm { f16, rb }`) で表し、`KernelId` に入れる。ソースは値から作る。wgpu ではパススルーで、Metal 直接ではそのままコンパイルする。ソースの先頭行 `// msl workgroup_size=N` で WGSL と見分ける。
 - `dev/metal/translate.rs`: Metal 直接のときに、WGSL のカーネルを naga で MSL に変換する。immediates を `buffer(0)`、binding `i` を `buffer(i + 1)` に置き、MSL のカーネルと同じ形でディスパッチできるようにする (単体テストで固定)。
 - `device.rs`:
@@ -479,7 +479,7 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 
 決定:
 
-- GPU 経路は wgpu で自前カーネル (ROCm も MLX も使わない)。Metal は wgpu の上で対応し、Apple GPU 向けのカーネルは MSL で書く。Metal を直接使うデバイス (`YAXUS_DEVICE=metal`) も同じ ops とカーネルで動く。
+- GPU 経路は wgpu で自前カーネル (ROCm も MLX も使わない)。Metal は wgpu の上で対応し、Apple GPU 向けのカーネルは MSL で書く。Metal を直接使うデバイス (`YAXUS_DEVICE=metal`) も同じ ops とカーネルで動く。macOS の既定は wgpu のまま。M2 で直接にしても速くならなかった (2B の Q4_K_M を交互に 3 回: prefill は 0.4〜0.9% 遅く、decode はほぼ同じ)。
 - Apple GPU の prefill の既定は f32 のタイル。f16 (llama.cpp と同じ丸め) は `--prefill-precision f16` で選ぶ (経緯 12.9)。
 - 既定モデルは 2B。safetensors の既定の重み形式は Q8、GGUF はファイルの形式のまま。
 - 生成は greedy 固定 (サンプリングの API は持たない)。訳文は、精度の設定が同じなら同時実行・投機・KV 再利用の有無によらず同じ。
@@ -501,7 +501,7 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 残課題:
 
 - Apple GPU の 1 行のパス (M2 の 2B で 21〜24 ms。llama.cpp は約 21 ms)。行列積はほぼ帯域の上限なので、残りは小さなカーネルの融合 (経緯 12.10)。
-- Metal 直接のデバイスを macOS の既定にするか (いまは wgpu と同じ速さ)。GPU に閉じたデコードループは、ホストの時間が 2% ほどなので後回し (経緯 12.10)。
+- GPU に閉じたデコードループは、ホストの時間が 2% ほどなので後回し (経緯 12.10)。
 - 8×8 の行列演算が `fma` の鎖と一致する性質は M2 でしか測っていない。M1、M3 以降で `gemv2` が起動時の検査に通るか。
 - 2B 本体の 4 ビット化の品質評価。
 - ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
