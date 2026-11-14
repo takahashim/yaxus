@@ -53,10 +53,10 @@ mod tests {
     use yaxus_model::{Event as EngineEvent, ReqId, Request, StartInfo};
     use yaxus_pfml::TranslationRequest;
 
-    /// An engine whose every pass panics.
+    /// An engine whose every pass panics, counting the passes.
     #[derive(Default)]
     struct Panicking {
-        aborted: Arc<std::sync::atomic::AtomicBool>,
+        steps: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Generator for Panicking {
@@ -65,6 +65,7 @@ mod tests {
             &'a mut self,
             _: &'a mut dyn FnMut(EngineEvent) -> bool,
         ) -> yaxus_model::LocalBoxFuture<'a, anyhow::Result<bool>> {
+            self.steps.fetch_add(1, Ordering::SeqCst);
             panic!("boom");
         }
         fn fresh_id(&mut self) -> ReqId {
@@ -75,9 +76,6 @@ mod tests {
         }
         fn active(&self) -> usize {
             1
-        }
-        fn abort_all(&mut self) {
-            self.aborted.store(true, Ordering::SeqCst);
         }
         fn backend_name(&self) -> String {
             "panicking".into()
@@ -114,7 +112,7 @@ mod tests {
         };
         queue.push(job).unwrap();
         let engine = Panicking::default();
-        let aborted = engine.aborted.clone();
+        let steps = engine.steps.clone();
         let (failed_tx, mut failed_rx) = tokio::sync::oneshot::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -129,6 +127,6 @@ mod tests {
         );
         assert!(queue.is_closed());
         assert!(failed_rx.try_recv().is_ok(), "the server was not told to shut down");
-        assert!(!aborted.load(Ordering::SeqCst), "the broken engine was called again");
+        assert_eq!(steps.load(Ordering::SeqCst), 1, "the broken engine was called again");
     }
 }

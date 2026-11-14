@@ -251,7 +251,9 @@ impl<'a> DocRunner<'a> {
                 })
                 .await
                 .map_err(DocRunError::Engine)?;
-            if run.accepts() && cancelled.as_mut().is_some_and(|c| c()) {
+            // (asked while there is something to cancel: after the last step it is too late,
+            // and saying so would call a finished document cancelled)
+            if run.accepts() && !run.is_over() && cancelled.as_mut().is_some_and(|c| c()) {
                 run.stop();
             }
             if !run.accepts() && !cancelled_all {

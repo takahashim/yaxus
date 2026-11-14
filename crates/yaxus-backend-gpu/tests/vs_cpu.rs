@@ -207,11 +207,11 @@ fn concurrent_matches_solo() {
     eprintln!("{} requests together in {steps} steps (speculative: {:?})", prompts.len(), eng.spec_stats());
 }
 
-/// After `abort_all` (the server's recovery from a failed step) the engine holds nothing:
+/// After every request is cancelled, running and waiting ones, the engine holds nothing:
 /// no streams, no waiting requests, all KV pages free, and it answers as before.
 #[test]
 #[ignore]
-fn abort_all_leaves_a_clean_engine() {
+fn cancelling_everything_leaves_a_clean_engine() {
     let dir = model_dir();
     let gpu = GpuBackend::new().unwrap();
     let draft = draft_dir().map(|d| Model::load(&d, gpu.share(), &ModelOptions::new(Quant::Q4)).unwrap());
@@ -231,16 +231,26 @@ fn abort_all_leaves_a_clean_engine() {
         eng.step(&mut |_| true).unwrap();
     }
     assert!(eng.active() > 0 && eng.waiting() > 0);
-    eng.abort_all();
+    for i in 0..3 {
+        assert!(eng.cancel(i));
+    }
+    let mut ended = Vec::new();
+    while eng
+        .step(&mut |ev| {
+            match ev {
+                Event::Done { id, finish, .. } => ended.push((id, finish)),
+                Event::Token { .. } => {}
+                Event::Error { id, message } => panic!("request {id} failed: {message}"),
+            }
+            true
+        })
+        .unwrap()
+    {}
+    ended.sort_by_key(|(id, _)| *id);
+    let cancelled = yaxus_model::Finish::Cancelled;
+    assert_eq!(ended, [(0, cancelled), (1, cancelled), (2, cancelled)]);
     assert!(eng.is_idle());
     assert_eq!(eng.free_pages(), free);
-    let mut events = 0;
-    eng.step(&mut |_| {
-        events += 1;
-        true
-    })
-    .unwrap();
-    assert_eq!(events, 0, "aborted requests send no events");
     assert_eq!(eng.generate(&prompt, 16, &[1, 16], &mut |_| true).unwrap(), before);
 }
 

@@ -288,25 +288,13 @@ impl<B: AsyncReadback> Engine<B> {
         match self.streams.iter_mut().find(|s| s.req.id == id && s.finish.is_none() && s.error.is_none()) {
             Some(s) => {
                 s.finish = Some(Finish::Cancelled);
+                // (the draft's next run does not continue the one before, as when requests
+                // are dropped)
+                self.tuner.lose_sync();
                 true
             }
             None => false,
         }
-    }
-
-    /// Drops every request, waiting or running, without events, and frees their KV (for
-    /// recovery after a failed [`step`](Engine::step): the caller has given up on them).
-    pub fn abort_all(&mut self) {
-        self.waiting.clear();
-        for s in self.streams.drain(..) {
-            self.target.free_seq(s.ts);
-            if let (Some(d), Some(dm)) = (s.ds, self.draft.as_mut()) {
-                dm.free_seq(d);
-            }
-        }
-        self.rr = 0;
-        self.prefill_turn = false;
-        self.tuner.lose_sync();
     }
 
     /// Runs one pass. `emit` receives tokens and completions; returning `false` for a
@@ -410,12 +398,17 @@ impl<B: AsyncReadback> Engine<B> {
                 emit(Event::Done { id: req.id, finish, generated, start });
                 continue;
             }
-            let tokens = req.prompt.len() + req.max_new_tokens;
-            let need = tokens.min(max_pos).div_ceil(crate::PAGE);
-            if tokens > max_pos || need > total {
+            // The most it can use: its prompt and all its output, up to the positions the
+            // model's KV covers. A request that would run past them is not refused for
+            // that: its output may end sooner, and if not it fails at the limit, as ever.
+            let need = req.prompt.len().saturating_add(req.max_new_tokens).min(max_pos).div_ceil(crate::PAGE);
+            if req.prompt.len() > max_pos || need > total {
                 let req = self.waiting.pop_front().unwrap();
-                let message = if tokens > max_pos {
-                    format!("the request needs {tokens} positions, more than the {max_pos} the model's KV covers")
+                let message = if req.prompt.len() > max_pos {
+                    format!(
+                        "the prompt has {} tokens, more than the {max_pos} positions the model's KV covers",
+                        req.prompt.len()
+                    )
                 } else {
                     format!("the request needs {need} KV pages, more than the {total} the arena has")
                 };
@@ -724,8 +717,6 @@ pub trait Generator {
     }
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
-    /// See [`Engine::abort_all`].
-    fn abort_all(&mut self);
     fn backend_name(&self) -> String;
     fn weight_bytes(&self) -> usize;
     /// Speculative decoding statistics, if any rounds ran.
@@ -794,14 +785,6 @@ impl<B: SyncReadback> SyncGenerator for Engine<B> {
     }
 }
 
-impl<B: SyncReadback> Engine<B> {
-    /// [`Engine::step_async`] for a backend that reads back without waiting, where the
-    /// step never has to wait for anything.
-    pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
-        poll_once(self.step_async(emit))
-    }
-}
-
 /// The output of a future that is ready at its first poll, as the steps of an engine on
 /// a native backend are. Panics if it is not: that one waits for something (WebGPU) and
 /// has to be awaited.
@@ -857,9 +840,6 @@ impl<B: AsyncReadback> Generator for Engine<B> {
     }
     fn active(&self) -> usize {
         Engine::active(self)
-    }
-    fn abort_all(&mut self) {
-        Engine::abort_all(self)
     }
     fn backend_name(&self) -> String {
         match &self.draft {
@@ -996,11 +976,23 @@ mod tests {
     }
 
     #[test]
-    fn a_request_past_the_positions_of_the_model_fails_at_once() {
+    fn a_prompt_past_the_positions_of_the_model_fails_at_once() {
         let mut eng = Engine::new(crate::testing::model_with_max_pos(4, 200), None, EngineConfig::default()).unwrap();
-        eng.submit(request(1, 150, 100));
+        eng.submit(request(1, 201, 1));
         let ended = run_all(&mut eng);
         assert!(ended[0].1.as_ref().unwrap_err().contains("positions"), "{ended:?}");
+    }
+
+    #[test]
+    fn a_budget_past_the_positions_is_not_refused_when_the_output_ends_first() {
+        // 150 + 100 asks for more than the 200 positions, but only 3 tokens are made: the
+        // request used to fail at once, and single requests with an unclamped budget (the
+        // CLI's, the benchmarks') still pass it on.
+        let mut eng = Engine::new(crate::testing::model_with_max_pos(4, 200), None, EngineConfig::default()).unwrap();
+        let mut req = request(1, 150, 100);
+        req.stop = vec![0]; // the test backend's first token
+        eng.submit(req);
+        assert_eq!(run_all(&mut eng), [(1, Ok(Finish::Stop))]);
     }
 
     #[test]

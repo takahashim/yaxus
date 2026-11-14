@@ -136,7 +136,8 @@ impl Clients {
     pub(super) fn handle(&mut self, update: Update<'_, Owner>) -> bool {
         match update {
             Update::Delta { tag: Owner::Single { events, .. }, text } => {
-                // (a token that completes no character yet has nothing to send)
+                // (a token that completes no character yet has nothing to send; that a
+                // client has gone is found by `cancel_abandoned`, before every step)
                 text.is_empty() || events.send(StreamEvent::Delta { text: text.to_string() })
             }
             Update::Done { tag: Owner::Single { events, label, enqueued }, done } => {

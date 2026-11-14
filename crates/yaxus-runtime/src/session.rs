@@ -193,14 +193,6 @@ impl<'a, T> Session<'a, T> {
         self.engine.waiting()
     }
 
-    /// Drops every request, in the engine too (after a failed
-    /// [`step_async`](Session::step_async)), and returns their tags, so that their owners
-    /// can be told.
-    pub fn abort_all(&mut self) -> Vec<T> {
-        self.engine.abort_all();
-        self.requests.live.drain().map(|(_, l)| l.tag).collect()
-    }
-
     /// Gives up on the engine (after a panic in [`step_async`](Session::step_async), when
     /// its state cannot be trusted and it must not be called again): returns the tags of
     /// the requests in flight without telling the engine.
@@ -223,7 +215,8 @@ mod tests {
         /// What the session answered to each event.
         answers: Vec<bool>,
         next_id: ReqId,
-        aborted: bool,
+        /// Requests the session cancelled.
+        cancelled: Vec<ReqId>,
     }
 
     impl Generator for Script {
@@ -244,14 +237,15 @@ mod tests {
             self.next_id += 1;
             self.next_id
         }
+        fn cancel(&mut self, id: ReqId) -> bool {
+            self.cancelled.push(id);
+            true
+        }
         fn waiting(&self) -> usize {
             0
         }
         fn active(&self) -> usize {
             0
-        }
-        fn abort_all(&mut self) {
-            self.aborted = true;
         }
         fn backend_name(&self) -> String {
             "script".into()
@@ -372,19 +366,18 @@ mod tests {
     }
 
     #[test]
-    fn abort_returns_the_tags_in_flight() {
+    fn cancel_where_cancels_the_requests_it_accepts_in_the_engine() {
         let tok = tokenizer();
         let mut memory = Memory::new(8);
         let mut engine = Script::default();
         let mut session = Session::new(&mut engine, &tok, &mut memory);
-        session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
-        session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
-        let mut tags = session.abort_all();
-        tags.sort();
-        assert_eq!(tags, ["a", "b"]);
-        assert!(session.is_idle());
+        let a = session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
+        let b = session.submit(Prompt::from_parts(vec![5], 2), 8, "b");
+        assert_eq!(session.cancel_where(|tag| *tag == "b"), 1);
+        assert!(!session.is_idle(), "a request ends when the engine says so, at its next step");
         drop(session);
-        assert!(engine.aborted, "the engine drops its requests too");
+        assert_eq!(engine.cancelled, [b]);
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -395,6 +388,6 @@ mod tests {
         let mut session = Session::new(&mut engine, &tok, &mut memory);
         session.submit(Prompt::from_parts(vec![5], 1), 8, "a");
         assert_eq!(session.abandon(), ["a"]);
-        assert!(!engine.aborted);
+        assert!(engine.cancelled.is_empty(), "the engine is not asked for anything");
     }
 }

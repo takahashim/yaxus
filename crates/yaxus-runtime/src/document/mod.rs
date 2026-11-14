@@ -384,9 +384,6 @@ mod tests {
         fn active(&self) -> usize {
             self.running.len()
         }
-        fn abort_all(&mut self) {
-            self.running.clear();
-        }
         fn backend_name(&self) -> String {
             "fake".into()
         }
@@ -551,6 +548,28 @@ mod tests {
             "the four in flight were cancelled in the engine, not at their next text"
         );
         assert!(engine.running.is_empty(), "everything in flight ended");
+    }
+
+    #[test]
+    fn a_cancel_asked_after_the_last_step_is_not_a_cancel() {
+        let (tok, mut engine) = fake(1);
+        engine.cancels = true;
+        let segs: Vec<String> = (0..2).map(|i| format!("p{i}")).collect();
+        let mut memory = Memory::new(8);
+        let mut asked = 0;
+        let mut cancel = || {
+            asked += 1;
+            true
+        };
+        // Two chains, one token each: the whole document ends in the first step.
+        let job = yaxus_model::poll_once(
+            DocRunner::new(&mut engine, &tok, &mut memory)
+                .cancel_when(&mut cancel)
+                .run(DocJob::new(segs, opts(2, 1000)), &mut |_| true),
+        )
+        .unwrap();
+        assert!(job.is_done(), "it was finished, not cancelled");
+        assert_eq!(asked, 0, "nothing was left to cancel");
     }
 
     #[test]

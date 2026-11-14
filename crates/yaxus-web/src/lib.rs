@@ -38,8 +38,8 @@ const HISTORY_CHARS: usize = 1600;
 /// Segments of one document translated side by side (the page's chains), at most. The
 /// KV arena holds this many segments' contexts.
 const MAX_CHAINS: usize = 4;
-/// One request at a time, no response cache (a repeated translation runs again, so a
-/// fault of the device shows), no draft model.
+/// Up to `MAX_CHAINS` requests side by side, no response cache (a repeated translation
+/// runs again, so a fault of the device shows), no draft model.
 const ENGINE: EngineConfig = EngineConfig {
     max_streams: MAX_CHAINS,
     decode_rows: MAX_CHAINS,
@@ -347,6 +347,8 @@ impl Translator {
         let started = Instant::now();
         let (mut prefill_ms, mut decode_ms) = (0.0, 0.0);
         let (mut any_limit, mut last_max_new) = (false, MAX_NEW_TOKENS as u32);
+        // Segments finish out of order when chains run side by side: count them.
+        let mut segments_done = 0usize;
 
         // The page keeps no translation memory: a repeated translation is computed again.
         let mut memory = Memory::new(0);
@@ -381,7 +383,8 @@ impl Translator {
                         output_tokens += end.generated as u32;
                         last_max_new = MAX_NEW_TOKENS.min(MAX_CONTEXT.saturating_sub(end.prompt_tokens)).max(1) as u32;
                         any_limit |= end.finish == Finish::Length;
-                        progress(end.segment + 1);
+                        segments_done += 1;
+                        progress(segments_done);
                     }
                 }
                 true
