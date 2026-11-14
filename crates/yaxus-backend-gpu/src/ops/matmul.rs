@@ -66,81 +66,81 @@ impl Gpu {
             self.tensor(t, n)
         };
         let case = MatmulCase { t, n, k, fmt: m.fmt, gemm: self.gemm, gemv };
-        let plan = case.plan(&self.caps, &self.tuning);
-        if let MatmulPlan::GemvInt { planes, inline } = plan {
-            let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
-            self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
-            return y;
-        }
-        if plan == MatmulPlan::GemvF32 {
-            self.gemv_f32(x, &y, m, n, false);
-            return y;
-        }
-        if plan == MatmulPlan::Gemv2 {
-            self.run_pieces(x, &y, m, n, false, &plan::gemv2_pieces(0, t, false, &self.tuning.apple));
-            return y;
-        }
-        if let MatmulPlan::GemmMsl { f16, gemv2 } = plan {
-            self.run_pieces(x, &y, m, n, false, &plan::gemm_msl_pieces(t, f16, gemv2, &self.tuning.apple));
-            return y;
-        }
-        if let MatmulPlan::GemmInt { planes } = plan {
-            // The integer GEMM reads the per-16 scale arrays where a format has them.
-            let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
-            self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
-            return y;
-        }
-        // The f32 kernels: the GEMVs read the decode layout, the GEMMs the per-16 scales
-        // (see `W_Q6`).
-        let mut all = vec![y.buf().clone(), x.buf().clone()];
-        // (`gemm_coop8` reads the decode layout too: it decodes through `load16`)
-        let coop8 = matches!(plan, MatmulPlan::GemmCoop { .. }) && self.caps.coop_size == 8;
-        all.extend(if plan.is_gemm() && !coop8 { m.prefill_bufs() } else { m.decode_bufs() });
-        let refs: Vec<&Buf> = all.iter().collect();
+        let apple = self.tuning.apple;
         let (n32, k32) = (n as u32, k as u32);
-        // The rows the dispatches below compute (gemv2 takes and accounts for a rest).
-        let mut rows = t;
-        let dispatches: Vec<(String, [u32; 4], (u32, u32))> = match plan {
-            MatmulPlan::GemvMulti { first } => [(0, first), (first, t - first)]
-                .into_iter()
-                .filter(|&(_, rows)| rows > 0)
-                .map(|(r0, rows)| {
-                    let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
-                    (name::gemvm(rows, m.fmt), [n32, k32, rows as u32, r0 as u32], groups)
-                })
-                .collect(),
-            MatmulPlan::Gemv1 => vec![(name::gemv1(m.fmt), [n32, k32, 1, 0], grid(n.div_ceil(8) as u32))],
+        let plan = case.plan(&self.caps, &self.tuning);
+        match plan {
+            MatmulPlan::GemvInt { planes, inline } => {
+                let [wq, wsc] = <[Buf; 2]>::try_from(m.decode_bufs()).unwrap();
+                self.gemv_int(x, &y, &wq, &wsc, n, m.fmt.gemv_int().unwrap(), (planes, inline), false);
+            }
+            MatmulPlan::GemmInt { planes } => {
+                // The integer GEMM reads the per-16 scale arrays where a format has them.
+                let [wq, scales] = <[Buf; 2]>::try_from(m.prefill_bufs()).unwrap();
+                self.gemm_int(x, &y, &wq, &scales, n, m.fmt.gemm_int().unwrap(), planes);
+            }
+            MatmulPlan::GemvF32 => self.gemv_f32(x, &y, m, n, false),
+            MatmulPlan::Gemv2 => self.run_pieces(x, &y, m, n, false, &plan::gemv2_pieces(0, t, false, &apple)),
+            MatmulPlan::GemmMsl { f16, gemv2 } => {
+                self.run_pieces(x, &y, m, n, false, &plan::gemm_msl_pieces(t, f16, gemv2, &apple));
+            }
+            MatmulPlan::GemvMulti { first } => {
+                let groups = grid(n.div_ceil(8 * self.tuning.gemvm_rows) as u32);
+                let dispatches: Vec<_> = [(0, first), (first, t - first)]
+                    .into_iter()
+                    .filter(|&(_, rows)| rows > 0)
+                    .map(|(r0, rows)| (name::gemvm(rows, m.fmt), [n32, k32, rows as u32, r0 as u32], groups))
+                    .collect();
+                self.f32_kernels(plan, x, &y, m, &dispatches, t);
+            }
+            MatmulPlan::Gemv1 => {
+                let d = (name::gemv1(m.fmt), [n32, k32, 1, 0], grid(n.div_ceil(8) as u32));
+                self.f32_kernels(plan, x, &y, m, &[d], t);
+            }
             MatmulPlan::Gemv8 => {
-                vec![(name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32))]
+                let d = (name::gemv8(m.fmt), [n32, k32, t as u32, 0], grid(n.div_ceil(8) as u32));
+                self.f32_kernels(plan, x, &y, m, &[d], t);
             }
             MatmulPlan::GemmCoop { gemv2_rest } => {
+                // The rows past the last whole tile go to gemv2 (they account for themselves).
                 let tiled = t - gemv2_rest;
-                rows = tiled;
-                let rest = plan::gemv2_pieces(tiled, gemv2_rest, false, &self.tuning.apple);
-                self.run_pieces(x, &y, m, n, false, &rest);
-                if tiled == 0 {
-                    return y;
+                self.run_pieces(x, &y, m, n, false, &plan::gemv2_pieces(tiled, gemv2_rest, false, &apple));
+                if tiled > 0 {
+                    let groups = ((n / 64) as u32, tiled.div_ceil(64) as u32);
+                    let d = (name::gemm_coop(m.fmt), [n32, k32, tiled as u32, 0], groups);
+                    self.f32_kernels(plan, x, &y, m, &[d], tiled);
                 }
-                vec![(
-                    name::gemm_coop(m.fmt),
-                    [n32, k32, tiled as u32, 0],
-                    ((n / 64) as u32, tiled.div_ceil(64) as u32),
-                )]
             }
             MatmulPlan::GemmF32 => {
-                vec![(name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], (n.div_ceil(128) as u32, t.div_ceil(64) as u32))]
+                let groups = (n.div_ceil(128) as u32, t.div_ceil(64) as u32);
+                let d = (name::gemm_f32(m.fmt), [n32, k32, t as u32, 0], groups);
+                self.f32_kernels(plan, x, &y, m, &[d], t);
             }
-            MatmulPlan::GemvInt { .. }
-            | MatmulPlan::GemmInt { .. }
-            | MatmulPlan::GemvF32
-            | MatmulPlan::Gemv2
-            | MatmulPlan::GemmMsl { .. } => unreachable!(),
-        };
-        for (name, params, groups) in dispatches {
-            self.dispatch_matmul(&name, &refs, &params, groups, (n, k));
         }
-        self.account(2.0 * (rows * n * k) as f64);
         y
+    }
+
+    /// The f32 kernels' `dispatches` (name, immediates, grid) of `plan`, `y = x W^T` over
+    /// `rows` rows. The GEMMs bind the weights' prefill layout (the per-16 scales, see
+    /// `W_Q6`), the GEMVs their decode layout.
+    fn f32_kernels(
+        &mut self,
+        plan: MatmulPlan,
+        x: &Tensor,
+        y: &Tensor,
+        m: &crate::Matrix,
+        dispatches: &[(String, [u32; 4], (u32, u32))],
+        rows: usize,
+    ) {
+        // (`gemm_coop8` reads the decode layout too: it decodes through `load16`)
+        let coop8 = matches!(plan, MatmulPlan::GemmCoop { .. }) && self.caps.coop_size == 8;
+        let mut all = vec![y.buf().clone(), x.buf().clone()];
+        all.extend(if plan.is_gemm() && !coop8 { m.prefill_bufs() } else { m.decode_bufs() });
+        let refs: Vec<&Buf> = all.iter().collect();
+        for (name, params, groups) in dispatches {
+            self.dispatch_matmul(name, &refs, params, *groups, (m.n, m.k));
+        }
+        self.account(2.0 * (rows * m.n * m.k) as f64);
     }
 
     pub(crate) fn matmul_glu(&mut self, x: &Tensor, w: &Weight, gemv: Gemv) -> Tensor {
