@@ -27,10 +27,6 @@ pub struct Prompt {
     memo: u64,
 }
 
-/// Generation budget a request keeps its history for in [`Prompt::fit`]: `max_new` is a
-/// cap that outputs rarely approach, so a prompt with history that leaves this much is kept.
-const MIN_BUDGET: usize = 512;
-
 impl Prompt {
     pub fn new(tok: &Tokenizer, req: &ValidRequest) -> Self {
         Prompt { ids: tok.encode(&req.render(), false), memo: memory::key(req) }
@@ -48,31 +44,22 @@ impl Prompt {
         Prompt::new(tok, &req).within(max_context, r.max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS))
     }
 
-    /// The prompt of `req` such that it and the generation budget fit in `max_context`
-    /// tokens: the budget is cut to what the prompt leaves, and the history is dropped
-    /// only when that would leave less than `MIN_BUDGET` (or `max_new`, if smaller).
-    /// Returns the prompt and the budget (at least 1), or an error when even the prompt
-    /// without history does not fit.
+    /// The prompt of `req` and its budget within `max_context` (see
+    /// [`yaxus_pfml::fit_prompt`]: a history that leaves too little room is dropped).
     pub fn fit(
         tok: &Tokenizer,
         req: ValidRequest,
         max_context: usize,
         max_new: usize,
     ) -> Result<(Self, usize), PromptError> {
-        let mut prompt = Prompt::new(tok, &req);
-        if max_context.saturating_sub(prompt.len()) < max_new.min(MIN_BUDGET) && !req.history().is_empty() {
-            prompt = Prompt::new(tok, &req.without_history());
-        }
-        prompt.within(max_context, max_new)
+        let (req, ids, max_new) = yaxus_pfml::fit_prompt(tok, req, max_context, max_new)?;
+        Ok((Prompt { ids, memo: memory::key(&req) }, max_new))
     }
 
     /// This prompt with the budget `max_new` cut to what it leaves of `max_context` (at
     /// least 1), or an error when the prompt alone does not fit.
     fn within(self, max_context: usize, max_new: usize) -> Result<(Self, usize), PromptError> {
-        if self.len() >= max_context {
-            return Err(PromptError::too_long(format!("prompt is {} tokens; the limit is {max_context}", self.len())));
-        }
-        let max_new = max_new.min(max_context - self.len()).max(1);
+        let max_new = yaxus_pfml::budget_within(self.len(), max_context, max_new)?;
         Ok((self, max_new))
     }
 

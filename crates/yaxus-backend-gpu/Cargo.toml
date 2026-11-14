@@ -11,11 +11,16 @@ wgpu = { version = "30", default-features = false, features = ["std", "parking_l
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 half = "2"
+web-time = "1"
 yaxus-model = { path = "../yaxus-model" }
 
 # The platform's GPU API (see `device::platform_backends`).
-[target.'cfg(not(target_os = "macos"))'.dependencies]
+[target.'cfg(all(not(target_os = "macos"), not(target_arch = "wasm32")))'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgpu"] }
+futures-channel = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30", default-features = false, features = ["metal"] }
@@ -34,3 +39,5 @@ test-hooks = []
 yaxus-backend-gpu = { path = ".", features = ["test-hooks"] }
 yaxus-backend-cpu = { path = "../yaxus-backend-cpu" }
 serde_json.workspace = true
+# Parses the WebGPU (wasm) variant of the kernels without a browser.
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }

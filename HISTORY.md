@@ -1696,3 +1696,27 @@ M2、llama.cpp b11972 で測った。yaxus は既定の設定 (wgpu の Metal、
 - 0.8B は 1 件あたりほぼ同じ。
 - 2〜16 行のパス (検証) は同じか速い。32 行以上の prefill は 4〜11% 遅い (yaxus は f32、llama.cpp は f16)。
 - 1 行のパスの値は回によって揺れる。2B の `bench rows` は 23.6〜24.0 ms で、12.8 の 21.1 ms より遅い。この計測の間、スワップは 11.7 GB 使われていた。
+
+## 13. ブラウザ版 (wasm32 + WebGPU、2026-11-13)
+
+**なぜ。** CLI とサーバは 1 プロセスで GPU を持つが、配布にはビルド済みバイナリが要る。wasm なら静的ファイルを置くだけで、モデルはユーザーが選んだファイルをタブの中で読める。0.8B Q4_K_M (573 MB、16 層、hidden 1536、KV ヘッド 1) なら GPU の重みは約 570 MB で、デスクトップの GPU に収まる。CPU の wasm は 1 桁 tok/s になるので採らない。
+
+**そのままでは動かなかったもの。**
+
+- WebGPU に push constants がない。全カーネルの `var<immediate> p: P;` を `@group(0) @binding(15) var<uniform> p: P;` に置き換え、1 MB の uniform バッファへ 256 バイトずつ書いて dynamic offset で渡す。native は今までどおり `set_immediates`。
+- `Device::poll` が WebGPU では no-op。`read` の `map_async` + `poll(wait)` は永久に返らないので、`read_async` を足して argmax の読み戻しだけ await する。Engine は使わず、`Model::start` / `forward` の間に `argmax_async` を挟む。
+- `WgpuDev::open` の `pollster::block_on` と `IMMEDIATES` の必須要求。wasm は `request_adapter` / `request_device` を await し、push constants を要求しない。
+- `Tuning::for_device` が Intel/AMD とみなして int16 を選ぶ。WebGPU は f32 固定 (subgroup の 32 レーンを WebGPU から確認できないため、subgroup も要求しない)。`gemv1` / `gemv8` と `gemm_f32`、行ごとの attention は lavapipe の CI と同じ経路。
+- GGUF が mmap とパス前提。`Gguf::parse(Vec<u8>)` と `TensorRef` の `Mmap | Arc<Vec<u8>>` を足した。トークナイザは `Tokenizer::from_vocab`。
+- std の `Instant` は wasm32-unknown-unknown で panic する。時間は `web-time` に置き換えた。
+- 0.8B の埋め込みを bf16 に展開すると 330 MB になり、WebGPU の `maxBufferSize` (256 MB の段階がある) に触れる。Q4_K の表をそのまま読む `embed_q4k` を足して 93 MB にした。native も同じ表を使う (下の「CLI との一致」)。行列のバッファが storage binding の上限を超える場合は Q4 に落とす。最初はページがテンソルの大きさを数えて `ModelOptions.lm_head_quant` で指定していたが、binding の上限はバックエンドの制約なので、判断をバックエンドの `load_weight` に移した (native も同じで、警告を出す)。また最初は「出力行列 (Q6_K、135 MB) は 128 MB の binding に入らない」と考えていたが、上限はバッファごとで、読み替えた Q6 の最大のバッファは 124 MB なので入る。ファイルの大きさで判定していたため、128 MB の段階のデバイスで無駄に Q4 へ落としていた。判定を読み替えたあとのバッファの大きさ (`ggml_largest_buffer`、配置と一致することを単体テストで固定) に直した。0.8B が Q4 に落ちるのは binding が 124 MB 未満のときで、WebGPU はそれより小さい上限を許さないので、ブラウザでは起きない。E2E では `device.limits` を 110 MiB と見せかけてこの経路を通す。
+
+**測ったこと。** native のテストと clippy (workspace と wasm32) は通る。wasm は 0.8 MB。M2 の Chrome (ヘッドレス、Playwright で操作) で、0.8B Q4_K_M の読み込みはファイルの読み込みを含めて 2.7 秒、decode は 72〜81 tok/s (1 段落)。
+
+**長文。** ブラウザは最初、入力全体を 1 プロンプトにしていたので、長い文は 2048 トークンの文脈と 1024 トークンの出力で切れた。`yaxus_pfml::segments` で空行の段落、次に文 (`.`、`!`、`?`、`。`、改行)、最後に語・文字の順に 768 入力トークン以下へ分け、1 セグメントずつ順に訳すようにした。直前 2 組 (1600 文字まで) を履歴にし、4096 トークンに収まらない履歴は捨てる。あとで、履歴の選び方を CLI と同じ `HistoryWindow` に、文脈への収め方を runtime から pfml に移した `fit_prompt` にして、同じ規則の別実装をなくした。ページには `on_progress(done, total)` で「3/12 段落」を出す。
+
+**CLI との一致。** 最初の版のページの訳は CLI と違った (「寝ています」と「寝ている」)。原因は埋め込み表ではなく、ページの文体の既定が「です・ます」だったこと (CLI は指定なし)。既定を「指定なし」にし、原文の言語も CLI と同じく渡さないようにした。そのうえで埋め込み表を native でも Q4_K のまま読むようにした。CLI の訳は、3 つの文 (英→日の短文と 3 文の段落、日→英) で bf16 の表のときと一字一句同じで、f32 と int16 でも同じ。ブラウザの訳はこの 3 つとも CLI と一致する。
+
+**Worker とエラー。** 最初の版はページのスレッドで動き、ファイルを JavaScript の配列に読んでから wasm にコピーしていた (573 MB が 2 つ)。また wasm では error scope を空にしていたので、GPU のエラーは捕まえられなかった。専用 Worker に移し、ファイルはチャンクごとに wasm の `ModelBuffer` へ足すようにした。WebGPU のエラーは uncaptured-error と device-lost のコールバックで `Fault` に残し、読み戻しが返す。`device.destroy()` と不正な `createBuffer` を Worker に差し込んで試し、どちらもエラーを表示し、翻訳を止め、「読み込む」で元に戻ることを確かめた。
+
+**残り。** WebGPU の subgroup (32 レーン) が使えるか、モデルの再読み込みを省くキャッシュ。

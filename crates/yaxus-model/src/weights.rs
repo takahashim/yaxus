@@ -10,11 +10,30 @@ use safetensors::{Dtype, SafeTensors};
 
 use crate::ggml::GgmlType;
 
-/// A tensor living inside a memory-mapped file: bf16 from safetensors, or any
-/// [`GgmlType`] from a GGUF file. `shape` is row-major (`[N, K]` for matrices).
+/// Where the bytes of a tensor live: a memory-mapped file, or a buffer assembled in
+/// memory (the browser reads the GGUF file the user chose into wasm memory).
+#[derive(Clone)]
+pub(crate) enum Backing {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Mmap(Arc<Mmap>),
+    Bytes(Arc<Vec<u8>>),
+}
+
+impl Backing {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => &m[..],
+            Backing::Bytes(b) => &b[..],
+        }
+    }
+}
+
+/// A tensor living inside a memory-mapped file or an in-memory buffer: bf16 from
+/// safetensors, or any [`GgmlType`] from a GGUF file. `shape` is row-major (`[N, K]`
+/// for matrices).
 #[derive(Clone)]
 pub struct TensorRef {
-    pub(crate) mmap: Arc<Mmap>,
+    pub(crate) backing: Backing,
     pub(crate) start: usize,
     pub(crate) len: usize,
     pub shape: Vec<usize>,
@@ -27,7 +46,7 @@ pub struct TensorRef {
 impl TensorRef {
     /// Raw bytes in the file's encoding.
     pub fn bytes(&self) -> &[u8] {
-        &self.mmap[self.start..self.start + self.len]
+        &self.backing.as_slice()[self.start..self.start + self.len]
     }
 
     pub fn numel(&self) -> usize {
@@ -125,7 +144,7 @@ impl Weights {
                 tensors.insert(
                     name.clone(),
                     TensorRef {
-                        mmap: mmap.clone(),
+                        backing: Backing::Mmap(mmap.clone()),
                         start: data_start + s,
                         len: e - s,
                         shape: info.shape.clone(),

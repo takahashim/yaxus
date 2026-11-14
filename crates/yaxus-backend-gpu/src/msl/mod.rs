@@ -23,6 +23,7 @@ pub(crate) fn header(workgroup_size: u32) -> String {
 }
 
 /// The workgroup size of `src` if it is an MSL source.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn workgroup_size(src: &str) -> Option<u32> {
     src.lines().next()?.strip_prefix("// msl workgroup_size=")?.trim().parse().ok()
 }

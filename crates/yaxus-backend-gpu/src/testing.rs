@@ -4,7 +4,7 @@
 use anyhow::Result;
 use yaxus_model::Quant;
 
-use crate::{GemmKind, Gemv, Gpu, GpuBackend, Weight};
+use crate::{Format, GemmKind, Gemv, Gpu, GpuBackend, Weight};
 
 impl Gpu {
     /// Whether the prefill GEMM rounds its operands (to f16 or to integers).
@@ -95,6 +95,31 @@ impl Gpu {
         self.dev.write(x.buf(), 0, bytemuck::cast_slice(logits));
         self.argmax_rows(&x)
     }
+
+    /// Test hook: embedding rows `ids` from a `[V, h]` table stored as Q4_K (raw GGUF
+    /// blocks) or bf16.
+    #[doc(hidden)]
+    pub fn debug_embed(&mut self, bytes: &[u8], dtype: yaxus_model::ggml::GgmlType, h: usize, ids: &[u32]) -> Vec<f32> {
+        use yaxus_model::ggml::GgmlType;
+        let table = match dtype {
+            GgmlType::Q4K => {
+                let q = yaxus_model::ggml::q4k_from_q4_k(bytes);
+                Weight::Embedding { table: self.upload("embedding-q4k", &q.data), h, fmt: Format::Q4K }
+            }
+            GgmlType::Bf16 => Weight::Embedding { table: self.upload("embedding", bytes), h, fmt: Format::Bf16 },
+            _ => panic!("debug_embed: Q4K or bf16 tables only"),
+        };
+        let pass = yaxus_model::PassMeta {
+            ids: ids.to_vec(),
+            pos: vec![0; ids.len()],
+            kv_slot: vec![0; ids.len()],
+            pt_off: vec![0; ids.len()],
+            pages: Vec::new(),
+        };
+        self.begin_pass(&pass);
+        let y = self.embed(&table);
+        self.to_host(&y)
+    }
 }
 
 impl GpuBackend {
@@ -174,6 +199,12 @@ impl GpuBackend {
     #[doc(hidden)]
     pub fn debug_alloc(&mut self, size: u64) -> Result<()> {
         self.g().debug_alloc(size)
+    }
+
+    /// Test hook, see [`Gpu::debug_embed`].
+    #[doc(hidden)]
+    pub fn debug_embed(&mut self, bytes: &[u8], dtype: yaxus_model::ggml::GgmlType, h: usize, ids: &[u32]) -> Vec<f32> {
+        self.g().debug_embed(bytes, dtype, h, ids)
     }
 
     #[doc(hidden)]

@@ -18,6 +18,10 @@
 //! - `dev`: the device layer (wgpu, or Metal directly); `msl`: the MSL sources.
 //! - `shaders`, `gemv_int`, `gemm_int`, `gemv_f32`: the WGSL sources.
 
+// WebGPU's device and buffers are single-threaded (`Rc` inside), so the handles that are
+// thread-safe on native are `Arc`s without `Send`/`Sync` in the browser.
+#![cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+
 mod commands;
 mod dev;
 mod device;
@@ -44,6 +48,8 @@ pub use dev::Buf;
 use dev::{Dev, Kernel};
 pub use device::{Api, AppleTuning, DeviceCaps, DeviceKind, Tuning, Vendor};
 use device::{CompileSettings, Diagnostics};
+#[cfg(target_arch = "wasm32")]
+use ops::parse_argmax;
 use ops::{ARGMAX_ROWS, ARGMAX_SLICES};
 use profile::Profile;
 pub(crate) use weights::SCALE_PAD;
@@ -122,6 +128,8 @@ pub struct Gpu {
     pub gemm: GemmKind,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
     oversized: Option<(String, usize)>,
+    /// Matrices loaded as Q4 because their own format exceeds the binding limit.
+    reduced_to_q4: usize,
     /// Extra detail (matrix shape) for the next profiled dispatch.
     prof_detail: Option<String>,
     /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
@@ -220,9 +228,25 @@ pub(crate) const ATTN_TILE_SHARED_BYTES_NO_QS: u32 = ATTN_TILE_SHARED_BYTES - 10
 
 impl Gpu {
     /// Opens the GPU (see `dev::Dev::open`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self> {
         let diag = Diagnostics::from_env();
-        let (mut dev, caps) = Dev::open(&diag)?;
+        let (dev, caps) = Dev::open(&diag)?;
+        Ok(Self::from_device(dev, caps, diag))
+    }
+
+    /// Opens WebGPU in the browser. `need_binding` and `need_buffer` are the largest
+    /// single weight buffer and the largest binding the model needs; WebGPU asks for
+    /// limits up front.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_async(need_binding: u64, need_buffer: u64) -> Result<Self> {
+        let diag = Diagnostics::from_env();
+        let (dev, caps) = dev::wgpu::WgpuDev::open_async(&diag, need_binding, need_buffer).await?;
+        Ok(Self::from_device(dev::Dev::Wgpu(Box::new(dev)), caps, diag))
+    }
+
+    fn from_device(dev: Dev, caps: DeviceCaps, diag: Diagnostics) -> Self {
+        let mut dev = dev;
         let tuning = Tuning::for_device(&caps);
         let compile = CompileSettings::for_device(&caps);
         let argmax_out = dev.storage("argmax", (ARGMAX_ROWS * 8) as u64);
@@ -246,6 +270,7 @@ impl Gpu {
             pending_flops: 0.0,
             pass_dispatches: 0,
             oversized: None,
+            reduced_to_q4: 0,
             profile: diag.profile.map(|_| Profile::default()),
             diag,
         };
@@ -254,7 +279,22 @@ impl Gpu {
             eprintln!("[gemv2] rows differ between its kernels on this device; using gemv_f32");
             b.tuning.apple.gemv2 = false;
         }
-        Ok(b)
+        b
+    }
+}
+
+/// The errors of a stretch of browser work (see [`GpuBackend::watch_errors`]).
+#[cfg(target_arch = "wasm32")]
+pub struct ErrorWatch(dev::wgpu::AsyncErrorScope);
+
+#[cfg(target_arch = "wasm32")]
+impl ErrorWatch {
+    /// The first error of the work since the watch began.
+    pub async fn finish(self) -> Result<()> {
+        match self.0.finish().await {
+            Some(e) => anyhow::bail!("{e}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -273,8 +313,17 @@ pub struct GpuBackend {
 
 impl GpuBackend {
     /// Opens the platform's GPU (see [`Gpu::new`]), with the device's tuned kernels.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self> {
         let gpu = Gpu::new()?;
+        let gemv = gpu.tuning.gemv;
+        Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
+    }
+
+    /// Opens WebGPU in the browser (see [`Gpu::new_async`]).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_async(need_binding: u64, need_buffer: u64) -> Result<Self> {
+        let gpu = Gpu::new_async(need_binding, need_buffer).await?;
         let gemv = gpu.tuning.gemv;
         Ok(GpuBackend { gpu: Arc::new(Mutex::new(gpu)), weight_bytes: 0, gemv, formats: Vec::new() })
     }
@@ -282,6 +331,54 @@ impl GpuBackend {
     /// What the device can do.
     pub fn caps(&self) -> DeviceCaps {
         self.g().caps.clone()
+    }
+
+    /// The largest buffer a single binding may cover (the model's output matrix has to
+    /// fit it whole).
+    pub fn max_binding_bytes(&self) -> u64 {
+        self.g().dev.max_binding()
+    }
+
+    /// How many matrices were loaded as Q4 because one storage binding cannot cover them
+    /// in their own format (see `Gpu::load_weight`). Their outputs change slightly.
+    pub fn reduced_to_q4(&self) -> usize {
+        self.g().reduced_to_q4
+    }
+
+    /// The greedy token of a one-row logits tensor, awaiting the read-back (browser).
+    /// The lock is held across the await on purpose: wasm is single-threaded, and the
+    /// recorded pass and its read-back must not interleave with another request.
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::await_holding_lock)]
+    pub async fn argmax_async(&mut self, logits: &Tensor) -> Result<u32> {
+        debug_assert_eq!(logits.rows, 1, "the browser path decodes one request");
+        let gpu = self.gpu.clone();
+        let mut g = gpu.lock().unwrap();
+        let (out, size) = g.argmax_prob_pending(logits);
+        let bytes = g.read_async(&out, 0, size).await?;
+        Ok(parse_argmax(&bytes, logits.cols as u32).first().map_or(0, |&(id, _)| id))
+    }
+
+    /// Starts capturing every error of the device, for [`ErrorWatch::finish`] to report
+    /// (browser). Wrap the model's loading in it: WebGPU reports a failed allocation after
+    /// `create_buffer` has returned, and only an error scope says for certain that no
+    /// error of the work before it is still on its way.
+    #[cfg(target_arch = "wasm32")]
+    pub fn watch_errors(&self) -> ErrorWatch {
+        let dev::Dev::Wgpu(d) = &self.g().dev;
+        ErrorWatch(d.async_error_scope())
+    }
+
+    /// Waits until the GPU has done everything submitted so far, and returns the first
+    /// error WebGPU has reported by then (see [`GpuBackend::watch_errors`] for one that
+    /// cannot be missed).
+    #[cfg(target_arch = "wasm32")]
+    #[allow(clippy::await_holding_lock)]
+    pub async fn sync_async(&mut self) -> Result<()> {
+        let gpu = self.gpu.clone();
+        let mut g = gpu.lock().unwrap();
+        let out = g.argmax_out.clone();
+        g.read_async(&out, 0, 8).await.map(|_| ())
     }
 
     /// The choices the kernels are run with on this device.

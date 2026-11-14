@@ -12,3 +12,4 @@ yaxus-tokenizer = { path = "../yaxus-tokenizer" }
 
 [dev-dependencies]
 serde_json.workspace = true
+yaxus-tokenizer = { path = "../yaxus-tokenizer", features = ["test-util"] }

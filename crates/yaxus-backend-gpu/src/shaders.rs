@@ -1207,6 +1207,28 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 }
 "#;
 
+/// The embedding table as the GGUF's Q4_K blocks, decoded a row at a time. `p.k` is the
+/// row length (`p.h`), as the shared Q4_K weight access expects.
+pub const EMBED_Q4K: &str = r#"
+struct P { h: u32, k: u32, _a: u32, _b: u32 }
+var<immediate> p: P;
+@group(0) @binding(0) var<storage, read_write> y: array<f32>;
+@group(0) @binding(1) var<storage, read> ids: array<u32>;
+{LOADER}
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let row = ids[wg.x];
+    let dst = wg.x * p.h;
+    for (var i = li; i < p.h / 4u; i += 256u) {
+        let v = load4(row, i);
+        y[dst + 4u * i] = v.x;
+        y[dst + 4u * i + 1u] = v.y;
+        y[dst + 4u * i + 2u] = v.z;
+        y[dst + 4u * i + 3u] = v.w;
+    }
+}
+"#;
+
 /// Weight access for `[N, K]` Q4K matrices (GGUF Q4_K kept as is): 144-byte blocks of a
 /// header and nibbles as in Q4, bound twice (`wq` for the nibbles, `wsc` for headers).
 pub const W_Q4K: &str = r#"

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yaxus — browser</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #677085; --border: #d9dde5;
+  --accent: #2f6fde; --accent-text: #ffffff; --danger: #c43c3c; --focus: #2f6fde55;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171d; --panel: #1c2028; --text: #e4e7ee; --muted: #9098aa; --border: #313745;
+    --accent: #5b8ff0; --accent-text: #0d1220; --danger: #e06464; --focus: #5b8ff055;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+header h1 { margin: 0; font-size: 18px; letter-spacing: .02em; }
+header .tag { color: var(--muted); font-size: 13px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+header .spacer { flex: 1; }
+main { max-width: 1000px; margin: 0 auto; padding: 16px; }
+section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-bottom: 14px; }
+h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+select, input, textarea, button {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+select, input { padding: 6px 8px; }
+textarea { width: 100%; padding: 10px; resize: vertical; }
+button { padding: 7px 14px; cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+button:disabled { opacity: .45; cursor: default; }
+#status { color: var(--muted); font-size: 13px; }
+#status.err { color: var(--danger); }
+.note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+#meter { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 8px; display: none; }
+#meter > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+#info { font-size: 13px; color: var(--muted); white-space: pre-wrap; }
+#output {
+  min-height: 7em; white-space: pre-wrap; word-break: break-word;
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+  background: var(--bg); font-size: 16px; line-height: 1.8;
+}
+#stats { font-size: 13px; color: var(--muted); margin-top: 8px; }
+#warn { color: var(--danger); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>yaxus</h1>
+  <span class="tag">browser · wasm + WebGPU · 実験版</span>
+  <span class="spacer"></span>
+  <span id="status">wasm を読み込んでいます…</span>
+</header>
+
+<main>
+  <section>
+    <h2>1. モデル（GGUF ファイル）</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".gguf,application/octet-stream">
+      <button id="load" class="primary" disabled>読み込む</button>
+      <span id="fileinfo" class="note"></span>
+    </div>
+    <div id="meter"><div></div></div>
+    <p class="note">
+      PLaMo 3 Translate の GGUF（<code>plamo-3-translate-0.8b-Q4_K_M.gguf</code>、約 573 MB）を選んでください。
+      ファイルはこのタブの中だけで読み、どこにも送りません。デスクトップの Chrome と WebGPU が必要です。
+    </p>
+    <div id="info"></div>
+    <div id="warn"></div>
+  </section>
+
+  <section>
+    <h2>2. 翻訳</h2>
+    <div class="row" style="margin-bottom:8px">
+      <select id="target" aria-label="翻訳の向き">
+        <option value="ja">英語 → 日本語</option>
+        <option value="en">日本語 → 英語</option>
+      </select>
+      <label for="form">文体</label>
+      <select id="form">
+        <option value="">指定なし</option>
+        <option value="polite">です・ます</option>
+        <option value="plain">だ・である</option>
+      </select>
+      <span class="spacer grow"></span>
+      <button id="sample">例文を入れる</button>
+      <button id="translate" class="primary" disabled>翻訳する</button>
+    </div>
+    <textarea id="source" rows="5" placeholder="The meeting has been moved to next Monday." disabled></textarea>
+    <p class="note">長い文章は段落・文単位に自動で分割して、順に訳します。</p>
+    <div id="output" aria-live="polite"></div>
+    <div id="stats"></div>
+  </section>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const fileEl = $('file');
+const loadEl = $('load');
+const translateEl = $('translate');
+const sourceEl = $('source');
+const outputEl = $('output');
+const statsEl = $('stats');
+const infoEl = $('info');
+const warnEl = $('warn');
+const meterEl = $('meter');
+const meterBar = meterEl.firstElementChild;
+const sampleEl = $('sample');
+const targetEl = $('target');
+const formEl = $('form');
+
+const SAMPLES = {
+  ja: 'The owner approved the revised plan, and the team will start work next Monday.',
+  en: '改訂した計画が承認されたので、来週の月曜日から作業を始めます。',
+};
+
+// The model lives in a worker (see worker.js). A new worker is started for every load,
+// so the memory of an earlier model is given back, and after an error of the GPU.
+let worker = null;
+let file = null;
+let ready = false;
+let busy = false;
+// The handler of the request in flight: {onText, resolve, reject}.
+let request = null;
+
+const setStatus = (text, err = false) => {
+  statusEl.textContent = text;
+  statusEl.classList.toggle('err', err);
+};
+const setBusy = (b) => {
+  busy = b;
+  fileEl.disabled = b;
+  loadEl.disabled = b || !file;
+  translateEl.disabled = b || !ready;
+  sourceEl.disabled = b || !ready;
+  sampleEl.disabled = b || !ready;
+  targetEl.disabled = b;
+  formEl.disabled = b || targetEl.value !== 'ja';
+};
+const fmtMB = (n) => (n / 1e6).toFixed(0) + ' MB';
+
+function startWorker() {
+  worker?.terminate();
+  ready = false;
+  worker = new Worker('./worker.js', { type: 'module' });
+  worker.onmessage = ({ data }) => onMessage(data);
+  // An error the worker could not report itself (a failed import, an abort).
+  worker.onerror = (e) => {
+    e.preventDefault();
+    finish({ type: 'error', message: e.message || 'worker error', fatal: true });
+  };
+}
+
+function onMessage(msg) {
+  switch (msg.type) {
+    case 'status':
+      setStatus(msg.message);
+      break;
+    case 'read':
+      meterEl.style.display = msg.done < msg.total ? 'block' : 'none';
+      meterBar.style.width = ((100 * msg.done) / msg.total).toFixed(1) + '%';
+      break;
+    case 'progress':
+      if (msg.total > 1) setStatus(`翻訳しています… ${Math.min(msg.done + 1, msg.total)}/${msg.total} 段落`);
+      break;
+    case 'text':
+      request?.onText?.(msg.text);
+      break;
+    default:
+      finish(msg);
+  }
+}
+
+// The end of the request in flight: `ready`, `done` or `error`.
+function finish(msg) {
+  const r = request;
+  request = null;
+  meterEl.style.display = 'none';
+  if (msg.type === 'error') {
+    if (msg.fatal) {
+      // The worker cannot be trusted any more; the file is kept for another load.
+      startWorker();
+      msg.message += '（GPU のエラーです。「読み込む」でモデルを読み込み直してください）';
+    }
+    r?.reject(new Error(msg.message));
+  } else {
+    r?.resolve(msg);
+  }
+}
+
+function send(msg, onText) {
+  return new Promise((resolve, reject) => {
+    request = { onText, resolve, reject };
+    worker.postMessage(msg);
+  });
+}
+
+function fail(e) {
+  console.error(e);
+  setStatus(e?.message || String(e), true);
+}
+
+fileEl.addEventListener('change', () => {
+  const f = fileEl.files?.[0];
+  // Allow picking the same file again (a `change` event only fires on a new value).
+  fileEl.value = '';
+  if (!f) return;
+  file = f;
+  // The file API may report the symlink's target (a blob hash) rather than the name
+  // the user picked.
+  const name = f.name.toLowerCase().endsWith('.gguf') ? f.name : '選択した GGUF';
+  $('fileinfo').textContent = `${name} · ${fmtMB(f.size)}`;
+  // Reading a model is the only reason to pick a file here; load it right away.
+  loadModel();
+});
+
+async function loadModel() {
+  if (!file || busy) return;
+  try {
+    setBusy(true);
+    startWorker();
+    outputEl.textContent = '';
+    statsEl.textContent = '';
+    infoEl.textContent = '';
+    warnEl.textContent = '';
+    setStatus('モデルを読み込んでいます…');
+    const t0 = performance.now();
+    const { info } = await send({ type: 'load', file });
+    const wall = performance.now() - t0;
+    ready = true;
+    infoEl.textContent =
+      `device: ${info.device}\n` +
+      `binding: ${fmtMB(info.maxBinding)}\n` +
+      `load: ${(info.loadMs / 1e3).toFixed(1)} s (wasm+GPU; ファイルの読み込みを含めて ${(wall / 1e3).toFixed(1)} s)`;
+    if (info.reducedToQ4) {
+      warnEl.textContent = 'この GPU の binding 上限に収まらない行列（出力行列）を Q4 にしました（訳の質が少し下がります）。';
+    }
+    setStatus('準備できました。文章を入れて翻訳してください。');
+  } catch (e) {
+    ready = false;
+    fail(e);
+  } finally {
+    setBusy(false);
+  }
+}
+
+loadEl.addEventListener('click', loadModel);
+
+targetEl.addEventListener('change', () => {
+  sourceEl.placeholder = SAMPLES[targetEl.value];
+  setBusy(busy);
+});
+
+translateEl.addEventListener('click', async () => {
+  if (!ready || busy) return;
+  const text = sourceEl.value.trim();
+  if (!text) { setStatus('訳す文章を入力してください。', true); return; }
+  try {
+    setBusy(true);
+    outputEl.textContent = '';
+    statsEl.textContent = '';
+    setStatus('翻訳しています…');
+    const { stats } = await send(
+      { type: 'translate', text, target: targetEl.value, form: targetEl.value === 'ja' ? formEl.value : '' },
+      (delta) => {
+        outputEl.textContent += delta;
+        outputEl.scrollTop = outputEl.scrollHeight;
+      },
+    );
+    const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
+    const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.maxNew} tokens`;
+    statsEl.textContent =
+      `prompt ${stats.promptTokens} tokens · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
+      `${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode · ` +
+      `${stats.tokensPerSecond.toFixed(1)} tok/s · ${stats.chars} 文字`;
+    if (stats.stop === 'limit') {
+      statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';
+    }
+    setStatus('完了');
+  } catch (e) {
+    // (after an error of the GPU, `finish` has started a new worker without a model)
+    fail(e);
+  } finally {
+    setBusy(false);
+  }
+});
+
+sampleEl.addEventListener('click', () => {
+  if (!ready) return;
+  sourceEl.value = SAMPLES[targetEl.value];
+  sourceEl.focus();
+});
+
+if (!navigator.gpu) {
+  fail(new Error('このブラウザには WebGPU がありません。デスクトップの Chrome で開いてください。'));
+  fileEl.disabled = true;
+} else {
+  setStatus('モデルを選んでください。');
+  setBusy(false);
+}
+</script>
+</body>
+</html>

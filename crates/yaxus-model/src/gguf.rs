@@ -10,7 +10,7 @@ use memmap2::Mmap;
 
 use crate::config::{Config, RopeParam, RopeParameters, Yarn};
 use crate::ggml::GgmlType;
-use crate::weights::{TensorRef, Weights};
+use crate::weights::{Backing, TensorRef, Weights};
 use crate::{POST_MIXER_NORM_OFFSET, POST_MLP_NORM_OFFSET, PRE_NORM_OFFSET};
 
 #[derive(Debug, Clone)]
@@ -122,8 +122,18 @@ impl Gguf {
         // SAFETY: read-only mapping; modifying the file while mapped is UB like with any
         // mmap-based loader.
         let mmap = Arc::new(unsafe { Mmap::map(&file)? });
-        let mut r = Reader { b: &mmap[..], at: 0 };
-        ensure!(r.take(4)? == b"GGUF", "{} is not a GGUF file", path.display());
+        Self::from_backing(Backing::Mmap(mmap)).with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// Parses a GGUF file already in memory (the browser reads the file the user chose).
+    pub fn parse(bytes: Vec<u8>) -> Result<Self> {
+        Self::from_backing(Backing::Bytes(Arc::new(bytes)))
+    }
+
+    fn from_backing(backing: Backing) -> Result<Self> {
+        let bytes = backing.as_slice();
+        let mut r = Reader { b: bytes, at: 0 };
+        ensure!(r.take(4)? == b"GGUF", "not a GGUF file");
         let version = r.u32()?;
         ensure!(version == 2 || version == 3, "GGUF version {version} is not supported");
         let n_tensors = r.u64()? as usize;
@@ -163,9 +173,9 @@ impl Gguf {
             let len =
                 (n / t.block().0).checked_mul(t.block().1).with_context(|| format!("{name}: too many elements"))?;
             let end = data.checked_add(off).and_then(|s| s.checked_add(len));
-            ensure!(end.is_some_and(|e| e <= mmap.len()), "{name}: data beyond the end of the file");
+            ensure!(end.is_some_and(|e| e <= bytes.len()), "{name}: data beyond the end of the file");
             let start = data + off;
-            tensors.push((name, TensorRef { mmap: mmap.clone(), start, len, shape, dtype: t, minus: 0.0 }));
+            tensors.push((name, TensorRef { backing: backing.clone(), start, len, shape, dtype: t, minus: 0.0 }));
         }
         Ok(Gguf { meta, tensors })
     }
@@ -262,7 +272,7 @@ impl Gguf {
             Ok(t)
         };
         let mut out = HashMap::new();
-        out.insert("model.embed_tokens.weight".to_string(), get("token_embd")?.clone());
+        out.insert(crate::EMBED_TOKENS.to_string(), get("token_embd")?.clone());
         out.insert("lm_head.weight".to_string(), get("output")?.clone());
         out.insert("model.norm.weight".to_string(), norm("output_norm", PRE_NORM_OFFSET)?);
         let layers = self.num("block_count")? as usize;
@@ -421,6 +431,23 @@ mod tests {
         let top = t.first_rows(1).unwrap();
         assert_eq!(top.shape, [1, 32]);
         assert_eq!(top.to_f32_vec(), all[..32]);
+    }
+
+    #[test]
+    fn an_in_memory_file_parses_like_a_mapped_one() {
+        let mut b = head(1, 0);
+        tensor(&mut b, &[2], 0);
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b.extend(1.5f32.to_le_bytes());
+        b.extend((-2.0f32).to_le_bytes());
+        let f = write("mem", &b);
+        let mapped = Gguf::open(&f.0).unwrap();
+        let parsed = Gguf::parse(b).unwrap();
+        assert_eq!(parsed.tensors.len(), mapped.tensors.len());
+        assert_eq!(parsed.tensors[0].1.shape, mapped.tensors[0].1.shape);
+        assert_eq!(parsed.tensors[0].1.dtype, mapped.tensors[0].1.dtype);
+        assert_eq!(parsed.tensors[0].1.bytes(), mapped.tensors[0].1.bytes());
+        assert_eq!(parsed.tensors[0].1.to_f32_vec(), [1.5, -2.0]);
     }
 
     #[test]

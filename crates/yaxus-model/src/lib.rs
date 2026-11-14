@@ -200,6 +200,10 @@ pub struct StartInfo {
     pub cached: bool,
 }
 
+/// The embedding table's name in [`Weights`] (the HF checkpoint's; GGUF's `token_embd`
+/// is renamed to it).
+pub const EMBED_TOKENS: &str = "model.embed_tokens.weight";
+
 /// Default KV arena size in tokens and maximum position.
 pub const DEFAULT_KV_TOKENS: usize = 16384;
 pub const DEFAULT_MAX_POS: usize = 8192;
@@ -240,14 +244,20 @@ pub struct Model<B: Backend> {
 impl<B: Backend> Model<B> {
     /// Loads a model from a Hugging Face directory (`config.json` and bf16 safetensors)
     /// or a GGUF file, and allocates its KV arena.
-    pub fn load(path: &Path, mut backend: B, opts: &ModelOptions) -> Result<Self> {
-        let quant = opts.quant;
+    pub fn load(path: &Path, backend: B, opts: &ModelOptions) -> Result<Self> {
         let (cfg, w) = if gguf::is_gguf(path) {
             let g = gguf::Gguf::open(path)?;
             (g.config()?, g.weights()?)
         } else {
             (Config::from_file(path.join("config.json"))?, Weights::open(path)?)
         };
+        Self::from_parts(cfg, w, backend, opts)
+    }
+
+    /// Loads a model from its configuration and tensors (the browser has them from a
+    /// GGUF file in memory, and looks at the tensors before the device is open).
+    pub fn from_parts(cfg: Config, w: Weights, mut backend: B, opts: &ModelOptions) -> Result<Self> {
+        let quant = opts.quant;
         let chunk = 512;
         backend.reserve_activations(&cfg, chunk);
         let (h, d) = (cfg.hidden_size, cfg.head_dim);
@@ -296,7 +306,7 @@ impl<B: Backend> Model<B> {
         let lm_head = backend.load_weight(lm_head_t, quant)?;
         // Last: the embedding table is read only a few rows per pass, so it should not take
         // the fast device memory the weight matrices could use.
-        let embed = backend.load_embedding(w.get_shaped("model.embed_tokens.weight", &[cfg.vocab_size, h])?)?;
+        let embed = backend.load_embedding(w.get_shaped(EMBED_TOKENS, &[cfg.vocab_size, h])?)?;
         let pages = opts.kv_tokens.div_ceil(PAGE);
         let metas: Vec<LayerMeta> = layers.iter().map(|l| l.meta.clone()).collect();
         let kv = backend.new_kv(&cfg, &metas, pages, opts.max_pos)?;

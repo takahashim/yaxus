@@ -221,6 +221,7 @@ pub(crate) fn base_sources(caps: &DeviceCaps, tuning: &Tuning) -> Vec<(String, S
     add("qk_rope".into(), QK_ROPE, &[false, false, false, true, true, true, true, true]);
     add("attention".into(), ATTENTION, &[false, true, true, true, true, true]);
     add("embed".into(), EMBED, &[false, true, true]);
+    add("embed_q4k".into(), &EMBED_Q4K.replace("{LOADER}", W_Q4K), &[false, true, true, true]);
     // (the split attention reduces with subgroup shuffles; without them the per-row
     // kernel takes every pass)
     let sg = caps.subgroups;
@@ -306,7 +307,7 @@ impl Gpu {
         if jobs.is_empty() {
             return;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let n = jobs.len();
         self.compile_all(&jobs);
         if self.diag.compile_log {
@@ -316,6 +317,24 @@ impl Gpu {
 
     /// Compiles `jobs` on all cores and adds them in their order (a cold shader cache
     /// makes a kernel cost a compiler run: on CI's virtual Apple GPUs, ~0.2 s each).
+    #[cfg(target_arch = "wasm32")]
+    fn compile_all(&mut self, jobs: &[Job]) {
+        // WebGPU's device is not `Send`, and the browser has no worker threads here.
+        let compiler = self.dev.compiler(self.compile);
+        let built: Vec<(usize, Kernel)> = jobs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, read_only, source))| {
+                let src = source().replace("{SPAD}", &SCALE_PAD.to_string());
+                (i, compiler.compile(name, &src, read_only))
+            })
+            .collect();
+        for (i, k) in built {
+            self.insert_kernel(jobs[i].0.clone(), k);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn compile_all(&mut self, jobs: &[Job]) {
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(jobs.len()).max(1);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -344,7 +363,7 @@ impl Gpu {
     }
 
     pub(crate) fn build_kernels(&mut self) {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let jobs: Vec<Job> = base_sources(&self.caps, &self.tuning)
             .into_iter()
             .map(|(name, src, read_only)| (name, read_only.to_vec(), Box::new(move || src.clone()) as _))
@@ -361,7 +380,7 @@ impl Gpu {
         if self.kernels.contains_key(&name) {
             return name;
         }
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         self.add_kernel(name.clone(), &source(), read_only);
         // (`precompile` should have covered it; a line here means a stall mid-request)
         if self.diag.compile_log {
@@ -558,6 +577,49 @@ mod tests {
             if let Some(why) = unbounded_loop(src) {
                 panic!("{name}: {why} may not end (the kernels are compiled without loop counters)");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod webgpu {
+    use super::*;
+    use crate::device::{Api, DeviceCaps, DeviceKind, Tuning, Vendor};
+
+    /// The browser's variant of every kernel (push constants as a uniform binding) has
+    /// to parse and pass naga's validator, including the uniform layout rules. This is
+    /// the part that cannot be run without a browser.
+    #[test]
+    fn transformed_kernels_parse_and_validate() {
+        let caps = DeviceCaps {
+            name: "webgpu".into(),
+            api: Api::WebGpu,
+            vendor: Vendor::Other,
+            kind: DeviceKind::Other,
+            f16: true,
+            subgroups: false,
+            coop: false,
+            fast_math: false,
+            msl: false,
+            coop_size: 0,
+            timestamps: false,
+            max_workgroup_storage: 32768,
+        };
+        let tuning = Tuning::for_device(&caps);
+        assert_eq!(tuning.gemm, GemmKind::F32);
+        for (name, src, _) in base_sources(&caps, &tuning) {
+            let src = crate::dev::wgpu::webgpu_source(&src.replace("{SPAD}", &SCALE_PAD.to_string()));
+            assert!(
+                src.contains("@group(0) @binding(15) var<uniform> p: P;"),
+                "{name}: the per-dispatch struct was not turned into a uniform"
+            );
+            let module =
+                naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&src)));
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+            );
+            validator.validate(&module).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
     }
 }
