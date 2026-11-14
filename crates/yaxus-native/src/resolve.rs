@@ -165,7 +165,7 @@ pub fn resolve_draft(spec: &DraftSpec, target: &Path) -> Result<Option<PathBuf>>
     let dir = match spec {
         DraftSpec::None => return Ok(None),
         // The 2-bit GGUF first: its steps are 1.27x faster than the checkpoint's at 4 bits
-        // and about as many of its tokens are accepted (HISTORY.md 11.32).
+        // and about as many of its tokens are accepted (docs/HISTORY.md 11.32).
         DraftSpec::Auto => match resolve_model("0.8b:Q2_K")
             .or_else(|_| resolve_model("pfnet/plamo-3-translate-0.8b"))
             .or_else(|_| resolve_model("0.8b:Q4_K_M"))

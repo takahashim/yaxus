@@ -65,7 +65,7 @@ impl Gemv2 {
 /// Column `k` of step `s` is value `4 k + s`, so a lane's A elements over a chunk are 8
 /// consecutive weights and its B elements one float4 a row. On the M2 a multiply-
 /// accumulate of 8x8 matrices is an `fma` chain over k = 0..7 from the accumulator, bit
-/// for bit (HISTORY.md 12.8), which makes the two kernels agree.
+/// for bit (docs/HISTORY.md 12.8), which makes the two kernels agree.
 ///
 /// Bindings: 0 `y [T][N]`, 1 `x [T][K]`, 2 and 3 the weights (decode layout). Immediates:
 /// N (the intermediate size with `glu`), K, T, first row. Needs K % 32 == 0.

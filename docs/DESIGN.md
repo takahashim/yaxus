@@ -135,8 +135,9 @@ HF `tokenizers` 互換ではなく、PFN 独自実装 (`tokenization_plamo.py`, 
 ```
 yaxus/
   Cargo.toml                 # workspace
-  DESIGN.md                  # 現在の設計 (このファイル)
-  HISTORY.md                 # 開発の経緯
+  docs/
+    DESIGN.md                # 現在の設計 (このファイル)
+    HISTORY.md               # 開発の経緯
   crates/
     yaxus-api/             # サーバとクライアントが共有する JSON の型、HistoryWindow
     yaxus-tokenizer/       # PLaMo トークナイザ (pure Rust、依存最小)
@@ -506,4 +507,4 @@ cargo test --release -p yaxus-backend-gpu --test vs_cpu -- --ignored --test-thre
 - ブラウザ版で WebGPU の subgroup を使えるか (32 レーンを保証できるか)。使えれば `GEMV_T1` とタイル attention が効く。
 - ブラウザ版で、モデルの再選択を省くキャッシュ (OPFS)。
 - 文書を進める手順の置き場所。状態と反応は `DocRun` にあるが、停止時のエンジンの取り消しと、終わったセグメントの次の投入は、それを駆動するループ (CLI とブラウザの `DocRunner`、server の `scheduler`) がそれぞれに書いている。キャンセルを足したとき (経緯 14) に両方へ書き足す形になった。`DocRun` にステップの合間の処理を移し、出力先を trait にして 1 か所にする案がある。ジョブごとの async fn と Driver に作り直す案は、費用に見合わないとして取り下げた (経緯 14)。
-- ブラウザ版で独立した翻訳を並行して走らせること (今は 1 件ずつ)。前提は、ステップ単位の GPU のエラースコープ (複数の要求が同じパスに乗ると、遅れて届くエラーをどの翻訳のものか決められない) と、`&self` でジョブを積む `translate` (wasm-bindgen の `&mut self` を await 中に再入できない)。要件が出るまで保留する。ほかの未決の点は [discussions/async-engine.md](discussions/async-engine.md) の「決めきれていない点」。
+- ブラウザ版で独立した翻訳を並行して走らせること (今は 1 件ずつ)。前提は、ステップ単位の GPU のエラースコープ (複数の要求が同じパスに乗ると、遅れて届くエラーをどの翻訳のものか決められない) と、`&self` でジョブを積む `translate` (wasm-bindgen の `&mut self` を await 中に再入できない)。要件が出るまで保留する。ほかの未決の点は [discussions/async-engine.md](../discussions/async-engine.md) の「決めきれていない点」。

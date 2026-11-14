@@ -27,8 +27,8 @@ Preferred Networks under the PLaMo Community License (see [License](#license)).
 This is a personal project. It is developed and measured on one machine: Ubuntu 24.04 with
 a Radeon 780M (RDNA3 integrated GPU) and Mesa RADV. It also runs on macOS through Metal
 (tested on an Apple M2). Other GPUs should work, but have not been tested. The current
-design is in [DESIGN.md](DESIGN.md), and how it got there, with every measurement, in
-[HISTORY.md](HISTORY.md) (both in Japanese).
+design is in [docs/DESIGN.md](docs/DESIGN.md), and how it got there, with every measurement, in
+[docs/HISTORY.md](docs/HISTORY.md) (both in Japanese).
 
 ## Requirements
 
