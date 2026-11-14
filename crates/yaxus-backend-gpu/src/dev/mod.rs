@@ -143,7 +143,9 @@ impl Dev {
         }
     }
 
-    /// Writes `bytes` into `dst` at `offset`, after everything recorded so far.
+    /// Writes `bytes` into `dst` at `offset`, after everything recorded so far (the start
+    /// check of gemv2 and the test hooks, both native).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn write(&mut self, dst: &Buf, offset: u64, bytes: &[u8]) {
         match self {
             Dev::Wgpu(d) => d.write(dst, offset, bytes),

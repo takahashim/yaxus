@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use yaxus_backend_cpu::CpuBackend;
-use yaxus_model::{Backend, Model, ModelOptions, Quant};
+use yaxus_model::{Model, ModelOptions, Quant, SyncReadback};
 
 fn model_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {

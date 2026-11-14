@@ -21,6 +21,7 @@ impl Gpu {
     /// passes of 8 and 16 rows (simdgroup matrices), on a Q8_0 matrix of varied values.
     /// The matrix kernel relies on the device multiplying 8x8 matrices as an `fma` chain
     /// in order, measured on the M2 only; a device that does not is left without gemv2.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn gemv2_rows_agree(&mut self) -> bool {
         let (n, k, t) = (40, 512, 16);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;

@@ -89,7 +89,7 @@ impl PassMeta {
 /// Compute primitives. Tensors are row-major `[rows, cols]` f32 activations.
 ///
 /// A forward pass starts with `begin_pass`, whose row metadata `embed` and `attention`
-/// then use. Every op may be asynchronous; only `argmax*` and `to_host` synchronize.
+/// then use. Every op may be asynchronous; reading results back is [`SyncReadback`]'s.
 pub trait Backend {
     type Tensor;
     /// A `[N, K]` weight matrix (bf16 or quantized) or a vector.
@@ -166,6 +166,13 @@ pub trait Backend {
     }
     /// The given rows, in order, as a new `[rows.len(), cols]` tensor.
     fn select_rows(&mut self, x: &Self::Tensor, rows: &[usize]) -> Self::Tensor;
+}
+
+/// Reading results back to the host, waiting for the device: the CPU, and the GPU from
+/// native code. WebGPU in a browser cannot block on the GPU (its backend reads back
+/// asynchronously instead), so it has no such impl, and what needs these
+/// ([`Model::generate`], [`Model::score`], the [`Engine`]) does not compile for it.
+pub trait SyncReadback: Backend {
     /// Argmax over the last row.
     fn argmax(&mut self, logits: &Self::Tensor) -> u32 {
         *self.argmax_rows(logits).last().unwrap()
@@ -445,7 +452,9 @@ impl<B: Backend> Model<B> {
         }
         Ok(logits.unwrap())
     }
+}
 
+impl<B: SyncReadback> Model<B> {
     /// Greedy generation of one request directly on the model, without the engine's
     /// scheduling, speculation or caches: the reference the engine's outputs are tested
     /// against. `on_token` returns `false` to stop early.
@@ -512,7 +521,7 @@ pub fn token_scores(logits: &[f32], vocab: usize, targets: &[u32]) -> Vec<TokenS
 /// f32s for PLaMo 3, so 64 rows are 27 MB).
 const SCORE_ROWS: usize = 64;
 
-impl<B: Backend> Model<B> {
+impl<B: SyncReadback> Model<B> {
     /// How likely `forced` is as the continuation of `prompt`: for each of its tokens,
     /// its log-probability given the prompt and the tokens before it, and the model's own
     /// choice there (teacher forcing: the model reads `forced` rather than its own
@@ -605,6 +614,9 @@ pub(crate) mod testing {
         fn select_rows(&mut self, _: &usize, rows: &[usize]) -> usize {
             rows.len()
         }
+    }
+
+    impl SyncReadback for NullBackend {
         fn argmax_rows(&mut self, x: &usize) -> Vec<u32> {
             vec![0; *x]
         }

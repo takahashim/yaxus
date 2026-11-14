@@ -8,7 +8,7 @@ use std::time::Instant;
 use serde_json::Value;
 use yaxus_backend_cpu::CpuBackend;
 use yaxus_backend_gpu::GpuBackend;
-use yaxus_model::{Backend, Engine, EngineConfig, Event, Generator, Model, ModelOptions, Quant, Request};
+use yaxus_model::{Backend, Engine, EngineConfig, Event, Generator, Model, ModelOptions, Quant, Request, SyncReadback};
 
 fn model_dir() -> PathBuf {
     if let Ok(d) = std::env::var("YAXUS_MODEL_DIR") {

@@ -99,13 +99,8 @@ impl Gpu {
         out
     }
 
-    /// A synchronous read on the web would deadlock (WebGPU polls itself); the browser
-    /// path goes through this instead.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn read(&mut self, _src: &Buf, _offset: u64, _size: u64) -> Vec<u8> {
-        panic!("synchronous read on wasm; use read_async")
-    }
-
+    /// The browser's read-back: a synchronous one would never return (WebGPU polls
+    /// itself), so there is none on wasm, and `SyncReadback` is native only.
     #[cfg(target_arch = "wasm32")]
     pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Result<Vec<u8>> {
         self.pending_flops = 0.0;

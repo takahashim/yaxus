@@ -5,7 +5,7 @@
 use anyhow::Result;
 use half::f16;
 use rayon::prelude::*;
-use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, TensorRef, bf16_to_f32};
+use yaxus_model::{Backend, Config, LayerMeta, PAGE, PassMeta, Quant, SyncReadback, TensorRef, bf16_to_f32};
 
 use yaxus_model::quant::Q8_BLOCK;
 
@@ -550,7 +550,9 @@ impl Backend for CpuBackend {
         let data = rows.iter().flat_map(|&r| x.row(r).iter().copied()).collect();
         Tensor { data, rows: rows.len(), cols: x.cols }
     }
+}
 
+impl SyncReadback for CpuBackend {
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
         (0..logits.rows).map(|r| argmax(logits.row(r))).collect()
     }

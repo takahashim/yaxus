@@ -32,7 +32,7 @@ use anyhow::Result;
 use self::cache::ResponseCache;
 use self::hint::HintCursor;
 use self::tuning::{DraftTuner, StreamTuning};
-use crate::{Backend, Model, SeqId, StartInfo};
+use crate::{Backend, Model, SeqId, StartInfo, SyncReadback};
 
 pub type ReqId = u64;
 
@@ -173,7 +173,7 @@ pub struct Engine<B: Backend> {
     end_token: Option<u32>,
 }
 
-impl<B: Backend> Engine<B> {
+impl<B: SyncReadback> Engine<B> {
     /// `draft` must share `target`'s backend context when given.
     pub fn new(target: Model<B>, draft: Option<Model<B>>, cfg: EngineConfig) -> Result<Self> {
         if let Some(d) = &draft {
@@ -670,7 +670,7 @@ pub trait Generator: Send {
     }
 }
 
-impl<B: Backend + Send> Generator for Engine<B>
+impl<B: SyncReadback + Send> Generator for Engine<B>
 where
     B::Weight: Send,
     B::Kv: Send,

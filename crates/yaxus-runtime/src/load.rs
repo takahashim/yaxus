@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::Result;
 use yaxus_backend_cpu::CpuBackend;
 use yaxus_backend_gpu::{Gemv, GpuBackend};
-use yaxus_model::{Backend, Engine, Generator, Model, ModelOptions, Quant};
+use yaxus_model::{Engine, Generator, Model, ModelOptions, Quant, SyncReadback};
 use yaxus_tokenizer::Tokenizer;
 
 use crate::options::{BackendKind, DraftOptions, LoadOptions};
@@ -76,7 +76,7 @@ fn load_engine<B>(
     warm: impl Fn(&B),
 ) -> Result<Box<dyn Generator>>
 where
-    B: Backend + Send + 'static,
+    B: SyncReadback + Send + 'static,
     B::Weight: Send,
     B::Kv: Send,
 {

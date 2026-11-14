@@ -191,12 +191,15 @@ impl Gpu {
         y
     }
 
+    // The synchronous read-backs (native; the browser awaits `read_async` instead).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
         self.argmax_prob_rows(logits).into_iter().map(|(i, _)| i).collect()
     }
 
     // (`&mut`: reading back submits the recorded work)
     #[allow(clippy::wrong_self_convention)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_host(&mut self, x: &Tensor) -> Vec<f32> {
         let size = (x.rows * x.cols * 4) as u64;
         let b = self.read(&x.buf().clone(), 0, size);
@@ -204,6 +207,7 @@ impl Gpu {
     }
 
     /// Greedy token and its softmax probability for every row (two-stage reduction).
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn argmax_prob_rows(&mut self, logits: &Tensor) -> Vec<(u32, f32)> {
         if logits.rows > ARGMAX_ROWS {
             // More streams than one dispatch covers (--max-streams has no upper bound).

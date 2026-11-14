@@ -34,7 +34,7 @@ mod ops;
 mod plan;
 mod profile;
 mod shaders;
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "test-hooks", not(target_arch = "wasm32")))]
 mod testing;
 mod weights;
 
@@ -42,6 +42,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+#[cfg(not(target_arch = "wasm32"))]
+use yaxus_model::SyncReadback;
 use yaxus_model::{Backend, Config, LayerMeta, PassMeta, Quant, TensorRef};
 
 pub use dev::Buf;
@@ -280,6 +282,8 @@ impl Gpu {
             diag,
         };
         b.build_kernels();
+        // (MSL is native only: WebGPU takes WGSL)
+        #[cfg(not(target_arch = "wasm32"))]
         if b.tuning.apple.gemv2 && b.caps.msl && !b.gemv2_rows_agree() {
             tracing::warn!("gemv2: rows differ between its kernels on this device; using gemv_f32");
             b.tuning.apple.gemv2 = false;
@@ -514,6 +518,11 @@ impl Backend for GpuBackend {
     fn select_rows(&mut self, x: &Tensor, rows: &[usize]) -> Tensor {
         self.g().select_rows(x, rows)
     }
+}
+
+/// Native only: the browser reads back asynchronously (`argmax_async`).
+#[cfg(not(target_arch = "wasm32"))]
+impl SyncReadback for GpuBackend {
     fn argmax_rows(&mut self, logits: &Tensor) -> Vec<u32> {
         self.g().argmax_rows(logits)
     }
