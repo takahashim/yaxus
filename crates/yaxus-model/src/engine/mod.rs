@@ -175,6 +175,8 @@ pub struct Engine<B: Backend> {
     /// The stop token that ended the last stopped request: hints (outputs without their
     /// stop token) are extended by it, so the end of an output is verified with the hint.
     end_token: Option<u32>,
+    /// Events of requests cancelled while they waited, delivered at the next step.
+    pending: Vec<Event>,
 }
 
 impl<B: AsyncReadback> Engine<B> {
@@ -208,6 +210,7 @@ impl<B: AsyncReadback> Engine<B> {
             cache: ResponseCache::default(),
             tuner: DraftTuner::default(),
             end_token: None,
+            pending: Vec::new(),
         })
     }
 
@@ -267,7 +270,28 @@ impl<B: AsyncReadback> Engine<B> {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.waiting.is_empty() && self.streams.is_empty()
+        self.waiting.is_empty() && self.streams.is_empty() && self.pending.is_empty()
+    }
+
+    /// Cancels request `id`; `false` if it is not waiting or running (it has ended, or
+    /// never existed). It ends with `Event::Done { finish: Cancelled }` at the next
+    /// [`step_async`](Engine::step_async), whichever state it is in: a waiting request
+    /// never starts, and a running one is not given another pass (its KV is kept for
+    /// prefix reuse, as for one that ended on its own). Callable only between steps,
+    /// which the borrow of a step in progress guarantees.
+    pub fn cancel(&mut self, id: ReqId) -> bool {
+        if let Some(at) = self.waiting.iter().position(|r| r.id == id) {
+            self.waiting.remove(at);
+            self.pending.push(Event::Done { id, finish: Finish::Cancelled, generated: 0, start: StartInfo::default() });
+            return true;
+        }
+        match self.streams.iter_mut().find(|s| s.req.id == id && s.finish.is_none() && s.error.is_none()) {
+            Some(s) => {
+                s.finish = Some(Finish::Cancelled);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drops every request, waiting or running, without events, and frees their KV (for
@@ -295,9 +319,16 @@ impl<B: AsyncReadback> Engine<B> {
     /// The step is never dropped half-way: its pass has already changed the KV by the
     /// time the read-back is awaited. Cancel a request through `emit`.
     pub async fn step_async(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        // The ends of requests cancelled since the last step come first, so that a
+        // cancelled stream is not given another pass and its pages are free for admission.
+        let cancelled = !self.pending.is_empty() || self.streams.iter().any(|s| s.finish.is_some());
+        for event in std::mem::take(&mut self.pending) {
+            emit(event);
+        }
+        self.sweep(emit);
         self.admit(emit);
         if self.streams.is_empty() {
-            return Ok(false);
+            return Ok(cancelled);
         }
         let decoding: Vec<usize> =
             (0..self.streams.len()).filter(|&i| matches!(self.streams[i].phase, Phase::Decode { .. })).collect();
@@ -686,6 +717,11 @@ pub trait Generator {
     /// See [`Engine::step_async`].
     fn step_async<'a>(&'a mut self, emit: &'a mut dyn FnMut(Event) -> bool) -> LocalBoxFuture<'a, Result<bool>>;
     fn fresh_id(&mut self) -> ReqId;
+    /// See [`Engine::cancel`]. An engine that cannot cancel says `false`: the request
+    /// then ends when its next token is refused, as before.
+    fn cancel(&mut self, _id: ReqId) -> bool {
+        false
+    }
     fn waiting(&self) -> usize;
     fn active(&self) -> usize;
     /// See [`Engine::abort_all`].
@@ -808,6 +844,9 @@ impl<B: AsyncReadback> Generator for Engine<B> {
     fn fresh_id(&mut self) -> ReqId {
         Engine::fresh_id(self)
     }
+    fn cancel(&mut self, id: ReqId) -> bool {
+        Engine::cancel(self, id)
+    }
     fn waiting(&self) -> usize {
         Engine::waiting(self)
     }
@@ -879,6 +918,47 @@ mod tests {
     fn request(id: ReqId, prompt_len: usize, max_new: usize) -> Request {
         // Distinct prompts, so that no prefix is shared and the KV needs are plain.
         Request::new(id, (0..prompt_len as u32).map(|t| t + id as u32 * 1000).collect(), max_new, vec![])
+    }
+
+    #[test]
+    fn a_waiting_request_is_cancelled_before_it_starts() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 3));
+        eng.submit(request(2, 130, 3));
+        eng.step(&mut |_| true).unwrap();
+        assert_eq!((eng.active(), eng.waiting()), (1, 1));
+        assert!(eng.cancel(2), "it waits");
+        assert!(!eng.cancel(2), "and only once");
+        assert!(!eng.cancel(99), "an unknown request");
+        let ended = run_all(&mut eng);
+        assert!(ended.contains(&(2, Ok(Finish::Cancelled))), "{ended:?}");
+        assert!(ended.contains(&(1, Ok(Finish::Length))), "the other runs on: {ended:?}");
+        assert!(eng.is_idle());
+    }
+
+    #[test]
+    fn a_running_request_is_cancelled_and_its_pages_serve_the_next() {
+        let mut eng = Engine::new(crate::testing::model(2), None, EngineConfig::default()).unwrap();
+        eng.submit(request(1, 130, 120)); // would run for 120 more steps
+        eng.submit(request(2, 130, 3)); // waits for 1's pages
+        eng.step(&mut |_| true).unwrap();
+        assert!(eng.cancel(1));
+        let mut tokens_of_1_after = 0;
+        let mut ended = Vec::new();
+        while eng
+            .step(&mut |ev| {
+                match ev {
+                    Event::Token { id: 1, .. } => tokens_of_1_after += 1,
+                    Event::Done { id, finish, .. } => ended.push((id, finish)),
+                    _ => {}
+                }
+                true
+            })
+            .unwrap()
+        {}
+        assert_eq!(tokens_of_1_after, 0, "a cancelled request is not given another pass");
+        assert_eq!(ended, [(1, Finish::Cancelled), (2, Finish::Length)]);
+        assert!(eng.is_idle());
     }
 
     #[test]

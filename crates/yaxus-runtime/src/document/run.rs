@@ -183,9 +183,25 @@ pub async fn run_document_async(
     memory: &mut Memory,
     on: &mut dyn FnMut(DocEvent) -> bool,
 ) -> Result<DocJob, DocRunError> {
+    run_document_until(engine, tok, job, memory, on, &mut || false).await
+}
+
+/// [`run_document_async`] that also asks `cancelled` between the engine's steps, and
+/// stops the document when it says `true`. Stopping, whichever way it comes about,
+/// cancels the segments that are waiting or running in the engine at once, rather than
+/// when they next produce text.
+pub async fn run_document_until(
+    engine: &mut dyn Generator,
+    tok: &Tokenizer,
+    job: DocJob,
+    memory: &mut Memory,
+    on: &mut dyn FnMut(DocEvent) -> bool,
+    cancelled: &mut dyn FnMut() -> bool,
+) -> Result<DocJob, DocRunError> {
     let mut session = Session::new(engine, tok, memory);
     let mut run = DocRun::new(job);
     let mut failure: Option<String> = None;
+    let mut cancelled_all = false;
     if let Err(e) = run.submit_ready(&mut session, |s| s) {
         failure = Some(e.to_string());
     }
@@ -219,6 +235,13 @@ pub async fn run_document_async(
             })
             .await
             .map_err(DocRunError::Engine)?;
+        if run.accepts() && cancelled() {
+            run.stop();
+        }
+        if !run.accepts() && !cancelled_all {
+            cancelled_all = true;
+            session.cancel_where(|_| true);
+        }
         if let Err(e) = run.submit_ready(&mut session, |s| s) {
             failure.get_or_insert(e.to_string());
         }

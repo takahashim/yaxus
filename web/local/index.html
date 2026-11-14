@@ -107,6 +107,7 @@ button:disabled { opacity: .45; cursor: default; }
       </select>
       <span class="spacer grow"></span>
       <button id="sample">例文を入れる</button>
+      <button id="stop" disabled>中止</button>
       <button id="translate" class="primary" disabled>翻訳する</button>
     </div>
     <textarea id="source" rows="5" placeholder="The meeting has been moved to next Monday." disabled></textarea>
@@ -126,6 +127,7 @@ const statusEl = $('status');
 const fileEl = $('file');
 const loadEl = $('load');
 const translateEl = $('translate');
+const stopEl = $('stop');
 const sourceEl = $('source');
 const outputEl = $('output');
 const statsEl = $('stats');
@@ -149,6 +151,8 @@ let worker = null;
 let file = null;
 let ready = false;
 let busy = false;
+// A translation (not a load) is in progress: it can be stopped.
+let translating = false;
 // The handler of the request in flight: {onText, resolve, reject}.
 let request = null;
 
@@ -166,6 +170,7 @@ const setBusy = (b) => {
   targetEl.disabled = b;
   formEl.disabled = b || targetEl.value !== 'ja';
   chainsEl.disabled = b;
+  stopEl.disabled = !(b && translating);
 };
 const fmtMB = (n) => (n / 1e6).toFixed(0) + ' MB';
 
@@ -301,6 +306,7 @@ translateEl.addEventListener('click', async () => {
   const text = sourceEl.value.trim();
   if (!text) { setStatus('訳す文章を入力してください。', true); return; }
   try {
+    translating = true;
     setBusy(true);
     outputEl.textContent = '';
     statsEl.textContent = '';
@@ -335,16 +341,27 @@ translateEl.addEventListener('click', async () => {
     statsEl.textContent =
       `prompt ${stats.promptTokens} tokens${stats.reusedTokens ? ` (${stats.reusedTokens} 再利用)` : ''} · ${times} · ` +
       `${stats.tokensPerSecond.toFixed(1)} tok/s · ${[...outputEl.textContent].length} 文字`;
-    if (stats.stop === 'limit') {
+    if (stats.cancelled) {
+      statsEl.textContent += '（中止しました。ここまでの訳です）';
+    } else if (stats.stop === 'limit') {
       statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';
     }
-    setStatus('完了');
+    setStatus(stats.cancelled ? '中止しました' : '完了');
   } catch (e) {
     // (after an error of the GPU, `finish` has started a new worker without a model)
     fail(e);
   } finally {
+    translating = false;
     setBusy(false);
   }
+});
+
+// The worker stops between the engine's steps: the translation ends with what it has so far.
+stopEl.addEventListener('click', () => {
+  if (!translating) return;
+  stopEl.disabled = true;
+  setStatus('中止しています…');
+  worker.postMessage({ type: 'cancel' });
 });
 
 sampleEl.addEventListener('click', () => {

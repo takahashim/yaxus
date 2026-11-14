@@ -13,7 +13,7 @@ use crate::prompt::Prompt;
 mod run;
 mod schedule;
 
-pub use run::{DocEvent, DocRun, DocRunError, SegmentEnd, run_document, run_document_async};
+pub use run::{DocEvent, DocRun, DocRunError, SegmentEnd, run_document, run_document_async, run_document_until};
 use schedule::ChainSchedule;
 
 /// Why a document cannot be translated: an option every segment shares, or one
@@ -348,6 +348,13 @@ mod tests {
         cancelled: usize,
         /// The request with this id fails at its first step.
         fail: Option<ReqId>,
+        /// Whether it can cancel a request at once (as the real engine); else a request is
+        /// cancelled only when its next token is refused.
+        cancels: bool,
+        /// Requests cancelled by `cancel`, which end at the next step.
+        to_cancel: Vec<ReqId>,
+        /// How many requests ended cancelled through `cancel`.
+        cancelled_at_once: usize,
     }
 
     impl Generator for FakeEngine {
@@ -366,6 +373,14 @@ mod tests {
         fn fresh_id(&mut self) -> ReqId {
             self.next_id += 1;
             self.next_id
+        }
+        fn cancel(&mut self, id: ReqId) -> bool {
+            let Some(at) = self.running.iter().position(|&(i, _)| i == id).filter(|_| self.cancels) else {
+                return false;
+            };
+            self.running.remove(at);
+            self.to_cancel.push(id);
+            true
         }
         fn waiting(&self) -> usize {
             0
@@ -392,8 +407,12 @@ mod tests {
 
     impl yaxus_model::SyncGenerator for FakeEngine {
         fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+            for id in std::mem::take(&mut self.to_cancel) {
+                self.cancelled_at_once += 1;
+                emit(Event::Done { id, finish: Finish::Cancelled, generated: 0, start: Default::default() });
+            }
             if self.running.is_empty() {
-                return Ok(false);
+                return Ok(self.cancelled_at_once > 0);
             }
             let mut keep = Vec::new();
             for (id, n) in std::mem::take(&mut self.running) {
@@ -482,6 +501,59 @@ mod tests {
         done.sort();
         assert_eq!(done, [0, 1, 2, 3, 4]);
         assert_eq!((engine.submitted, engine.cancelled), (5, 0));
+    }
+
+    #[test]
+    fn a_stopped_document_leaves_nothing_in_flight() {
+        let (tok, mut engine) = fake(50);
+        engine.cancels = true;
+        let segs: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        let mut memory = Memory::new(8);
+        let mut texts = 0;
+        // Four chains: four segments run side by side. The sink stops at the first text.
+        let job = run_document(&mut engine, &tok, DocJob::new(segs, opts(4, 1000)), &mut memory, &mut |ev| {
+            texts += usize::from(matches!(ev, DocEvent::Delta { .. }));
+            false
+        })
+        .unwrap();
+        assert!(!job.is_done());
+        assert_eq!(engine.submitted, 4, "nothing new is started");
+        assert_eq!(engine.cancelled + engine.cancelled_at_once, 4, "each of the four ended cancelled");
+        assert!(engine.running.is_empty());
+        assert_eq!(texts, 1, "no text after the sink said no");
+    }
+
+    #[test]
+    fn an_outside_cancel_stops_the_document_between_steps() {
+        let (tok, mut engine) = fake(50);
+        engine.cancels = true;
+        let segs: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        let mut memory = Memory::new(8);
+        let mut steps = 0;
+        let mut texts = 0;
+        let job = yaxus_model::poll_once(run_document_until(
+            &mut engine,
+            &tok,
+            DocJob::new(segs, opts(4, 1000)),
+            &mut memory,
+            &mut |ev| {
+                texts += usize::from(matches!(ev, DocEvent::Delta { .. }));
+                true
+            },
+            &mut || {
+                steps += 1;
+                steps >= 3 // asked after each step: the third step is the last
+            },
+        ))
+        .unwrap();
+        assert!(!job.is_done());
+        assert_eq!(texts, 4 * 3, "four segments for three steps");
+        assert_eq!(engine.submitted, 4);
+        assert_eq!(
+            engine.cancelled_at_once, 4,
+            "the four in flight were cancelled in the engine, not at their next text"
+        );
+        assert!(engine.running.is_empty(), "everything in flight ended");
     }
 
     #[test]

@@ -22,7 +22,7 @@ use yaxus_backend_gpu::GpuBackend;
 use yaxus_model::{Engine, EngineConfig, Finish, Model, ModelOptions, Quant, gguf::Gguf};
 use yaxus_pfml::{Form, TranslationRequest, segments::split_for_context};
 use yaxus_runtime::document::{
-    DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, auto_chains, run_document_async,
+    DocEvent, DocJob, DocOptions, DocRunError, HistoryRules, auto_chains, run_document_until,
 };
 use yaxus_runtime::memory::Memory;
 use yaxus_tokenizer::{TokenKind, Tokenizer};
@@ -251,16 +251,16 @@ impl Translator {
     /// output out: for each segment, the separator that goes before its text (a blank line
     /// after a paragraph, a space or nothing between sentences). `on_text` receives
     /// `(segment, text)` as the text is produced: the text of different segments may
-    /// interleave, so the page keeps each segment's text apart. `on_progress` gets
+    /// interleave, so the page keeps each segment's text apart. `cancelled` is asked
+    /// between the engine's steps: once it says true, the translation stops (what it has
+    /// produced stays shown) and the result says so. `progress` (optional) gets
     /// `(segments_done, segments_total)`.
     pub async fn translate(
         &mut self,
         text: String,
         target: String,
         form: Option<String>,
-        on_plan: Function,
-        on_text: Function,
-        on_progress: Option<Function>,
+        callbacks: &PageCallbacks,
     ) -> Result<Stats, JsError> {
         if self.broken {
             return Err(JsError::new("the GPU failed earlier; load the model again"));
@@ -269,8 +269,10 @@ impl Translator {
         // error WebGPU reports late fails this translation, not the next one (`Fault`
         // and the read-backs only see what has arrived by then).
         let watch = self.engine.backend().watch_errors();
-        let callbacks = Callbacks { plan: &on_plan, text: &on_text, progress: on_progress.as_ref() };
-        let result = self.translate_inner(&text, &target, form.as_deref(), &callbacks).await;
+        let (plan, text_fn, cancelled, progress) =
+            (callbacks.plan(), callbacks.text(), callbacks.cancelled(), callbacks.progress());
+        let hooks = Callbacks { plan: &plan, text: &text_fn, cancelled: &cancelled, progress: progress.as_ref() };
+        let result = self.translate_inner(&text, &target, form.as_deref(), &hooks).await;
         let scope = watch.finish().await;
         match (result, scope) {
             (Err(Failure::Device(e)), _) => {
@@ -346,31 +348,46 @@ impl Translator {
 
         // The page keeps no translation memory: a repeated translation is computed again.
         let mut memory = Memory::new(0);
-        let result = run_document_async(&mut self.engine, &self.tokenizer, job, &mut memory, &mut |event| {
-            match event {
-                DocEvent::Delta { segment, text } => {
-                    let sent =
-                        page.text.call2(&JsValue::NULL, &JsValue::from_f64(segment as f64), &JsValue::from_str(text));
-                    if let Err(e) = sent {
-                        write_failure = Some(request_err(format!("on_text callback failed: {e:?}")));
-                        return false;
+        let mut was_cancelled = false;
+        let result = run_document_until(
+            &mut self.engine,
+            &self.tokenizer,
+            job,
+            &mut memory,
+            &mut |event| {
+                match event {
+                    DocEvent::Delta { segment, text } => {
+                        let sent = page.text.call2(
+                            &JsValue::NULL,
+                            &JsValue::from_f64(segment as f64),
+                            &JsValue::from_str(text),
+                        );
+                        if let Err(e) = sent {
+                            write_failure = Some(request_err(format!("on_text callback failed: {e:?}")));
+                            return false;
+                        }
+                    }
+                    DocEvent::SegmentDone(end) => {
+                        // As the session measured them: the prompt's pass ends with the first
+                        // token, until then the GPU has only been given the work.
+                        prefill_ms += end.prefill.as_secs_f64() * 1e3;
+                        decode_ms += end.decode.as_secs_f64() * 1e3;
+                        prompt_tokens += end.prompt_tokens as u32;
+                        reused_tokens += end.reused as u32;
+                        output_tokens += end.generated as u32;
+                        last_max_new = MAX_NEW_TOKENS.min(MAX_CONTEXT.saturating_sub(end.prompt_tokens)).max(1) as u32;
+                        any_limit |= end.finish == Finish::Length;
+                        progress(end.segment + 1);
                     }
                 }
-                DocEvent::SegmentDone(end) => {
-                    // As the session measured them: the prompt's pass ends with the first
-                    // token, until then the GPU has only been given the work.
-                    prefill_ms += end.prefill.as_secs_f64() * 1e3;
-                    decode_ms += end.decode.as_secs_f64() * 1e3;
-                    prompt_tokens += end.prompt_tokens as u32;
-                    reused_tokens += end.reused as u32;
-                    output_tokens += end.generated as u32;
-                    last_max_new = MAX_NEW_TOKENS.min(MAX_CONTEXT.saturating_sub(end.prompt_tokens)).max(1) as u32;
-                    any_limit |= end.finish == Finish::Length;
-                    progress(end.segment + 1);
-                }
-            }
-            true
-        })
+                true
+            },
+            &mut || {
+                let yes = page.cancelled.call0(&JsValue::NULL).map(|v| v.is_truthy()).unwrap_or(false);
+                was_cancelled |= yes;
+                yes
+            },
+        )
         .await;
         if let Some(e) = write_failure {
             return Err(e);
@@ -388,6 +405,7 @@ impl Translator {
             segments: total as u32,
             stop: (if any_limit { "limit" } else { "tag" }).into(),
             elapsed_ms: started.elapsed().as_secs_f64() * 1e3,
+            cancelled: was_cancelled,
             reused_tokens,
             prefill_ms,
             decode_ms,
@@ -395,10 +413,25 @@ impl Translator {
     }
 }
 
-/// What the page gave `translate`.
+/// The functions the page gives `translate`, as one object: `{plan, text, cancelled, progress}`.
+#[wasm_bindgen]
+extern "C" {
+    pub type PageCallbacks;
+    #[wasm_bindgen(method, getter)]
+    fn plan(this: &PageCallbacks) -> Function;
+    #[wasm_bindgen(method, getter)]
+    fn text(this: &PageCallbacks) -> Function;
+    #[wasm_bindgen(method, getter)]
+    fn cancelled(this: &PageCallbacks) -> Function;
+    #[wasm_bindgen(method, getter)]
+    fn progress(this: &PageCallbacks) -> Option<Function>;
+}
+
+/// What the page gave `translate`, unpacked.
 struct Callbacks<'a> {
     plan: &'a Function,
     text: &'a Function,
+    cancelled: &'a Function,
     progress: Option<&'a Function>,
 }
 
@@ -412,6 +445,8 @@ pub struct Stats {
     stop: String,
     /// The translation from start to end (segments translated side by side overlap).
     elapsed_ms: f64,
+    /// Stopped by the page before it was done.
+    cancelled: bool,
     /// Prompt tokens served from the KV of earlier segments.
     reused_tokens: u32,
     prefill_ms: f64,
@@ -453,6 +488,12 @@ impl Stats {
     #[wasm_bindgen(getter)]
     pub fn reused_tokens(&self) -> u32 {
         self.reused_tokens
+    }
+
+    /// The translation was stopped by the page: what was produced is partial.
+    #[wasm_bindgen(getter)]
+    pub fn cancelled(&self) -> bool {
+        self.cancelled
     }
 
     /// Time from the start to the end of the translation.

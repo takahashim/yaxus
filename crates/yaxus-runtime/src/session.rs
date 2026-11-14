@@ -122,6 +122,14 @@ impl<'a, T> Session<'a, T> {
         engine.step_async(&mut |ev| on_event(live, tok, memory, ev, on)).await
     }
 
+    /// Cancels the requests whose tag `pred` accepts, waiting or running, in the engine
+    /// too: each ends at the next step as `Update::Done` with [`Finish::Cancelled`].
+    /// Returns how many were cancelled.
+    pub fn cancel_where(&mut self, mut pred: impl FnMut(&T) -> bool) -> usize {
+        let ids: Vec<ReqId> = self.live.iter().filter(|(_, l)| pred(&l.tag)).map(|(id, _)| *id).collect();
+        ids.into_iter().filter(|&id| self.engine.cancel(id)).count()
+    }
+
     /// No request is in flight.
     pub fn is_idle(&self) -> bool {
         self.live.is_empty()

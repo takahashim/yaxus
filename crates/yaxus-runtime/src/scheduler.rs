@@ -141,6 +141,7 @@ pub async fn run(engine: &mut dyn Generator, tok: &Tokenizer, memory: &mut Memor
         if session.is_idle() {
             continue;
         }
+        cancel_abandoned(&mut session, &mut docs);
         let step = AssertUnwindSafe(session.step_async(&mut |u| handle(u, &mut docs))).catch_unwind().await;
         let failure = match step {
             Ok(Ok(_)) => None,
@@ -160,6 +161,25 @@ pub async fn run(engine: &mut dyn Generator, tok: &Tokenizer, memory: &mut Memor
             submit_ready(key, &mut session, &mut docs);
         }
     }
+}
+
+/// Cancels, in the engine, the requests whose client has gone or whose document has
+/// stopped: the ones still waiting too, which would otherwise start and be cancelled at
+/// their first text.
+fn cancel_abandoned(session: &mut Session<Owner>, docs: &mut Docs) {
+    let mut gone = Vec::new();
+    for (key, d) in docs.docs.iter_mut() {
+        if d.events.is_closed() {
+            d.run.stop();
+        }
+        if !d.run.accepts() {
+            gone.push(*key);
+        }
+    }
+    session.cancel_where(|owner| match owner {
+        Owner::Single { events, .. } => events.is_closed(),
+        Owner::Doc { key, .. } => gone.contains(key),
+    });
 }
 
 /// Tells the clients of the requests in flight and of every document that they failed.

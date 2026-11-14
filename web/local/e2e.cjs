@@ -118,7 +118,7 @@ const settled = (page) =>
   page.waitForFunction(
     () => {
       const s = document.querySelector('#status');
-      return /準備できました|^完了$/.test(s.textContent) || s.classList.contains('err');
+      return /準備できました|^完了$|^中止しました$/.test(s.textContent) || s.classList.contains('err');
     },
     null,
     { timeout: 600_000 },
@@ -227,6 +227,21 @@ async function translate(page, c) {
       check(`${label}: the document is translated in full`, !s.err && parts.length === 12 && parts.every((p) => p.trim()) && side, s.stats);
     }
     await page.locator('#chains').selectOption('1');
+
+    // A stop: the translation ends with what it has, soon after, and the model is still there.
+    await page.locator('#chains').selectOption('0');
+    await page.locator('#target').selectOption('ja');
+    // (a long one: 36 paragraphs, about 3,500 characters when done)
+    await page.locator('#source').fill([CASES[4].text, CASES[4].text, CASES[4].text].join('\n\n'));
+    await page.locator('#translate').click();
+    await page.waitForFunction(() => document.querySelector('#output').textContent.length > 0, null, { timeout: 120_000 });
+    const stopAt = Date.now();
+    await page.locator('#stop').click();
+    await settled(page);
+    s = await state(page);
+    check('a stop ends the translation with what it had', !s.err && s.status === '中止しました' && /中止/.test(s.stats) && s.out.length > 0 && s.out.length < 3000, `${s.status} (${Date.now() - stopAt} ms) ${s.out.length} chars`);
+    s = await translate(page, CASES[0]);
+    check('after a stop the model translates again', !s.err && s.out === CASES[0].want, s.out);
 
     // Segments may be translated side by side: the text of each is kept apart and laid out in order.
     const laid = await page.evaluate(async () => {

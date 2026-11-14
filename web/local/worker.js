@@ -3,6 +3,7 @@
 // all) after an error it cannot trust, or before loading another file.
 //
 // Messages in:  {type: 'load', file}  {type: 'translate', text, target, form, chains}
+//               {type: 'cancel'}  (stops the translation in progress)
 // Messages out: {type: 'status', message}  {type: 'read', done, total}
 //               {type: 'ready', info}  {type: 'progress', done, total}
 //               {type: 'plan', breaks}  {type: 'text', segment, text}
@@ -18,7 +19,15 @@ let queue = Promise.resolve();
 const post = (msg) => postMessage(msg);
 const status = (message) => post({ type: 'status', message });
 
+// A stop asked for while a translation runs is not queued behind it: the translation asks
+// `cancelled` between its steps.
+let cancelled = false;
+
 onmessage = ({ data }) => {
+  if (data.type === 'cancel') {
+    cancelled = true;
+    return;
+  }
   queue = queue.then(() => handle(data));
 };
 
@@ -87,15 +96,14 @@ async function translate({ text, target, form, chains, neighbor }) {
   if (!translator) throw new Error('モデルが読み込まれていません。');
   // 0 is the automatic number of chains.
   translator.set_chains(chains ?? 1);
+  cancelled = false;
   translator.set_neighbor_context(!!neighbor);
-  const stats = await translator.translate(
-    text,
-    target,
-    form || null,
-    (breaks) => post({ type: 'plan', breaks: Array.from(breaks) }),
-    (segment, text) => post({ type: 'text', segment, text }),
-    (done, total) => post({ type: 'progress', done, total }),
-  );
+  const stats = await translator.translate(text, target, form || null, {
+    plan: (breaks) => post({ type: 'plan', breaks: Array.from(breaks) }),
+    text: (segment, text) => post({ type: 'text', segment, text }),
+    cancelled: () => cancelled,
+    progress: (done, total) => post({ type: 'progress', done, total }),
+  });
   const plain = {
     promptTokens: stats.prompt_tokens,
     outputTokens: stats.output_tokens,
@@ -103,6 +111,7 @@ async function translate({ text, target, form, chains, neighbor }) {
     segments: stats.segments,
     stop: stats.stop,
     reusedTokens: stats.reused_tokens,
+    cancelled: stats.cancelled,
     elapsedMs: stats.elapsed_ms,
     prefillMs: stats.prefill_ms,
     decodeMs: stats.decode_ms,
