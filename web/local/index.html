@@ -285,7 +285,14 @@ translateEl.addEventListener('click', async () => {
     let stats;
     try {
       ({ stats } = await send(
-        { type: 'translate', text, target: targetEl.value, form: targetEl.value === 'ja' ? formEl.value : '' },
+        {
+          type: 'translate',
+          text,
+          target: targetEl.value,
+          form: targetEl.value === 'ja' ? formEl.value : '',
+          // `?chains=N` (1 to 4): segments of a document translated side by side.
+          chains: Number(new URLSearchParams(location.search).get('chains')) || 1,
+        },
         { onPlan: (breaks) => layout.plan(breaks), onText: (segment, text) => layout.add(segment, text) },
       ));
     } finally {
@@ -293,9 +300,14 @@ translateEl.addEventListener('click', async () => {
     }
     const stop = stats.stop === 'tag' ? '停止トークン' : stats.stop === 'eos' ? 'EOS' : '出力上限';
     const size = stats.segments > 1 ? ` · ${stats.segments} 段落` : `/${stats.maxNew} tokens`;
+    // Segments translated side by side overlap: their prefill and decode times are sums, so
+    // a single segment shows them, and a document shows the time that passed.
+    const times =
+      stats.segments === 1
+        ? `${stats.prefillMs.toFixed(0)} ms prefill · ${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode`
+        : `${stats.outputTokens} tokens${size} (${stop}) · ${stats.elapsedMs.toFixed(0)} ms`;
     statsEl.textContent =
-      `prompt ${stats.promptTokens} tokens${stats.reusedTokens ? ` (${stats.reusedTokens} 再利用)` : ''} · ${stats.prefillMs.toFixed(0)} ms prefill · ` +
-      `${stats.outputTokens} tokens${size} (${stop}) · ${stats.decodeMs.toFixed(0)} ms decode · ` +
+      `prompt ${stats.promptTokens} tokens${stats.reusedTokens ? ` (${stats.reusedTokens} 再利用)` : ''} · ${times} · ` +
       `${stats.tokensPerSecond.toFixed(1)} tok/s · ${[...outputEl.textContent].length} 文字`;
     if (stats.stop === 'limit') {
       statsEl.textContent += '（出力上限に達しました。文をさらに分けてください）';

@@ -35,11 +35,14 @@ const SEGMENT_INPUT_TOKENS: usize = 768;
 /// Characters of earlier source/translation pairs sent as history (`HistoryWindow`, as
 /// the CLI's document mode; smaller than its default to leave room in `MAX_CONTEXT`).
 const HISTORY_CHARS: usize = 1600;
+/// Segments of one document translated side by side (the page's chains), at most. The
+/// KV arena holds this many segments' contexts.
+const MAX_CHAINS: usize = 4;
 /// One request at a time, no response cache (a repeated translation runs again, so a
 /// fault of the device shows), no draft model.
 const ENGINE: EngineConfig = EngineConfig {
-    max_streams: 1,
-    decode_rows: 1,
+    max_streams: MAX_CHAINS,
+    decode_rows: MAX_CHAINS,
     busy_prefill_rows: 64,
     draft_k: 7,
     spec_max_streams: 1,
@@ -124,7 +127,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
 
     report(&on_progress, "重みを GPU に転送しています…");
     let opts = ModelOptions {
-        kv_tokens: MAX_CONTEXT,
+        kv_tokens: MAX_CONTEXT * MAX_CHAINS,
         max_pos: MAX_CONTEXT,
         prefix_cache: true,
         ..ModelOptions::new(Quant::Auto)
@@ -140,7 +143,7 @@ pub async fn load_model(file: ModelBuffer, on_progress: Function) -> Result<Tran
     let load_ms = total.elapsed().as_secs_f64() * 1e3;
     let reduced_to_q4 = model.backend.reduced_to_q4() > 0;
     let engine = Engine::new(model, None, ENGINE).map_err(jserr)?;
-    Ok(Translator { engine, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false })
+    Ok(Translator { engine, tokenizer, name, load_ms, max_binding, reduced_to_q4, broken: false, chains: 1 })
 }
 
 /// One loaded model. Only one translation runs at a time (the page's button is disabled
@@ -155,6 +158,8 @@ pub struct Translator {
     reduced_to_q4: bool,
     /// Set by an error of the GPU (see the crate documentation).
     broken: bool,
+    /// Chains of the next translation: the segments translated side by side.
+    chains: usize,
 }
 
 /// An error of `translate`, by whether the model is still usable.
@@ -181,6 +186,13 @@ impl Translator {
     #[wasm_bindgen(getter)]
     pub fn device(&self) -> String {
         self.name.clone()
+    }
+
+    /// How many segments of a document are translated side by side (1 to 4; 1 by default).
+    /// With more, a segment's history is only that of its own chain, so the translation
+    /// differs from the one in a single chain.
+    pub fn set_chains(&mut self, chains: u32) {
+        self.chains = (chains as usize).clamp(1, MAX_CHAINS);
     }
 
     /// True after an error of the GPU: the model cannot be used again.
@@ -285,7 +297,7 @@ impl Translator {
         let opts = DocOptions {
             request: TranslationRequest { target_lang: target.into(), form, ..Default::default() },
             history_chars: HISTORY_CHARS,
-            chains: 1,
+            chains: self.chains,
             neighbor_context: false,
             max_new_tokens: MAX_NEW_TOKENS,
             history_rules: HistoryRules { skip_truncated: true, trim: true },
@@ -305,7 +317,8 @@ impl Translator {
         progress(0);
 
         let mut write_failure = None;
-        let (mut prompt_tokens, mut output_tokens, mut decode_steps, mut reused_tokens) = (0u32, 0u32, 0u32, 0u32);
+        let (mut prompt_tokens, mut output_tokens, mut reused_tokens) = (0u32, 0u32, 0u32);
+        let started = Instant::now();
         let (mut prefill_ms, mut decode_ms) = (0.0, 0.0);
         let (mut any_limit, mut last_max_new) = (false, MAX_NEW_TOKENS as u32);
 
@@ -329,7 +342,6 @@ impl Translator {
                     prompt_tokens += end.prompt_tokens as u32;
                     reused_tokens += end.reused as u32;
                     output_tokens += end.generated as u32;
-                    decode_steps += end.generated.saturating_sub(1) as u32;
                     last_max_new = MAX_NEW_TOKENS.min(MAX_CONTEXT.saturating_sub(end.prompt_tokens)).max(1) as u32;
                     any_limit |= end.finish == Finish::Length;
                     progress(end.segment + 1);
@@ -353,7 +365,7 @@ impl Translator {
             max_new: last_max_new,
             segments: total as u32,
             stop: (if any_limit { "limit" } else { "tag" }).into(),
-            decode_steps,
+            elapsed_ms: started.elapsed().as_secs_f64() * 1e3,
             reused_tokens,
             prefill_ms,
             decode_ms,
@@ -376,8 +388,8 @@ pub struct Stats {
     max_new: u32,
     segments: u32,
     stop: String,
-    /// Decode passes (see [`Stats::tokens_per_second`]).
-    decode_steps: u32,
+    /// The translation from start to end (segments translated side by side overlap).
+    elapsed_ms: f64,
     /// Prompt tokens served from the KV of earlier segments.
     reused_tokens: u32,
     prefill_ms: f64,
@@ -421,20 +433,28 @@ impl Stats {
         self.reused_tokens
     }
 
+    /// Time from the start to the end of the translation.
+    #[wasm_bindgen(getter)]
+    pub fn elapsed_ms(&self) -> f64 {
+        self.elapsed_ms
+    }
+
+    /// The prompt processing of all segments, added up: with segments translated side by
+    /// side it is more than the time that passed.
     #[wasm_bindgen(getter)]
     pub fn prefill_ms(&self) -> f64 {
         self.prefill_ms
     }
 
+    /// The decoding of all segments, added up (see [`Stats::prefill_ms`]).
     #[wasm_bindgen(getter)]
     pub fn decode_ms(&self) -> f64 {
         self.decode_ms
     }
 
-    /// Tokens per second over the decode loop: the passes after each segment's first
-    /// token (which comes with the prefill), over their time.
+    /// Output tokens per second over the whole translation, prompts included.
     #[wasm_bindgen(getter)]
     pub fn tokens_per_second(&self) -> f64 {
-        if self.decode_ms <= 0.0 { 0.0 } else { f64::from(self.decode_steps) * 1e3 / self.decode_ms }
+        if self.elapsed_ms <= 0.0 { 0.0 } else { f64::from(self.output_tokens) * 1e3 / self.elapsed_ms }
     }
 }

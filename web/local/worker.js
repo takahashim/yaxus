@@ -2,7 +2,7 @@
 // page, and the page can throw the whole worker away (wasm memory, WebGPU device and
 // all) after an error it cannot trust, or before loading another file.
 //
-// Messages in:  {type: 'load', file}  {type: 'translate', text, target, form}
+// Messages in:  {type: 'load', file}  {type: 'translate', text, target, form, chains}
 // Messages out: {type: 'status', message}  {type: 'read', done, total}
 //               {type: 'ready', info}  {type: 'progress', done, total}
 //               {type: 'plan', breaks}  {type: 'text', segment, text}
@@ -83,8 +83,9 @@ async function adapterName() {
   }
 }
 
-async function translate({ text, target, form }) {
+async function translate({ text, target, form, chains }) {
   if (!translator) throw new Error('モデルが読み込まれていません。');
+  translator.set_chains(chains || 1);
   const stats = await translator.translate(
     text,
     target,
@@ -100,6 +101,7 @@ async function translate({ text, target, form }) {
     segments: stats.segments,
     stop: stats.stop,
     reusedTokens: stats.reused_tokens,
+    elapsedMs: stats.elapsed_ms,
     prefillMs: stats.prefill_ms,
     decodeMs: stats.decode_ms,
     tokensPerSecond: stats.tokens_per_second,
