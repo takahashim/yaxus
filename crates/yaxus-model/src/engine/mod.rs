@@ -25,14 +25,16 @@ mod hint;
 mod tuning;
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 use anyhow::Result;
+use web_time::Instant;
 
 use self::cache::ResponseCache;
 use self::hint::HintCursor;
 use self::tuning::{DraftTuner, StreamTuning};
-use crate::{Backend, Model, SeqId, StartInfo, SyncReadback};
+use crate::{AsyncReadback, Backend, Model, SeqId, StartInfo, SyncReadback};
 
 pub type ReqId = u64;
 
@@ -173,7 +175,7 @@ pub struct Engine<B: Backend> {
     end_token: Option<u32>,
 }
 
-impl<B: SyncReadback> Engine<B> {
+impl<B: AsyncReadback> Engine<B> {
     /// `draft` must share `target`'s backend context when given.
     pub fn new(target: Model<B>, draft: Option<Model<B>>, cfg: EngineConfig) -> Result<Self> {
         if let Some(d) = &draft {
@@ -205,6 +207,11 @@ impl<B: SyncReadback> Engine<B> {
             tuner: DraftTuner::default(),
             end_token: None,
         })
+    }
+
+    /// The backend, e.g. for the device's error handling in the browser.
+    pub fn backend(&self) -> &B {
+        &self.target.backend
     }
 
     /// Speculative decoding and response cache counts so far.
@@ -278,7 +285,14 @@ impl<B: SyncReadback> Engine<B> {
 
     /// Runs one pass. `emit` receives tokens and completions; returning `false` for a
     /// token cancels that request. Returns `false` when there was nothing to do.
-    pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+    ///
+    /// An `Err` is a failure of the backend (a read-back failed): it belongs to the whole
+    /// batch, not to one request, and the engine is not to be used again. A failure of
+    /// one request is an [`Event::Error`] for it.
+    ///
+    /// The step is never dropped half-way: its pass has already changed the KV by the
+    /// time the read-back is awaited. Cancel a request through `emit`.
+    pub async fn step_async(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
         self.admit(emit);
         if self.streams.is_empty() {
             return Ok(false);
@@ -291,7 +305,7 @@ impl<B: SyncReadback> Engine<B> {
             Some(_) if decoding.is_empty() || self.prefill_turn => {
                 self.prefill_turn = false;
                 let busy = !decoding.is_empty();
-                self.prefill_step(&prefilling, busy, emit);
+                self.prefill_step(&prefilling, busy, emit).await?;
             }
             _ => {
                 self.prefill_turn = true;
@@ -299,8 +313,8 @@ impl<B: SyncReadback> Engine<B> {
                 if decoding.len() <= self.cfg.spec_max_streams && decoding.iter().all(|&i| speculate(&self.streams[i]))
                 {
                     for &i in &decoding {
-                        if let Err(e) = self.spec_round(i, emit) {
-                            self.streams[i].error = Some(format!("{e:#}"));
+                        if let Err(e) = self.spec_round(i, emit).await {
+                            self.streams[i].error = Some(request_failure(e)?);
                         }
                     }
                 } else {
@@ -308,9 +322,10 @@ impl<B: SyncReadback> Engine<B> {
                     let start = self.rr % decoding.len();
                     self.rr = self.rr.wrapping_add(n);
                     let picked: Vec<usize> = (0..n).map(|j| decoding[(start + j) % decoding.len()]).collect();
-                    if let Err(e) = self.decode_step(&picked, emit) {
+                    if let Err(e) = self.decode_step(&picked, emit).await {
+                        let message = request_failure(e)?;
                         for &i in &picked {
-                            self.streams[i].error = Some(format!("{e:#}"));
+                            self.streams[i].error = Some(message.clone());
                         }
                     }
                 }
@@ -371,7 +386,12 @@ impl<B: SyncReadback> Engine<B> {
 
     /// Processes prompt chunks of waiting streams (oldest first) in one pass, up to the
     /// row budget; streams whose prompt completes get their first token.
-    fn prefill_step(&mut self, prefilling: &[usize], busy: bool, emit: &mut dyn FnMut(Event) -> bool) {
+    async fn prefill_step(
+        &mut self,
+        prefilling: &[usize],
+        busy: bool,
+        emit: &mut dyn FnMut(Event) -> bool,
+    ) -> Result<()> {
         let mut budget = if busy { self.cfg.busy_prefill_rows } else { self.target.chunk };
         let mut plan: Vec<(usize, usize, usize)> = Vec::new(); // (stream, from, to)
         for &i in prefilling {
@@ -385,16 +405,21 @@ impl<B: SyncReadback> Engine<B> {
         }
         let items: Vec<(SeqId, &[u32])> =
             plan.iter().map(|&(i, a, b)| (self.streams[i].ts, &self.streams[i].req.prompt[a..b])).collect();
-        let result = self.target.forward(&items, false).map(|logits| {
-            // Only the streams whose prompt is complete need their last row's argmax.
-            let complete: Vec<usize> =
-                (0..plan.len()).filter(|&j| plan[j].2 == self.streams[plan[j].0].req.prompt.len()).collect();
-            if complete.is_empty() {
-                return Vec::new();
+        let forward = self.target.forward(&items, false);
+        let result: Result<Vec<(usize, u32)>> = match forward {
+            Ok(logits) => {
+                // Only the streams whose prompt is complete need their last row's argmax.
+                let complete: Vec<usize> =
+                    (0..plan.len()).filter(|&j| plan[j].2 == self.streams[plan[j].0].req.prompt.len()).collect();
+                if complete.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    let toks = self.target.backend.argmax_rows_async(&logits).await.map_err(backend_failure)?;
+                    Ok(complete.into_iter().map(|j| (j, toks[j])).collect())
+                }
             }
-            let toks = self.target.backend.argmax_rows(&logits);
-            complete.into_iter().map(|j| (j, toks[j])).collect()
-        });
+            Err(e) => Err(e),
+        };
         match result {
             Ok(firsts) => {
                 for &(i, _, to) in &plan {
@@ -405,14 +430,16 @@ impl<B: SyncReadback> Engine<B> {
                 }
             }
             Err(e) => {
+                let message = request_failure(e)?;
                 for &(i, _, _) in &plan {
-                    self.streams[i].error = Some(format!("{e:#}"));
+                    self.streams[i].error = Some(message.clone());
                 }
             }
         }
+        Ok(())
     }
 
-    fn decode_step(&mut self, picked: &[usize], emit: &mut dyn FnMut(Event) -> bool) -> Result<()> {
+    async fn decode_step(&mut self, picked: &[usize], emit: &mut dyn FnMut(Event) -> bool) -> Result<()> {
         let nexts: Vec<[u32; 1]> = picked
             .iter()
             .map(|&i| match self.streams[i].phase {
@@ -424,7 +451,7 @@ impl<B: SyncReadback> Engine<B> {
             picked.iter().zip(&nexts).map(|(&i, n)| (self.streams[i].ts, n.as_slice())).collect();
         let t0 = Instant::now();
         let logits = self.target.forward(&items, false)?;
-        let toks = self.target.backend.argmax_rows(&logits);
+        let toks = self.target.backend.argmax_rows_async(&logits).await.map_err(backend_failure)?;
         drop(logits);
         if picked.len() == 1 {
             self.tuner.plain_step(t0.elapsed().as_secs_f64());
@@ -437,12 +464,12 @@ impl<B: SyncReadback> Engine<B> {
 
     /// One speculative round for decoding stream `i`: verifies hint tokens when the
     /// output matches the hint, else draft tokens; without either, decodes one token.
-    fn spec_round(&mut self, i: usize, emit: &mut dyn FnMut(Event) -> bool) -> Result<()> {
+    async fn spec_round(&mut self, i: usize, emit: &mut dyn FnMut(Event) -> bool) -> Result<()> {
         let Phase::Decode { next } = self.streams[i].phase else { unreachable!() };
-        let Some((props, source)) = self.propose(i, next)? else { return self.decode_step(&[i], emit) };
+        let Some((props, source)) = self.propose(i, next).await? else { return self.decode_step(&[i], emit).await };
         let ts = self.streams[i].ts;
         let base = self.target.seq_len(ts);
-        let g = self.verify(ts, next, &props)?;
+        let g = self.verify(ts, next, &props).await?;
         let m = props.iter().zip(&g).take_while(|(p, t)| p == t).count();
         self.spec.rounds += 1;
         self.spec.proposed += props.len();
@@ -469,7 +496,7 @@ impl<B: SyncReadback> Engine<B> {
 
     /// The tokens decoding stream `i` (whose next input is `next`) should verify, and
     /// where they come from; `None` when a single decode step is the better next move.
-    fn propose(&mut self, i: usize, next: u32) -> Result<Option<(Vec<u32>, Source)>> {
+    async fn propose(&mut self, i: usize, next: u32) -> Result<Option<(Vec<u32>, Source)>> {
         let s = &mut self.streams[i];
         let left = s.req.max_new_tokens - s.generated;
         let end = self.end_token.filter(|e| s.req.stop.contains(e));
@@ -491,20 +518,20 @@ impl<B: SyncReadback> Engine<B> {
             }
             k => {
                 let started = Instant::now();
-                Ok(Some((self.draft_tokens(i, next, k)?, Source::Draft { started })))
+                Ok(Some((self.draft_tokens(i, next, k).await?, Source::Draft { started })))
             }
         }
     }
 
     /// Runs the target over `next` and `props` on sequence `ts`: `g[j]` is its choice
     /// after consuming `next` and `props[..j]`.
-    fn verify(&mut self, ts: SeqId, next: u32, props: &[u32]) -> Result<Vec<u32>> {
+    async fn verify(&mut self, ts: SeqId, next: u32, props: &[u32]) -> Result<Vec<u32>> {
         let mut ver = Vec::with_capacity(props.len() + 1);
         ver.push(next);
         ver.extend_from_slice(props);
         let t0 = Instant::now();
         let logits = self.target.forward(&[(ts, &ver)], true)?;
-        let g = self.target.backend.argmax_rows(&logits);
+        let g = self.target.backend.argmax_rows_async(&logits).await.map_err(backend_failure)?;
         drop(logits);
         self.tuner.verify_pass(ver.len(), t0.elapsed().as_secs_f64());
         Ok(g)
@@ -522,7 +549,7 @@ impl<B: SyncReadback> Engine<B> {
 
     /// Runs the draft model for stream `i` (whose next input is `next`) and returns up
     /// to `k` proposals, ending early at a stop token.
-    fn draft_tokens(&mut self, i: usize, next: u32, k: usize) -> Result<Vec<u32>> {
+    async fn draft_tokens(&mut self, i: usize, next: u32, k: usize) -> Result<Vec<u32>> {
         let ts = self.streams[i].ts;
         let draft = self.draft.as_mut().unwrap();
         let ds = match self.streams[i].ds {
@@ -543,7 +570,7 @@ impl<B: SyncReadback> Engine<B> {
         let t0 = Instant::now();
         let mut dl = draft.prefill(ds, &feed)?;
         loop {
-            let d = draft.backend.argmax(&dl);
+            let d = *draft.backend.argmax_rows_async(&dl).await.map_err(backend_failure)?.last().unwrap();
             props.push(d);
             if props.len() == k || stop.contains(&d) {
                 break;
@@ -667,6 +694,44 @@ pub trait Generator: Send {
             Some(e) => Err(anyhow::anyhow!(e)),
             None => Ok(out),
         }
+    }
+}
+
+impl<B: SyncReadback> Engine<B> {
+    /// [`Engine::step_async`] for a backend that reads back without waiting, where the
+    /// step never has to wait for anything.
+    pub fn step(&mut self, emit: &mut dyn FnMut(Event) -> bool) -> Result<bool> {
+        let mut step = std::pin::pin!(self.step_async(emit));
+        match step.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(r) => r,
+            Poll::Pending => unreachable!("a SyncReadback backend reads back at once"),
+        }
+    }
+}
+
+/// A failure of the backend itself (a read-back failed), as opposed to one of a request:
+/// it travels up through `anyhow::Error` to [`Engine::step_async`], which returns it.
+#[derive(Debug)]
+struct BackendFailure(anyhow::Error);
+
+impl std::fmt::Display for BackendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for BackendFailure {}
+
+fn backend_failure(e: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(BackendFailure(e))
+}
+
+/// The message of a failure that belongs to the requests of a pass; a failure of the
+/// backend is returned as `Err`, the error of the step.
+fn request_failure(e: anyhow::Error) -> Result<String> {
+    match e.downcast::<BackendFailure>() {
+        Ok(BackendFailure(e)) => Err(e),
+        Err(e) => Ok(format!("{e:#}")),
     }
 }
 

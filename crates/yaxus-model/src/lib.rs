@@ -182,6 +182,27 @@ pub trait SyncReadback: Backend {
     fn to_host(&mut self, x: &Self::Tensor) -> Vec<f32>;
 }
 
+/// What the [`Engine`] reads back: the greedy token of every logits row, as a future.
+/// Every [`SyncReadback`] backend has it, ready at once; WebGPU in a browser, which
+/// cannot block on the GPU, implements it by awaiting the read-back. A failed read-back
+/// (the device was lost, an error was reported) is an `Err`, and the engine fails the
+/// whole step with it, not one request.
+pub trait AsyncReadback: Backend {
+    fn argmax_rows_async<'a>(
+        &'a mut self,
+        logits: &'a Self::Tensor,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a;
+}
+
+impl<B: SyncReadback> AsyncReadback for B {
+    fn argmax_rows_async<'a>(
+        &'a mut self,
+        logits: &'a Self::Tensor,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>>> + 'a {
+        std::future::ready(Ok(self.argmax_rows(logits)))
+    }
+}
+
 struct Layer<B: Backend> {
     meta: LayerMeta,
     pre_mixer_norm: B::Weight,
