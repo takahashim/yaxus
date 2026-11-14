@@ -285,11 +285,20 @@ pub enum Job {
 ## 実装の状況
 
 - 出発点の `Engine::step_async` と Web の prefix 再利用は main に入っている。
-- 段階 1 の前半 (`Generator` の非同期化、`Session::step_async`、`run_document_async`、`run_request_async`、
-  runtime の wasm ビルド) と、段階 5 の `Scheduler` の取り出し (server の worker を runtime の
-  `scheduler` に移した) は、ブランチ `async-engine` で実装し、ネイティブで検証した。
-  `Scheduler` は上の順序より先に進んだ部分で、Web はまだ使わない (server だけが使う)。
-- 段階 1 の後半 (Web の `Translator` を `run_document_async` に載せる) 以降は未着手。
+- **段階 1 は実装済み** (ブランチ `async-engine`、訳は変えていない)。
+  - `Generator` の非同期化、`Session::step_async`、`run_document_async`、`run_request_async`、
+    runtime の wasm ビルド。`Engine` は WebGPU を含む `AsyncReadback` の全バックエンドで `Generator` になる
+    (`score` はバックエンドが待てるときだけ)。
+  - Web の `Translator` は、一文書を `run_document_async` で最後まで駆動する (チェーン 1 本)。
+    分割 (`split_for_context`) だけが Web に残り、履歴、プロンプト、エンジンの駆動は runtime のもの。
+    今の Web の履歴の扱いは `DocOptions` の `HistoryRules` (訳の trim、上限に達した訳の除外) で表し、
+    native の既定は変えていない。
+  - 確かめたこと: Chrome E2E (0.8B Q4_K_M) の全件、12 段落の文書の出力が変更前とバイト単位で同じ
+    (プロンプトは 2888 トークン、再利用は 2651 トークンで同じ)、ネイティブの 19 文のセットが 19/19 一致で
+    速度はばらつきの範囲 (61.7〜62.0 tok/s)。
+- 段階 5 の `Scheduler` の取り出し (server の worker を runtime の `scheduler` に移した) も実装し、
+  ネイティブで検証した。上の順序より先に進んだ部分で、Web はまだ使わない (server だけが使う)。
+- 段階 2 (KV の予約と文書内のバッチ) 以降は未着手。
 
 ## 決めきれていない点
 
