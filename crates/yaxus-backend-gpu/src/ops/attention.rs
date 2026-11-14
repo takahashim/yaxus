@@ -19,11 +19,11 @@ impl Gpu {
         let (Weight::Vector(qn), Weight::Vector(kn)) = (q_norm, k_norm) else { panic!("q/k norm") };
         let (hq, hkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
         let t = qkv.rows;
-        assert_eq!(t, self.pass_rows, "attention rows differ from the pass");
+        assert_eq!(t, self.pass.rows, "attention rows differ from the pass");
         let (kc, vc) = (kv.k[layer.index].clone(), kv.v[layer.index].clone());
         let rope = if layer.full_attn { kv.rope_full.clone() } else { kv.rope_sliding.clone() };
         // (cos and sin, HEAD_DIM / 2 f32 each per position)
-        let rope_bytes = (self.pass_max_pos as u64 + 1) * (HEAD_DIM as u64 / 2) * 4 * 2;
+        let rope_bytes = (self.pass.max_pos as u64 + 1) * (HEAD_DIM as u64 / 2) * 4 * 2;
         assert!(rope_bytes <= rope.size(), "position beyond the rope table");
         let (rows, pages) = (self.meta_buf(MetaBuf::Rows), self.meta_buf(MetaBuf::Pages));
         let q = self.tensor(t, hq * HEAD_DIM);
@@ -43,8 +43,8 @@ impl Gpu {
             hq,
             hkv,
             window: layer.window,
-            max_pos: self.pass_max_pos,
-            tiles: self.pass_tiles,
+            max_pos: self.pass.max_pos,
+            tiles: self.pass.tiles,
         };
         let g = hq / hkv;
         let plan = case.plan(&self.caps, &self.tuning);
@@ -74,7 +74,7 @@ impl Gpu {
                 "attn_tile",
                 &[o.buf(), part.buf(), ml.buf(), q.buf(), &kc, &vc, &rows, &pages, &tiles],
                 &[hq as u32, hkv as u32, window, scale.to_bits(), nch as u32, ch as u32],
-                ((self.pass_tiles * nch) as u32, hq as u32),
+                ((self.pass.tiles * nch) as u32, hq as u32),
             );
             if nch > 1 {
                 self.dispatch(

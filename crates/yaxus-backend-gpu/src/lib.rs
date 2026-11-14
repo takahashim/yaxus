@@ -108,30 +108,44 @@ pub struct Gpu {
     tuning: Tuning,
     diag: Diagnostics,
     kernels: HashMap<String, Kernel>,
-    /// Row metadata of the current forward pass (see [`MetaBuf`]).
-    meta_bufs: [Option<Buf>; 4],
-    pass_rows: usize,
-    pass_max_pos: usize,
-    /// Attention tiles of the pass (see `ATTN_TILE`).
-    pass_tiles: usize,
+    /// The forward pass being recorded.
+    pass: Pass,
     pool: Pool,
-    /// Total bytes of uploaded weights.
-    pub weight_bytes: usize,
+    /// What loading the weights left behind.
+    loaded: LoadReport,
     argmax_out: Buf,
     /// Per-slice argmax partials `[rows][ARGMAX_SLICES]` of (value bits, index).
     argmax_part: Buf,
     /// Matmul FLOPs recorded since the last submission.
     pending_flops: f64,
-    /// Dispatches recorded since the pass began (early submission of small passes).
-    pass_dispatches: usize,
     /// Which prefill GEMM to use.
     pub gemm: GemmKind,
+    /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
+    profile: Option<Profile>,
+}
+
+/// The forward pass being recorded (set by `begin_pass`).
+#[derive(Default)]
+struct Pass {
+    /// Its row metadata (see [`MetaBuf`]); the buffers are reused by later passes.
+    meta: [Option<Buf>; 4],
+    rows: usize,
+    max_pos: usize,
+    /// Attention tiles (see `ATTN_TILE`).
+    tiles: usize,
+    /// Dispatches recorded since it began (early submission of small passes).
+    dispatches: usize,
+}
+
+/// What loading the weights left behind.
+#[derive(Default)]
+struct LoadReport {
+    /// Bytes of weights uploaded.
+    weight_bytes: usize,
     /// An uploaded buffer larger than a storage binding may be (see `checked`).
     oversized: Option<(String, usize)>,
     /// Matrices loaded as Q4 because their own format exceeds the binding limit.
     reduced_to_q4: usize,
-    /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
-    profile: Option<Profile>,
 }
 
 impl Drop for Gpu {
@@ -257,17 +271,11 @@ impl Gpu {
             compile,
             caps,
             kernels: HashMap::new(),
-            meta_bufs: [None, None, None, None],
-            pass_tiles: 0,
-            pass_rows: 0,
-            pass_max_pos: 0,
+            pass: Pass::default(),
             pool: Arc::new(Mutex::new(HashMap::new())),
-            weight_bytes: 0,
+            loaded: LoadReport::default(),
             argmax_out,
             pending_flops: 0.0,
-            pass_dispatches: 0,
-            oversized: None,
-            reduced_to_q4: 0,
             profile: diag.profile.map(|_| Profile::default()),
             diag,
         };
@@ -339,7 +347,7 @@ impl GpuBackend {
     /// How many matrices were loaded as Q4 because one storage binding cannot cover them
     /// in their own format (see `Gpu::load_weight`). Their outputs change slightly.
     pub fn reduced_to_q4(&self) -> usize {
-        self.g().reduced_to_q4
+        self.g().loaded.reduced_to_q4
     }
 
     /// The greedy token of a one-row logits tensor, awaiting the read-back (browser).
@@ -415,7 +423,7 @@ impl GpuBackend {
     }
 
     fn track(&mut self, before: usize) {
-        let after = self.g().weight_bytes;
+        let after = self.g().loaded.weight_bytes;
         self.weight_bytes += after - before;
     }
 }
@@ -432,7 +440,7 @@ impl Backend for GpuBackend {
         self.weight_bytes
     }
     fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
-        let before = self.g().weight_bytes;
+        let before = self.g().loaded.weight_bytes;
         let w = self.g().checked("loading a weight", |g| g.load_weight(t, quant));
         self.track(before);
         if let Ok(Weight::Matrix(m)) = &w
@@ -443,7 +451,7 @@ impl Backend for GpuBackend {
         w
     }
     fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
-        let before = self.g().weight_bytes;
+        let before = self.g().loaded.weight_bytes;
         let w = self.g().checked("loading the embedding table", |g| g.load_embedding(t));
         self.track(before);
         w

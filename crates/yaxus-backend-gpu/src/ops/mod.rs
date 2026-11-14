@@ -95,15 +95,15 @@ impl Gpu {
             }
         }
         self.upload_ordered(MetaBuf::Tiles, bytemuck::cast_slice(&tiles));
-        self.pass_tiles = tiles.len();
-        self.pass_rows = rows;
-        self.pass_dispatches = 0;
-        self.pass_max_pos = pass.pos.iter().copied().max().unwrap_or(0) as usize;
+        self.pass.tiles = tiles.len();
+        self.pass.rows = rows;
+        self.pass.dispatches = 0;
+        self.pass.max_pos = pass.pos.iter().copied().max().unwrap_or(0) as usize;
     }
 
     pub(crate) fn embed(&mut self, table: &Weight) -> Tensor {
         let Weight::Embedding { table, h, fmt } = table else { panic!("embed needs the embedding table") };
-        let y = self.tensor(self.pass_rows, *h);
+        let y = self.tensor(self.pass.rows, *h);
         let ids = self.meta_buf(MetaBuf::Ids);
         match fmt {
             // The Q4_K table is bound twice (nibbles and headers), as the matrix kernels do.
@@ -112,11 +112,11 @@ impl Gpu {
                     "embed_q4k",
                     &[y.buf(), &ids, table, table],
                     &[*h as u32, *h as u32],
-                    (self.pass_rows as u32, 1),
+                    (self.pass.rows as u32, 1),
                 );
             }
             _ => {
-                self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass_rows as u32, 1));
+                self.dispatch("embed", &[y.buf(), table, &ids], &[*h as u32], (self.pass.rows as u32, 1));
             }
         }
         y

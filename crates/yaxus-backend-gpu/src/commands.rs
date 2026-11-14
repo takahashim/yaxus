@@ -58,9 +58,9 @@ impl Gpu {
         self.dev.dispatch(k, bufs, &imm, groups, label);
         // Small passes (decode, verification) are recorded while the GPU already runs their
         // first layer: one early submission. More submissions cost more than they hide.
-        self.pass_dispatches += 1;
-        if self.pass_dispatches == self.tuning.early_submit_dispatches
-            && self.pass_rows <= self.tuning.split_attn_max_rows
+        self.pass.dispatches += 1;
+        if self.pass.dispatches == self.tuning.early_submit_dispatches
+            && self.pass.rows <= self.tuning.split_attn_max_rows
             && !timing
         {
             self.submit();
@@ -113,21 +113,21 @@ impl Gpu {
     }
 
     pub(crate) fn upload(&mut self, label: &str, bytes: &[u8]) -> Buf {
-        self.weight_bytes += bytes.len();
+        self.loaded.weight_bytes += bytes.len();
         // Binding it would fail at the first dispatch, long after loading.
         if bytes.len() as u64 > self.dev.max_binding() {
-            self.oversized.get_or_insert((label.to_string(), bytes.len()));
+            self.loaded.oversized.get_or_insert((label.to_string(), bytes.len()));
         }
         self.dev.upload(label, bytes)
     }
 
     /// Puts `data` in the pass metadata `slot` for the commands recorded from now on.
     pub(crate) fn upload_ordered(&mut self, slot: MetaBuf, data: &[u8]) {
-        self.dev.upload_meta(&mut self.meta_bufs[slot as usize], data);
+        self.dev.upload_meta(&mut self.pass.meta[slot as usize], data);
     }
 
     pub(crate) fn meta_buf(&self, slot: MetaBuf) -> Buf {
-        self.meta_bufs[slot as usize].clone().expect("begin_pass first")
+        self.pass.meta[slot as usize].clone().expect("begin_pass first")
     }
 
     /// Runs `f` with the device's out-of-memory and validation errors captured, so that
@@ -135,13 +135,13 @@ impl Gpu {
     /// in the device's default error handler.
     pub(crate) fn checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         // Only report a buffer from this call (uploads outside `checked` also set it).
-        self.oversized = None;
+        self.loaded.oversized = None;
         let scope = self.dev.error_scope();
         let r = f(self);
         if let Some(e) = scope.finish().or_else(|| self.dev.take_failure()) {
             anyhow::bail!("{what}: {e}");
         }
-        if let Some((label, bytes)) = self.oversized.take() {
+        if let Some((label, bytes)) = self.loaded.oversized.take() {
             anyhow::bail!(
                 "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",
                 self.dev.max_binding()

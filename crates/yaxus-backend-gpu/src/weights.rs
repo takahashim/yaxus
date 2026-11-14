@@ -264,7 +264,7 @@ impl Gpu {
                 t.dtype.name(),
                 self.dev.max_binding()
             );
-            self.reduced_to_q4 += 1;
+            self.loaded.reduced_to_q4 += 1;
             return self.load_matrix(&bf16_of(t), n, k, Quant::Q4).map(Weight::Matrix);
         }
         match plan {
