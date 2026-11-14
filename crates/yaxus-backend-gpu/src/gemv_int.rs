@@ -10,9 +10,11 @@
 
 use std::fmt::Write;
 
+use crate::Format;
+
 /// A weight format the integer GEMV reads.
 pub struct IntFmt {
-    pub name: &'static str,
+    pub format: Format,
     /// WGSL declaring `wq` and `wsc` (bindings 2 and 3) and the format's helpers.
     decl: &'static str,
     /// WGSL giving `ea` and `eb`, `vec4<u32>` of int8 x 4: the 8 u32 of weights of block
@@ -52,7 +54,7 @@ const META_SCALE: &str = "fn mscale(row: u32, blk: u32) -> f32 {
 
 pub const FORMATS: [IntFmt; 6] = [
     IntFmt {
-        name: "q4k",
+        format: Format::Q4K,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 // Scale and min of 32-block `sub` of a row from its Q4_K header (see `W_Q4K`).
@@ -80,7 +82,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
         xmode: 1,
     },
     IntFmt {
-        name: "q4",
+        format: Format::Q4,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 ",
@@ -94,7 +96,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
         xmode: 1,
     },
     IntFmt {
-        name: "q8",
+        format: Format::Q8,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<vec4<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 ",
@@ -108,7 +110,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
     },
     // 6 u32 per block: 4 of low nibbles, 2 of high 2-bit fields (see `W_Q6`).
     IntFmt {
-        name: "q6",
+        format: Format::Q6,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 ",
@@ -128,7 +130,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
     },
     // 3 u32 per block: 2 of low 2-bit fields, 1 of high bits (see `W_Q3`).
     IntFmt {
-        name: "q3",
+        format: Format::Q3,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<u32>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 ",
@@ -148,7 +150,7 @@ fn q4k_sm(row: u32, sub: u32) -> vec2<f32> {
     },
     // 2 u32 per block, scales and mins as in the file (see `W_Q2_16`).
     IntFmt {
-        name: "q2",
+        format: Format::Q2,
         decl: "@group(0) @binding(2) var<storage, read> wq: array<vec2<u32>>;
 @group(0) @binding(3) var<storage, read> wsc: array<u32>;
 fn q2sm(row: u32, blk: u32) -> vec2<f32> {
@@ -171,8 +173,8 @@ fn q2sm(row: u32, blk: u32) -> vec2<f32> {
     },
 ];
 
-pub fn format(name: &str) -> Option<&'static IntFmt> {
-    FORMATS.iter().find(|f| f.name == name)
+pub fn format(format: Format) -> Option<&'static IntFmt> {
+    FORMATS.iter().find(|f| f.format == format)
 }
 
 /// Source of the kernel for exactly `t` activation rows of `planes` int8 planes (1: 7 bits

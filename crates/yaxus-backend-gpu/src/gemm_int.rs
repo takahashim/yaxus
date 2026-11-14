@@ -12,11 +12,13 @@
 
 use std::fmt::Write;
 
+use crate::Format;
+
 use crate::shaders::{W_Q2, W_Q3, W_Q4, W_Q4K, W_Q6, W_Q8};
 
 /// A weight format the integer GEMM reads.
 pub struct IntFmt {
-    pub name: &'static str,
+    pub format: Format,
     /// WGSL declaring `wq` and `wsc` (bindings 2 and 3) and the format's helpers.
     loader: &'static str,
     /// WGSL giving `e0` and `e1`, int8 x 4 each: weights `8 c .. 8 c + 8` of block `kb` in
@@ -44,7 +46,7 @@ pub const FORMATS: [IntFmt; 6] = [
     // to match: the rounding error of the activations then multiplies values around zero
     // (about half the error with Q4_K's 0..15).
     IntFmt {
-        name: "q4k",
+        format: Format::Q4K,
         loader: W_Q4K,
         stage: "let v = wq[(wrow * (p.k / 256u) + kb / 8u) * 36u + 4u + (kb % 8u) * 4u + c];
         let e0 = (((v & 0x0f0f0f0fu) | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
@@ -55,7 +57,7 @@ pub const FORMATS: [IntFmt; 6] = [
         xmode: 1,
     },
     IntFmt {
-        name: "q4",
+        format: Format::Q4,
         loader: W_Q4,
         stage: "let v = wq[wrow * (p.k / 8u) + kb * 4u + c];
         let e0 = (((v & 0x0f0f0f0fu) | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
@@ -66,7 +68,7 @@ pub const FORMATS: [IntFmt; 6] = [
         xmode: 1,
     },
     IntFmt {
-        name: "q8",
+        format: Format::Q8,
         loader: W_Q8,
         stage: "let o = wrow * (p.k / 4u) + kb * 8u + 2u * c;
         let e0 = wq[o];
@@ -77,7 +79,7 @@ pub const FORMATS: [IntFmt; 6] = [
         xmode: 0,
     },
     IntFmt {
-        name: "q6",
+        format: Format::Q6,
         loader: W_Q6,
         stage:
             "let g = wrow * (3u * p.k / 16u) + kb * 6u;
@@ -91,7 +93,7 @@ pub const FORMATS: [IntFmt; 6] = [
         xmode: 1,
     },
     IntFmt {
-        name: "q3",
+        format: Format::Q3,
         loader: W_Q3,
         stage: "let g = wrow * (3u * p.k / 32u) + kb * 3u;
         let lo = wq[g + c / 2u] >> (16u * (c & 1u));
@@ -104,7 +106,7 @@ pub const FORMATS: [IntFmt; 6] = [
         xmode: 0,
     },
     IntFmt {
-        name: "q2",
+        format: Format::Q2,
         loader: W_Q2,
         stage: "let lo = wq[wrow * (p.k / 16u) + kb * 2u + c / 2u] >> (16u * (c & 1u));
         let e0 = ((spread2(lo) | 0x80808080u) - 0x02020202u) ^ 0x80808080u;
@@ -116,8 +118,8 @@ pub const FORMATS: [IntFmt; 6] = [
     },
 ];
 
-pub fn format(name: &str) -> Option<&'static IntFmt> {
-    FORMATS.iter().find(|f| f.name == name)
+pub fn format(format: Format) -> Option<&'static IntFmt> {
+    FORMATS.iter().find(|f| f.format == format)
 }
 
 /// Source of the kernel for `f` with lanes covering 4 outputs x `tn` tokens (a workgroup:

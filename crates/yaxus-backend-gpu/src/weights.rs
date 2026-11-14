@@ -1,10 +1,11 @@
-//! Weights on the GPU: their formats, and how checkpoint and GGUF tensors are packed
-//! into them.
+//! Weights on the GPU: their formats, how checkpoint and GGUF tensors are packed into
+//! them, and what loading them left behind ([`LoadReport`]).
 
 use anyhow::Result;
 use yaxus_model::{Quant, TensorRef, Weights};
 
 use crate::dev::Buf;
+use crate::steps::Layout;
 use crate::{Gpu, GpuBackend, gemm_int, gemv_int};
 
 /// How a weight matrix is stored on the GPU (and which kernels read it).
@@ -26,6 +27,10 @@ pub enum Format {
 }
 
 impl Format {
+    /// Every format.
+    pub(crate) const ALL: [Format; 7] =
+        [Format::Q8, Format::Q4, Format::Q4K, Format::Q6, Format::Q3, Format::Q2, Format::Bf16];
+
     /// The suffix of the kernels that read it (`gemv1_q8`, ...).
     pub fn suffix(self) -> &'static str {
         match self {
@@ -41,12 +46,12 @@ impl Format {
 
     /// The integer GEMV's description of it, if that kernel reads it.
     pub(crate) fn gemv_int(self) -> Option<&'static gemv_int::IntFmt> {
-        gemv_int::format(self.suffix())
+        gemv_int::format(self)
     }
 
     /// The integer GEMM's description of it, if that kernel reads it.
     pub(crate) fn gemm_int(self) -> Option<&'static gemm_int::IntFmt> {
-        gemm_int::format(self.suffix())
+        gemm_int::format(self)
     }
 }
 
@@ -66,14 +71,14 @@ pub struct Matrix {
 }
 
 impl Matrix {
-    /// The weight bindings of the decode kernels (GEMVs).
-    pub(crate) fn decode_bufs(&self) -> Vec<Buf> {
-        std::iter::once(&self.q).chain(&self.s).cloned().collect()
-    }
-
-    /// The weight bindings of the prefill GEMMs: the per-16 scales where there are some.
-    pub(crate) fn prefill_bufs(&self) -> Vec<Buf> {
-        std::iter::once(&self.q).chain(self.s16.as_ref().or(self.s.as_ref())).cloned().collect()
+    /// The weight bindings of a kernel that reads `layout`: the values, then the scales
+    /// (for the prefill GEMMs the per-16 scales where there are some).
+    pub(crate) fn bufs(&self, layout: Layout) -> impl Iterator<Item = &Buf> {
+        let scales = match layout {
+            Layout::Decode => self.s.as_ref(),
+            Layout::Prefill => self.s16.as_ref().or(self.s.as_ref()),
+        };
+        std::iter::once(&self.q).chain(scales)
     }
 }
 
@@ -98,6 +103,17 @@ impl Weight {
             _ => panic!("a matrix product needs a matrix"),
         }
     }
+}
+
+/// What loading the weights left behind.
+#[derive(Default)]
+pub(crate) struct LoadReport {
+    /// Bytes of weights uploaded.
+    pub(crate) weight_bytes: usize,
+    /// An uploaded buffer larger than a storage binding may be (see `Gpu::load_checked`).
+    oversized: Option<(String, usize)>,
+    /// Matrices loaded as Q4 because their own format exceeds the binding limit.
+    pub(crate) reduced_to_q4: usize,
 }
 
 /// f16 values added to the scales of each row of a quantized matrix when the row has a
@@ -231,21 +247,50 @@ impl GpuBackend {
 }
 
 impl Gpu {
+    /// Uploads a buffer of a weight, counting its bytes. One larger than a storage binding
+    /// may be is noted for [`Gpu::load_checked`]: binding it would fail at the first
+    /// dispatch, long after loading.
+    fn upload_weight(&mut self, label: &str, bytes: &[u8]) -> Buf {
+        self.loaded.weight_bytes += bytes.len();
+        if bytes.len() as u64 > self.rec.dev.max_binding() {
+            self.loaded.oversized.get_or_insert((label.to_string(), bytes.len()));
+        }
+        self.rec.dev.upload(label, bytes)
+    }
+
+    /// Runs a load with the device's errors captured (see [`Gpu::captured`]), and fails it
+    /// if it uploaded a buffer that exceeds the storage binding limit.
+    pub(crate) fn load_checked<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // Only report a buffer from this load.
+        self.loaded.oversized = None;
+        let (r, error) = self.captured(f);
+        if let Some(e) = error {
+            anyhow::bail!("{what}: {e}");
+        }
+        if let Some((label, bytes)) = self.loaded.oversized.take() {
+            anyhow::bail!(
+                "{what}: a {label} buffer of {bytes} bytes exceeds the device's storage binding limit of {}",
+                self.rec.dev.max_binding()
+            );
+        }
+        r
+    }
+
     pub(crate) fn load_embedding(&mut self, t: &TensorRef) -> Result<Weight> {
         let h = t.shape[1];
         if embedding_stays_q4k(t) {
             let q = yaxus_model::ggml::q4k_from_q4_k(t.bytes());
-            let table = self.upload("embedding-q4k", &q.data);
+            let table = self.upload_weight("embedding-q4k", &q.data);
             return Ok(Weight::Embedding { table, h, fmt: Format::Q4K });
         }
-        let table = self.upload("embedding", bytemuck::cast_slice(&bf16_of(t)));
+        let table = self.upload_weight("embedding", bytemuck::cast_slice(&bf16_of(t)));
         Ok(Weight::Embedding { table, h, fmt: Format::Bf16 })
     }
 
     pub(crate) fn load_weight(&mut self, t: &TensorRef, quant: Quant) -> Result<Weight> {
         if t.shape.len() == 1 {
             let v = t.to_f32_vec();
-            return Ok(Weight::Vector(self.upload("vector", bytemuck::cast_slice(&v))));
+            return Ok(Weight::Vector(self.upload_weight("vector", bytemuck::cast_slice(&v))));
         }
         let (n, k) = (t.shape[0], t.shape[1]);
         let plan = MatrixPlan::of(t, quant);
@@ -257,12 +302,12 @@ impl Gpu {
         let format_left_to_us = matches!(quant, Quant::Auto | Quant::Auto4);
         if format_left_to_us
             && plan != MatrixPlan::Convert(Quant::Q4)
-            && plan.largest_buffer(t.dtype, n, k) as u64 > self.dev.max_binding()
+            && plan.largest_buffer(t.dtype, n, k) as u64 > self.rec.dev.max_binding()
         {
             tracing::warn!(
                 "a {n}x{k} {} matrix exceeds the storage binding limit ({} bytes); loading it as Q4",
                 t.dtype.name(),
-                self.dev.max_binding()
+                self.rec.dev.max_binding()
             );
             self.loaded.reduced_to_q4 += 1;
             return self.load_matrix(&bf16_of(t), n, k, Quant::Q4).map(Weight::Matrix);
@@ -282,7 +327,7 @@ impl Gpu {
             Quant::Q8 | Quant::Auto => self.upload_q8(yaxus_model::quant::quantize_q8(bf16, k), n, k),
             Quant::Q4 | Quant::Auto4 => self.upload_q4(yaxus_model::quant::quantize_q4(bf16, k), n, k),
             Quant::Bf16 => {
-                let q = self.upload("bf16", bytemuck::cast_slice(bf16));
+                let q = self.upload_weight("bf16", bytemuck::cast_slice(bf16));
                 Matrix { fmt: Format::Bf16, n, k, q, s: None, s16: None }
             }
         })
@@ -320,31 +365,31 @@ impl Gpu {
             GgmlType::Q4_0 => self.upload_q4(ggml::q4_from_q4_0(b), n, k),
             GgmlType::Q4K => {
                 // One buffer, read through two bindings (nibbles and headers).
-                let qb = self.upload("q4k", &ggml::q4k_from_q4_k(b).data);
+                let qb = self.upload_weight("q4k", &ggml::q4k_from_q4_k(b).data);
                 Matrix { fmt: Format::Q4K, n, k, q: qb.clone(), s: Some(qb), s16: None }
             }
             GgmlType::Q6K => {
                 let q = ggml::q6_from_q6_k(b, n, k);
-                let qb = self.upload("q6", &q.qs);
-                let sb = self.upload("q6-meta", &q.meta);
+                let qb = self.upload_weight("q6", &q.qs);
+                let sb = self.upload_weight("q6-meta", &q.meta);
                 let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
-                let s16 = self.upload("q6-scales", bytemuck::cast_slice(&s16));
+                let s16 = self.upload_weight("q6-scales", bytemuck::cast_slice(&s16));
                 Matrix { fmt: Format::Q6, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             GgmlType::Q3K => {
                 let q = ggml::q3_from_q3_k(b, n, k);
-                let qb = self.upload("q3", &q.qs);
-                let sb = self.upload("q3-meta", &q.meta);
+                let qb = self.upload_weight("q3", &q.qs);
+                let sb = self.upload_weight("q3-meta", &q.meta);
                 let s16 = pad_scales(q.scales16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 1);
-                let s16 = self.upload("q3-scales", bytemuck::cast_slice(&s16));
+                let s16 = self.upload_weight("q3-scales", bytemuck::cast_slice(&s16));
                 Matrix { fmt: Format::Q3, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             GgmlType::Q2K => {
                 let q = ggml::q2_from_q2_k(b, n, k);
-                let qb = self.upload("q2", &q.qs);
-                let sb = self.upload("q2-meta", &q.meta);
+                let qb = self.upload_weight("q2", &q.qs);
+                let sb = self.upload_weight("q2-meta", &q.meta);
                 let s16 = pad_scales(q.pairs16.iter().map(|s| s.to_bits()).collect(), n, k / 16, 2);
-                let s16 = self.upload("q2-scales", bytemuck::cast_slice(&s16));
+                let s16 = self.upload_weight("q2-scales", bytemuck::cast_slice(&s16));
                 Matrix { fmt: Format::Q2, n, k, q: qb, s: Some(sb), s16: Some(s16) }
             }
             _ => return None,
@@ -352,16 +397,16 @@ impl Gpu {
     }
 
     pub(crate) fn upload_q8(&mut self, q: yaxus_model::quant::Q8Data, n: usize, k: usize) -> Matrix {
-        let qb = self.upload("q8", bytemuck::cast_slice(&q.qs));
+        let qb = self.upload_weight("q8", bytemuck::cast_slice(&q.qs));
         let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 32, 1);
-        let sb = self.upload("q8-scales", bytemuck::cast_slice(&sc));
+        let sb = self.upload_weight("q8-scales", bytemuck::cast_slice(&sc));
         Matrix { fmt: Format::Q8, n, k, q: qb, s: Some(sb), s16: None }
     }
 
     pub(crate) fn upload_q4(&mut self, q: yaxus_model::quant::Q4Data, n: usize, k: usize) -> Matrix {
-        let qb = self.upload("q4", &q.qs);
+        let qb = self.upload_weight("q4", &q.qs);
         let sc = pad_scales(q.scales.iter().map(|s| s.to_bits()).collect(), n, k / 32, 1);
-        let sb = self.upload("q4-scales", bytemuck::cast_slice(&sc));
+        let sb = self.upload_weight("q4-scales", bytemuck::cast_slice(&sc));
         Matrix { fmt: Format::Q4, n, k, q: qb, s: Some(sb), s16: None }
     }
 }

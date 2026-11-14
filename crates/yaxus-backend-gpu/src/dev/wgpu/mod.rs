@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 
 use super::{Buf, BufImpl};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::device::Diagnostics;
+use crate::device::Environment;
 use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
 use crate::profile::{KernelProfile, MAX_TIMED};
 
@@ -83,10 +83,10 @@ pub(crate) struct ErrorScope {
 }
 
 impl ErrorScope {
-    pub(crate) fn finish(self) -> Option<String> {
+    fn finish(self) -> Option<String> {
         // Popping an error scope is async in WebGPU, and `Gpu::checked` runs while the
         // model loads, synchronously. The errors go to `Fault` instead, which
-        // `take_failure` and every read-back report.
+        // `WgpuDev::finish_errors` and every read-back report.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let invalid = pollster::block_on(self.invalid.pop());
@@ -105,7 +105,7 @@ impl WgpuDev {
     /// `YAXUS_SOFTWARE_GPU=1` accepts a software adapter too (lavapipe), so the kernel tests
     /// can run on machines without a GPU (CI).
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn open(diag: &Diagnostics) -> Result<(WgpuDev, DeviceCaps)> {
+    pub(crate) fn open(env: &Environment) -> Result<(WgpuDev, DeviceCaps)> {
         let backends = platform_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
@@ -114,7 +114,7 @@ impl WgpuDev {
         let adapters = pollster::block_on(instance.enumerate_adapters(backends));
         let adapter = adapters
             .into_iter()
-            .find(|a| diag.software || a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .find(|a| env.software || a.get_info().device_type != wgpu::DeviceType::Cpu)
             .with_context(|| {
                 let hint = if cfg!(target_os = "linux") {
                     ". Check that the user is in the `render` group and that the session has it \
@@ -129,7 +129,7 @@ impl WgpuDev {
         if !adapter.features().contains(wgpu::Features::IMMEDIATES) {
             bail!("{} does not support push constants (wgpu IMMEDIATES)", caps.name);
         }
-        let timed = diag.profile == Some(2) && caps.timestamps;
+        let timed = env.profile == Some(2) && caps.timestamps;
         let (f16, coop, subgroups) = (caps.f16, caps.coop, caps.subgroups);
         let limits = wgpu::Limits {
             max_buffer_size: alimits.max_buffer_size,
@@ -330,7 +330,10 @@ impl WgpuDev {
                     layout: &k.layout,
                     entries: &entries,
                 });
-                // Per-request buffers (KV cache, rope tables) make old entries stale.
+                // Per-request buffers (KV cache, rope tables) make old entries stale, and
+                // the keys keep their buffers alive: a dropped buffer's memory is released
+                // only here. Clearing everything is simpler than tracking use, and the
+                // groups a token needs are recreated in its first pass.
                 if self.bind_groups.len() >= 4096 {
                     self.bind_groups.clear();
                 }
@@ -443,6 +446,14 @@ impl WgpuDev {
         {
             ErrorScope {}
         }
+    }
+
+    /// The first error of `scope`, or on wasm the browser's fault recorded meanwhile.
+    pub(crate) fn finish_errors(&self, scope: ErrorScope) -> Option<String> {
+        let e = scope.finish();
+        #[cfg(target_arch = "wasm32")]
+        let e = e.or_else(|| self.web.fault.get());
+        e
     }
 }
 

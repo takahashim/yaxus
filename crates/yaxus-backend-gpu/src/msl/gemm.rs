@@ -12,7 +12,7 @@ pub(crate) fn gemm_reads(f: Format) -> bool {
 }
 
 /// A [`gemm`] kernel: tiles of `32 rb` rows of the pass, f16 or f32.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Gemm {
     pub(crate) f16: bool,
     pub(crate) rb: usize,
