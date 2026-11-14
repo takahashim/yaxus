@@ -2,12 +2,20 @@
 
 use std::collections::HashMap;
 
+#[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result, bail};
 use wgpu::util::DeviceExt;
 
 use super::Buf;
-use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Diagnostics, Vendor};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::device::Diagnostics;
+use crate::device::{Api, CompileSettings, DeviceCaps, DeviceKind, Vendor};
 use crate::profile::{KernelProfile, MAX_TIMED};
+
+#[cfg(target_arch = "wasm32")]
+mod web;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use web::AsyncErrorScope;
 
 /// Weight bytes uploaded between flushes of the staging memory. Smaller in the browser,
 /// where a flush does not wait for the queue and the GPU process holds the copies.
@@ -20,9 +28,6 @@ const UPLOAD_FLUSH_BYTES: usize = 64 << 20;
 /// no push constants). It is above every storage binding the kernels use.
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const PARAM_BINDING: u32 = 15;
-/// The uniform ring: 4096 slots of 256 bytes (the usual offset alignment).
-#[cfg(target_arch = "wasm32")]
-const PARAM_BYTES: u64 = 1 << 20;
 
 pub(crate) struct WgpuKernel {
     pub(crate) pipeline: wgpu::ComputePipeline,
@@ -44,16 +49,10 @@ pub(crate) struct WgpuDev {
     readback: wgpu::Buffer,
     /// Bytes uploaded since the staging memory was last released.
     unflushed_upload: usize,
-    /// The uniform buffer carrying the per-dispatch scalars, and the ring cursor.
+    /// What only WebGPU has: the uniform ring of the per-dispatch scalars, and the
+    /// device's first error (see `web`).
     #[cfg(target_arch = "wasm32")]
-    params: wgpu::Buffer,
-    #[cfg(target_arch = "wasm32")]
-    param_offset: u64,
-    #[cfg(target_arch = "wasm32")]
-    param_stride: u64,
-    /// The first error WebGPU reported, or the device's loss (see `Fault`).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fault: Fault,
+    pub(crate) web: web::WebState,
     pub(crate) kernels_profile: Option<KernelProfile>,
 }
 
@@ -72,61 +71,6 @@ fn wb(b: &Buf) -> &wgpu::Buffer {
         Buf::Wgpu(b) => b,
         #[allow(unreachable_patterns)]
         _ => panic!("a buffer of another device"),
-    }
-}
-
-/// The first error of a WebGPU device. Error scopes resolve asynchronously in the browser,
-/// so the device reports every error to its uncaptured-error hook instead, and the loss
-/// of the device to its lost callback; both land here, and the next read-back (the point
-/// where the browser path awaits the GPU anyway) returns it. A device that failed once is
-/// not trusted again: the slot is never cleared.
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Default)]
-pub(crate) struct Fault(std::sync::Arc<std::sync::Mutex<Option<String>>>);
-
-#[cfg(target_arch = "wasm32")]
-impl Fault {
-    fn record(&self, what: String) {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.is_none() {
-            *slot = Some(what);
-        }
-    }
-
-    pub(crate) fn get(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    fn watch(&self, device: &wgpu::Device) {
-        let fault = self.clone();
-        device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| fault.record(format!("WebGPU: {e}"))));
-        let fault = self.clone();
-        device.set_device_lost_callback(move |reason, message| {
-            fault.record(format!("the GPU device was lost ({reason:?}): {message}"));
-        });
-    }
-}
-
-/// Error scopes pushed around a stretch of work in the browser (see
-/// `WgpuDev::async_error_scope`).
-#[cfg(target_arch = "wasm32")]
-pub(crate) struct AsyncErrorScope {
-    scopes: [wgpu::ErrorScopeGuard; 3],
-}
-
-#[cfg(target_arch = "wasm32")]
-impl AsyncErrorScope {
-    /// Pops the scopes (innermost first) and returns the first error they captured.
-    pub(crate) async fn finish(self) -> Option<String> {
-        let [oom, invalid, internal] = self.scopes;
-        let popped = [internal.pop(), invalid.pop(), oom.pop()];
-        let mut first = None;
-        for p in popped {
-            if let Some(e) = p.await {
-                first.get_or_insert_with(|| format!("WebGPU: {e}"));
-            }
-        }
-        first
     }
 }
 
@@ -230,86 +174,6 @@ impl WgpuDev {
         Ok((Self::from_device(device, queue, timed), caps))
     }
 
-    /// Opens WebGPU (wasm32) and requests room for the model's largest tensor. WebGPU
-    /// reports a conservative set of limits; asking for more than the adapter supports
-    /// makes `requestDevice` fail, so a smaller request is retried.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn open_async(
-        diag: &Diagnostics,
-        need_binding: u64,
-        need_buffer: u64,
-    ) -> Result<(WgpuDev, DeviceCaps)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-                ..Default::default()
-            })
-            .await
-            .context("WebGPU is not available (requestAdapter failed)")?;
-        let info = adapter.get_info();
-        if !diag.software && info.device_type == wgpu::DeviceType::Cpu {
-            bail!("only a software WebGPU adapter is available");
-        }
-        let mut caps = detect(&adapter);
-        // The subgroup kernels assume 32 lanes, which WebGPU does not report; keep to
-        // the f32 kernels tested on lavapipe. Cooperative matrices are not in WebGPU.
-        caps.subgroups = false;
-        caps.coop = false;
-        caps.coop_size = 0;
-        caps.msl = false;
-        let alimits = adapter.limits();
-        let timed = false;
-        // Ask for what the model needs, not for the adapter's maximum (Deno's WebGPU on
-        // an M2 reports a 9.5 GB `maxBufferSize`, for example).
-        let limits = wgpu::Limits {
-            max_buffer_size: alimits.max_buffer_size.min(need_buffer.max(256 << 20)),
-            max_storage_buffer_binding_size: alimits.max_storage_buffer_binding_size.min(need_binding.max(128 << 20)),
-            max_storage_buffers_per_shader_stage: alimits.max_storage_buffers_per_shader_stage.clamp(6, 10),
-            max_compute_workgroup_storage_size: caps.max_workgroup_storage,
-            max_compute_invocations_per_workgroup: 256,
-            max_uniform_buffer_binding_size: 64 << 10,
-            max_bind_groups: 4,
-            ..wgpu::Limits::default()
-        };
-        let desc = wgpu::DeviceDescriptor {
-            label: Some("yaxus"),
-            required_features: wgpu::Features::empty(),
-            required_limits: limits.clone(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            ..Default::default()
-        };
-        let (device, queue) = match adapter.request_device(&desc).await {
-            Ok(x) => x,
-            Err(e) => {
-                // Some adapters advertise more than `requestDevice` grants. Fall back to the
-                // buffer sizes every WebGPU device has (256 MB, a 128 MB binding); a matrix
-                // that does not fit one binding then loads as Q4 (`Gpu::load_weight`).
-                let base = wgpu::Limits::default();
-                let limits = wgpu::Limits {
-                    max_buffer_size: base.max_buffer_size.min(alimits.max_buffer_size),
-                    max_storage_buffer_binding_size: base
-                        .max_storage_buffer_binding_size
-                        .min(alimits.max_storage_buffer_binding_size),
-                    ..limits
-                };
-                let desc = wgpu::DeviceDescriptor { required_limits: limits, ..desc };
-                adapter.request_device(&desc).await.with_context(|| {
-                    format!(
-                        "creating the WebGPU device ({e}); the model needs a {need_buffer} byte buffer \
-                         and a {need_binding} byte storage binding"
-                    )
-                })?
-            }
-        };
-        Ok((Self::from_device(device, queue, timed), caps))
-    }
-
     fn from_device(device: wgpu::Device, queue: wgpu::Queue, timed: bool) -> WgpuDev {
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
@@ -343,20 +207,7 @@ impl WgpuDev {
             }
         });
         #[cfg(target_arch = "wasm32")]
-        let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: PARAM_BYTES,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        #[cfg(target_arch = "wasm32")]
-        let param_stride = device.limits().min_uniform_buffer_offset_alignment.max(32) as u64;
-        #[cfg(target_arch = "wasm32")]
-        let fault = {
-            let fault = Fault::default();
-            fault.watch(&device);
-            fault
-        };
+        let web = web::WebState::new(&device);
         WgpuDev {
             device,
             queue,
@@ -366,13 +217,7 @@ impl WgpuDev {
             readback,
             unflushed_upload: 0,
             #[cfg(target_arch = "wasm32")]
-            params,
-            #[cfg(target_arch = "wasm32")]
-            param_offset: 0,
-            #[cfg(target_arch = "wasm32")]
-            param_stride,
-            #[cfg(target_arch = "wasm32")]
-            fault,
+            web,
             kernels_profile,
         }
     }
@@ -478,14 +323,7 @@ impl WgpuDev {
                     .collect();
                 #[cfg(target_arch = "wasm32")]
                 if k.has_params {
-                    entries.push(wgpu::BindGroupEntry {
-                        binding: PARAM_BINDING,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &self.params,
-                            offset: 0,
-                            size: std::num::NonZeroU64::new(32),
-                        }),
-                    });
+                    entries.push(self.web.params.bind_entry());
                 }
                 let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
@@ -541,28 +379,13 @@ impl WgpuDev {
         pass.dispatch_workgroups(groups.0, groups.1, 1);
     }
 
-    /// Writes the scalars of one dispatch into the next uniform slot and returns its
-    /// dynamic offset. Slots are reused only after the submission that reads them.
-    #[cfg(target_arch = "wasm32")]
-    fn next_param(&mut self, imm: &[u32; 8]) -> u32 {
-        if self.param_offset + self.param_stride > self.params.size() {
-            self.submit();
-        }
-        let offset = self.param_offset;
-        self.queue.write_buffer(&self.params, offset, bytemuck::cast_slice(imm));
-        self.param_offset += self.param_stride;
-        offset as u32
-    }
-
     pub(crate) fn submit(&mut self) {
         self.pass = None;
         if let Some(enc) = self.encoder.take() {
             self.queue.submit([enc.finish()]);
         }
         #[cfg(target_arch = "wasm32")]
-        {
-            self.param_offset = 0;
-        }
+        self.web.params.reset();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -609,56 +432,6 @@ impl WgpuDev {
         out
     }
 
-    /// Submits, waits for the map callback, and returns `size` bytes at `offset`.
-    /// WebGPU polls the device itself; `Device::poll` is a no-op there, so the read
-    /// must be awaited rather than blocked on. An error the device reported by then (the
-    /// work before the read included) fails the read.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn read_async(&mut self, src: &Buf, offset: u64, size: u64) -> Result<Vec<u8>> {
-        if let Some(e) = self.fault.get() {
-            bail!("{e}");
-        }
-        let src = wb(src).clone();
-        let staging = if size <= self.readback.size() {
-            self.readback.clone()
-        } else {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("readback-large"),
-                size: size.next_multiple_of(4),
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
-        self.encoder().copy_buffer_to_buffer(&src, offset, &staging, 0, size);
-        self.submit();
-        let (tx, rx) = futures_channel::oneshot::channel();
-        staging.map_async(wgpu::MapMode::Read, ..size, move |r| {
-            let _ = tx.send(r);
-        });
-        let mapped = rx.await;
-        if let Some(e) = self.fault.get() {
-            bail!("{e}");
-        }
-        match mapped {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => bail!("reading back from the GPU: {e}"),
-            Err(_) => bail!("reading back from the GPU: the map request was dropped"),
-        }
-        let out = staging.get_mapped_range(..size).context("reading back from the GPU")?.to_vec();
-        staging.unmap();
-        Ok(out)
-    }
-
-    /// Captures every error of the device until [`AsyncErrorScope::finish`], which
-    /// resolves only after the errors of all earlier work are known (unlike `Fault`, which
-    /// an uncaptured-error event may reach after a read-back has already completed).
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn async_error_scope(&self) -> AsyncErrorScope {
-        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Validation, wgpu::ErrorFilter::Internal]
-            .map(|f| self.device.push_error_scope(f));
-        AsyncErrorScope { scopes }
-    }
-
     pub(crate) fn error_scope(&self) -> ErrorScope {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -699,16 +472,7 @@ pub(crate) fn compile(
     let mut entries: Vec<_> = read_only.iter().enumerate().map(|(i, &r)| storage_entry(i as u32, r)).collect();
     #[cfg(target_arch = "wasm32")]
     if _has_params {
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: PARAM_BINDING,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: std::num::NonZeroU64::new(32),
-            },
-            count: None,
-        });
+        entries.push(web::param_layout_entry());
     }
     let layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(name), entries: &entries });
@@ -733,6 +497,9 @@ pub(crate) fn compile(
     });
     WgpuKernel { pipeline, layout, has_params: _has_params }
 }
+
+#[cfg(target_arch = "wasm32")]
+use web::compile_module;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn compile_module(
@@ -774,19 +541,6 @@ fn compile_module(
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn webgpu_source(src: &str) -> String {
     src.replace("var<immediate> p: P;", &format!("@group(0) @binding({PARAM_BINDING}) var<uniform> p: P;"))
-}
-
-/// WebGPU has no push constants: the per-dispatch struct becomes a uniform binding.
-#[cfg(target_arch = "wasm32")]
-fn compile_module(
-    device: &wgpu::Device,
-    _settings: CompileSettings,
-    name: &str,
-    src: &str,
-) -> (wgpu::ShaderModule, &'static str) {
-    let src = webgpu_source(src);
-    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
-    (device.create_shader_module(desc), "main")
 }
 
 /// The wgpu backends of the platform: Metal on macOS, Vulkan elsewhere.

@@ -7,6 +7,11 @@
 //! object: there are two, both in this crate, and a dispatch is recorded some 200 times a
 //! token, so the call stays static. A third implementation would be the time to make the
 //! methods a trait.
+//!
+//! WebGPU in the browser is not a third one: it is wgpu too, and shares the buffers, the
+//! bind-group cache and the compute passes of `wgpu`. What it does differently (scalars
+//! in a uniform ring, opening and reading back with `await`, asynchronous errors) lives
+//! in `wgpu::web`, and `WgpuDev` holds its state in one field.
 
 #[cfg(target_os = "macos")]
 pub(crate) mod metal;
@@ -232,7 +237,7 @@ impl Dev {
     pub(crate) fn take_failure(&self) -> Option<String> {
         match self {
             #[cfg(target_arch = "wasm32")]
-            Dev::Wgpu(d) => d.fault.get(),
+            Dev::Wgpu(d) => d.web.fault.get(),
             #[cfg(not(target_arch = "wasm32"))]
             Dev::Wgpu(_) => None,
             #[cfg(target_os = "macos")]
