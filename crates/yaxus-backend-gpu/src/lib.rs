@@ -130,8 +130,6 @@ pub struct Gpu {
     oversized: Option<(String, usize)>,
     /// Matrices loaded as Q4 because their own format exceeds the binding limit.
     reduced_to_q4: usize,
-    /// Extra detail (matrix shape) for the next profiled dispatch.
-    prof_detail: Option<String>,
     /// `YAXUS_PROFILE=1`: time spent recording vs. waiting for the GPU.
     profile: Option<Profile>,
 }
@@ -253,7 +251,6 @@ impl Gpu {
         let argmax_part = dev.storage("argmax-part", (ARGMAX_ROWS * ARGMAX_SLICES * 16) as u64);
         let mut b = Gpu {
             argmax_part,
-            prof_detail: None,
             dev,
             gemm: tuning.gemm,
             tuning,

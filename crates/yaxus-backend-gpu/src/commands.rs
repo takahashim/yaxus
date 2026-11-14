@@ -20,6 +20,30 @@ impl Gpu {
     }
 
     pub(crate) fn dispatch(&mut self, name: &str, bufs: &[&Buf], params: &[u32], groups: (u32, u32)) {
+        self.dispatch_shaped(name, bufs, params, groups, None);
+    }
+
+    /// [`Gpu::dispatch`] of a matrix product over an `[n, k]` weight: the per-kernel
+    /// profile (`YAXUS_PROFILE=2`) labels it with that shape.
+    pub(crate) fn dispatch_matmul(
+        &mut self,
+        name: &str,
+        bufs: &[&Buf],
+        params: &[u32],
+        groups: (u32, u32),
+        shape: (usize, usize),
+    ) {
+        self.dispatch_shaped(name, bufs, params, groups, Some(shape));
+    }
+
+    fn dispatch_shaped(
+        &mut self,
+        name: &str,
+        bufs: &[&Buf],
+        params: &[u32],
+        groups: (u32, u32),
+        shape: Option<(usize, usize)>,
+    ) {
         let k = &self.kernels[name];
         let mut imm = [0u32; 8];
         imm[..params.len()].copy_from_slice(params);
@@ -27,8 +51,8 @@ impl Gpu {
             p.dispatches += 1;
         }
         let timing = self.dev.timing();
-        let label = timing.then(|| match self.prof_detail.take() {
-            Some(d) => format!("{name} {d}"),
+        let label = timing.then(|| match shape {
+            Some((n, k)) => format!("{name} {n}x{k}"),
             None => name.to_string(),
         });
         self.dev.dispatch(k, bufs, &imm, groups, label);
