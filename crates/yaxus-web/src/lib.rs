@@ -255,7 +255,8 @@ impl Translator {
         let mut history: Vec<Pair> = Vec::new();
         let mut prompt_tokens = 0u32;
         let mut output_tokens = 0u32;
-        let mut chars = 0usize;
+        let mut decode_steps = 0u32;
+        let mut out = Output { on_text, chars: 0, owed: "" };
         let mut prefill_ms = 0.0;
         let mut decode_ms = 0.0;
         let mut any_limit = false;
@@ -267,19 +268,13 @@ impl Translator {
                 let _ = progress.call2(&JsValue::NULL, &JsValue::from_f64(i as f64), &JsValue::from_f64(total as f64));
             }
             let (ids, max_new) = self.fit_segment(segment, target, form, &history)?;
-            if chars > 0 {
-                let separator = if segment.paragraph { "\n\n" } else { sentence_gap };
-                if !separator.is_empty() {
-                    chars += separator.chars().count();
-                    emit(on_text, separator)?;
-                }
-            }
+            out.owe(if segment.paragraph { "\n\n" } else { sentence_gap });
             let prompt_len = ids.len() as u32;
             let started = Instant::now();
             // `start` and `forward` fail only on host-side limits (KV pages, positions);
             // a GPU error shows at the read-back in `decode_segment`.
             let (id, first) = self.model.start(&ids).map_err(request_err)?;
-            let decoded = self.decode_segment(id, first, max_new, on_text, &mut chars).await?;
+            let decoded = self.decode_segment(id, first, max_new, &mut out).await?;
             let (translated, stop, generated) = (decoded.text, decoded.stop, decoded.tokens);
             // The prompt's pass ends with the first token's read-back: until then the GPU
             // has only been given the work, so that is where prefill ends.
@@ -288,6 +283,7 @@ impl Translator {
             decode_ms += started.elapsed().as_secs_f64() * 1e3 - first_ms;
             prompt_tokens += prompt_len;
             output_tokens += generated;
+            decode_steps += decoded.steps;
             last_max_new = max_new as u32;
             if stop == "limit" {
                 any_limit = true;
@@ -315,7 +311,8 @@ impl Translator {
             max_new: last_max_new,
             segments: total as u32,
             stop: (if any_limit { "limit" } else { last_stop }).into(),
-            chars: chars as u32,
+            chars: out.chars as u32,
+            decode_steps,
             prefill_ms,
             decode_ms,
         })
@@ -359,13 +356,13 @@ impl Translator {
         id: SeqId,
         first: Tensor,
         max_new: usize,
-        on_text: &Function,
-        chars: &mut usize,
+        out: &mut Output<'_>,
     ) -> Result<Decoded, Failure> {
         let mut logits = first;
         let mut decoder = StreamDecoder::new();
         let mut translated = String::new();
         let mut output_tokens = 0u32;
+        let mut steps = 0u32;
         let mut stop = "limit";
         let mut first_token = None;
         let result = async {
@@ -381,25 +378,20 @@ impl Translator {
                     break;
                 }
                 let delta = decoder.push(&self.tokenizer, next);
-                if !delta.is_empty() {
-                    *chars += delta.chars().count();
-                    translated.push_str(&delta);
-                    emit(on_text, &delta)?;
-                }
+                translated.push_str(&delta);
+                out.text(&delta)?;
                 output_tokens += 1;
                 if output_tokens as usize >= max_new {
                     break;
                 }
                 logits = self.model.forward(&[(id, &[next])], false).map_err(request_err)?;
+                steps += 1;
             }
             // A character split across byte tokens is held until the next token; there is
             // no next token at the end, so emit its replacement here.
             let tail = decoder.finish();
-            if !tail.is_empty() {
-                *chars += tail.chars().count();
-                translated.push_str(&tail);
-                emit(on_text, &tail)?;
-            }
+            translated.push_str(&tail);
+            out.text(&tail)?;
             Ok::<(), Failure>(())
         }
         .await;
@@ -407,7 +399,7 @@ impl Translator {
             Ok(()) => {
                 self.model.finish(id);
                 let first_token = first_token.unwrap_or_else(Instant::now);
-                Ok(Decoded { text: translated, stop, tokens: output_tokens, first_token })
+                Ok(Decoded { text: translated, stop, tokens: output_tokens, steps, first_token })
             }
             Err(e) => {
                 self.model.free_seq(id);
@@ -423,16 +415,46 @@ struct Decoded {
     /// `tag`, `eos` or `limit` (see [`Stats::stop`]).
     stop: &'static str,
     tokens: u32,
+    /// Decode passes after the first token (each one read back one more token).
+    steps: u32,
     /// When the first token was read back.
     first_token: Instant,
 }
 
-/// Emits text to the page.
-fn emit(on_text: &Function, text: &str) -> Result<(), Failure> {
-    on_text
-        .call1(&JsValue::NULL, &JsValue::from_str(text))
-        .map(|_| ())
-        .map_err(|e| request_err(format!("on_text callback failed: {e:?}")))
+/// The page's output. The separator a segment owes the text before it is written just
+/// before its own first text, so a segment that produces nothing adds no separator.
+struct Output<'a> {
+    on_text: &'a Function,
+    /// Characters sent so far.
+    chars: usize,
+    owed: &'static str,
+}
+
+impl Output<'_> {
+    /// The next segment follows the text so far after `separator` (a paragraph break
+    /// owed by a segment with no text is kept).
+    fn owe(&mut self, separator: &'static str) {
+        if self.chars > 0 && (self.owed.is_empty() || separator == "\n\n") {
+            self.owed = separator;
+        }
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), Failure> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let owed = std::mem::take(&mut self.owed);
+        for part in [owed, text] {
+            if part.is_empty() {
+                continue;
+            }
+            self.chars += part.chars().count();
+            self.on_text
+                .call1(&JsValue::NULL, &JsValue::from_str(part))
+                .map_err(|e| request_err(format!("on_text callback failed: {e:?}")))?;
+        }
+        Ok(())
+    }
 }
 
 /// The newest pairs within the history budget (at most two).
@@ -463,6 +485,8 @@ pub struct Stats {
     segments: u32,
     stop: String,
     chars: u32,
+    /// Decode passes (see [`Stats::tokens_per_second`]).
+    decode_steps: u32,
     prefill_ms: f64,
     decode_ms: f64,
 }
@@ -512,11 +536,10 @@ impl Stats {
         self.decode_ms
     }
 
-    /// Output tokens per second over the decode loop (the first token of each segment
-    /// comes with the prefill, so it is not counted).
+    /// Tokens per second over the decode loop: the passes after each segment's first
+    /// token (which comes with the prefill), over their time.
     #[wasm_bindgen(getter)]
     pub fn tokens_per_second(&self) -> f64 {
-        let tokens = self.output_tokens.saturating_sub(self.segments);
-        if self.decode_ms <= 0.0 { 0.0 } else { f64::from(tokens) * 1e3 / self.decode_ms }
+        if self.decode_ms <= 0.0 { 0.0 } else { f64::from(self.decode_steps) * 1e3 / self.decode_ms }
     }
 }
